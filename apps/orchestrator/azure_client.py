@@ -207,8 +207,6 @@ def get_authorization_client():
 # blast radius of an MI-token leak to just the names listed here plus the
 # tenant's own internal key.
 DEFAULT_TENANT_KV_SECRETS: tuple[str, ...] = (
-    "anthropic-api-key",
-    "openai-api-key",
     "openrouter-api-key",
     "brave-api-key",
 )
@@ -1601,6 +1599,45 @@ def _entry_name(entry: Any) -> str | None:
     return getattr(entry, "name", None)
 
 
+PLATFORM_PROVIDER_SECRET_NAMES = frozenset({"anthropic-key", "openai-key"})
+PLATFORM_PROVIDER_ENV_NAMES = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY"})
+
+
+def scrub_platform_provider_bindings(app: Any) -> bool:
+    """Remove legacy platform OpenAI/Anthropic bindings from an app spec.
+
+    Returns ``True`` when the spec changed, otherwise ``False``. The caller
+    owns persistence so dry-run fleet operations can inspect without writing.
+    """
+    current_secrets = list(app.configuration.secrets or [])
+    retained_secrets = [
+        secret for secret in current_secrets if _entry_name(secret) not in PLATFORM_PROVIDER_SECRET_NAMES
+    ]
+    changed = len(retained_secrets) != len(current_secrets)
+    app.configuration.secrets = retained_secrets
+
+    for container in app.template.containers:
+        if container.name != "openclaw":
+            continue
+        current_env = list(container.env or [])
+        retained_env = [env for env in current_env if _entry_name(env) not in PLATFORM_PROVIDER_ENV_NAMES]
+        if len(retained_env) != len(current_env):
+            changed = True
+        container.env = retained_env
+        break
+
+    return changed
+
+
+def force_new_container_revision(app: Any, reason: str) -> None:
+    """Set a unique, Container Apps-safe revision suffix on an app spec."""
+    import hashlib
+    import time
+
+    seed = f"{reason}-{time.time_ns()}"
+    app.template.revision_suffix = f"b{hashlib.sha256(seed.encode()).hexdigest()[:6]}"
+
+
 def apply_byo_credentials_to_container(tenant: Any) -> None:
     """Reconcile the tenant container's BYO secret + env bindings, then
     create a new revision so the Container Apps runtime picks up any
@@ -1651,16 +1688,11 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
 
     BYO_SECRET = "claude-code-oauth-token"
     BYO_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-    PLATFORM_SECRETS = {"anthropic-key", "openai-key"}
-    PLATFORM_ENVS = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
 
-    # Reconcile secrets list — drop stale BYO + platform entries, then
-    # optionally re-add only the tenant's BYO credential.
-    secrets = [
-        secret
-        for secret in (app.configuration.secrets or [])
-        if _entry_name(secret) not in PLATFORM_SECRETS | {BYO_SECRET}
-    ]
+    scrub_platform_provider_bindings(app)
+
+    # Reconcile the BYO secret, then optionally re-add the tenant credential.
+    secrets = [secret for secret in (app.configuration.secrets or []) if _entry_name(secret) != BYO_SECRET]
     if cred:
         secrets.append(
             _build_container_secret(
@@ -1676,16 +1708,13 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
     for container in app.template.containers:
         if container.name != "openclaw":
             continue
-        env_list = [env for env in (container.env or []) if _entry_name(env) not in PLATFORM_ENVS | {BYO_ENV}]
+        env_list = [env for env in (container.env or []) if _entry_name(env) != BYO_ENV]
         if cred:
             env_list.append({"name": BYO_ENV, "secretRef": BYO_SECRET})
         container.env = env_list
         break
 
-    import hashlib
-    import time
-
-    app.template.revision_suffix = f"b{hashlib.sha256(f'byo-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+    force_new_container_revision(app, "byo")
 
     client.container_apps.begin_create_or_update(
         settings.AZURE_RESOURCE_GROUP,

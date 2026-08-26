@@ -266,6 +266,11 @@ class AssignKeyVaultRoleTest(SimpleTestCase):
     def test_creates_per_secret_role_assignments(self, mock_get_auth_client, _mock_is_mock):
         from apps.orchestrator.azure_client import DEFAULT_TENANT_KV_SECRETS
 
+        self.assertEqual(
+            DEFAULT_TENANT_KV_SECRETS,
+            ("openrouter-api-key", "brave-api-key"),
+        )
+
         mock_client = MagicMock()
         mock_get_auth_client.return_value = mock_client
 
