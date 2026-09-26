@@ -667,6 +667,10 @@ def _resolve_chat_timeout(tenant: Tenant) -> float:
     import to keep the queue module self-contained and avoid a circular
     coupling between router → orchestrator → router.
     """
+    local_timeout = getattr(settings, "LOCAL_TEST_CHAT_TIMEOUT", None)
+    if getattr(settings, "LOCAL_TEST_ROOT", "") and local_timeout:
+        return float(local_timeout)
+
     from apps.billing.constants import (
         DEFAULT_CHAT_TIMEOUT,
         REASONING_MODEL_TIMEOUT,

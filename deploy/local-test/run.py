@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -101,9 +102,9 @@ def main():
         sys.argv = ["manage.py", "runserver", "127.0.0.1:18080", "--noreload"]
         runpy.run_path(str(ROOT / "manage.py"), run_name="__main__")
     elif command == "gateway":
-        processes = subprocess.run(["/bin/ps", "-axo", "comm="], capture_output=True, text=True, check=True).stdout
-        if any("loanarmy" in line.lower() for line in processes.splitlines()):
-            raise RuntimeError("Loanarmy process present; refuse to start GPU inference gateway")
+        processes = subprocess.run(["/bin/ps", "-axo", "args="], capture_output=True, text=True, check=True).stdout
+        if re.search(r"qwen_match_analysis|run_bench", processes):
+            raise RuntimeError("GPU job running (qwen_match_analysis|run_bench); refuse to start the inference gateway")
         if not (TEST_HOME / "openclaw.json").exists():
             raise RuntimeError("MJ signup and provision step must complete first")
         # Seatbelt denies remote network from Node and all plugin subprocesses.

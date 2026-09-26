@@ -7,6 +7,8 @@ from .development import *  # noqa: F403,F401
 if os.environ.get("AZURE_MOCK") != "true":
     raise RuntimeError("The local test stack cannot use Azure")
 LOCAL_TEST_ROOT = os.environ["LOCAL_TEST_ROOT"]
+# Local model turns outlast the 120 s fleet default; stay below yuki_local's 900 s poll.
+LOCAL_TEST_CHAT_TIMEOUT = 840
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 SAUTAI_M2M_BASE_URL = "http://127.0.0.1:8000"

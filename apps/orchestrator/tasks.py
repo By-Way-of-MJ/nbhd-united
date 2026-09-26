@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 
 import httpx
 
+from apps.orchestrator.gateway_url import gateway_base_url
+
 from .services import (
     bump_openclaw_version_for_tenant,
     deprovision_tenant,
@@ -1779,6 +1781,3 @@ def converge_unencrypted_chat_tenants_task() -> dict:
     tail = buf.getvalue()[-4000:]
     logger.info("converge_unencrypted_chat_tenants: %s", tail)
     return {"output": tail}
-
-
-from apps.orchestrator.gateway_url import gateway_base_url
