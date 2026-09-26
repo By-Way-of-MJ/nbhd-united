@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / "deploy/local-test/.state"
 TEST_HOME = Path("/Users/mjjones/openclaw-yuki-test")
 PYTHON = str(ROOT / ".venv/bin/python")
+GPU_JOB = re.compile(r"qwen_match_analysis|run_bench")
 
 
 def environment():
@@ -72,6 +73,21 @@ def network_guard(event, args):
             raise PermissionError("Local test stack refused external Unix socket")
 
 
+def gpu_job_running(ps_output: str) -> bool:
+    """Match GPU job process names like the nightly sim supervisor, never arguments."""
+    for line in ps_output.splitlines():
+        words = line.split()
+        if not words:
+            continue
+        names = [os.path.basename(words[0])]
+        if names[0].startswith("python") or names[0] in {"node", "bash", "sh", "zsh"}:
+            script = next((word for word in words[1:] if not word.startswith("-")), "")
+            names.append(os.path.basename(script))
+        if any(GPU_JOB.search(name) for name in names):
+            return True
+    return False
+
+
 def main():
     os.umask(0o077)
     os.chdir(ROOT)
@@ -103,7 +119,7 @@ def main():
         runpy.run_path(str(ROOT / "manage.py"), run_name="__main__")
     elif command == "gateway":
         processes = subprocess.run(["/bin/ps", "-axo", "args="], capture_output=True, text=True, check=True).stdout
-        if re.search(r"qwen_match_analysis|run_bench", processes):
+        if gpu_job_running(processes):
             raise RuntimeError("GPU job running (qwen_match_analysis|run_bench); refuse to start the inference gateway")
         if not (TEST_HOME / "openclaw.json").exists():
             raise RuntimeError("MJ signup and provision step must complete first")

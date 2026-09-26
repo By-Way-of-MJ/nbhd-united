@@ -37,7 +37,7 @@ launchctl bootstrap gui/$(id -u) "$PWD/deploy/local-test/.state/com.mj.yuki-unit
 
 There is no need to copy plists into `~/Library/LaunchAgents`. The launchers read
 the gitignored `.env.local-test`; plist XML contains no tokens. Gateway startup
-refuses while a GPU job is running (any process whose command line matches
+refuses while a GPU job is running (any process whose process name matches
 `qwen_match_analysis|run_bench`). It never uses `--force`, installs a personal
 daemon, or restarts Ollama. Keep GPU scheduling coordinated with the loanarmy
 lane for the whole inference run.

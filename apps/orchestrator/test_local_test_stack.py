@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import httpx
 from django.conf import settings
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from apps.tenants.models import Tenant, User
 
@@ -239,6 +239,23 @@ class LocalStackTests(TestCase):
         config = json.loads(share_path(self.tenant.id, "openclaw.json").read_text())
         self.assertEqual(config["gateway"]["port"], 19443)
         self.assertIn("nbhd-sautai-tools", config["plugins"]["entries"])
+
+
+class GpuGuardTests(SimpleTestCase):
+    def test_gpu_job_running_matches_process_names_only(self):
+        running = runpy.run_path(str(settings.BASE_DIR / "deploy/local-test/run.py"), run_name="local_test_run")[
+            "gpu_job_running"
+        ]
+        for line in ("python3 /x/qwen_match_analysis.py", "/opt/bin/run_bench --n 3", "bash /y/run_bench.sh"):
+            self.assertTrue(running(f"/sbin/launchd\n{line}\n"), line)
+        for line in (
+            "/Users/mjjones/Projects/loanarmy/.loan/bin/python src/workers/vision_worker.py",
+            "sleep 60 qwen_match_analysis",
+            'claude -p "... qwen_match_analysis|run_bench ..."',
+            'python3 -c "import run_bench"',
+            "",
+        ):
+            self.assertFalse(running(line), line)
 
 
 @override_settings(DEBUG=True)

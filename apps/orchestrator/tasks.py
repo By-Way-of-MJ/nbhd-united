@@ -5,8 +5,6 @@ from datetime import UTC, datetime
 
 import httpx
 
-from apps.orchestrator.gateway_url import gateway_base_url
-
 from .services import (
     bump_openclaw_version_for_tenant,
     deprovision_tenant,
@@ -774,7 +772,7 @@ def broadcast_single_tenant_task(tenant_id: str, message: str) -> None:
         logger.info("Broadcast skipped for tenant %s (no entitlement)", tenant_id[:8])
         return
 
-    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
+    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
