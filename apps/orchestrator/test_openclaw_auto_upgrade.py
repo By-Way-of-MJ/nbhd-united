@@ -34,6 +34,13 @@ def failed(step, reason, status="FAILED"):
     return {"status": status, "step": step, "reason": reason, "reasons": {}}
 
 
+def stub_source_runtime(test, image="nbhdunited.azurecr.io/nbhd-openclaw:2026.5.28-abcdef0"):
+    """Hermetic Azure read for reset_unsubmitted_migration: the live app still runs 5.28."""
+    test.enterContext(patch.object(openclaw_migration.azure_client, "is_mock", return_value=False))
+    test.enterContext(patch.object(openclaw_migration, "get_app", return_value=object()))
+    test.enterContext(patch.object(openclaw_migration, "_image", return_value=image))
+
+
 class RulesTableTests(SimpleTestCase):
     def test_every_directive_outcome(self):
         cases = [
@@ -307,6 +314,7 @@ class SweepHookTests(TestCase):
 class SafeExitGuardTests(TestCase):
     def setUp(self):
         self.tenant = tenant_fixture(94030)
+        stub_source_runtime(self)
 
     def claim(self, **record):
         Tenant.objects.filter(pk=self.tenant.pk).update(
@@ -355,6 +363,13 @@ class SafeExitGuardTests(TestCase):
         self.assertFalse(self.tenant.openclaw_migration_cron_fenced)
         self.assertEqual(self.tenant.openclaw_migration["previous"]["failure"]["reason"], "owner_exited")
 
+    def test_reset_refuses_when_azure_already_runs_9_4(self):
+        self.claim(status="FAILED")
+        with patch.object(openclaw_migration, "_image", return_value="x/nbhd-openclaw:2026.9.4-abcdef0@sha256:a"):
+            self.assertEqual(au.ensure_safe_exit(self.tenant, "mine"), "failed:unexpected_target_revision")
+        self.tenant.refresh_from_db()
+        self.assertTrue(self.tenant.openclaw_migration_cron_fenced)
+
     def test_rollback_retried_once_then_reported(self):
         self.claim(status="FAILED", undo={"share_snapshot": "s"})
         with patch.object(
@@ -382,6 +397,7 @@ class TaskFlowTests(TestCase):
 
     def setUp(self):
         self.tenant = tenant_fixture(94040)
+        stub_source_runtime(self)
         Tenant.objects.filter(pk=self.tenant.pk).update(last_message_at=timezone.now() - timedelta(hours=3))
         self.token = au.acquire(self.tenant)
         OpenClawAutoUpgrade.objects.create(tenant=self.tenant, run_token=self.token)
