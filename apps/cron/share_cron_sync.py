@@ -63,8 +63,63 @@ def _desired_jobs(tenant) -> list[dict]:
             if not getattr(row, "managed", False) or _is_unmanaged_cron(row.name):
                 continue  # leave agent-owned and system self-cleaning crons alone
         job["declarationKey"] = f"nbhd:{row.id}"
-        jobs.append(job)
+        jobs.append(_payload_model(job))
+    return jobs + _fuel_jobs(tenant)
+
+
+def _fuel_jobs(tenant) -> list[dict]:
+    """The CURRENT ``_fuel:*`` set, computed by the Fuel reconciler.
+
+    ``_fuel:*`` CronJob rows are a stale mirror (old plans linger there); the
+    desired set comes from the Fuel models. 9.4 gates the gateway ``cron.add``
+    the Fuel reconciler used, so the signed file is the only way these reach a
+    9.4 container. The key is stable per name, so an edited prep cron replaces
+    its predecessor and a dropped plan's cron is removed by the writer.
+    """
+    from apps.orchestrator.cron_drift import strip_date_line
+    from apps.orchestrator.fuel_cron import _desired_fuel_crons
+
+    jobs = []
+    for job in _desired_fuel_crons(tenant):
+        job = dict(job)
+        # Fuel messages are rebuilt on every call with a minute-stamped
+        # "Current date and time: ... SNAPSHOT" first paragraph (the prompt
+        # says never to use it; the runtime appends the live clock at fire
+        # time). Left in, every file rewrite changes the job, so the 9.4
+        # writer re-adds it each pass and verify never matches (eval-behavior
+        # canary 2026-09-26). The 5.28 reconciler strips it the same way.
+        payload = job.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            job["payload"] = {**payload, "message": strip_date_line(payload["message"])}
+        job["declarationKey"] = "nbhd:fuel:" + sha256(job["name"].encode("utf-8")).hexdigest()[:16]
+        jobs.append(_payload_model(job))
     return jobs
+
+
+def _payload_model(job: dict) -> dict:
+    """Carry a top-level ``model`` pin as ``payload.model``.
+
+    System crons stamp their tier/user-preference model at the top level
+    (``config_generator``); 5.28's gateway ``cron.add`` folded it into
+    ``payload.model``. The 9.4 writer only emits ``--model`` from
+    ``payload.model``, so without this the pin is silently dropped and the
+    job runs on the chat primary. An explicit ``payload.model`` wins.
+    """
+    model = job.pop("model", None)
+    if model is None:
+        return job
+    payload = job.get("payload")
+    if (
+        isinstance(model, str)
+        and model
+        and isinstance(payload, dict)
+        and payload.get("kind") == "agentTurn"
+        and payload.get("model") in (None, model)
+    ):
+        job["payload"] = {**payload, "model": model}
+    else:
+        logger.warning("signed crons: dropped unmappable top-level model pin on %r", job.get("name"))
+    return job
 
 
 def build_signed_crons_doc(tenant) -> tuple[bytes, int]:

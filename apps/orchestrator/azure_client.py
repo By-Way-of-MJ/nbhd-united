@@ -366,7 +366,7 @@ def store_tenant_internal_key_in_key_vault(tenant_id: str, plaintext_key: str) -
     return secret_name
 
 
-def read_key_vault_secret(secret_name: str) -> str | None:
+def read_key_vault_secret(secret_name: str, *, metadata_only: bool = False) -> str | None:
     """Read a secret value from Azure Key Vault.
 
     Returns the secret value or None if not found / not configured.
@@ -388,7 +388,10 @@ def read_key_vault_secret(secret_name: str) -> str | None:
         secret = client.get_secret(secret_name)
         return secret.value
     except Exception as exc:
-        logger.warning("Failed to read KV secret %s: %s", secret_name, exc)
+        if metadata_only:
+            logger.warning("Key Vault failure reason=secret_read_failed")
+        else:
+            logger.warning("Failed to read KV secret %s: %s", secret_name, exc)
         return None
 
 
@@ -941,6 +944,110 @@ def _put_share_file(
 
     run_with_lease(tenant_id, lease, upload)
     logger.info("Uploaded %s (%d bytes) to file share %s", file_path, len(payload), share_name)
+
+
+# Container-local EmptyDir mounts shadow these share paths, so the runtime never
+# reads them; migration undo neither restores nor deletes them.
+_UNDO_SKIP_DIRS = frozenset({"agents", "plugin-runtime-deps", "index"})
+
+
+def _share_clients(tenant_id: str, *, snapshot: str | None = None):
+    from azure.storage.fileshare import ShareClient
+
+    from apps.orchestrator.storage_credentials import acquire_account_key
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+    lease = acquire_account_key(tenant_id)
+    url = f"https://{account_name}.file.core.windows.net"
+    share = f"ws-{str(tenant_id)[:20]}"
+    return lease, lambda key, snap=snapshot: ShareClient(
+        account_url=url, share_name=share, snapshot=snap, credential=key
+    )
+
+
+def snapshot_tenant_share(tenant_id: str) -> str:
+    """Point-in-time snapshot of the tenant's workspace share; returns its id."""
+    if _is_mock():
+        return "mock-snapshot"
+    from apps.orchestrator.storage_credentials import run_with_lease
+
+    lease, share = _share_clients(tenant_id)
+    snapshot, _ = run_with_lease(tenant_id, lease, lambda key: share(key).create_snapshot()["snapshot"])
+    return snapshot
+
+
+def _walk_share(share_client, path=""):
+    """Yield ("dir"|"file", relative_path) for a share, skipping shadowed dirs."""
+    directory = share_client.get_directory_client(path) if path else share_client.get_directory_client()
+    for item in directory.list_directories_and_files():
+        child = f"{path}/{item['name']}" if path else item["name"]
+        if not path and item["name"] in _UNDO_SKIP_DIRS:
+            continue
+        if item["is_directory"]:
+            yield "dir", child
+            yield from _walk_share(share_client, child)
+        else:
+            yield "file", child
+
+
+def restore_tenant_share(tenant_id: str, snapshot: str) -> dict:
+    """Mirror a snapshot back onto the live share (migration undo).
+
+    Every snapshot file is rewritten byte-for-byte; files created since the
+    snapshot are deleted. Shadowed EmptyDir paths are left alone.
+    """
+    if _is_mock():
+        return {"restored": 0, "deleted": 0}
+    from azure.core.exceptions import ResourceExistsError
+
+    from apps.orchestrator.storage_credentials import run_with_lease
+
+    lease, share = _share_clients(tenant_id, snapshot=snapshot)
+
+    def restore(key):
+        source, live = share(key), share(key, None)
+        wanted = list(_walk_share(source))
+        wanted_files = {p for kind, p in wanted if kind == "file"}
+        for kind, path in wanted:
+            if kind == "dir":
+                try:
+                    live.get_directory_client(path).create_directory()
+                except ResourceExistsError:
+                    pass
+        for path in sorted(wanted_files):
+            payload = source.get_file_client(path).download_file().readall()
+            live.get_file_client(path).upload_file(payload, length=len(payload))
+        extra = [p for kind, p in _walk_share(live) if kind == "file" and p not in wanted_files]
+        for path in extra:
+            live.get_file_client(path).delete_file()
+        return {"restored": len(wanted_files), "deleted": len(extra)}
+
+    result, _ = run_with_lease(tenant_id, lease, restore)
+    return result
+
+
+def copy_revision(container_name: str, from_revision: str, revision_suffix: str, *, operation_timeout=300) -> None:
+    """Redeploy an earlier revision's exact template under a new suffix."""
+    if _is_mock():
+        return
+    client = get_container_client()
+    group = settings.AZURE_RESOURCE_GROUP
+    source = client.container_apps_revisions.get_revision(group, container_name, from_revision)
+    app = client.container_apps.get(group, container_name)
+    app.template = source.template
+    app.template.revision_suffix = revision_suffix
+    client.container_apps.begin_update(group, container_name, app).result(timeout=operation_timeout)
+
+
+def restart_revision(container_name: str, revision_name: str) -> None:
+    """Restart a revision's replicas in place (no new revision)."""
+    if _is_mock():
+        return
+    get_container_client().container_apps_revisions.restart_revision(
+        settings.AZURE_RESOURCE_GROUP, container_name, revision_name
+    )
 
 
 def upload_config_to_file_share(tenant_id: str, config_json: str) -> None:
@@ -2225,7 +2332,14 @@ def _new_image_revision_suffix(image: str) -> str:
     return f"{_image_revision_tag_part(image)}-{nonce}"
 
 
-def update_container_image(container_name: str, image: str) -> None:
+def update_container_image(
+    container_name: str,
+    image: str,
+    *,
+    revision_suffix: str | None = None,
+    operation_timeout: int | None = None,
+    retrofit_storage: bool = False,
+) -> None:
     """Update the container image of an existing Container App.
 
     This triggers a new revision, effectively restarting the container.
@@ -2250,19 +2364,26 @@ def update_container_image(container_name: str, image: str) -> None:
     _ensure_plugin_runtime_deps_in_template(app)
     _ensure_index_cache_in_template(app)
     _ensure_gateway_readiness_probe_in_template(app)
+    # Explicit migration only; ordinary image updates preserve main behavior.
+    if retrofit_storage:
+        _ensure_oc_state_dir_in_template(app)
 
     # Keep the stable tag-derived part for image comparisons, but mint a
     # per-attempt nonce so applying the same tag still creates a new revision.
     # The 12-character result stays well below Azure's 64-character limit and
     # contains only lowercase alphanumerics and a hyphen.
-    suffix = _new_image_revision_suffix(image)
+    suffix = revision_suffix or _new_image_revision_suffix(image)
     app.template.revision_suffix = suffix
 
-    client.container_apps.begin_create_or_update(
+    poller = client.container_apps.begin_create_or_update(
         settings.AZURE_RESOURCE_GROUP,
         container_name,
         app,
-    ).result()
+    )
+    if operation_timeout is None:
+        poller.result()
+    else:
+        poller.result(timeout=operation_timeout)
     logger.info("Updated image to %s on %s (revision suffix: %s)", image, container_name, suffix)
 
 

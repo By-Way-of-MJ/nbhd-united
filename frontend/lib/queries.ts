@@ -63,6 +63,7 @@ import {
   fetchRefreshConfigStatus,
   fetchSidebarTree,
   fetchTenant,
+  fetchRecentAssistantCards,
   fetchTemplates,
   fetchTelegramStatus,
   fetchLineStatus,
@@ -77,6 +78,9 @@ import {
   updatePurpose,
   completeTask,
   reopenTask,
+  createGoalTask,
+  updateGoalNotes,
+  achieveGoal,
   fetchHorizons,
   fetchJournalStatus,
   fetchUsageHistory,
@@ -174,6 +178,9 @@ import {
   dismissLesson,
   deleteLesson,
   fetchNeighborhood,
+  fetchNeighborhoodHome,
+  setInMySky,
+  fetchDatebookAgenda,
   sendWave,
   acceptWave,
   declineWave,
@@ -201,6 +208,7 @@ import {
   markThreadRead,
   patchThreadMembership,
   fetchMissions,
+  fetchMissionAsks,
   createMission,
   fetchMissionDetail,
   patchMission,
@@ -326,6 +334,7 @@ export function useCompleteTaskMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (taskId: string) => completeTask(taskId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["horizons"] }),
     // CurrentStatusCard shows an inline "couldn't save — retry" on failure, so
     // opt out of the global mutation error toast (avoid a double signal).
     meta: { skipErrorToast: true },
@@ -345,9 +354,38 @@ export function useReopenTaskMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (taskId: string) => reopenTask(taskId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["horizons"] }),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["journal-status"] });
     },
+  });
+}
+
+export function useCreateGoalTaskMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createGoalTask,
+    meta: { skipErrorToast: true },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
+  });
+}
+
+export function useUpdateGoalNotesMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, description }: { id: string; description: string }) =>
+      updateGoalNotes(id, description),
+    meta: { skipErrorToast: true },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
+  });
+}
+
+export function useAchieveGoalMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: achieveGoal,
+    meta: { skipErrorToast: true },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
   });
 }
 
@@ -1779,6 +1817,25 @@ export function useDeleteRestingHRMutation() {
   });
 }
 
+// Web Overview — recent assistant cards (read-only; hides when none).
+export function useAssistantCardsQuery(enabled: boolean) {
+  return useQuery({
+    queryKey: ["web-assistant-cards"],
+    queryFn: () => fetchRecentAssistantCards(7),
+    staleTime: 60_000,
+    enabled: enabled && isLoggedIn(),
+  });
+}
+
+export function useDatebookAgendaQuery(enabled: boolean, days = 7) {
+  return useQuery({
+    queryKey: ["datebook-agenda", days],
+    queryFn: () => fetchDatebookAgenda(days),
+    staleTime: 60_000,
+    enabled: enabled && isLoggedIn(),
+  });
+}
+
 // Sleep
 export function useSleepQuery() {
   return useQuery({
@@ -2509,6 +2566,41 @@ export function useCreateMissionMutation() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["missions"] });
     },
+  });
+}
+
+// Keyed under "neighborhood" so wave accept/decline/unfriend invalidations
+// (prefix match) refresh the Open Sky home too.
+export function useNeighborhoodHomeQuery(enabled = true) {
+  const { data: tenant } = useTenantQuery();
+  return useQuery({
+    queryKey: ["neighborhood", "home"],
+    queryFn: fetchNeighborhoodHome,
+    staleTime: 30_000,
+    enabled: enabled && isLoggedIn() && !!tenant?.neighborhood_enabled,
+  });
+}
+
+export function useSkyMembershipMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ friendshipId, inSky }: { friendshipId: string; inSky: boolean }) => setInMySky(friendshipId, inSky),
+    // The server owns the cap; its 409 message is shown inline by the caller.
+    meta: { skipErrorToast: true },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["neighborhood"] });
+    },
+  });
+}
+
+// Keyed under "missions" so join/leave invalidations refresh the asks list.
+export function useMissionAsksQuery(enabled = true) {
+  const { data: tenant } = useTenantQuery();
+  return useQuery({
+    queryKey: ["missions", "asks"],
+    queryFn: fetchMissionAsks,
+    staleTime: 30_000,
+    enabled: enabled && isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 

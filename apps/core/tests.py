@@ -37,6 +37,7 @@ def _valid_manifest(*, total: int = 600) -> dict:
     return {
         "lesson": {
             "tradition": "taoist",
+            "intention": "release-control",
             "teaching_slug": "wu-wei",
             "core_teaching": "Let attention settle without force.",
             "summary": "Release the urge to force calm. Let the breath move on its own.",
@@ -506,6 +507,19 @@ class RenderMeditationOrchestrationTests(TestCase):
             manifest=manifest if manifest is not None else _valid_manifest(),
         )
 
+    @override_settings(GEMINI_TTS_MODEL="gemini-2.5-flash-preview-tts")
+    def test_model_setting_still_allows_legacy_rollback(self):
+        session = self._session()
+        with (
+            patch.object(render, "render_manifest_to_audio", return_value=_fake_result()) as mock_render,
+            patch.object(services, "upload_workspace_file_binary"),
+            patch.object(services, "notify_meditation_ready"),
+        ):
+            services.render_meditation(session)
+        self.assertEqual(mock_render.call_args.kwargs["model"], "gemini-2.5-flash-preview-tts")
+        session.refresh_from_db()
+        self.assertEqual(session.model, "gemini-2.5-flash-preview-tts")
+
     def test_happy_path_sets_ready_and_fields(self):
         session = self._session()
         with (
@@ -520,7 +534,7 @@ class RenderMeditationOrchestrationTests(TestCase):
         self.assertEqual(session.status, MeditationStatus.READY)
         self.assertEqual(session.duration_ms, 601_000)
         self.assertEqual(session.guidance_text, "flattened narration")
-        self.assertEqual(session.model, "gemini-2.5-flash-preview-tts")
+        self.assertEqual(session.model, "gemini-3.8-flash-lite-tts")
         self.assertEqual(session.artifact_manifest_sha256, services._manifest_sha256(session.manifest))
         tid = str(self.tenant.id)
         self.assertEqual(session.audio_url, f"https://api.example.test/api/v1/meditations/{tid}/{session.id}.mp3")
@@ -1759,7 +1773,7 @@ class ComposeAuthoringTests(ComposeSchemaCacheMixin, SimpleTestCase):
 
         for tradition in TRADITIONS:
             self.assertIn(tradition, system)
-        self.assertIn("serve what today's signals show", system)
+        self.assertIn("support today's concrete aspect and chosen intention", system)
         self.assertIn("Never preach", system)
         self.assertIn("never presume what this person believes", system)
 
@@ -2448,21 +2462,6 @@ class MeditationSignalGatheringTests(TestCase):
         self.assertEqual(stars[0]["id"], star.id)
         self.assertEqual(stars[0]["galaxy_note"], "protect the off-days")
 
-    def test_gathers_recent_daily_note_snippets(self):
-        from apps.journal.models import Document
-
-        Document.objects.create(
-            tenant=self.tenant,
-            kind="daily",
-            slug=str(timezone.now().date()),
-            title="Today",
-            markdown="# Daily\nFelt scattered this morning but found focus after a walk.",
-        )
-        snippets = services.gather_meditation_signals(self.tenant).get("recent_notes")
-        self.assertTrue(snippets)
-        self.assertIn("found focus after a walk", snippets[0])
-        self.assertNotIn("# Daily", snippets[0])  # heading stripped
-
     def test_format_signals_renders_constellation(self):
         signals = {
             "constellation_stars": [
@@ -2472,6 +2471,7 @@ class MeditationSignalGatheringTests(TestCase):
                     "galaxy_note": "say it out loud",
                     "journal_entries": [{"text": "it shrank once I named it"}],
                     "tutoring_insights": [{"mastery_achieved": True}],
+                    "recent_activity": True,
                 }
             ],
         }
@@ -2587,6 +2587,15 @@ class MeditationLookBackTests(TestCase):
         self.assertEqual(len(recent), 20)
         self.assertEqual(recent[0]["title"], "Sit 1")  # newest kept
         self.assertEqual(recent[-1]["title"], "Sit 20")  # the 21st-oldest is dropped
+
+    def test_history_includes_intention_but_does_not_invent_legacy_intention(self):
+        self._sit(1, lesson={"tradition": "taoist", "intention": "release-control"})
+        self._sit(2, lesson={"tradition": "zen"})
+        self._sit(3, lesson={})
+        recent = services._recent_meditation_entries(self.tenant)
+        self.assertEqual(recent[0]["lesson"]["intention"], "release-control")
+        self.assertNotIn("intention", recent[1]["lesson"])
+        self.assertNotIn("lesson", recent[2])
 
     def test_sit_with_neither_title_nor_theme_is_dropped(self):
         self._sit(1, title="", theme="")

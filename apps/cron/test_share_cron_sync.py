@@ -12,18 +12,73 @@ import json
 import time
 from hashlib import sha256
 from unittest import mock
+from unittest.mock import patch
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
-from apps.cron.models import CronJob
+from apps.cron.models import CronCreationPath, CronJob, CronPattern
 from apps.cron.share_cron_sync import (
     _desired_jobs,
     build_signed_crons_doc,
     tenant_uses_file_cron_sync,
 )
+from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
 
 _KEY = "test-internal-key-xyz"
+
+
+class SignedParameterCarryTest(SimpleTestCase):
+    """Exercise the real derivation, row renderer, signer and writer without a DB."""
+
+    def test_typed_and_fallback_stamped_rows_keep_parameters_and_contract(self):
+        from apps.cron.share_cron_sync import write_tenant_crons_file
+        from apps.cron.signals import cronjob_derive_data_from_typed_payload
+
+        tenant = Tenant(internal_api_key=_KEY)
+        for pattern, typed_payload, light_context in (
+            (CronPattern.PURE_REMINDER, {"text": "Reminder 東京"}, True),
+            (CronPattern.TASK_HYGIENE, {}, False),
+        ):
+            for stamp_fallbacks in (False, True):
+                with self.subTest(pattern=pattern, stamp_fallbacks=stamp_fallbacks):
+                    row = CronJob(
+                        tenant=tenant,
+                        name="Typed scheduled job",
+                        pattern=pattern,
+                        creation_path=CronCreationPath.TYPED,
+                        typed_payload=typed_payload,
+                        data={"schedule": {"kind": "every", "everyMs": 3600000}},
+                    )
+                    # Same receiver called by pre_save; no database writes.
+                    with mock.patch.object(CronJob.objects, "get", side_effect=CronJob.DoesNotExist):
+                        cronjob_derive_data_from_typed_payload(CronJob, row)
+                    row.id = 42
+                    if stamp_fallbacks:
+                        row.data["payload"]["fallbacks"] = ["v4-pro"]
+                    self.assertEqual(row.data["payload"]["lightContext"], light_context)
+                    for key in ("model", "timeoutSeconds", "toolsAllow"):
+                        self.assertTrue(row.data["payload"][key])
+                    self.assertTrue(row.data["description"].startswith("nbhd.v1 "))
+                    if pattern == CronPattern.TASK_HYGIENE:
+                        contract = json.loads(row.data["description"].removeprefix("nbhd.v1 "))
+                        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 10})
+                    with (
+                        mock.patch.object(CronJob.objects, "filter") as rows,
+                        mock.patch("apps.orchestrator.azure_client._put_share_file") as put,
+                    ):
+                        rows.return_value.order_by.return_value = [row]
+                        self.assertEqual(write_tenant_crons_file(tenant), 1)
+                    doc = json.loads(put.call_args.kwargs["data"])
+                    self.assertEqual(doc["sig"], hmac.new(_KEY.encode(), doc["signed"].encode(), sha256).hexdigest())
+                    [job] = json.loads(doc["signed"])
+                    self.assertEqual(job["declarationKey"], "nbhd:42")
+                    self.assertEqual(job["payload"], row.data["payload"])
+                    self.assertEqual(job["description"], row.data["description"])
+                    if stamp_fallbacks:
+                        self.assertEqual(job["payload"]["fallbacks"], ["v4-pro"])
+                    else:
+                        self.assertNotIn("fallbacks", job["payload"])
 
 
 class TenantVersionGateTest(TestCase):
@@ -78,6 +133,83 @@ class DesiredJobsTest(TestCase):
         names = {j["name"] for j in _desired_jobs(self.t)}
         self.assertIn("Future Reminder", names)
         self.assertNotIn("Past Reminder", names)
+
+    def test_top_level_model_pin_travels_as_payload_model(self):
+        row = _mk(self.t, "Morning Briefing", kind="cron")
+        row.data["model"] = "openrouter/tier/model"
+        row.save()
+        [job] = _desired_jobs(self.t)
+        self.assertNotIn("model", job)
+        self.assertEqual(job["payload"]["model"], "openrouter/tier/model")
+
+    def test_explicit_payload_model_wins_over_top_level(self):
+        row = _mk(self.t, "Typed", kind="cron")
+        row.data["model"] = "openrouter/top/level"
+        row.data["payload"]["model"] = "openrouter/payload/pin"
+        row.save()
+        [job] = _desired_jobs(self.t)
+        self.assertNotIn("model", job)
+        self.assertEqual(job["payload"]["model"], "openrouter/payload/pin")
+
+    def test_conflicting_or_non_string_pins_are_dropped_loudly(self):
+        conflict = _mk(self.t, "Conflict", kind="cron")
+        conflict.data["model"] = "openrouter/top/level"
+        conflict.data["payload"]["model"] = "openrouter/payload/pin"
+        conflict.save()
+        odd = _mk(self.t, "Odd", kind="cron")
+        odd.data["model"] = {"provider": "x"}
+        odd.save()
+        with self.assertLogs("apps.cron.share_cron_sync", "WARNING") as logs:
+            jobs = {j["name"]: j for j in _desired_jobs(self.t)}
+        self.assertEqual(len(logs.output), 2)
+        self.assertEqual(jobs["Conflict"]["payload"]["model"], "openrouter/payload/pin")
+        self.assertNotIn("model", jobs["Odd"]["payload"])
+        self.assertNotIn("model", jobs["Odd"])
+
+    def test_current_fuel_set_is_carried_and_stale_mirror_rows_are_not(self):
+        _mk(self.t, "_fuel:Old Plan", kind="cron")  # stale mirror row: never projected
+        prep = {
+            "name": "_fuel:Soccer Engine",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "0 6 * * *", "tz": "Asia/Tokyo"},
+            "payload": {"kind": "agentTurn", "message": "prep"},
+            "delivery": {"mode": "none"},
+            "sessionTarget": "isolated",
+        }
+        with patch("apps.orchestrator.fuel_cron._desired_fuel_crons", return_value=[prep]):
+            first = {j["name"]: j for j in _desired_jobs(self.t)}
+            edited = [{**prep, "payload": {"kind": "agentTurn", "message": "edited"}}]
+        with patch("apps.orchestrator.fuel_cron._desired_fuel_crons", return_value=edited):
+            second = {j["name"]: j for j in _desired_jobs(self.t)}
+        self.assertNotIn("_fuel:Old Plan", first)
+        key = first["_fuel:Soccer Engine"]["declarationKey"]
+        self.assertTrue(key.startswith("nbhd:fuel:"))
+        self.assertEqual(second["_fuel:Soccer Engine"]["declarationKey"], key)
+        self.assertNotIn("declarationKey", prep)
+
+    def test_fuel_message_is_stable_across_rebuilds(self):
+        def prep(minute):
+            return [
+                {
+                    "name": "_fuel:Plan",
+                    "enabled": True,
+                    "schedule": {"kind": "cron", "expr": "0 6 * * *", "tz": "UTC"},
+                    "payload": {
+                        "kind": "agentTurn",
+                        "message": f"Current date and time: Saturday, September 26, 2026 at 05:{minute} (UTC) "
+                        "— SNAPSHOT taken when this cron payload was last reconciled, may be stale.\n\nPrep body",
+                    },
+                    "delivery": {"mode": "none"},
+                    "sessionTarget": "isolated",
+                }
+            ]
+
+        with patch("apps.orchestrator.fuel_cron._desired_fuel_crons", return_value=prep("05")):
+            first = [j for j in _desired_jobs(self.t) if j["name"] == "_fuel:Plan"][0]
+        with patch("apps.orchestrator.fuel_cron._desired_fuel_crons", return_value=prep("47")):
+            later = [j for j in _desired_jobs(self.t) if j["name"] == "_fuel:Plan"][0]
+        self.assertEqual(first, later)
+        self.assertEqual(first["payload"]["message"], "Prep body")
 
     def test_each_job_carries_stable_nbhd_declaration_key(self):
         row = _mk(self.t, "R", kind="cron")

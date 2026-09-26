@@ -1099,7 +1099,11 @@ def redact_text(
 MINT_ALL = "all"  # human-typed chat ingress — mint everything (legacy behavior)
 MINT_VALIDATED = "validated"  # tool responses — mint only validator-approved types
 MINT_NEVER = "never"  # agent-authored markdown (memory sync, co-pilot) — mint nothing
-_MINT_POLICIES = frozenset({MINT_ALL, MINT_VALIDATED, MINT_NEVER})
+# Read-only model context: detect unknown PII and mask it without allocating a
+# placeholder or touching the tenant registry/counters. Unlike NEVER, this does
+# not leave unfamiliar detected values in the output.
+MINT_REDACT_ONLY = "redact_only"
+_MINT_POLICIES = frozenset({MINT_ALL, MINT_VALIDATED, MINT_NEVER, MINT_REDACT_ONLY})
 
 
 def _structured_validator():
@@ -1154,7 +1158,7 @@ def _should_mint_new(mint: str, entity_type: str, text: str) -> bool:
     """
     if mint == MINT_ALL:
         return True
-    if mint == MINT_NEVER:
+    if mint in {MINT_NEVER, MINT_REDACT_ONLY}:
         return False
     validate = _structured_validator()
     if validate is None:
@@ -1541,7 +1545,9 @@ def redact_user_message_checked(
 
     Disabled-policy and exception paths retain the existing fail-open text
     behavior, but are explicitly unconfirmed so downstream persistence cannot
-    mistake the original string for placeholder-space text.
+    mistake the original string for placeholder-space text. ``MINT_REDACT_ONLY``
+    reuses known bindings and masks unknown detected spans as ``[REDACTED]``
+    without creating bindings. Model-context readers must require ``confirmed``.
     """
     if not text or not text.strip():
         return RedactionOutcome(text=text, confirmed=False, reason="empty-input")
@@ -1561,8 +1567,13 @@ def redact_user_message_checked(
             mint=mint,
             ingress=ingress,
         )
-    except Exception:
-        logger.exception("User message PII redaction failed — returning original")
+    except Exception as exc:
+        if mint == MINT_REDACT_ONLY:
+            # Detector exceptions may contain the private input; context readers
+            # drop this unconfirmed result and need only the error class.
+            logger.warning("Read-only PII redaction failed: %s", type(exc).__name__)
+        else:
+            logger.exception("User message PII redaction failed — returning original")
         return RedactionOutcome(text=text, confirmed=False, reason="redaction-error")
     if _neural_detector_available() is not True:
         return RedactionOutcome(text=redacted, confirmed=False, reason="neural-unavailable")
@@ -1717,6 +1728,10 @@ def _redact_user_message(
         ci_key = _canonical_key(original)
         if ci_key and ci_key in inverted_ci:
             known_replacements.append((result.start, result.end, inverted_ci[ci_key][1]))
+            continue
+
+        if mint == MINT_REDACT_ONLY:
+            known_replacements.append((result.start, result.end, "[REDACTED]"))
             continue
 
         # Mint-policy gate. Known entities were replaced above (always allowed);
@@ -2048,6 +2063,8 @@ def _detect_pii(
     text: str,
     entities: list[str],
     score_threshold: float,
+    *,
+    deadline: float | None = None,
 ) -> list[DetectedEntity]:
     """Detect PII using DeBERTa (contextual) + Presidio regex (financial).
 
@@ -2082,10 +2099,28 @@ def _detect_pii(
     # Pattern recognizers below still run, so financial PII stays redacted.
     try:
         pii_pipeline = get_pii_pipeline()
-        model_results = pii_pipeline(detect_text)
+        if deadline is None:
+            model_results = pii_pipeline(detect_text)
+        else:
+            from time import monotonic
+
+            from apps.pii.shared_client import SharedPiiPipeline
+
+            if monotonic() >= deadline:
+                raise TimeoutError("Redaction deadline exceeded")
+            if isinstance(pii_pipeline, SharedPiiPipeline):
+                # Keep the process-wide client warm without charging short
+                # speculative deadlines to the normal chat circuit breaker.
+                model_results = pii_pipeline.detect_ephemeral(detect_text, deadline=deadline)
+            else:
+                model_results = pii_pipeline(detect_text)
+            if monotonic() >= deadline:
+                raise TimeoutError("Redaction deadline exceeded")
         _neural_detector_outcome.available = True
-    except Exception:
+    except Exception as exc:
         _neural_detector_outcome.available = False
+        if deadline is not None and (isinstance(exc, TimeoutError) or getattr(exc, "outcome", None) == "timeout"):
+            raise TimeoutError("Redaction deadline exceeded") from None
         model_results = []
 
     for ent in model_results:
@@ -2310,6 +2345,10 @@ def _redact(
             if ci_key and ci_key in inverted_ci:
                 replacements.append((result.start, result.end, inverted_ci[ci_key][1]))
                 continue
+
+        if mint == MINT_REDACT_ONLY:
+            replacements.append((result.start, result.end, "[REDACTED]"))
+            continue
 
         # Mint-policy gate: known entities were reused above; a NEW binding is
         # coined only when the policy allows it for this type/text (agent-authored

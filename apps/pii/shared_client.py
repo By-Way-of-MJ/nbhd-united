@@ -204,7 +204,7 @@ class SharedPiiPipeline:
             span_count,
         )
 
-    def __call__(self, text: str) -> list[dict[str, Any]]:
+    def __call__(self, text: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
         started = time.monotonic()
         text_length = len(text) if isinstance(text, str) else 0
         if not isinstance(text, str):
@@ -214,7 +214,7 @@ class SharedPiiPipeline:
         half_open = False
         try:
             generation, half_open = self._before_call()
-            spans = self._call(text)
+            spans = self._call(text) if deadline is None else self._call(text, deadline=deadline)
         except SharedPiiError as exc:
             self._record_failure(exc.outcome, generation, half_open)
             self._log_call(outcome=exc.outcome, started=started, text_length=text_length, span_count=0)
@@ -223,10 +223,31 @@ class SharedPiiPipeline:
         self._log_call(outcome="ok", started=started, text_length=text_length, span_count=len(spans))
         return spans
 
-    def _call(self, text: str) -> list[dict[str, Any]]:
+    def detect_ephemeral(self, text: str, *, deadline: float) -> list[dict[str, Any]]:
+        """Reuse this client without reading or mutating normal chat's breaker.
+
+        Speculative shape deadlines can be much shorter than chat's budget.
+        Keep their accounting isolated, as the former throwaway clients did.
+        Protocol v1 is one frame per socket: each operation owns and closes its
+        socket, so an abandoned call cannot hold a client-wide connection lock.
+        """
+        started = time.monotonic()
+        text_length = len(text) if isinstance(text, str) else 0
+        try:
+            if not isinstance(text, str):
+                raise SharedPiiError("shared detector input must be text", outcome="bad_response")
+            spans = self._call(text, deadline=deadline)
+        except SharedPiiError as exc:
+            self._log_call(outcome=exc.outcome, started=started, text_length=text_length, span_count=0)
+            raise
+        self._log_call(outcome="ok", started=started, text_length=text_length, span_count=len(spans))
+        return spans
+
+    def _call(self, text: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
         if len(text.encode("utf-8")) + 128 > MAX_REQUEST_BYTES:
             raise SharedPiiError("shared detector request exceeds byte cap", outcome="too_large")
-        deadline = time.monotonic() + self.deadline_s
+        own_deadline = time.monotonic() + self.deadline_s
+        deadline = own_deadline if deadline is None else min(deadline, own_deadline)
         connection: socket.socket | None = None
         try:
             try:

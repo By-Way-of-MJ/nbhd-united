@@ -1572,7 +1572,7 @@ class WorkoutPlanListView(APIView):
                 data["deduped"] = True
                 return Response(data, status=status.HTTP_200_OK)
 
-        from apps.pii.store_authoring import author_store_fields
+        from .authoring import author_store_fields
 
         authored_plan, plan_receipts = author_store_fields(
             tenant,
@@ -1692,7 +1692,7 @@ class WorkoutPlanDetailView(APIView):
                 return sched_err
             serializer.validated_data["schedule_json"] = normalized_schedule
 
-        from apps.pii.store_authoring import author_store_fields
+        from .authoring import author_store_fields
 
         authored_plan, plan_receipts = author_store_fields(
             tenant,

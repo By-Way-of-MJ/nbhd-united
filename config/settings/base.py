@@ -296,6 +296,22 @@ OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS = env("OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS", def
 # and subagents denied unless a tenant is explicitly listed here.
 SUBAGENT_TENANT_IDS = env("SUBAGENT_TENANT_IDS", default="")
 
+# Image-independent Living Chat: explicit tenant UUID allowlist, no wildcard; dark by default.
+CHAT_SHAPE_TENANT_IDS = env("CHAT_SHAPE_TENANT_IDS", default="")
+# Tool/plugin panels: set ONLY after verifying the running image has the #1638
+# journal-tools manifest (panelsEnabled). Separate from Django-only shape panels.
+CHAT_PANELS_TOOL_TENANT_IDS = env("CHAT_PANELS_TOOL_TENANT_IDS", default="")
+CHAT_SHAPE_PANELS = env(
+    "CHAT_SHAPE_PANELS", default="sleep,schedule,training_week,workout,timer,log_table,journal_table"
+)
+
+# Talk routing: explicit tenant UUID allowlist, no wildcard; dark by default.
+TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
+
+# Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
+# (empty = nobody, exact "*" = everyone). Container App env var name MUST match.
+WEB_REDESIGN_TENANT_IDS = env("WEB_REDESIGN_TENANT_IDS", default="")
+
 # Human-review gate for agent-authored scheduled tasks. Comma-separated tenant
 # UUIDs open individual tenants; the literal "*" opens the gate fleet-wide.
 # Empty/unset means nobody so every non-explicit configuration fails closed.
@@ -459,7 +475,7 @@ BRAVE_API_KEY = env("BRAVE_API_KEY", default="")
 # Gemini TTS — Core pillar meditation render (server-side, key stays here).
 # Secret lives in Key Vault; set GEMINI_API_KEY on the Container App. Never echo it.
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
-GEMINI_TTS_MODEL = env("GEMINI_TTS_MODEL", default="gemini-2.5-flash-preview-tts")
+GEMINI_TTS_MODEL = env("GEMINI_TTS_MODEL", default="gemini-3.8-flash-lite-tts")
 # PRIMARY model that AUTHORS the meditation manifest (OpenRouter, JSON mode) — the
 # web orb's compose path. compose.py fronts a low-cost fallback chain with this id
 # (then DeepSeek V4 Flash, then Pro). Default is Gemma 4 31B: it's the cheap roster

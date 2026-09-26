@@ -1,0 +1,342 @@
+"""Bounded, metadata-only operator access to the running OpenClaw replica.
+
+Uses the same authenticated console protocol as Azure CLI's containerapp exec.
+No command output, credential, config or reminder payload is logged on errors.
+"""
+
+import base64
+import json
+import re
+import textwrap
+import time
+from datetime import UTC
+from pathlib import Path
+
+import requests
+import websocket
+from django.conf import settings
+
+from .azure_client import get_container_client, is_mock
+
+
+class OperatorError(RuntimeError):
+    pass
+
+
+# Azure Container Apps console framing (same as `az containerapp exec`).
+_STDIN = b"\x00\x00"
+_RESIZE = b"\x00\x04"
+_STDIN_LINE = 700
+
+
+def _connection(tenant):
+    if is_mock():
+        raise OperatorError("Operator verification is unavailable with AZURE_MOCK=true")
+    client = get_container_client()
+    app = client.container_apps.get(settings.AZURE_RESOURCE_GROUP, tenant.container_id)
+    if not app.latest_ready_revision_name or app.latest_ready_revision_name != app.latest_revision_name:
+        raise OperatorError("Latest revision is not ready")
+    replicas = client.container_apps_revision_replicas.list_replicas(
+        settings.AZURE_RESOURCE_GROUP, tenant.container_id, app.latest_ready_revision_name
+    )
+    # A replica stopped by a restart can linger in the list, still "ready";
+    # only a running replica on a running container can serve the console.
+    containers = [
+        c
+        for r in replicas.value
+        if str(getattr(r, "running_state", "Running")) == "Running"
+        for c in (r.containers or [])
+        if c.name == "openclaw" and c.ready and str(getattr(c, "running_state", "Running")) == "Running"
+    ]
+    if len(containers) != 1:
+        raise OperatorError("Expected exactly one ready OpenClaw replica")
+    token = client.container_apps.get_auth_token(settings.AZURE_RESOURCE_GROUP, tenant.container_id).token
+    return containers[0], token
+
+
+def _comparison_adapter():
+    """Bundle the same semantic comparator used by offline fixture tests."""
+    digest = Path(__file__).with_name("migration_cron_digest.mjs").read_text()
+    digest = digest.replace("import fs from 'node:fs';", "")
+    digest = digest.replace(
+        "JSON.parse(fs.readFileSync(new URL('./cron-normalization.json', import.meta.url)))",
+        Path(__file__).with_name("cron-normalization.json").read_text().strip(),
+    )
+    digest = digest.replace(
+        "JSON.parse(fs.readFileSync(new URL('./cron-proven-shapes.json', import.meta.url)))",
+        Path(__file__).with_name("cron-proven-shapes.json").read_text().strip(),
+    )
+    comparator = (
+        Path(__file__)
+        .with_name("migration_cron_compare.mjs")
+        .read_text()
+        .replace(
+            "import { normalizedDeclaration, stableJSON, provenShape, normalizedOptionals } from './migration_cron_digest.mjs';",
+            "",
+        )
+    )
+    return (digest + comparator).replace("export ", "")
+
+
+def run_node(tenant, body: str, *, timeout: int = 90):
+    """Execute a fixed JS adapter; only its explicit JSON result leaves the replica."""
+    container, token = _connection(tenant)
+    # Supply the migration comparator without changing the runtime image.
+    if "readSignedJobs,sameCron" in body:
+        adapter = _comparison_adapter()
+        body = body.replace(
+            "const {readSignedJobs,sameCron,buildAddArgs,atFireMs}=await import('/opt/nbhd/nbhd-cron-sync.mjs');",
+            "const {readSignedJobs}=await import('/opt/nbhd/nbhd-cron-sync.mjs');" + adapter,
+        )
+    script = (
+        "const {execFileSync}=require('node:child_process');"
+        "const fs=require('node:fs');const crypto=require('node:crypto');"
+        f"const deadline=Date.now()+{max(1000, (timeout - 5) * 1000)};"
+        "const oc=(args)=>{const remaining=deadline-Date.now();if(remaining<=0)throw Error('deadline');"
+        "return execFileSync('openclaw',args,{encoding:'utf8',maxBuffer:8*1024*1024,"
+        "env:{...process.env,NODE_OPTIONS:''},timeout:Math.min(30000,remaining),stdio:['ignore','pipe','pipe']});};"
+        "(async()=>{" + body + "})().then(result=>console.log('NBHD_RESULT:'+JSON.stringify(result)))"
+        ".catch(()=>console.log('NBHD_RESULT:'+JSON.stringify({operatorError:true})));"
+    )
+    endpoint = container.exec_endpoint
+    if not endpoint or not endpoint.startswith("wss://"):
+        raise OperatorError("Missing secure console endpoint")
+    # The console splits `?command=` on whitespace (no shell quoting) and the proxy
+    # rejects long URLs, so the adapter can't travel in the URL. Open a plain `sh`
+    # and stream the script over stdin as short base64 lines (the console is a TTY
+    # in canonical mode: lines must stay well under 4 KiB). Echo is disabled before
+    # the script is sent, so only the NBHD_RESULT line leaves the replica.
+    lines = textwrap.wrap(base64.b64encode(script.encode()).decode(), _STDIN_LINE)
+    sock = websocket.create_connection(
+        endpoint + "?command=sh",
+        header=[f"Authorization: Bearer {token}"],
+        timeout=timeout,
+    )
+    output = b""
+    stage = "connecting"
+    deadline = time.monotonic() + timeout
+
+    def send(line: str) -> None:
+        sock.send_binary(_STDIN + line.encode() + b"\n")
+
+    try:
+        sock.send_binary(_RESIZE + b'{"Width": 200, "Height": 50}')
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.1, deadline - time.monotonic()))
+            chunk = sock.recv()
+            if not chunk:
+                break
+            if not isinstance(chunk, bytes) or chunk[0] == 2:
+                raise OperatorError("Console protocol failure")
+            if chunk[:1] == b"\x01":
+                # Proxy info frame; the session accepts stdin once connected.
+                if stage == "connecting" and b"uccessfully connected" in chunk:
+                    send("PS1=''; stty -echo 2>/dev/null; f=$(mktemp); echo NBHD_RE''ADY")
+                    stage = "handshake"
+                continue
+            if chunk[:2] not in (b"\x00\x01", b"\x00\x02"):
+                continue
+            output += chunk[2:]
+            if len(output) > 2 * 1024 * 1024:
+                raise OperatorError("Operator response exceeded metadata limit")
+            if stage == "handshake" and re.search(rb"(?:^|[\r\n])NBHD_READY[\r\n]", output):
+                send(f'head -n {len(lines)} | base64 -d > "$f" && env NODE_OPTIONS= node "$f"; rm -f "$f"; exit')
+                for line in lines:
+                    send(line)
+                stage = "running"
+                continue
+            if stage != "running":
+                continue
+            match = re.search(rb"(?:^|[\r\n])(?:\$ )?NBHD_RESULT:([^\r\n]+)[\r\n]", output)
+            if match:
+                result = json.loads(match[1])
+                if isinstance(result, dict) and result.get("operatorError"):
+                    raise OperatorError("Operator command failed (output withheld)")
+                return result
+    except (websocket.WebSocketException, ValueError) as exc:
+        raise OperatorError("Operator console failed (output withheld)") from None
+    finally:
+        sock.close()
+    raise OperatorError("Operator command timed out or returned no result")
+
+
+# Kept payload-free: even names can contain user prose, so callers print counts only.
+_LIST = """
+const doc=JSON.parse(oc(['cron','list','--all','--json']));
+const allJobs=Array.isArray(doc)?doc:doc.jobs;
+if(!Array.isArray(allJobs)) throw Error('shape');
+if(doc.hasMore===true || Number(doc.total||0)>allJobs.length ||
+    (doc.nextOffset!=null && doc.nextOffset!==false)) throw Error('incomplete list');
+// The real CLI reserves these namespaces and refuses removal. These monitor
+// rows are recreated by the gateway itself, not by the signed cron writer.
+const jobs=allJobs.filter(j=>!(['heartbeat:','skill-collection-review:'].some(prefix=>
+    typeof j.agentId==='string' && j.agentId && j.declarationKey===prefix+j.agentId)) &&
+    // memory-core creates and owns its dreaming job at boot (seen on MJ's and
+    // the E2E canary's 9.4 runtime); it is never a legacy cron to clean up.
+    j.declarationKey!=='memory-core:memory-dreaming-promotion');
+
+"""
+
+
+def list_crons(tenant) -> list[dict]:
+    return run_node(
+        tenant,
+        _LIST
+        + """
+return jobs.map(j=>({id:j.id||j.jobId,name:j.name,declarationKey:j.declarationKey||'',
+    enabled:j.enabled!==false,schedule:j.schedule,state:{nextRunAtMs:j.state?.nextRunAtMs,runningAtMs:j.state?.runningAtMs,lastDelivered:j.state?.lastDelivered,lastRunAtMs:j.state?.lastRunAtMs}}));
+""",
+    )
+
+
+def inspect_signed_crons(tenant, *, cleanup: bool = False, canonical_digests=None) -> dict:
+    """Compare in-container desired jobs, remove only proven legacy duplicates.
+
+    Comparison includes payloads INSIDE the replica via the image's tested adapter.
+    Only IDs, declaration keys and match flags cross the console boundary.
+    """
+    private_expected = json.dumps(canonical_digests) if canonical_digests is not None else "null"
+    return run_node(
+        tenant,
+        "const canonical="
+        + private_expected
+        + ";"
+        + _LIST
+        + """
+const {readSignedJobs,sameCron,buildAddArgs,atFireMs}=await import('/opt/nbhd/nbhd-cron-sync.mjs');
+const signed=await readSignedJobs();
+if(signed===null) throw Error('signature');
+const desired=signed.filter(j=>j.enabled!==false &&
+    (j.schedule?.kind!=='at'||atFireMs(j.schedule)>Date.now()));
+if(desired.some(j=>!buildAddArgs(j))) throw Error('unmappable');
+const removed=[];
+const matches=desired.map(d=>{
+    const found=jobs.filter(j=>j.declarationKey===d.declarationKey);
+    let valid=found.length===1 && found[0].enabled!==false && sameCron(found[0],d);
+    if(canonical!==null) {
+        const expected=canonical[d.declarationKey];
+        valid=valid && !!expected && crypto.createHash('sha256').update(stableJSON(normalizedDeclaration(found[0],expected.pins))).digest('hex')===expected.digest;
+    }
+    if(valid && CLEANUP){
+        for(const legacy of jobs.filter(j=>!String(j.declarationKey||'').startsWith('nbhd:'))){
+            if(legacy.enabled!==false && sameCron({...legacy,declarationKey:d.declarationKey},d)){
+                oc(['cron','rm',legacy.id||legacy.jobId]);removed.push(legacy.id||legacy.jobId);
+            }
+        }
+    }
+    return {key:d.declarationKey,id:found[0]?.id||found[0]?.jobId||'',match:valid};
+});
+const keys=new Set(desired.map(d=>d.declarationKey));
+const extras=jobs.filter(j=>String(j.declarationKey||'').startsWith('nbhd:')&&!keys.has(j.declarationKey));
+const legacy=jobs.filter(j=>j.enabled!==false && !String(j.declarationKey||'').startsWith('nbhd:') &&
+    !removed.includes(j.id||j.jobId)).map(j=>j.id||j.jobId);
+return {matches,removed,legacy,extras:extras.map(j=>j.id||j.jobId),expected:desired.length};
+""".replace("CLEANUP", "true" if cleanup else "false"),
+    )
+
+
+def config_observed(tenant) -> dict:
+    return run_node(
+        tenant,
+        """
+const file=fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH,'utf8');
+const digest=crypto.createHash('sha256').update(file).digest('hex');
+// config.get's applied/revision tokens differ even on healthy 9.4 tenants
+// after a restart (observed on MJ's and the E2E canary, 2026-09-25), so they
+// are not evidence. The caller restarts after writing (9.4 never sees edits on
+// the SMB share); the file the CLI validates is then the file the gateway loaded.
+if(!/Config valid/.test(oc(['config','validate']))) throw Error('config invalid');
+JSON.parse(oc(['health','--json']));
+return {sha256:digest,valid:true};
+""",
+    )
+
+
+def console_error_counts(tenant, *, since) -> dict:
+    """Inspect recent console records locally; retain counts, never log lines.
+
+    A saturated tail cannot establish a clean time window, so it fails closed.
+    """
+    from django.utils.dateparse import parse_datetime
+
+    container, token = _connection(tenant)
+    response = requests.get(
+        container.log_stream_endpoint,
+        headers={"Authorization": f"Bearer {token}"},
+        params={"follow": "false", "output": "json", "tailLines": 300},
+        timeout=30,
+    )
+    response.raise_for_status()
+    rows = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+    # The console log API stamps records in UTC without an offset; make them
+    # comparable with the aware verification window (E2E canary 2026-09-25).
+    timestamps = [parse_datetime(row.get("TimeStamp", "")) for row in rows]
+    timestamps = [t if t is None or t.tzinfo else t.replace(tzinfo=UTC) for t in timestamps]
+    if not rows or any(t is None for t in timestamps):
+        raise OperatorError("Console log window unavailable")
+    # The API caps the tail at 300 lines, and a 9.4 gateway under stdout
+    # redaction emits ~300 lines every ~2 minutes even when idle (E2E canary
+    # 2026-09-25), so a saturated tail rarely spans the whole window. Recurring
+    # runtime errors repeat within minutes: scan what the tail covers when it
+    # spans at least a minute, and report the coverage actually inspected.
+    covered_from = max(since, min(timestamps))
+    if len(rows) >= 300 and (max(timestamps) - covered_from).total_seconds() < 60:
+        raise OperatorError("Console log tail does not cover verification window")
+    patterns = {
+        "fs_safe": r"FsSafeError|fs-safe.*(?:error|fail)",
+        "sqlite": r"SQLite.*(?:error|fail|invalid|corrupt)",
+        "config": r"(?:invalid|failed|error).*config|config.*(?:invalid|error|failed)|last.good.*rollback",
+        "proxy": r"proxy_attribution_required|proxy.*(?:error|fail)",
+        "signature": r"signature INVALID|cron-sync.*(?:REFUSED|failed|unmappable)",
+    }
+    recent = [str(row.get("Log", "")) for row, stamp in zip(rows, timestamps) if stamp >= since]
+    counts = {key: sum(bool(re.search(pattern, line, re.I)) for line in recent) for key, pattern in patterns.items()}
+    return {
+        "since": since.isoformat(),
+        "covered_from": covered_from.isoformat(),
+        "partial_window": covered_from > since,
+        "lines": len(recent),
+        "errors": counts,
+    }
+
+
+def preservation_inventory(tenant, *, canonical_pins=None):
+    """Evaluate literal controls INSIDE the replica; return safe findings only."""
+    from .cron_reconcile import _UNMANAGED_PREFIXES
+
+    return run_node(
+        tenant,
+        _comparison_adapter()
+        + "const canonicalPins="
+        + json.dumps(canonical_pins or {})
+        + ";"
+        + "const unmanagedPrefixes="
+        # Fuel crons are projected by the signed writer from the Fuel models.
+        + json.dumps([p for p in _UNMANAGED_PREFIXES if p != "_fuel:"])
+        + ";"
+        + _LIST
+        + r"""
+return jobs.map(j=>{
+    const key='runtime:'+crypto.createHash('sha256').update(String(j.declarationKey||j.id||j.jobId||'unknown')).digest('hex').slice(0,16);
+    const reasons=new Set();
+    try {
+        const copy=normalizedOptionals(j);
+        const pins=canonicalPins[j.declarationKey];
+        if(pins && pins.kind===copy.schedule?.kind) {
+            for(const field of ['anchorMs','staggerMs']) if(!pins[field]) delete copy.schedule[field];
+        }
+        if(!supportedDeclaration(copy) || !buildAddArgs({...copy,declarationKey:'nbhd:probe'})) reasons.add('unsupported_declaration');
+        if(!isSafeJob(copy)) reasons.add('writer_safety_refusal');
+        if(copy.enabled===false) reasons.add('disabled_not_projected');
+        if(copy.schedule?.kind!=='at' && (!copy.name || unmanagedPrefixes.some(p=>copy.name.startsWith(p)))) reasons.add('unmanaged_not_projected');
+        const aliases=NORMALIZATION.aliases[copy.payload?.kind]?.sources||[];
+        const texts=aliases.filter(k=>copy.payload[k]!=null).map(k=>copy.payload[k]);
+        if(texts.some(v=>v!==texts[0])) reasons.add('conflicting_text_aliases');
+        if(copy.displayName!=null && copy.displayName!=='' && copy.displayName!==copy.name) reasons.add('display_name');
+        if(copy.schedule?.kind==='cron' && (typeof copy.schedule.expr!=='string' || copy.schedule.expr.trim().split(/\s+/).length!==5)) reasons.add('cron_seconds_or_nonstandard');
+        if(!provenShape(copy)) reasons.add('unproven_shape');
+    } catch { reasons.add('unsupported_declaration'); }
+    return {key,reasons:[...reasons].sort()};
+}).filter(j=>j.reasons.length);
+""",
+    )

@@ -583,6 +583,10 @@ class Tenant(models.Model):
         ),
     )
     journal_shaping_enabled = models.BooleanField(default=False)
+    mood_context_enabled = models.BooleanField(
+        default=False,
+        help_text="Include the latest mood self-report in assistant context; canary opt-in.",
+    )
     digest_thread_attribution_enabled = models.BooleanField(
         default=False,
         help_text="Label non-main iOS chat content in the shared conversation digest with its source thread",
@@ -684,6 +688,14 @@ class Tenant(models.Model):
         default=dict,
         blank=True,
         help_text='Last-known cron job list from gateway. Format: {"jobs": [...], "snapshot_at": "ISO8601"}',
+    )
+
+    openclaw_migration_cron_fenced = models.BooleanField(default=False, db_index=True, editable=False)
+
+    openclaw_migration = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Private OpenClaw migration checkpoints, source snapshot and verification evidence.",
     )
 
     # Per-tenant flag for the Postgres-canonical cron rollout. The dashboard,
