@@ -286,8 +286,10 @@ its own undo because nobody is watching it.
 - **Rules**: PASS → hibernate. Failure at `image`/`version`/`config` → roll
   back at once. Console timeout or 429 at `preflight`/`capture`/`crons`/`verify`
   → wait 12 min and resume, twice at most. `tenant_unavailable` → re-wake and
-  retry once. Cron timing (`cron_imminent`/`cron_running`) → give up quietly,
-  1-hour cooldown. `BLOCKED_UNSUPPORTED` or anything unrecognised → roll back,
+  retry once. Cron timing (`cron_imminent`/`cron_running`) → give up quietly
+  and stay awake so a later sweep retries (every wake leaves a fresh `_sync:`
+  notice that reads as imminent for an hour); after 6 in a row, hibernate
+  with a 1-hour cooldown. `BLOCKED_UNSUPPORTED` or anything unrecognised → roll back,
   email, 7-day cooldown. With the Jev flag on, an unrecognised failure goes to
   Jev, which can only choose "retry once later" (at p ≥ 0.85) or "roll back".
 - **Safe exit**: a run never ends with its own record fenced. It rolls back
