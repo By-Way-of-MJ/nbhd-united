@@ -7,4 +7,4 @@
 
 (deny file-read* (subpath "/Users/mjjones/.openclaw"))
 (deny file-write*)
-(allow file-write* (subpath "/Users/mjjones/openclaw-yuki-test") (subpath "/Users/mjjones/worktrees/united-yuki-test") (subpath "/Users/mjjones/codex-runs") (literal "/dev/null") (literal "/dev/tty"))
+(allow file-write* (subpath "/Users/mjjones/openclaw-yuki-test") (subpath (param "LOCAL_TEST_ROOT_DIR")) (subpath "/Users/mjjones/codex-runs") (literal "/dev/null") (literal "/dev/tty"))

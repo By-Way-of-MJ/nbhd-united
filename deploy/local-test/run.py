@@ -113,6 +113,7 @@ def main():
         import django
 
         django.setup()
+        runpy.run_path(str(ROOT / "deploy/local-test/local_overrides.py"))["apply"]()
         handoff = runpy.run_path(str(ROOT / "deploy/local-test/handoff.py"))
         handoff["start_listener"](STATE)
         sys.argv = ["manage.py", "runserver", "127.0.0.1:18080", "--noreload"]
@@ -123,11 +124,21 @@ def main():
             raise RuntimeError("GPU job running (qwen_match_analysis|run_bench); refuse to start the inference gateway")
         if not (TEST_HOME / "openclaw.json").exists():
             raise RuntimeError("MJ signup and provision step must complete first")
-        # Seatbelt denies remote network from Node and all plugin subprocesses.
+        # Seatbelt denies remote network from Node and all plugin subprocesses;
+        # writes are allowed only inside the checkout this launcher runs from.
         profile = ROOT / "deploy/local-test/gateway.sb"
         os.execve(
             "/usr/bin/sandbox-exec",
-            ["sandbox-exec", "-f", str(profile), "/Users/mjjones/.local/bin/openclaw", "gateway", "run"],
+            [
+                "sandbox-exec",
+                "-D",
+                f"LOCAL_TEST_ROOT_DIR={ROOT}",
+                "-f",
+                str(profile),
+                "/Users/mjjones/.local/bin/openclaw",
+                "gateway",
+                "run",
+            ],
             dict(os.environ),
         )
     elif command == "sautai-handoff":
