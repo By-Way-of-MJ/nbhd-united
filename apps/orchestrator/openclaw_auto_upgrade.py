@@ -55,6 +55,12 @@ LEASE_TTL = timedelta(minutes=10)
 HEARTBEAT_SECONDS = 60
 FAILURE_COOLDOWN = timedelta(days=7)
 QUIET_COOLDOWN = timedelta(hours=1)
+# Cron timing (a one-shot or a fresh _sync notice due within the hour) keeps
+# the tenant awake so the next sweep retries; every wake leaves a fresh
+# _sync notice, so hibernating here would reset the clock on each return.
+# After this many consecutive cron-timing give-ups, hibernate with QUIET_COOLDOWN.
+MAX_CRON_TIMING_STREAK = 6
+CRON_TIMING_REASONS = frozenset({"cron_imminent", "cron_running", "cron_next_fire_unknown"})
 WAKE_SETTLE_SECONDS = 120
 UNAVAILABLE_RETRY_SECONDS = 300
 TRANSIENT_RETRY_SECONDS = 720
@@ -270,11 +276,12 @@ def intercept_idle_tenant(tenant) -> bool:
     if not run_token:
         return False
     state = _state(tenant)
+    streak = (state.counters or {}).get("cron_timing_streak", 0)
     # The tag is pinned for the whole run: a deploy mid-run must not retarget a resume.
     state.run_token, state.migration_token, state.counters, state.last_outcome = (
         run_token,
         "",
-        {"tag": target_tag()},
+        {"tag": target_tag(), "cron_timing_streak": streak},
         {},
     )
     _note(state, "start", tag=target_tag())
@@ -328,6 +335,11 @@ def reap_stale_run() -> str | None:
 
 def is_transient(reason) -> bool:
     return any(marker in str(reason or "") for marker in TRANSIENT_MARKERS)
+
+
+def is_cron_timing(outcome) -> bool:
+    reasons = set(outcome.get("reasons") or ()) | {str(outcome.get("reason") or "")}
+    return bool(reasons & CRON_TIMING_REASONS)
 
 
 def decide(outcome: dict, counters: dict) -> str:
@@ -603,6 +615,8 @@ def _handle(tenant, state, run_token, outcome):
         action,
     )
 
+    if action != GIVE_UP_QUIET:
+        state.counters = {**(state.counters or {}), "cron_timing_streak": 0}
     if action == FINISH_PASS:
         return _finish(tenant, state, run_token, hibernate=True, result="PASS")
 
@@ -626,11 +640,19 @@ def _handle(tenant, state, run_token, outcome):
     guard = _safe_exit(tenant, state, run_token)
     _note(state, "safe_exit", guard=guard)
     if action == GIVE_UP_QUIET:
-        state.cooldown_until = timezone.now() + QUIET_COOLDOWN
         if guard.startswith("failed"):
             alert(tenant, outcome=outcome, action="give_up", guard=guard)
             state.cooldown_until = timezone.now() + FAILURE_COOLDOWN
-        return _finish(tenant, state, run_token, hibernate=not guard.startswith("failed"), result="GAVE_UP")
+            return _finish(tenant, state, run_token, hibernate=False, result="GAVE_UP")
+        counters = dict(state.counters or {})
+        streak = counters.get("cron_timing_streak", 0) + 1 if is_cron_timing(outcome) else 0
+        if 0 < streak < MAX_CRON_TIMING_STREAK:
+            # Stay awake (the run's cron shield holds the sweep off ~30 min), then retry.
+            state.counters = {**counters, "cron_timing_streak": streak}
+            return _finish(tenant, state, run_token, hibernate=False, result="GAVE_UP_RETRY_NEXT_SWEEP")
+        state.counters = {**counters, "cron_timing_streak": 0}
+        state.cooldown_until = timezone.now() + QUIET_COOLDOWN
+        return _finish(tenant, state, run_token, hibernate=True, result="GAVE_UP")
 
     # ROLLBACK_ALERT / ALERT_ONLY
     state.cooldown_until = timezone.now() + FAILURE_COOLDOWN

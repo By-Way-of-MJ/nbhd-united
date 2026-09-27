@@ -421,6 +421,8 @@ class TaskFlowTests(TestCase):
 
         def run(tenant_id, tag, *, owner_token=None, **kwargs):
             self.assertEqual(tag, TAG)
+            if result is not None and result.get("status") != "PASS":
+                return result  # readiness refusal: nothing claimed, nothing changed
             if fail is None:
                 Tenant.objects.filter(pk=tenant_id).update(
                     openclaw_migration={"owner_token": owner_token, "status": "PASS"}, openclaw_version="2026.9.4"
@@ -534,16 +536,50 @@ class TaskFlowTests(TestCase):
         self.assertLess(self.state().cooldown_until, timezone.now() + timedelta(hours=2))
         self.assert_released()
 
-    def test_cron_imminent_gives_up_quietly(self):
+    def test_cron_imminent_stays_awake_for_the_next_sweep(self):
         with self.migrate(result={"status": "DEFER", "reasons": {"cron_imminent": 1}, "steps": []}):
             result = self.run_task()
-        self.assertEqual(result["status"], "GAVE_UP")
+        self.assertEqual(result["status"], "GAVE_UP_RETRY_NEXT_SWEEP")
+        self.assertFalse(result["hibernated"])
+        self.hibernate.assert_not_called()
         self.assertEqual(len(mail.outbox), 0)
+        state = self.state()
+        self.assertIsNone(state.cooldown_until)
+        self.assertEqual(state.counters["cron_timing_streak"], 1)
+        self.assert_released()
+        self.tenant.refresh_from_db()
+        self.assertIsNotNone(self.tenant.cron_wake_at)  # shield: the sweep waits ~30 min
+
+    def test_cron_timing_streak_eventually_hibernates_with_cooldown(self):
+        defer = {"status": "DEFER", "reasons": {"cron_imminent": 1}, "steps": []}
+        results = []
+        with self.migrate(result=defer):
+            for n in range(au.MAX_CRON_TIMING_STREAK):
+                OpenClawAutoUpgradeLock.objects.filter(pk=1).update(next_allowed_at=None)
+                if n:
+                    OpenClawAutoUpgrade.objects.filter(tenant=self.tenant).update(cooldown_until=None)
+                    self.tenant.refresh_from_db()
+                    self.assertTrue(au.intercept_idle_tenant(self.tenant))
+                results.append(self.run_task()["status"])
+        self.assertEqual(results[:-1], ["GAVE_UP_RETRY_NEXT_SWEEP"] * (au.MAX_CRON_TIMING_STREAK - 1))
+        self.assertEqual(results[-1], "GAVE_UP")
+        self.hibernate.assert_called_once()
+        state = self.state()
+        self.assertEqual(state.counters["cron_timing_streak"], 0)
+        self.assertGreater(state.cooldown_until, timezone.now() + timedelta(minutes=50))
+
+    def test_pass_resets_the_cron_timing_streak(self):
+        state = self.state()
+        state.counters = {"tag": TAG, "cron_timing_streak": 3}
+        state.save()
+        with self.migrate():
+            self.assertEqual(self.run_task()["status"], "PASS")
+        self.assertEqual(self.state().counters["cron_timing_streak"], 0)
 
     def test_deferred_mid_image_resets_unfenced(self):
         with self.migrate(fail=("DEFERRED", "image", "cron_imminent"), undo=False):
             result = self.run_task()
-        self.assertEqual(result["status"], "GAVE_UP")
+        self.assertEqual(result["status"], "GAVE_UP_RETRY_NEXT_SWEEP")
         self.tenant.refresh_from_db()
         self.assertFalse(self.tenant.openclaw_migration_cron_fenced)
 
