@@ -123,7 +123,7 @@ with its saved credentials. An existing file must already have mode 0600.
 unset HARNESS_ROOT
 python3 deploy/local-test/run.py manage yuki_local signup
 python3 deploy/local-test/run.py manage yuki_local link
-python3 deploy/local-test/run.py manage yuki_local chat-plan --week YYYY-MM-DD
+python3 deploy/local-test/run.py manage yuki_local chat-plan --week YYYY-MM-DD [--must-mention PHRASE]...
 python3 deploy/local-test/run.py manage yuki_local tonight
 ```
 
@@ -141,12 +141,29 @@ python3 deploy/local-test/run.py manage yuki_local tonight
   up to 900 seconds, sends `Yes, please go ahead.` at most twice when confirmation
   is requested or the expected job does not exist, then waits at most 1800
   seconds for a ready job. Only the assistant invokes the plugin and uses its
-  preview/confirm token. Wrong-week jobs created during the run fail with both
+  preview/confirm token. Optional `--must-mention` may repeat up to five times;
+  each phrase must be 1–60 characters after trimming and single line. Invalid
+  phrases fail with `invalid_must_mention` before any HTTP call. For example,
+  use `--must-mention pescatarian --must-mention 'three cook nights'` to check
+  those constraints in both the preview and the forwarded prompt. Matching is
+  case-insensitive and collapses whitespace runs to one space everywhere.
+  Before each confirmation (or whenever no job exists), a reply missing any
+  phrase gets `That is not quite what I asked. Please use my request exactly: <original message>`
+  as a single correction line, truncated to 400 characters in total. At most
+  two corrections are sent; another missing-phrase preview fails with
+  `preview_lost_request` without confirming it. The two-confirmation limit
+  remains. As soon as the expected job is found, its stored `user_prompt` must
+  contain every phrase or the helper fails with `prompt_not_forwarded` and
+  `job_id`, without waiting for completion. Stored PII placeholders are compared
+  as-is, without rehydration. With no phrases, the original message sequence
+  is unchanged. Wrong-week jobs created during the run fail with both
   `week` and `job_week`. Ready jobs must have a linked identity, result and no
   error. Returns `proof`, `status`, `week`, `turns` (user/assistant exchanges),
-  `confirm_turns`, `job_id`, `addressed_by`, `meal_count` (or null), `transcript`,
+  `confirm_turns`, `correction_turns`, `must_mention` (trimmed phrases),
+  `job_id`, `addressed_by`, `meal_count` (or null), `transcript`,
   `reply_excerpts` (first 160 characters of each assistant reply).
-  Threads remain as evidence. Timestamped messages/replies, including partial
+  Without phrases, success includes `correction_turns: 0` and `must_mention: []`.
+  Threads remain as evidence. Timestamped messages/replies, including corrections and partial
   evidence on failure, are saved in `.state/proof/chat-plan-<week>-<UTC>.json`
   (0600); failures include `reason` and, when available, `transcript`.
 - `tonight`: no stdin. Reads console link status and Fuel's Tonight endpoint.

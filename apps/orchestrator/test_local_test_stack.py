@@ -509,6 +509,7 @@ class YukiLocalTests(TestCase):
         self.on_poll = lambda: self.job() if len(self.messages) == 3 else None
         result = self.run_helper("chat-plan", "Plan the week of 2026-09-21.\n", week="2026-09-21")
         self.assertEqual((result["turns"], result["confirm_turns"], result["meal_count"]), (3, 2, 1))
+        self.assertEqual((result["correction_turns"], result["must_mention"]), (0, []))
         self.assertEqual(
             [m["text"] for m in self.messages],
             ["Plan the week of 2026-09-21.", self.helper.CONFIRM, self.helper.CONFIRM],
@@ -520,6 +521,133 @@ class YukiLocalTests(TestCase):
         self.assertEqual([m["role"] for m in transcript], ["yuki", "assistant"] * 3)
         self.assertTrue(all(m["timestamp"] for m in transcript))
         self.client.delete.assert_not_called()
+
+    def test_chat_checks_all_phrases_with_case_and_whitespace_normalized(self):
+        self.credentials()
+        self.replies = ["PESCATARIAN dinners, THREE\n  COOK\tNIGHTS. Confirm?", "Generation started."]
+        self.on_poll = lambda: (
+            self.job(user_prompt="pescatarian; three\t cook\n nights") if len(self.messages) == 2 else None
+        )
+        result = self.run_helper(
+            "chat-plan",
+            "Pescatarian dinners, three cook nights.",
+            week="2026-09-21",
+            must_mention=[" Pescatarian ", "three  cook nights"],
+        )
+        self.assertEqual((result["confirm_turns"], result["correction_turns"], result["turns"]), (1, 0, 2))
+        self.assertEqual(result["must_mention"], ["Pescatarian", "three  cook nights"])
+        self.assertEqual(self.messages[1]["text"], self.helper.CONFIRM)
+
+    def test_chat_corrects_preview_before_confirming(self):
+        self.credentials()
+        original = "Plan dinners for 2026-09-21: pescatarian, three cook nights, use my pantry."
+        self.replies = ["Prompt: pantry. Confirm?", "Pescatarian, three cook nights. Confirm?", "Started."]
+        self.on_poll = lambda: self.job(user_prompt=original) if len(self.messages) == 3 else None
+        result = self.run_helper(
+            "chat-plan", original, week="2026-09-21", must_mention=["pescatarian", "three cook nights"]
+        )
+        correction = f"That is not quite what I asked. Please use my request exactly: {original}"
+        self.assertEqual([m["text"] for m in self.messages], [original, correction, self.helper.CONFIRM])
+        self.assertEqual((result["confirm_turns"], result["correction_turns"], result["turns"]), (1, 1, 3))
+        transcript = json.loads(Path(result["transcript"]).read_text())["messages"]
+        self.assertEqual(
+            [m["text"] for m in transcript if m["role"] == "yuki"], [original, correction, self.helper.CONFIRM]
+        )
+
+    def test_chat_three_bad_previews_never_confirms_and_truncates_corrections(self):
+        self.credentials()
+        original = "Pescatarian dinners " + "x" * 380
+        self.replies = ["Prompt: pantry. Confirm?", "I can help with pantry.", "Prompt: pantry. Confirm?"]
+        result = self.run_helper("chat-plan", original, week="2026-09-21", must_mention=["pescatarian"], success=False)
+        self.assertEqual(result["reason"], "preview_lost_request")
+        self.assertEqual((result["proof"], result["status"], result["week"]), ("chat-plan", "failed", "2026-09-21"))
+        correction = f"That is not quite what I asked. Please use my request exactly: {original}"[:400]
+        self.assertEqual(len(correction), 400)
+        self.assertEqual([m["text"] for m in self.messages], [original, correction, correction])
+        transcript = json.loads(Path(result["transcript"]).read_text())["messages"]
+        self.assertEqual([m["text"] for m in transcript if m["role"] == "yuki"], [original, correction, correction])
+        self.helper.time.sleep.assert_not_called()
+
+    def test_chat_two_corrections_leave_both_confirmation_turns_available(self):
+        self.credentials()
+        self.replies = ["Pantry?", "Pantry?", "Pescatarian. Confirm?", "Pescatarian. Confirm?", "Started."]
+        self.on_poll = lambda: self.job(user_prompt="pescatarian") if len(self.messages) == 5 else None
+        result = self.run_helper("chat-plan", "Pescatarian", week="2026-09-21", must_mention=["pescatarian"])
+        correction = "That is not quite what I asked. Please use my request exactly: Pescatarian"
+        self.assertEqual(
+            [m["text"] for m in self.messages],
+            ["Pescatarian", correction, correction, self.helper.CONFIRM, self.helper.CONFIRM],
+        )
+        self.assertEqual((result["confirm_turns"], result["correction_turns"], result["turns"]), (2, 2, 5))
+
+    def test_chat_still_checks_preview_after_second_confirmation(self):
+        self.credentials()
+        self.replies = ["Pescatarian. Confirm?", "Pescatarian. Confirm?", "Pantry?", "Pantry?", "Pantry?"]
+        result = self.run_helper(
+            "chat-plan", "Pescatarian", week="2026-09-21", must_mention=["pescatarian"], success=False
+        )
+        self.assertEqual(result["reason"], "preview_lost_request")
+        correction = "That is not quite what I asked. Please use my request exactly: Pescatarian"
+        self.assertEqual(
+            [m["text"] for m in self.messages],
+            ["Pescatarian", self.helper.CONFIRM, self.helper.CONFIRM, correction, correction],
+        )
+        self.helper.time.sleep.assert_not_called()
+
+    def test_chat_rejects_lost_forwarded_prompt_before_waiting(self):
+        self.credentials()
+        job = self.job(user_prompt="pantry", status="pending")
+        self.replies = ["Pescatarian dinners. Confirm?"]
+        result = self.run_helper(
+            "chat-plan", "Pescatarian dinners", week="2026-09-21", must_mention=["pescatarian"], success=False
+        )
+        self.assertEqual((result["reason"], result["job_id"]), ("prompt_not_forwarded", str(job.id)))
+        self.assertEqual(len(self.messages), 1)
+        self.assertTrue(Path(result["transcript"]).is_file())
+        self.helper.time.sleep.assert_not_called()
+
+    def test_chat_checks_forwarding_after_confirmation_in_stored_placeholder_form(self):
+        self.credentials()
+        self.replies = ["Dinners for Yuki. Confirm?", "Generation started."]
+        self.on_poll = lambda: self.job(user_prompt="Dinners for [PERSON_1]") if len(self.messages) == 2 else None
+        result = self.run_helper(
+            "chat-plan", "Dinners for Yuki", week="2026-09-21", must_mention=["Yuki"], success=False
+        )
+        self.assertEqual(result["reason"], "prompt_not_forwarded")
+        self.assertIn("job_id", result)
+        self.assertEqual([m["text"] for m in self.messages], ["Dinners for Yuki", self.helper.CONFIRM])
+        self.helper.time.sleep.assert_not_called()
+
+    def test_chat_invalid_must_mention_fails_before_http(self):
+        for phrases in (["x"] * 6, [""], [" \t "], ["x" * 61], ["cook\nnights"], ["cook\rnights"], ["a\u2028b"]):
+            with self.subTest(phrases=phrases):
+                result = self.run_helper("chat-plan", week="2026-09-21", must_mention=phrases, success=False)
+                self.assertEqual(result["reason"], "invalid_must_mention")
+        self.factory.assert_not_called()
+        self.client.post.assert_not_called()
+        self.client.get.assert_not_called()
+
+    def test_chat_must_mention_repeatable_flag_and_valid_boundaries(self):
+        from django.core.management import call_command
+
+        self.credentials()
+        phrases = ["x", "y" * 60, "pantry", "dinners", "pescatarian"]
+        self.replies = [" ".join(phrases)]
+        self.on_poll = lambda: self.job(user_prompt=" ".join(phrases))
+        with patch.object(self.helper.sys, "stdin", self.stdin):
+            self.stdin.write("Plan my dinners")
+            self.stdin.seek(0)
+            call_command(
+                "yuki_local",
+                "chat-plan",
+                "--week",
+                "2026-09-21",
+                *[arg for phrase in phrases for arg in ("--must-mention", f" {phrase} ")],
+                stdout=self.stdout,
+            )
+        result = json.loads(self.stdout.getvalue())
+        self.assertEqual(result["must_mention"], phrases)
+        self.assertEqual(result["confirm_turns"], 0)
 
     def test_chat_no_job_prompts_confirmation_without_question(self):
         self.credentials()

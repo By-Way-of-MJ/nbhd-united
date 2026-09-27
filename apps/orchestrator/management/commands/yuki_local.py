@@ -79,6 +79,17 @@ def asks_confirmation(reply):
     )
 
 
+def normalize(text):
+    return " ".join(text.casefold().split())
+
+
+def validate_must_mention(values):
+    phrases = [value.strip() for value in values]
+    if len(phrases) > 5 or any(not 1 <= len(p) <= 60 or len(p.splitlines()) != 1 for p in phrases):
+        raise Failure("invalid_must_mention")
+    return phrases
+
+
 class Command(BaseCommand):
     help = "Yuki's local account, console link, chat plan and Tonight proof"
     requires_system_checks = []
@@ -87,7 +98,9 @@ class Command(BaseCommand):
         subcommands = parser.add_subparsers(dest="action", required=True)
         subcommands.add_parser("signup")
         subcommands.add_parser("link")
-        subcommands.add_parser("chat-plan").add_argument("--week")
+        chat_plan = subcommands.add_parser("chat-plan")
+        chat_plan.add_argument("--week")
+        chat_plan.add_argument("--must-mention", action="append", default=[])
         subcommands.add_parser("tonight")
 
     def handle(self, *args, **options):
@@ -99,6 +112,8 @@ class Command(BaseCommand):
             "tonight": {"proof": "tonight", "status": "failed"},
         }[action]
         try:
+            if action == "chat-plan":
+                must_mention = validate_must_mention(options.get("must_mention") or [])
             self.tid = os.environ.get("NBHD_TENANT_ID", "")
             try:
                 if action == "signup":
@@ -122,7 +137,7 @@ class Command(BaseCommand):
                     if action == "link":
                         result = self.link()
                     elif action == "chat-plan":
-                        result = self.chat_plan(options.get("week"))
+                        result = self.chat_plan(options.get("week"), must_mention)
                     else:
                         result = self.tonight()
         except Exception as exc:
@@ -240,7 +255,7 @@ class Command(BaseCommand):
             time.sleep(min(1.5, max(0, deadline - time.monotonic())))
         raise Failure("chat_timeout")
 
-    def chat_plan(self, value):
+    def chat_plan(self, value, must_mention):
         try:
             week = date.fromisoformat(value)
         except (ValueError, TypeError):
@@ -260,6 +275,12 @@ class Command(BaseCommand):
         transcript = []
         path = STATE / "proof" / f"chat-plan-{value}-{started.strftime('%Y%m%dT%H%M%S%fZ')}.json"
         confirms = 0
+        corrections = 0
+        job = None
+        phrases = [normalize(phrase) for phrase in must_mention]
+
+        def contains_request(value):
+            return all(phrase in normalize(value) for phrase in phrases)
 
         def find_job():
             # Detect wrong-week jobs even when a previous correct-week job exists.
@@ -267,15 +288,27 @@ class Command(BaseCommand):
             if wrong:
                 raise Failure("week_mismatch", week=value, job_week=str(wrong.week_start), job_id=str(wrong.id))
             job = jobs.filter(week_start=week).order_by("-created_at").first()
+            # Compare placeholder-space at rest as stored; never rehydrate PII.
+            if job and not contains_request(job.user_prompt):
+                raise Failure("prompt_not_forwarded", job_id=str(job.id))
             if job and job.status == "failed":
                 raise Failure("job_failed", job_id=str(job.id))
             return job
 
         try:
             reply = self.chat_turn(thread["id"], text, transcript)
-            for _ in range(2):
+            while must_mention or confirms < 2:
                 job = find_job()
                 if job is not None and not asks_confirmation(reply):
+                    break
+                if not contains_request(reply):
+                    if corrections == 2:
+                        raise Failure("preview_lost_request")
+                    correction = f"That is not quite what I asked. Please use my request exactly: {text}"[:400]
+                    reply = self.chat_turn(thread["id"], correction, transcript)
+                    corrections += 1
+                    continue
+                if confirms == 2:
                     break
                 reply = self.chat_turn(thread["id"], CONFIRM, transcript)
                 confirms += 1
@@ -294,8 +327,10 @@ class Command(BaseCommand):
                         "proof": "chat-plan",
                         "status": "ready",
                         "week": value,
-                        "turns": 1 + confirms,
+                        "turns": 1 + confirms + corrections,
                         "confirm_turns": confirms,
+                        "correction_turns": corrections,
+                        "must_mention": must_mention,
                         "job_id": str(job.id),
                         "addressed_by": job.addressed_by,
                         "meal_count": meal_count(job.result),
@@ -308,6 +343,8 @@ class Command(BaseCommand):
             raise Failure("job_timeout")
         except Failure as exc:
             exc.payload["transcript"] = str(path)
+            if must_mention and job:
+                exc.payload.setdefault("job_id", str(job.id))
             raise
         finally:
             private_json(path, {"week": value, "thread_id": thread["id"], "messages": transcript})
