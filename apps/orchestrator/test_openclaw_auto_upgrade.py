@@ -65,6 +65,8 @@ class RulesTableTests(SimpleTestCase):
                 au.ROLLBACK_ALERT,
             ),
             (failed("crons", "HTTP 429 Too Many Requests"), {}, au.WAIT_RESUME),
+            (failed("crons", "Expected exactly one ready OpenClaw replica"), {}, au.WAIT_RESUME),
+            (failed("image", "Expected exactly one ready OpenClaw replica"), {}, au.ROLLBACK_ALERT),
             (
                 failed("image", "Hibernated tenant refused: wake on its current image, then migrate"),
                 {},

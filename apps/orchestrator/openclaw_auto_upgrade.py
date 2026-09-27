@@ -90,6 +90,9 @@ TRANSIENT_MARKERS = (
     "Console protocol failure",
     "429",
     "Too Many Requests",
+    # Right after the image swap the old 5.28 replica can still be draining;
+    # a resume 12 min later passed (99352b56 at crons, 2026-09-27).
+    "Expected exactly one ready OpenClaw replica",
 )
 
 
