@@ -58,10 +58,16 @@ class LocalStackTests(TestCase):
             local_root(self.tenant.id)
 
     def test_handoff_survives_disconnected_probe_and_rejects_invalid_host(self):
+        import shutil
+
+        # macOS caps AF_UNIX paths at 103 bytes; keep the socket shallow so any checkout path fits.
+        sockets = settings.BASE_DIR / "deploy/local-test/.state/hs"
+        sockets.mkdir(mode=0o700, exist_ok=True)
+        self.addCleanup(shutil.rmtree, sockets, ignore_errors=True)
         handoff = runpy.run_path(str(settings.BASE_DIR / "deploy/local-test/handoff.py"))
-        listener = handoff["start_listener"](Path(self.directory.name))
+        listener = handoff["start_listener"](sockets)
         self.addCleanup(listener.close)
-        path = str(Path(self.directory.name) / "sautai-handoff.sock")
+        path = str(sockets / "sautai-handoff.sock")
         with socket.socket(socket.AF_UNIX) as client:
             client.connect(path)
         # A second request must receive a rejection even after the first client
@@ -172,6 +178,8 @@ class LocalStackTests(TestCase):
                 process = subprocess.Popen(
                     [
                         "/usr/bin/sandbox-exec",
+                        "-D",
+                        f"LOCAL_TEST_ROOT_DIR={Path(settings.BASE_DIR).resolve()}",
                         "-f",
                         str(profile),
                         "/Users/mjjones/.local/bin/openclaw",
@@ -256,6 +264,44 @@ class GpuGuardTests(SimpleTestCase):
             "",
         ):
             self.assertFalse(running(line), line)
+
+
+class CheckoutPortabilityTests(SimpleTestCase):
+    def test_gateway_sandbox_is_scoped_to_the_launcher_checkout(self):
+        import sys
+
+        directory = settings.BASE_DIR / "deploy/local-test"
+        profile = (directory / "gateway.sb").read_text()
+        self.assertNotIn("/worktrees/", profile)
+        self.assertIn('(subpath (param "LOCAL_TEST_ROOT_DIR"))', profile)
+        adapter = (directory / "openclaw-paths.mjs").read_text()
+        self.assertNotIn("/worktrees/", adapter)
+        self.assertIn("new URL('./.state/', import.meta.url)", adapter)
+
+        launcher = runpy.run_path(str(directory / "run.py"), run_name="local_test_run")["main"]
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "openclaw.json").write_text("{}")
+            with (
+                patch.dict(
+                    launcher.__globals__,
+                    environment=dict,
+                    gpu_job_running=lambda _: False,
+                    TEST_HOME=Path(home),
+                ),
+                patch.dict(os.environ, LOCAL_TEST_CLEAN_PROCESS="1"),
+                patch.object(sys, "argv", ["run.py", "gateway"]),
+                patch("subprocess.run"),
+                patch("os.umask"),
+                patch("os.chdir"),
+                patch("os.execve") as execve,
+            ):
+                launcher()
+        root = launcher.__globals__["ROOT"]
+        self.assertEqual(root, Path(settings.BASE_DIR).resolve())
+        self.assertEqual(
+            execve.call_args.args[1][:5],
+            ["sandbox-exec", "-D", f"LOCAL_TEST_ROOT_DIR={root}", "-f", str(root / "deploy/local-test/gateway.sb")],
+        )
 
 
 @override_settings(DEBUG=True)

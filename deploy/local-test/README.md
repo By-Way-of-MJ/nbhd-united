@@ -6,6 +6,9 @@ unchanged; its host/account allowlist must not be weakened for this stack.
 
 ## Install and start
 
+The stack runs from whichever checkout the launcher lives in (the path below is
+only an example); `run.py` scopes the gateway sandbox and TMPDIR to that checkout.
+
 ```sh
 cd /Users/mjjones/worktrees/united-yuki-test
 python3 deploy/local-test/bootstrap.py

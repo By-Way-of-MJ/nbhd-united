@@ -4,7 +4,9 @@
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-if (!process.env.TMPDIR?.startsWith('/Users/mjjones/worktrees/united-yuki-test/deploy/local-test/.state/')) {
+// The launcher sets TMPDIR under this checkout's .state, wherever it lives.
+const stateDir = fileURLToPath(new URL('./.state/', import.meta.url));
+if (!process.env.TMPDIR?.startsWith(stateDir)) {
   throw new Error('OpenClaw test launcher requires its isolated TMPDIR');
 }
 registerHooks({
