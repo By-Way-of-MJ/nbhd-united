@@ -859,6 +859,30 @@ class PendingMessageTimeoutResolutionTest(TestCase):
 
         self.assertEqual(_resolve_chat_timeout(tenant), REASONING_MODEL_TIMEOUT)
 
+    def test_local_test_timeout_applies_only_when_both_settings_set(self):
+        from apps.billing.constants import (
+            ANTHROPIC_SONNET_MODEL,
+            DEFAULT_CHAT_TIMEOUT,
+            MINIMAX_MODEL,
+            REASONING_MODEL_TIMEOUT,
+        )
+        from apps.router.pending_queue import _resolve_chat_timeout
+
+        user = _make_user(line_user_id="U_to_local")
+        tenant = _make_tenant(user)
+        for model, fleet_timeout in (
+            (MINIMAX_MODEL, DEFAULT_CHAT_TIMEOUT),
+            (ANTHROPIC_SONNET_MODEL, REASONING_MODEL_TIMEOUT),
+        ):
+            tenant.preferred_model = model
+            with self.subTest(model=model):
+                with override_settings(LOCAL_TEST_ROOT="/tmp/local-test", LOCAL_TEST_CHAT_TIMEOUT=840):
+                    self.assertEqual(_resolve_chat_timeout(tenant), 840.0)
+                with override_settings(LOCAL_TEST_ROOT="", LOCAL_TEST_CHAT_TIMEOUT=840):
+                    self.assertEqual(_resolve_chat_timeout(tenant), fleet_timeout)
+                with override_settings(LOCAL_TEST_ROOT="/tmp/local-test", LOCAL_TEST_CHAT_TIMEOUT=None):
+                    self.assertEqual(_resolve_chat_timeout(tenant), fleet_timeout)
+
 
 # ---------------------------------------------------------------------------
 # Reaper tests — closes the gap when a drain task's original publish

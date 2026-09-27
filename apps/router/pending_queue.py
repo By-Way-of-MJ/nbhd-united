@@ -59,6 +59,7 @@ from apps.billing.services import (
     resolve_model_for_attribution,
 )
 from apps.common.eval_sink import blocks_real_transport_for_identifier, suppresses_real_transport
+from apps.orchestrator.gateway_url import gateway_base_url
 from apps.pii.authoring import placeholder_redactions
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage, RuntimeWriteActivity
 from apps.router.reply_text import clamp_reply_text
@@ -666,6 +667,10 @@ def _resolve_chat_timeout(tenant: Tenant) -> float:
     import to keep the queue module self-contained and avoid a circular
     coupling between router → orchestrator → router.
     """
+    local_timeout = getattr(settings, "LOCAL_TEST_CHAT_TIMEOUT", None)
+    if getattr(settings, "LOCAL_TEST_ROOT", "") and local_timeout:
+        return float(local_timeout)
+
     from apps.billing.constants import (
         DEFAULT_CHAT_TIMEOUT,
         REASONING_MODEL_TIMEOUT,
@@ -2104,7 +2109,7 @@ def _is_tenant_container_live(tenant: Tenant) -> bool:
     This helper performs network I/O and must only be called outside
     ``transaction.atomic()``.
     """
-    url = f"https://{tenant.container_fqdn}/health"
+    url = f"{gateway_base_url(tenant)}/health"
     try:
         response = httpx.get(url, timeout=_CONTAINER_HEALTH_TIMEOUT_SECONDS)
     except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
@@ -2484,7 +2489,7 @@ def _drain_line_batch(tenant: Tenant, batch: list[PendingMessage], timeout: floa
     # drains, the LINE Reply API window (~1 min) is almost always
     # closed. We always Push.
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
@@ -2614,7 +2619,7 @@ def _drain_telegram_batch(tenant: Tenant, batch: list[PendingMessage], timeout: 
 
     content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
@@ -2758,7 +2763,7 @@ def _drain_ios_batch(
 
     content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
