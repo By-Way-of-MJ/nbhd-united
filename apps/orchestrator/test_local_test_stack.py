@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -587,3 +588,66 @@ class YukiLocalTests(TestCase):
         )
         result = self.run_helper("tonight")
         self.assertEqual((result["linked"], result["meals_today"], result["empty_reason"]), (True, 0, "no_meal_today"))
+
+
+@override_settings(
+    DEBUG=True,
+    LOCAL_TEST_ROOT="/nonexistent/local-test-root",
+    SAUTAI_M2M_BASE_URL="http://127.0.0.1:8000",
+    SAUTAI_PLATFORM_SECRET="fixture-secret",
+)
+class LocalOverridesTests(TestCase):
+    def setUp(self):
+        from apps.integrations import sautai_client
+
+        self.client_module = sautai_client
+        self.original = sautai_client.REQUEST_TIMEOUT_SECONDS
+        self.addCleanup(setattr, sautai_client, "REQUEST_TIMEOUT_SECONDS", self.original)
+        self.apply = runpy.run_path(str(settings.BASE_DIR / "deploy/local-test/local_overrides.py"))["apply"]
+        self.env = patch.dict(os.environ, AZURE_MOCK="true")
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_apply_extends_legacy_generate_timeout(self):
+        from apps.integrations.models import Integration, SautaiMealPlanJob
+        from apps.integrations.sautai_client import (
+            ASYNC_CONTRACT_REQUEST_DECISION_KEY,
+            RetryableSautaiError,
+            call_sautai_generate_plan,
+        )
+
+        self.apply()
+        self.assertEqual(self.client_module.REQUEST_TIMEOUT_SECONDS, 1700.0)
+        user = User.objects.create(email="local-overrides-fixture@example.invalid")
+        tenant = Tenant.objects.create(user=user, is_synthetic=True, is_eval_sink=False, sautai_enabled=True)
+        Integration.objects.create(
+            tenant=tenant, provider=Integration.Provider.SAUTAI, status=Integration.Status.ACTIVE, sautai_user_id=501
+        )
+        job = SautaiMealPlanJob.objects.create(
+            tenant=tenant, week_start=date(2026, 9, 28), funnel={ASYNC_CONTRACT_REQUEST_DECISION_KEY: False}
+        )
+        with (
+            patch("apps.integrations.sautai_client.httpx.post", side_effect=httpx.ReadTimeout("fixture")) as post,
+            self.assertRaises(RetryableSautaiError),
+        ):
+            call_sautai_generate_plan(job)
+        self.assertEqual(post.call_args.kwargs["timeout"], 1700.0)
+
+    def test_apply_refuses_outside_local_stack(self):
+        cases = [
+            override_settings(LOCAL_TEST_ROOT=""),
+            override_settings(DEBUG=False),
+            patch.dict(os.environ, AZURE_MOCK="false"),
+            patch.object(self.client_module, "REQUEST_TIMEOUT_SECONDS", new=None),
+        ]
+        for index, context in enumerate(cases):
+            with self.subTest(case=index), context:
+                before = getattr(self.client_module, "REQUEST_TIMEOUT_SECONDS", None)
+                if index == 3:
+                    del self.client_module.REQUEST_TIMEOUT_SECONDS
+                    before = "missing"
+                with self.assertRaises(RuntimeError):
+                    self.apply()
+                after = getattr(self.client_module, "REQUEST_TIMEOUT_SECONDS", "missing")
+                self.assertEqual(after, before)
+        self.assertEqual(self.client_module.REQUEST_TIMEOUT_SECONDS, self.original)

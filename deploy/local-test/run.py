@@ -113,6 +113,7 @@ def main():
         import django
 
         django.setup()
+        runpy.run_path(str(ROOT / "deploy/local-test/local_overrides.py"))["apply"]()
         handoff = runpy.run_path(str(ROOT / "deploy/local-test/handoff.py"))
         handoff["start_listener"](STATE)
         sys.argv = ["manage.py", "runserver", "127.0.0.1:18080", "--noreload"]

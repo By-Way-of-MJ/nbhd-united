@@ -231,6 +231,9 @@ a supplied positive integer links that fixture ID on the designated tenant. This
 link. The token is neither put in the DB nor persisted to `.env.local-test`.
 Re-send after either process restarts. An accepted hand-off proves transfer,
 not successful plan generation.
+The `django` launcher raises the synchronous sautai generate timeout from 125 s to
+1700 s for that process only (`local_overrides.py`), so a local-model week can
+finish inside `chat-plan`'s 1800 s wait.
 
 QStash stays blank. The existing fallback is `apps/cron/publish.py::publish_task`
 → `apps/cron/views.py::execute_task_sync`. For this local setting only, a daemon
