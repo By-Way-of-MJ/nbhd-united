@@ -88,3 +88,14 @@ class DependencyView(ProjectView):
     def delete(self, request, mission_id, dependency_id):
         projects.dependency_write(self.get_tenant(request), mission_id, dependency_id=dependency_id)
         return Response(status=204)
+
+
+class MembershipView(ProjectView):
+    """PATCH my own membership: ``linked_goal_id`` (my Horizons goal, or null)."""
+
+    def patch(self, request, mission_id):
+        data = self.data(request)
+        if set(data) - {"linked_goal_id"} or "linked_goal_id" not in data:
+            raise ValidationError("Only linked_goal_id can be changed here.")
+        member = projects.set_linked_goal(self.get_tenant(request), mission_id, data.get("linked_goal_id"))
+        return Response({"linked_goal_id": str(member.linked_goal_id) if member.linked_goal_id else None})

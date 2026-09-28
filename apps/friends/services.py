@@ -638,10 +638,51 @@ def _decision_moments(tenant, pending, profiles, *, since=None) -> list[dict]:
             }
         )
 
+    moments.extend(_project_ask_moments(tenant, since=since))
+
     moments.sort(key=lambda m: m["_sort"], reverse=True)
     for m in moments:
         m.pop("_sort", None)
     return moments
+
+
+def _project_ask_moments(tenant, *, since=None) -> list[dict]:
+    """Projects v2: steps someone asked ME to take and I haven't answered (a decision
+    for me, like a wave). Names + titles only. Flag-gated so older apps never see a
+    moment kind they can't render (they'd drop it anyway)."""
+    from .project_flags import projects_v2_enabled
+
+    if not projects_v2_enabled(tenant):
+        return []
+    rows = (
+        access.my_open_project_asks(tenant)
+        .select_related("step", "step__shared_goal")
+        .order_by(F("asked_at").desc(nulls_last=True))[:20]
+    )
+    out = []
+    for row in rows:
+        stamp = row.asked_at or row.responded_at or timezone.now()
+        if since is not None and stamp <= since:
+            continue
+        out.append(
+            {
+                "id": f"project_ask:{row.id}",
+                "kind": "project_ask",
+                "created_at": _iso_z(stamp),
+                "_sort": stamp,
+                "mission_id": str(row.step.shared_goal_id),
+                "step_id": str(row.step_id),
+                "project_title": row.step.shared_goal.title,
+                "step_title": row.step.title,
+                "asked_by_name": _project_member_name(row.asked_by_id),
+            }
+        )
+    return out
+
+
+def _project_member_name(tenant_id) -> str:
+    profile = NeighborProfile.objects.filter(tenant_id=tenant_id).only("display_name").first()
+    return profile.display_name if profile and profile.display_name else "A neighbor"
 
 
 def _share_audience_label(tenant, share) -> str:
@@ -1575,6 +1616,18 @@ def _prepare_member_task(tenant, title, description):
     )
 
 
+def _linked_goal_for(tenant, mission):
+    """Projects v2 §11.1: the caller's private Horizons goal for this project, if it
+    still exists in their own journal."""
+    from apps.journal.models import Goal
+
+    member = access.mission_memberships().filter(shared_goal=mission, tenant=tenant).only("linked_goal_id").first()
+    goal_id = getattr(member, "linked_goal_id", None)
+    if goal_id and Goal.objects.filter(id=goal_id, tenant=tenant).exists():
+        return goal_id
+    return None
+
+
 def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None):
     """Author outside transactions, then persist only the caller's private Task."""
     from apps.journal.models import Task
@@ -1583,6 +1636,7 @@ def _mint_member_task(tenant, mission, title, description, due_date, *, step=Non
     return Task.objects.create(
         **values,
         due_date=due_date,
+        parent_goal_id=_linked_goal_for(tenant, mission),
         related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
         if step
         else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
@@ -1625,6 +1679,13 @@ def create_mission(
             shared_goal=mission, tenant=other, user=other.user, role="member", status="invited"
         )
     _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="created the mission")
+    if other_ids:
+        from .project_flags import projects_v2_enabled
+
+        if projects_v2_enabled(tenant):
+            from .project_notifications import notify_project_invite
+
+            notify_project_invite(mission, tenant)
     return mission
 
 

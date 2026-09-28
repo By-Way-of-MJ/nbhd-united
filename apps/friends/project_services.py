@@ -209,9 +209,15 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
     members = list(access.mission_memberships().filter(shared_goal=goal, status__in=["active", "invited"], id__in=ids))
     if len(members) != len(ids):
         raise NotFound("No such project member.")
+    from .project_flags import projects_v2_enabled
+
     for member in members:
         if member.status == "invited":
             access.assert_project_invitee(member.tenant_id, goal)
+        if member.tenant_id != tenant.id and not projects_v2_enabled(member.tenant):
+            # Their app can't show or answer an ask yet — refuse rather than dead-end.
+            raise ValidationError("They need the newest version of the app before you can ask them.")
+    newly_asked = []
     for member in members:
         assignment, created = access.project_assignments(goal).get_or_create(
             step=step, membership=member, defaults={"asked_by": tenant}
@@ -220,12 +226,18 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
             continue
         assignment.status = "asked"
         assignment.asked_by = tenant
+        assignment.asked_at = timezone.now()
         assignment.counter_start = assignment.counter_due = assignment.responded_at = None
         assignment.note = ""
         assignment.save()
+        newly_asked.append(member.id)
         services._append_update(
             goal, tenant, user, "step_assigned", payload={"step_id": str(step.id), "membership_id": str(member.id)}
         )
+    if newly_asked:
+        from .project_notifications import notify_step_ask
+
+        notify_step_ask(goal, step, newly_asked, tenant)
 
 
 def respond(tenant, user, mission_id, step_id, data):
@@ -278,6 +290,10 @@ def respond(tenant, user, mission_id, step_id, data):
         services._append_update(
             goal, tenant, user, "step_answered", payload={"step_id": str(step.id), "answer": answer}
         )
+        if assignment.asked_by_id and assignment.asked_by_id != tenant.id:
+            from .project_notifications import notify_step_answer
+
+            notify_step_answer(goal, step, answer, tenant, assignment.asked_by_id)
         return assignment
 
 
@@ -313,6 +329,9 @@ def _refresh_milestones(goal, tenant, user):
             services._append_update(
                 goal, tenant, user, "milestone_reached", payload={"milestone_id": str(milestone.id)}
             )
+            from .project_notifications import notify_milestone_reached
+
+            notify_milestone_reached(goal, milestone.title, tenant)
         elif not reached and milestone.reached_at:
             milestone.reached_at = None
             milestone.save(update_fields=["reached_at"])
@@ -337,6 +356,9 @@ def _finish(goal, step, tenant, user, *, reopen=False):
                 .exists()
             ):
                 services._append_update(goal, tenant, user, "step_unblocked", payload={"step_id": str(edge.blocked_id)})
+                from .project_notifications import notify_step_unblocked
+
+                notify_step_unblocked(goal, edge.blocked_id, step.title, tenant)
     _refresh_milestones(goal, tenant, user)
 
 
@@ -421,3 +443,33 @@ def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
             seen.add(current)
             stack.extend(children.get(current, []))
     return access.project_dependencies(goal).create(blocker=blocker, blocked=blocked)
+
+
+@transaction.atomic
+def set_linked_goal(tenant, mission_id, goal_id):
+    """Link this project to ONE of my own Horizons goals (or clear it with None).
+
+    Private to me. My accepted step Tasks move under the goal (so they show in its
+    Horizons checklist); unlinking moves back only the Tasks this link placed there.
+    Queryset ``update()`` on my own Tasks: no Task.save signal re-enters the project.
+    """
+    from django.db.models import Q
+
+    from apps.journal.models import Goal, Task
+
+    goal, member = access.lock_project(tenant, mission_id)
+    new_id = _uuid(goal_id) if goal_id else None
+    if new_id and not Goal.objects.filter(id=new_id, tenant=tenant).exists():
+        raise NotFound("No such goal.")
+    old_id = member.linked_goal_id
+    if old_id == new_id:
+        return member
+    task_ids = list(access.my_linked_step_tasks(member).values_list("task_id", flat=True))
+    mine = Task.objects.filter(id__in=task_ids, tenant=tenant)
+    if old_id:
+        mine.filter(parent_goal_id=old_id).update(parent_goal_id=new_id)
+    if new_id:
+        mine.filter(Q(parent_goal__isnull=True)).update(parent_goal_id=new_id)
+    member.linked_goal_id = new_id
+    member.save(update_fields=["linked_goal_id"])
+    return member
