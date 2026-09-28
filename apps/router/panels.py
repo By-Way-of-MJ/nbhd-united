@@ -18,7 +18,17 @@ from apps.router.chat_gates import chat_panels_tool_enabled, chat_shape_enabled
 
 logger = logging.getLogger(__name__)
 
-PANEL_KINDS = ("sleep", "schedule", "training_week", "workout", "timer", "journal_table", "tasks", "log_table")
+PANEL_KINDS = (
+    "sleep",
+    "schedule",
+    "training_week",
+    "workout",
+    "timer",
+    "journal_table",
+    "tasks",
+    "log_table",
+    "project",
+)
 PanelKind = Literal[*PANEL_KINDS]
 PANEL_RANGES = ("last_night", "today", "yesterday", "tomorrow", "this_week", "last_week", "this_month", "last_month")
 TASK_FILTERS = ("due_today", "overdue", "open", "this_week")

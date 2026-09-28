@@ -230,6 +230,7 @@ class GenerateSmokeConfigCommandTests(TestCase):
         paths = config.get("plugins", {}).get("load", {}).get("paths", [])
         self.assertTrue(any("nbhd-friends-tools" in p for p in paths))
         self.assertIn("/opt/nbhd/plugins/nbhd-journal-shaping", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", paths)
         self.assertIn("/opt/nbhd/plugins/nbhd-document-keep", paths)
         self.assertIn("/opt/nbhd/plugins/nbhd-site-editor", paths)
         entries = config.get("plugins", {}).get("entries", {})

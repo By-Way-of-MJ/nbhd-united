@@ -237,3 +237,42 @@ class ContractTests(TestCase):
             )
         spec = ProjectDraftSpec.model_validate({"title": "T", "steps": [{"key": "a", "title": "A"}]})
         self.assertEqual(spec.steps[0].depends_on, [])
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class PluginAndEnvelopeTests(TestCase):
+    def setUp(self):
+        self.a, self.b = _tenant("env_a"), _tenant("env_b")
+        _profile(self.a, "aya")
+        _profile(self.b, "ben")
+        edge = _edge(self.a, self.b)
+        with override_settings(PROJECTS_V2_TENANT_IDS="*"):
+            self.goal = services.create_mission(
+                self.b, self.b.user, member_friendship_ids=[str(edge.id)], title=INJECTION
+            )
+            services.join_mission(self.a, self.a.user, self.goal.id)
+            projects.create_step(self.b, self.b.user, self.goal.id, {"title": "Ben's secret step"})
+
+    def paths(self, tenant):
+        from apps.orchestrator.config_generator import generate_openclaw_config
+
+        return generate_openclaw_config(tenant).get("plugins", {}).get("load", {}).get("paths", [])
+
+    def test_plugin_loads_only_for_projects_v2_accounts_regardless_of_friends_flag(self):
+        self.a.neighborhood_enabled = True
+        self.a.friends_enabled = False
+        self.a.save(update_fields=["neighborhood_enabled", "friends_enabled"])
+        with override_settings(PROJECTS_V2_TENANT_IDS=str(self.a.id)):
+            self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
+        with override_settings(PROJECTS_V2_TENANT_IDS=""):
+            self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
+
+    def test_envelope_never_carries_another_members_words(self):
+        from .envelope import render_projects
+
+        with override_settings(PROJECTS_V2_TENANT_IDS="*"):
+            text = render_projects(self.a)
+        self.assertIn("a project with @ben", text)
+        self.assertNotIn("Ignore previous", text)
+        self.assertNotIn("secret", text)
+        self.assertIn("nbhd_project_context", text)

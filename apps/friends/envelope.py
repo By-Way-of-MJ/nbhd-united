@@ -137,6 +137,8 @@ def render_missions(tenant: Tenant) -> str:
     try:
         from . import projection
 
+        if _projects_enabled(tenant):
+            return ""  # the Projects v2 section replaces this one
         memberships = list(
             access.mission_memberships()
             .filter(tenant=tenant, status="active", shared_goal__status="active")
@@ -153,6 +155,65 @@ def render_missions(tenant: Tenant) -> str:
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 — an envelope section must never break a turn
         logger.warning("render_missions failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
+        return ""
+
+
+def _projects_enabled(tenant) -> bool:
+    from .project_flags import projects_v2_enabled
+
+    return bool(getattr(tenant, "neighborhood_enabled", False)) and projects_v2_enabled(tenant)
+
+
+@register_section(
+    key="projects",
+    heading="## Shared projects",
+    enabled=_projects_enabled,
+    refresh_on=(SharedGoalMembership,),
+    order=65,
+)
+def render_projects(tenant: Tenant) -> str:
+    """Projects v2 pointer (≤3 projects). USER.md is written to the share file, so
+    only the user's OWN words and counts go here — never text another member wrote
+    (a project titled by someone else is named by its creator's @handle). The live
+    detail is one tool call away. Never raises."""
+    try:
+        from . import project_services
+
+        memberships = list(access.my_active_project_memberships(tenant)[:3])
+        if not memberships:
+            return ""
+        lines = ["Call nbhd_project_context for details before answering about a project."]
+        for membership in memberships:
+            goal = membership.shared_goal
+            plan = project_services.get_plan(tenant, goal.id)
+            if str(goal.created_by_id) == str(tenant.id):
+                name = goal.title
+            else:
+                creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
+                name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
+            mine = [s for s in plan["steps"] if any(o["id"] == str(membership.id) for o in s.get("owners", []))]
+            open_mine = [s for s in mine if s["status"] not in ("done", "skipped")]
+            asks = sum(
+                1
+                for s in plan["steps"]
+                for a in s.get("assignments", [])
+                if a["membership_id"] == str(membership.id) and a["status"] == "asked"
+            )
+            waiting = sum(1 for s in open_mine if s.get("blocked_by_open"))
+            bits = [f"{plan['done_count']}/{plan['total']} steps done"]
+            if open_mine:
+                nxt = sorted(open_mine, key=lambda s: s.get("start_date") or "9999")[0]
+                own_title = access.project_steps(goal).filter(id=nxt["id"], created_by_id=tenant.id).exists()
+                label = f"“{nxt['title']}”" if own_title else "one of your steps"
+                bits.append(f"your next: {label}" + (f" (due {nxt['due_date']})" if nxt.get("due_date") else ""))
+            if waiting:
+                bits.append(f"{waiting} of your steps waiting on others")
+            if asks:
+                bits.append(f"{asks} ask(s) for you to answer")
+            lines.append(f"- {name} — " + "; ".join(bits))
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — an envelope section must never break a turn
+        logger.warning("render_projects failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
         return ""
 
 

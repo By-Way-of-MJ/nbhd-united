@@ -96,10 +96,19 @@ class PolicyTests(SimpleTestCase):
             "timer",
             "body_weight",
             "journal",
+            "project",
         }:
             with self.subTest(unsupported=surface):
                 answer = jev.ChoiceAnswer.model_validate(choice_answer(SURFACES, surface))
                 self.assertEqual(decide_panel(answer, 2, 1, "today"), ("none", None, "no_panel"))
+
+    def test_project_surface_opens_the_project_panel_only_when_enabled(self):
+        answer = jev.ChoiceAnswer.model_validate(choice_answer(SURFACES, "project"))
+        self.assertEqual(decide_panel(answer, 2, 0, "unspecified"), ("open", "project", "ok"))
+        self.assertEqual(
+            decide_panel(answer, 2, 0, "unspecified", None, frozenset(PANELS) - {"project"}),
+            ("none", None, "panel_disabled"),
+        )
 
     def test_workout_tie_boundaries(self):
         for top, second, confidence, period, expected in [

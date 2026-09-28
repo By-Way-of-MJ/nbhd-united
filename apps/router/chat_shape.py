@@ -35,6 +35,7 @@ SURFACES = {
     "journal": "Their journal or diary entries, mood over time, reflections they wrote",
     "place": "A specific place, venue, route or directions somewhere, or places nearby",
     "checklist": "A list of separate items or steps to tick off, such as a packing list, shopping list or to-do list being made now",
+    "project": "A shared project with other people: its plan, who is doing which step, the timeline, milestones, what they are waiting on, or a request to take a step",
     "timer": "Starting a timer, focus session or countdown for a duration right now",
     "comparison": "Comparing two or more options side by side to choose between them",
     "none": "Casual talk, feelings, advice, open questions or anything where a plain text reply is best and no visual would help",
@@ -95,6 +96,7 @@ SURFACE_PANELS = {
     "timer": "timer",
     "body_weight": "log_table",
     "journal": "journal_table",
+    "project": "project",
 }
 
 
@@ -434,6 +436,11 @@ def _shape_chat(payload, tenant, deadline, panels, timings):
             resolved_range = candidate if candidate in RANGES else "unspecified"
         surface = answers["surface"]
         follow_up = answers["follow_up_on_open_panel"].noul
+        if "project" in panels:
+            from apps.friends.project_flags import projects_v2_enabled
+
+            if not projects_v2_enabled(tenant):
+                panels = panels - {"project"}  # the Project panel only for Projects v2 accounts
         decision, panel, reason = decide_panel(
             surface,
             answers["visual_helps"].score,

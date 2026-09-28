@@ -1,0 +1,16 @@
+{
+  "id": "nbhd-project-tools",
+  "name": "NBHD Project Tools",
+  "description": "Shared projects (Neighborhood Projects v2): read the user's projects, save a PRIVATE starter draft, and SUGGEST changes the user approves in the app. No tool can apply, share, invite, ask or complete anything by itself.",
+  "contracts": {
+    "tools": ["nbhd_project_context", "nbhd_project_draft", "nbhd_project_propose_change"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiBaseUrl": {"type": "string", "description": "Override NBHD API base URL. Defaults to NBHD_API_BASE_URL env var."},
+      "requestTimeoutMs": {"type": "number", "minimum": 1000, "maximum": 60000, "description": "HTTP timeout for NBHD runtime endpoint requests."}
+    }
+  }
+}
