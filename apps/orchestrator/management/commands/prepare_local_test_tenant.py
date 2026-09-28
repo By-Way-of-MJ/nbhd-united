@@ -12,6 +12,7 @@ from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from apps.fuel.models import FuelProfile
 from apps.orchestrator.services import update_tenant_config
 from apps.tenants.models import Tenant, User
 
@@ -98,7 +99,11 @@ class Command(BaseCommand):
             raise CommandError("Provisioning did not reach active")
         tenant.container_fqdn = "127.0.0.1:19443"
         tenant.internal_api_key = settings.NBHD_INTERNAL_API_KEY
-        tenant.save(update_fields=["container_fqdn", "internal_api_key", "updated_at"])
+        # Yuki uses Fuel (her sautai plan shows as Fuel Tonight; meals + workouts), so her local
+        # tenant has the pillar on, as her Settings toggle would: flag + profile. Idempotent.
+        tenant.fuel_enabled = True
+        tenant.save(update_fields=["container_fqdn", "internal_api_key", "fuel_enabled", "updated_at"])
+        FuelProfile.objects.get_or_create(tenant=tenant)
         update_tenant_config(str(tenant.id))
         self.stdout.write(
             json.dumps(
