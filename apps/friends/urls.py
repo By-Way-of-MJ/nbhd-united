@@ -2,6 +2,7 @@
 
 from django.urls import path
 
+from . import project_views
 from .views import (
     AbsorbedListView,
     AbsorbedPurgeView,
@@ -129,3 +130,21 @@ urlpatterns = [
     path("invites/<str:token>/", InviteDetailView.as_view(), name="friends-invite-detail"),
     path("<uuid:friendship_id>/", UnfriendView.as_view(), name="friends-unfriend"),
 ]
+
+urlpatterns += [
+    path("missions/<uuid:mission_id>/plan/", project_views.PlanView.as_view()),
+    path("missions/<uuid:mission_id>/steps/", project_views.StepsView.as_view()),
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/", project_views.StepView.as_view()),
+    path("missions/<uuid:mission_id>/milestones/", project_views.MilestonesView.as_view()),
+    path("missions/<uuid:mission_id>/milestones/<uuid:milestone_id>/", project_views.MilestoneView.as_view()),
+    path("missions/<uuid:mission_id>/dependencies/", project_views.DependenciesView.as_view()),
+    path("missions/<uuid:mission_id>/dependencies/<uuid:dependency_id>/", project_views.DependencyView.as_view()),
+]
+for action in ("ask", "respond", "complete", "reopen"):
+    urlpatterns.append(
+        path(
+            f"missions/<uuid:mission_id>/steps/<uuid:step_id>/{action}/",
+            project_views.StepActionView.as_view(),
+            {"action": action},
+        )
+    )

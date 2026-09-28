@@ -1,0 +1,357 @@
+"""Projects v2 writes. Every mutation serializes on the project row.
+
+Text authoring for a private journal mirror runs before the transaction. The
+locked recheck is the lease validation: a changed step asks the caller to retry.
+No other tenant's journal is ever loaded or changed.
+"""
+
+from datetime import date
+from uuid import UUID
+
+from django.db import transaction
+from django.utils import timezone
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
+
+from . import access, plan_projection, services
+from .project_hygiene import clean_text
+
+
+class Conflict(APIException):
+    status_code = 409
+    default_detail = "This step changed since you loaded it — refresh and try again."
+
+    def __init__(self, detail=None):
+        super().__init__(detail)
+        if isinstance(detail, dict) and "version" in detail:
+            self.detail["version"] = detail["version"]
+
+
+def _uuid(value):
+    try:
+        return UUID(str(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValidationError("A valid ID is required.") from exc
+
+
+def _date(value):
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except (ValueError, TypeError) as exc:
+        raise ValidationError("Dates must be YYYY-MM-DD.") from exc
+
+
+def _row(qs, pk):
+    row = qs.filter(id=_uuid(pk)).first()
+    if row is None:
+        raise NotFound("No such project item.")
+    return row
+
+
+def _fields(data, *, milestone=False, creating=False):
+    allowed = (
+        {"title", "order", "target_date"}
+        if milestone
+        else {"title", "description", "start_date", "due_date", "milestone_id", "order", "status", "version"}
+    )
+    if set(data) - allowed:
+        raise ValidationError("Unknown project fields.")
+    result = {}
+    if creating or "title" in data:
+        result["title"] = clean_text(data.get("title"), limit=120, required=True)
+    if "description" in data:
+        result["description"] = clean_text(data["description"])
+    for field in {"target_date", "start_date", "due_date"} & set(data):
+        result[field] = _date(data[field])
+    if "order" in data:
+        if type(data["order"]) is not int or not -(2**31) <= data["order"] < 2**31:
+            raise ValidationError("order must be an integer.")
+        result["order"] = data["order"]
+    if "milestone_id" in data:
+        result["milestone_id"] = _uuid(data["milestone_id"]) if data["milestone_id"] else None
+    if "status" in data:
+        if data["status"] not in {"open", "in_progress"}:
+            raise ValidationError("Use complete/reopen to change completion.")
+        result["status"] = data["status"]
+    return result
+
+
+def _validate_step(goal, fields, step=None):
+    if fields.get("milestone_id"):
+        _row(access.project_milestones(goal), fields["milestone_id"])
+    start = fields.get("start_date", getattr(step, "start_date", None))
+    due = fields.get("due_date", getattr(step, "due_date", None))
+    if start and due and start > due:
+        raise ValidationError("Start must be on or before due date.")
+    if step and step.status in {"done", "skipped"} and "status" in fields:
+        raise ValidationError("Use reopen to change completion.")
+
+
+def get_plan(tenant, mission_id):
+    from apps.common.tenant_tz import tenant_tz
+
+    goal, member = services._assert_mission_member(tenant, mission_id)
+    plan = plan_projection.build_plan(
+        access.project_snapshot(goal), today=timezone.now().astimezone(tenant_tz(tenant)).date()
+    )
+    plan.update(my_membership_id=str(member.id), my_role=member.role)
+    return plan
+
+
+@transaction.atomic
+def create_step(tenant, user, mission_id, data):
+    goal, _ = access.lock_project(tenant, mission_id)
+    fields = _fields(data, creating=True)
+    _validate_step(goal, fields)
+    if access.project_steps(goal).count() >= 60:
+        raise ValidationError("A project can have at most 60 steps.")
+    step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
+    services._append_update(goal, tenant, user, "step_added", text=step.title, payload={"step_id": str(step.id)})
+    _refresh_milestones(goal, tenant, user)
+    return step
+
+
+@transaction.atomic
+def patch_step(tenant, mission_id, step_id, data):
+    goal, _ = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if type(data.get("version")) is not int:
+        raise ValidationError("version is required and must be an integer.")
+    if data["version"] != step.version:
+        raise Conflict({"detail": Conflict.default_detail, "version": step.version})
+    fields = _fields(data)
+    _validate_step(goal, fields, step)
+    for key, value in fields.items():
+        setattr(step, key, value)
+    step.version += 1
+    step.save()
+    _refresh_milestones(goal, tenant, None)
+    return step
+
+
+@transaction.atomic
+def delete_step(tenant, mission_id, step_id):
+    goal, _ = access.lock_project(tenant, mission_id)
+    _row(access.project_steps(goal), step_id).delete()
+    _refresh_milestones(goal, tenant, None)
+
+
+@transaction.atomic
+def ask(tenant, user, mission_id, step_id, membership_ids):
+    goal, _ = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if not isinstance(membership_ids, list) or not membership_ids:
+        raise ValidationError("membership_ids must be a nonempty list.")
+    ids = {_uuid(value) for value in membership_ids}
+    members = list(access.mission_memberships().filter(shared_goal=goal, status__in=["active", "invited"], id__in=ids))
+    if len(members) != len(ids):
+        raise NotFound("No such project member.")
+    for member in members:
+        if member.status == "invited":
+            access.assert_project_invitee(member.tenant_id, goal)
+    for member in members:
+        assignment, created = access.project_assignments(goal).get_or_create(
+            step=step, membership=member, defaults={"asked_by": tenant}
+        )
+        if not created and assignment.status in {"accepted", "asked"}:
+            continue
+        assignment.status = "asked"
+        assignment.asked_by = tenant
+        assignment.counter_start = assignment.counter_due = assignment.responded_at = None
+        assignment.note = ""
+        assignment.save()
+        services._append_update(
+            goal, tenant, user, "step_assigned", payload={"step_id": str(step.id), "membership_id": str(member.id)}
+        )
+
+
+def respond(tenant, user, mission_id, step_id, data):
+    goal, member = services._assert_mission_member(tenant, mission_id)
+    answer = data.get("answer")
+    if answer not in {"yes", "dates", "smaller", "no"}:
+        raise ValidationError("answer must be yes, dates, smaller, or no.")
+    note = clean_text(data.get("note"), limit=200 if answer == "smaller" else 500)
+    start, due = _date(data.get("start")), _date(data.get("due"))
+    if start and due and start > due:
+        raise ValidationError("Start must be on or before due date.")
+    if answer == "dates" and not (start or due):
+        raise ValidationError("Suggest a start or due date.")
+    if answer == "smaller" and not note:
+        raise ValidationError("Describe the smaller part.")
+    before = _row(access.project_steps(goal), step_id)
+    existing = access.project_assignments(goal).filter(step=before, membership=member).first()
+    if existing is None or existing.status not in {"asked", "countered", "accepted"}:
+        raise PermissionDenied("Only the asked member can respond.")
+    if existing.status == "accepted" and answer != "yes":
+        raise ValidationError("This step is already accepted.")
+    prepared = (
+        services._prepare_member_task(tenant, before.title, before.description)
+        if answer == "yes" and not existing.task_id
+        else None
+    )
+    with transaction.atomic():
+        goal, member = access.lock_project(tenant, mission_id)
+        step = _row(access.project_steps(goal), step_id)
+        if step.version != before.version:
+            raise Conflict()
+        assignment = access.project_assignments(goal).filter(step=step, membership=member).first()
+        if assignment is None or assignment.status not in {"asked", "countered", "accepted"}:
+            raise PermissionDenied("Only the asked member can respond.")
+        if assignment.status == "accepted":
+            if answer == "yes":
+                return assignment
+            raise ValidationError("This step is already accepted.")
+        assignment.status = {"yes": "accepted", "no": "declined", "dates": "countered", "smaller": "countered"}[answer]
+        assignment.counter_start, assignment.counter_due = (start, due) if answer == "dates" else (None, None)
+        assignment.note = note
+        assignment.responded_at = timezone.now()
+        if answer == "yes" and not assignment.task_id:
+            if prepared is None:
+                raise Conflict()
+            assignment.task = services._mint_member_task(
+                tenant, goal, step.title, step.description, step.due_date, step=step, prepared=prepared
+            )
+        assignment.save()
+        services._append_update(
+            goal, tenant, user, "step_answered", payload={"step_id": str(step.id), "answer": answer}
+        )
+        return assignment
+
+
+def add_owned_step(tenant, user, mission_id, *, title, description="", due_date=None, prepared=None):
+    services._assert_mission_member(tenant, mission_id)
+    title, description = clean_text(title, limit=120, required=True), clean_text(description)
+    if prepared is None:
+        prepared = services._prepare_member_task(tenant, title, description)
+    with transaction.atomic():
+        goal, member = access.lock_project(tenant, mission_id)
+        step = create_step(tenant, user, mission_id, {"title": title, "description": description, "due_date": due_date})
+        task = services._mint_member_task(tenant, goal, title, description, due_date, step=step, prepared=prepared)
+        access.project_assignments(goal).create(
+            step=step, membership=member, status="accepted", task=task, asked_by=tenant, responded_at=timezone.now()
+        )
+        services._append_update(
+            goal,
+            tenant,
+            user,
+            "task_added",
+            text=title,
+            payload={"title": title, "task_id": str(task.id), "step_id": str(step.id)},
+        )
+        return step, task
+
+
+def _refresh_milestones(goal, tenant, user):
+    for milestone in access.milestone_completion_rows(goal):
+        reached = milestone.step_count > 0 and milestone.open_count == 0
+        if reached and not milestone.reached_at:
+            milestone.reached_at = timezone.now()
+            milestone.save(update_fields=["reached_at"])
+            services._append_update(
+                goal, tenant, user, "milestone_reached", payload={"milestone_id": str(milestone.id)}
+            )
+        elif not reached and milestone.reached_at:
+            milestone.reached_at = None
+            milestone.save(update_fields=["reached_at"])
+
+
+def _finish(goal, step, tenant, user, *, reopen=False):
+    status = "open" if reopen else "done"
+    if step.status == status:
+        return
+    step.status = status
+    step.completed_at = None if reopen else timezone.now()
+    step.completed_by = None if reopen else tenant
+    step.version += 1
+    step.save(update_fields=["status", "completed_at", "completed_by", "version"])
+    if not reopen:
+        services._append_update(goal, tenant, user, "step_done", text=step.title, payload={"step_id": str(step.id)})
+        for edge in access.project_dependencies(goal).filter(blocker=step):
+            if (
+                not access.project_dependencies(goal)
+                .filter(blocked_id=edge.blocked_id)
+                .exclude(blocker__status__in=["done", "skipped"])
+                .exists()
+            ):
+                services._append_update(goal, tenant, user, "step_unblocked", payload={"step_id": str(edge.blocked_id)})
+    _refresh_milestones(goal, tenant, user)
+
+
+@transaction.atomic
+def complete(tenant, user, mission_id, step_id, *, reopen=False):
+    from apps.journal.models import Task
+
+    # Match journal writes' lock order: private Task first, project second.
+    # Otherwise Task.save's synchronous receiver (Task -> project) can deadlock
+    # against a project completion holding the project while waiting on Task.
+    goal, member = services._assert_mission_member(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
+    if assignment is None:
+        raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
+    linked_task_id = assignment.task_id
+    task = Task.objects.select_for_update().filter(id=linked_task_id, tenant=tenant).first() if linked_task_id else None
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
+    if assignment is None:
+        raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
+    if assignment.task_id != linked_task_id:
+        raise Conflict()
+    _finish(goal, step, tenant, user, reopen=reopen)
+    # Owner-only private mirror; never fetch another owner's task.
+    if task and reopen and task.status == "done":
+        task.status, task.completed_at = "open", None
+        task.save(update_fields=["status", "completed_at", "updated_at"])
+    elif task and not reopen and task.status != "done":
+        task.complete()
+    return step
+
+
+@transaction.atomic
+def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=False):
+    goal, _ = access.lock_project(tenant, mission_id)
+    if milestone_id:
+        milestone = _row(access.project_milestones(goal), milestone_id)
+        if delete:
+            milestone.delete()
+            return None
+        fields = _fields(data, milestone=True)
+        for key, value in fields.items():
+            setattr(milestone, key, value)
+        milestone.save()
+        return milestone
+    if access.project_milestones(goal).count() >= 8:
+        raise ValidationError("A project can have at most 8 milestones.")
+    return access.project_milestones(goal).create(
+        shared_goal=goal, created_by=tenant, **_fields(data, milestone=True, creating=True)
+    )
+
+
+@transaction.atomic
+def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
+    goal, _ = access.lock_project(tenant, mission_id)
+    if dependency_id:
+        _row(access.project_dependencies(goal), dependency_id).delete()
+        return None
+    blocker = _row(access.project_steps(goal), data.get("blocker_id"))
+    blocked = _row(access.project_steps(goal), data.get("blocked_id"))
+    edges = list(access.project_dependencies(goal))
+    for edge in edges:
+        if edge.blocker_id == blocker.id and edge.blocked_id == blocked.id:
+            return edge
+    if len(edges) >= 120:
+        raise ValidationError("A project can have at most 120 dependencies.")
+    children = {}
+    for edge in edges:
+        children.setdefault(edge.blocker_id, []).append(edge.blocked_id)
+    stack, seen = [blocked.id], set()
+    while stack:
+        current = stack.pop()
+        if current == blocker.id:
+            raise ValidationError("Dependencies cannot form a cycle.")
+        if current not in seen:
+            seen.add(current)
+            stack.extend(children.get(current, []))
+    return access.project_dependencies(goal).create(blocker=blocker, blocked=blocked)

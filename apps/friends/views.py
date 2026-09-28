@@ -334,7 +334,13 @@ class ThreadsView(FriendsView):
     def post(self, request):
         tenant = self.get_tenant(request)
         friendship_id = request.data.get("friendship_id")
-        if not friendship_id:
+        member_ids = request.data.get("member_friendship_ids")
+        if member_ids is not None:
+            from .project_flags import projects_v2_enabled
+
+            if not projects_v2_enabled(tenant):
+                raise NotFound("No such endpoint.")
+        if not friendship_id and member_ids is None:
             raise ValidationError("friendship_id is required.")
         thread = services.open_thread(tenant, friendship_id)
         return Response(
@@ -426,12 +432,19 @@ class MissionsView(FriendsView):
     def post(self, request):
         tenant = self.get_tenant(request)
         friendship_id = request.data.get("friendship_id")
-        if not friendship_id:
+        member_ids = request.data.get("member_friendship_ids")
+        if member_ids is not None:
+            from .project_flags import projects_v2_enabled
+
+            if not projects_v2_enabled(tenant):
+                raise NotFound("No such endpoint.")
+        if not friendship_id and member_ids is None:
             raise ValidationError("friendship_id is required.")
         mission = services.create_mission(
             tenant,
             request.user,
             friendship_id,
+            member_friendship_ids=member_ids,
             title=request.data.get("title", ""),
             description=request.data.get("description", ""),
             pillar=request.data.get("pillar", ""),

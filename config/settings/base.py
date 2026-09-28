@@ -1079,3 +1079,5 @@ if SENTRY_DSN and not _SENTRY_RUNNING_TESTS:
 # accumulate DB connections + outbound HTTP attempts on every CronJob save.
 # See ``config/test_runner.py`` for the full rationale.
 TEST_RUNNER = "config.test_runner.QuietCronSignalRunner"
+
+PROJECTS_V2_TENANT_IDS = env("PROJECTS_V2_TENANT_IDS", default="")

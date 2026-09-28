@@ -78,6 +78,7 @@ class TenantSerializer(serializers.ModelSerializer):
     free_model_offer = serializers.SerializerMethodField()
     friends_agent_propose_enabled = serializers.SerializerMethodField()
     web_redesign = serializers.SerializerMethodField()
+    projects_v2_enabled = serializers.SerializerMethodField()
 
     class Meta:
         model = Tenant
@@ -128,8 +129,14 @@ class TenantSerializer(serializers.ModelSerializer):
             "friends_agent_propose_enabled",
             "byo_models_enabled",
             "web_redesign",
+            "projects_v2_enabled",
         )
         read_only_fields = fields
+
+    def get_projects_v2_enabled(self, obj):
+        from apps.friends.project_flags import projects_v2_enabled
+
+        return projects_v2_enabled(obj)
 
     def get_web_redesign(self, obj):
         """Open Sky web console gate (WEB_REDESIGN_TENANT_IDS, fail-closed)."""
