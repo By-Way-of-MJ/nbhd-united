@@ -416,15 +416,33 @@ def _describe(goal, change: dict, plan_steps: dict, milestones: dict) -> str:
     def title(step_id):
         return f"“{plan_steps.get(step_id, {}).get('title', 'a step')}”"
 
+    def day(value):
+        from datetime import date
+
+        try:
+            d = date.fromisoformat(value)
+        except (TypeError, ValueError):
+            return value or ""
+        return f"{d:%b} {d.day}"
+
     def when(c):
         start, due = c.get("start_date"), c.get("due_date")
         if start and due:
-            return f"{start} – {due}"
-        return start or due or ""
+            if start[:7] == due[:7]:
+                return f"{day(start)} – {due[8:].lstrip('0')}"
+            return f"{day(start)} – {day(due)}"
+        if due:
+            return f"by {day(due)}"
+        return day(start) if start else ""
 
     kind = change["kind"]
     if kind == "move_step":
-        return f"Move {title(change['step_id'])} to {when(change)}"
+        start, due = change.get("start_date"), change.get("due_date")
+        if start and due:
+            return f"Move {title(change['step_id'])} to {when(change)}"
+        if due:
+            return f"Move the finish of {title(change['step_id'])} to {day(due)}"
+        return f"Start {title(change['step_id'])} on {day(start)}"
     if kind == "add_step":
         who = "you’ll take it" if change.get("owner") == "me" else "open for anyone"
         extra = f", {when(change)}" if when(change) else ""

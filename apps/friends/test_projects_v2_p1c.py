@@ -151,7 +151,7 @@ class AssistantSurfaceTests(TestCase):
         self.mine.refresh_from_db()
         self.assertEqual(self.mine.due_date.isoformat(), "2026-10-24")  # untouched
         [card] = self.jwt(self.a).get("/api/v1/friends/project-proposals/").data
-        self.assertIn("Move “Build frames” to 2026-10-27", card["changes"][0])
+        self.assertEqual(card["changes"][0], "Move the finish of “Build frames” to Oct 27")
         self.assertFalse(card["touches_others"])
         res = self.jwt(self.a).post(
             f"/api/v1/friends/project-proposals/{card['proposal_id']}/approve/", {}, format="json"
