@@ -24,7 +24,7 @@
     "runtime/openclaw/pinned-runtime/package-lock.json": "c5b06690c89a4c3bdc7f1cc5534e76458520b08eb8f176511f3fe349932fb2b5",
     "runtime/openclaw/pinned-runtime/package.json": "f2f295b8e3e209682c86bd314d67003fb3faaa3232f46051705f3e988bfd2121",
     "runtime/openclaw/plugins/assert-hook-activation.mjs": "6021e8e0e1fc7addd7c7d1068d3160e928188241a23bc1d5a0bf4e274aee6120",
-    "runtime/openclaw/plugins/error-transport.test.js": "d779e239b8c73e4335adda224cd0dd43ff8681d120bee635c0d0373f0b95ac3f",
+    "runtime/openclaw/plugins/error-transport.test.js": "63145f079da1d2a59dab192dcde973b83e2222f1ef96f1856e4844cf6e26b95f",
     "runtime/openclaw/plugins/hook-activation-contract.mjs": "32d1b581b2e4ef57ac6efababc20066516c180f64045f01af85d6ee9a0ad80a8",
     "runtime/openclaw/plugins/hook-activation.test.mjs": "08ee86e1febbfc9c24e6cd6cd048e773db353d5803f35ada56bbda710d083b9a",
     "runtime/openclaw/plugins/nbhd-activity-stream/index.js": "a52b2c964f04e35dc23aff0032840ddf6de5a3a3a0787affe5fbfcbfa7c1d4ea",

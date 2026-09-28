@@ -137,6 +137,12 @@ const PLUGINS = [
     throwsOnError: true,
   },
   {
+    dir: "nbhd-project-tools",
+    tool: "nbhd_project_context",
+    params: {},
+    throwsOnError: true,
+  },
+  {
     dir: "nbhd-document-keep",
     tool: "nbhd_document_list_ingestions",
     params: {},
