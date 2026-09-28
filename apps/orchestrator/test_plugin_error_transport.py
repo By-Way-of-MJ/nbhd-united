@@ -52,6 +52,8 @@ PLUGIN_DIRS = [
     # runtime, i.e. exactly the shape DRF answers with a validation body.
     "nbhd-agenda-tools",
     "nbhd-datebook-tools",
+    # Projects v2: read context, save a private draft, propose changes (POSTs).
+    "nbhd-project-tools",
 ]
 
 # nbhd-* plugin directories that do NOT need the canonical NBHD-runtime

@@ -64,6 +64,7 @@ SUBAGENT_READ_ONLY_TOOLS: tuple[str, ...] = (
     "nbhd_finance_summary",  # Finance summary read.
     "nbhd_gravity_query",  # Grounded finance query.
     "nbhd_mission_context",  # Neighborhood mission context read.
+    "nbhd_project_context",  # Projects v2 context read (others' text fenced).
     "nbhd_neighborhood_context",  # Neighborhood context read.
     "nbhd_fuel_audit",  # Fuel history audit read.
     "nbhd_fuel_get_plan",  # Full workout-plan read.
@@ -2655,6 +2656,23 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 str(getattr(settings, "OPENCLAW_FRIENDS_PLUGIN_ID", "nbhd-friends-tools") or "").strip(),
                 str(
                     getattr(settings, "OPENCLAW_FRIENDS_PLUGIN_PATH", "/opt/nbhd/plugins/nbhd-friends-tools") or ""
+                ).strip(),
+            )
+        )
+
+    # Projects v2 plugin — read the user's shared projects, save a PRIVATE draft, and
+    # SUGGEST changes the user approves in the app (DIRECTIVE_neighborhood_projects
+    # §4). Deliberately NOT gated on friends_enabled: a user's part of a project is
+    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag.
+    from apps.friends.project_flags import projects_v2_enabled
+
+    if getattr(tenant, "neighborhood_enabled", False) and projects_v2_enabled(tenant):
+        _plugin_defs.append(
+            (
+                str(getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_ID", "nbhd-project-tools") or "").strip(),
+                str(
+                    getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_PATH", "/opt/nbhd/plugins/nbhd-project-tools")
+                    or ""
                 ).strip(),
             )
         )

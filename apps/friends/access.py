@@ -1433,3 +1433,59 @@ def milestone_completion_rows(goal):
         step_count=Count("steps"),
         open_count=Count("steps", filter=~Q(steps__status__in=["done", "skipped"])),
     )
+
+
+# ── Projects v2 assistant (P1c): the user's PRIVATE drafts + proposals ──────────
+
+
+def my_project_drafts(tenant):
+    from django.utils import timezone
+
+    from .models import ProjectDraft
+
+    return ProjectDraft.objects.filter(
+        tenant_id=_tenant_id(tenant), published_goal__isnull=True, expires_at__gt=timezone.now()
+    )
+
+
+def my_project_proposals(tenant):
+    from .models import PendingProjectAction
+
+    return PendingProjectAction.objects.filter(tenant_id=_tenant_id(tenant))
+
+
+def create_project_draft(tenant, **fields):
+    from .models import ProjectDraft
+
+    return ProjectDraft.objects.create(tenant_id=_tenant_id(tenant), **fields)
+
+
+def create_project_proposal(tenant, goal, **fields):
+    from .models import PendingProjectAction
+
+    return PendingProjectAction.objects.create(tenant_id=_tenant_id(tenant), shared_goal=goal, **fields)
+
+
+def my_active_project_memberships(tenant):
+    """Projects I have joined that are still active (for the assistant's context)."""
+    return (
+        mission_memberships()
+        .filter(tenant_id=_tenant_id(tenant), status="active", shared_goal__status="active")
+        .select_related("shared_goal")
+    )
+
+
+def my_neighbor_edges_by_handle(tenant) -> dict:
+    """``{lowercase @handle: accepted Friendship}`` for the tenant's neighbors."""
+    from django.db.models import Q
+
+    viewer = _tenant_id(tenant)
+    edges = list(
+        Friendship.objects.filter(Q(requester_id=viewer) | Q(addressee_id=viewer), status=Friendship.Status.ACCEPTED)
+    )
+    other = {str(e.addressee_id if str(e.requester_id) == str(viewer) else e.requester_id): e for e in edges}
+    out = {}
+    for profile in NeighborProfile.objects.filter(tenant_id__in=list(other)):
+        if profile.handle:
+            out[profile.handle.lower()] = other[str(profile.tenant_id)]
+    return out

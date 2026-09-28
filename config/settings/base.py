@@ -313,7 +313,7 @@ CHAT_SHAPE_TENANT_IDS = env("CHAT_SHAPE_TENANT_IDS", default="")
 # journal-tools manifest (panelsEnabled). Separate from Django-only shape panels.
 CHAT_PANELS_TOOL_TENANT_IDS = env("CHAT_PANELS_TOOL_TENANT_IDS", default="")
 CHAT_SHAPE_PANELS = env(
-    "CHAT_SHAPE_PANELS", default="sleep,schedule,training_week,workout,timer,log_table,journal_table"
+    "CHAT_SHAPE_PANELS", default="sleep,schedule,training_week,workout,timer,log_table,journal_table,project"
 )
 
 # Talk routing: explicit tenant UUID allowlist, no wildcard; dark by default.

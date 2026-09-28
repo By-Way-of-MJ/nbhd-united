@@ -86,6 +86,7 @@ export const SUBAGENT_READ_ONLY_TOOL_IDS = new Set([
   "nbhd_finance_summary",
   "nbhd_gravity_query",
   "nbhd_mission_context",
+  "nbhd_project_context",
   "nbhd_neighborhood_context",
   "nbhd_fuel_audit",
   "nbhd_fuel_get_plan",

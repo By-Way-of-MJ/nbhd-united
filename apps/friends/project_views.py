@@ -99,3 +99,61 @@ class MembershipView(ProjectView):
             raise ValidationError("Only linked_goal_id can be changed here.")
         member = projects.set_linked_goal(self.get_tenant(request), mission_id, data.get("linked_goal_id"))
         return Response({"linked_goal_id": str(member.linked_goal_id) if member.linked_goal_id else None})
+
+
+# ── Assistant drafts + proposals: the HUMAN side (app JWT only) ────────────────
+
+
+class DraftsView(ProjectView):
+    def get(self, request):
+        from . import project_assistant as assistant
+
+        return Response(assistant.list_drafts(self.get_tenant(request)))
+
+
+class DraftView(ProjectView):
+    def get(self, request, draft_id):
+        from . import project_assistant as assistant
+
+        return Response(assistant.get_draft(self.get_tenant(request), draft_id))
+
+    def patch(self, request, draft_id):
+        from . import project_assistant as assistant
+
+        return Response(assistant.update_draft(self.get_tenant(request), draft_id, self.data(request).get("payload")))
+
+    def delete(self, request, draft_id):
+        from . import project_assistant as assistant
+
+        assistant.delete_draft(self.get_tenant(request), draft_id)
+        return Response(status=204)
+
+
+class DraftPublishView(ProjectView):
+    def post(self, request, draft_id):
+        from . import project_assistant as assistant
+
+        extra = self.data(request).get("member_friendship_ids") or []
+        if not isinstance(extra, list):
+            raise ValidationError("member_friendship_ids must be a list.")
+        result = assistant.publish_draft(self.get_tenant(request), request.user, draft_id, extra)
+        return Response(result, status=201)
+
+
+class ProposalsView(ProjectView):
+    """GET my pending suggestions (optionally ``?mission_id=``)."""
+
+    def get(self, request):
+        from . import project_assistant as assistant
+
+        return Response(assistant.list_proposals(self.get_tenant(request), request.query_params.get("mission_id")))
+
+
+class ProposalActionView(ProjectView):
+    def post(self, request, proposal_id, action):
+        from . import project_assistant as assistant
+
+        tenant = self.get_tenant(request)
+        if action == "approve":
+            return Response(assistant.approve(tenant, request.user, proposal_id))
+        return Response(assistant.reject(tenant, proposal_id))
