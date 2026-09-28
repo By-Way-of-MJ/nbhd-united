@@ -12,7 +12,8 @@ export const panelSchema = {
           "timer",
           "journal_table",
           "tasks",
-          "log_table"
+          "log_table",
+          "project"
         ],
         "title": "Kind",
         "type": "string"
