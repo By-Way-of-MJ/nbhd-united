@@ -70,7 +70,7 @@ def backstop_service_context():
     a background read would see zero rows and the feature would break.
 
     A no-op when ``FRIENDS_DB_BACKSTOP`` is off, and harmless (inert) while the
-    app role bypasses RLS. On exit it clears ONLY ``app.service_role`` — never
+    app role bypasses RLS. On exit it restores ONLY ``app.service_role`` (including a nested service context) — never
     ``app.tenant_id`` / ``app.user_id`` — so a middleware-set tenant GUC on an
     in-request caller survives untouched."""
     if not getattr(settings, "FRIENDS_DB_BACKSTOP", True):
@@ -78,13 +78,16 @@ def backstop_service_context():
         return
     from apps.tenants.middleware import set_rls_context
 
+    with connection.cursor() as cur:
+        cur.execute("SELECT current_setting('app.service_role', true)")
+        previous = cur.fetchone()[0] or ""
     set_rls_context(service_role=True)
     try:
         yield
     finally:
         if connection.connection is not None:
             with connection.cursor() as cur:
-                cur.execute("SELECT set_config('app.service_role', '', false)")
+                cur.execute("SELECT set_config('app.service_role', %s, false)", [previous])
 
 
 def are_neighbors(a: Tenant, b: Tenant) -> bool:
@@ -122,7 +125,7 @@ def assert_neighbors(viewer_tenant, friendship_id) -> Friendship:
     viewer_id = _tenant_id(viewer_tenant)
     try:
         edge = Friendship.objects.get(id=friendship_id)
-    except Friendship.DoesNotExist as exc:
+    except (Friendship.DoesNotExist, ValueError, ValidationError) as exc:
         raise PermissionDenied("No such friendship") from exc
     if viewer_id not in (edge.requester_id, edge.addressee_id):
         raise PermissionDenied("Not a party to this friendship")
@@ -914,10 +917,9 @@ def absorb_pending_chat(viewer_tenant) -> list[dict]:
 
 # ── Missions (SharedGoal) data layer — SharedGoal.objects confined here ──────
 #
-# Only ``SharedGoal`` is chokepoint-confined (SharedGoalMembership /
-# SharedGoalUpdate / PendingGoalAction are ordinary friends models used freely
-# by services + projection). So the mission's create / read / list / locked-edit
-# funnel here; membership + the append-only update stream do not.
+# SharedGoal and all related project managers are confined here, including
+# memberships, updates, pending legacy actions, and Projects v2 plan rows.
+# Services enforce membership before loading a plan or mutating its rows.
 
 
 def create_mission(creator_tenant, friendship, *, title, description="", pillar="", target=None, target_date=None):
@@ -933,9 +935,12 @@ def create_mission(creator_tenant, friendship, *, title, description="", pillar=
     )
 
 
-def get_mission(mission_id):
+def get_mission(mission_id, *, lock=False):
     try:
-        return SharedGoal.objects.select_related("friendship").get(id=mission_id)
+        qs = SharedGoal.objects.select_related("friendship")
+        if lock:
+            qs = qs.select_for_update(of=("self",))
+        return qs.get(id=mission_id)
     except (SharedGoal.DoesNotExist, ValueError, ValidationError):
         return None
 
@@ -944,7 +949,11 @@ def missions_for(tenant, *, include_invited=False):
     """Active participation plus optional invitations on still-accepted edges."""
     states = Q(memberships__status="active")
     if include_invited:
-        states |= Q(memberships__status="invited", friendship__status="accepted")
+        neighbor_ids = Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status="accepted")
+        counterparts = [e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in neighbor_ids]
+        states |= Q(memberships__status="invited") & (
+            Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts)
+        )
     return SharedGoal.objects.filter(states, memberships__tenant=tenant).distinct().order_by("-created_at")
 
 
@@ -1221,3 +1230,138 @@ def bond_by_counterpart(viewer_tenant, edges) -> dict:
         )
         for cid in counterparts
     }
+
+
+# Projects v2. Callers authenticate membership before loading a plan. Every write
+# takes the goal lock before changing the plan. Existing Task mirrors lock the
+# caller's Task before the goal, matching the journal completion receiver.
+def mission_memberships():
+    return SharedGoalMembership.objects.all()
+
+
+def mission_updates():
+    from .models import SharedGoalUpdate
+
+    return SharedGoalUpdate.objects.all()
+
+
+def pending_goal_actions():
+    from .models import PendingGoalAction
+
+    return PendingGoalAction.objects.all()
+
+
+def assert_project_invitee(tenant, mission):
+    if mission.friendship_id:
+        return assert_neighbors(tenant, mission.friendship_id)
+    if _tenant_id(tenant) == mission.created_by_id:
+        return  # The creator can rejoin their own friendship-less/solo project.
+    if not are_neighbors(tenant, mission.created_by_id):
+        raise PermissionDenied("Friendship is not active")
+
+
+def lock_project(tenant, mission_id):
+    from rest_framework.exceptions import NotFound
+
+    goal = SharedGoal.objects.select_for_update().filter(id=mission_id).first()
+    member = mission_memberships().filter(shared_goal=goal, tenant=tenant, status="active").first() if goal else None
+    if member is None:
+        raise NotFound("No such mission.")
+    return goal, member
+
+
+def project_steps(goal):
+    from .models import SharedGoalStep
+
+    return SharedGoalStep.objects.filter(shared_goal=goal)
+
+
+def project_milestones(goal):
+    from .models import SharedGoalMilestone
+
+    return SharedGoalMilestone.objects.filter(shared_goal=goal)
+
+
+def project_assignments(goal):
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(step__shared_goal=goal, membership__shared_goal=goal)
+
+
+def project_dependencies(goal):
+    from .models import SharedGoalStepDependency
+
+    return SharedGoalStepDependency.objects.filter(blocker__shared_goal=goal, blocked__shared_goal=goal)
+
+
+def project_snapshot(goal, *, viewer):
+    """Eager control-plane data; mute preferences are private to the viewer.
+
+    Pure projection cannot lazily read a Task. The caller has checked membership.
+    """
+    members = list(mission_memberships().filter(shared_goal=goal).values("id", "tenant_id", "role", "status", "muted"))
+    profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
+    for member in members:
+        if member["tenant_id"] != _tenant_id(viewer):
+            member.pop("muted")
+        profile = profiles.get(member.pop("tenant_id"))
+        member.update(
+            handle=profile.handle if profile else None,
+            display_name=profile.display_name if profile else "Neighbor",
+            hue=profile.avatar_hue if profile else 210,
+        )
+    return {
+        "mission_id": goal.id,
+        "title": goal.title,
+        "description": goal.description,
+        "status": goal.status,
+        "version": goal.version,
+        "target_date": goal.target_date,
+        "members": members,
+        "milestones": list(project_milestones(goal).values("id", "title", "target_date", "order", "reached_at")),
+        "steps": list(
+            project_steps(goal).values(
+                "id",
+                "milestone_id",
+                "title",
+                "description",
+                "start_date",
+                "due_date",
+                "status",
+                "completed_at",
+                "completed_by_id",
+                "order",
+                "version",
+            )
+        ),
+        "assignments": list(
+            project_assignments(goal).values(
+                "id", "step_id", "membership_id", "status", "counter_start", "counter_due", "note", "responded_at"
+            )
+        ),
+        "edges": list(project_dependencies(goal).order_by("id").values("id", "blocker_id", "blocked_id")),
+    }
+
+
+def assignment_for_task(task):
+    """Trusted receiver lookup: exact task link AND accepted active tenant owner."""
+    from .models import SharedGoalStepAssignment
+
+    return (
+        SharedGoalStepAssignment.objects.filter(
+            task_id=task.id,
+            membership__tenant_id=task.tenant_id,
+            membership__status="active",
+            status="accepted",
+        )
+        .select_related("step", "membership")
+        .first()
+    )
+
+
+def milestone_completion_rows(goal):
+    """One aggregate read for all milestone completion counts (bounded at eight)."""
+    return project_milestones(goal).annotate(
+        step_count=Count("steps"),
+        open_count=Count("steps", filter=~Q(steps__status__in=["done", "skipped"])),
+    )

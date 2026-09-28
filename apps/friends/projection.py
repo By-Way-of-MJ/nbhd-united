@@ -13,7 +13,8 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from .models import NeighborProfile, SharedGoalMembership, SharedGoalUpdate
+from . import access
+from .models import NeighborProfile, SharedGoalUpdate
 
 
 def _handle_for(tenant_id) -> str | None:
@@ -57,9 +58,9 @@ def build_mission_status(mission, *, now=None) -> dict:
     window_days = 28 if cadence == "weekly" else 7
     window_start = now - timedelta(days=window_days)
 
-    updates = list(SharedGoalUpdate.objects.filter(shared_goal=mission).order_by("created_at"))
+    updates = list(access.mission_updates().filter(shared_goal=mission).order_by("created_at"))
     memberships = list(
-        SharedGoalMembership.objects.filter(shared_goal=mission, status="active").select_related("tenant")
+        access.mission_memberships().filter(shared_goal=mission, status="active").select_related("tenant")
     )
 
     members: list[dict] = []

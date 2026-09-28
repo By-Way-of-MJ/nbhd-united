@@ -138,9 +138,9 @@ def render_missions(tenant: Tenant) -> str:
         from . import projection
 
         memberships = list(
-            SharedGoalMembership.objects.filter(
-                tenant=tenant, status="active", shared_goal__status="active"
-            ).select_related("shared_goal")[:3]
+            access.mission_memberships()
+            .filter(tenant=tenant, status="active", shared_goal__status="active")
+            .select_related("shared_goal")[:3]
         )
         if not memberships:
             return ""
@@ -225,9 +225,11 @@ def _refresh_mission_crew(sender, instance, **kwargs) -> None:
     members' USER.md (the registry's tenant-FK receiver would only refresh the
     update's author). Defensive: never raises."""
     try:
-        member_ids = SharedGoalMembership.objects.filter(
-            shared_goal_id=instance.shared_goal_id, status="active"
-        ).values_list("tenant_id", flat=True)
+        member_ids = (
+            access.mission_memberships()
+            .filter(shared_goal_id=instance.shared_goal_id, status="active")
+            .values_list("tenant_id", flat=True)
+        )
         for tenant_id in member_ids:
             _schedule_recipient_push(tenant_id)
     except Exception:  # noqa: BLE001

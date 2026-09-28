@@ -555,6 +555,7 @@ class SharedGoalMembership(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="+")
     role = models.CharField(max_length=8, default="member")  # owner | member
     status = models.CharField(max_length=8, default="active")  # invited | active | left | declined
+    muted = models.BooleanField(default=False)
     commitment = models.CharField(max_length=200, blank=True)  # "what I'll do"
     # Idempotency for the weekly digest — compare-and-set per (member, iso-week).
     last_digest_window = models.CharField(max_length=24, blank=True)
@@ -577,6 +578,12 @@ class SharedGoalUpdate(models.Model):
 
     class Kind(models.TextChoices):
         JOINED = "joined", "Joined"
+        STEP_ADDED = "step_added", "Step added"
+        STEP_ASSIGNED = "step_assigned", "Step assigned"
+        STEP_ANSWERED = "step_answered", "Step answered"
+        STEP_DONE = "step_done", "Step done"
+        STEP_UNBLOCKED = "step_unblocked", "Step unblocked"
+        MILESTONE_REACHED = "milestone_reached", "Milestone reached"
         TASK_ADDED = "task_added", "Task added"
         TASK_COMPLETED = "task_completed", "Task completed"
         MILESTONE = "milestone", "Milestone"
@@ -587,7 +594,7 @@ class SharedGoalUpdate(models.Model):
     shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="updates")
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="+")
-    kind = models.CharField(max_length=16, choices=Kind.choices)
+    kind = models.CharField(max_length=24, choices=Kind.choices)
     text = models.TextField(blank=True)
     payload = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -696,3 +703,83 @@ class ContentReport(models.Model):
 
     def __str__(self) -> str:
         return f"report:{self.id} ({self.target_kind})"
+
+
+class SharedGoalMilestone(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="milestones")
+    title = models.CharField(max_length=120)
+    target_date = models.DateField(null=True, blank=True)
+    order = models.IntegerField(default=0)
+    reached_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+
+    class Meta:
+        db_table = "shared_goal_milestones"
+        ordering = ["order", "id"]
+
+
+class SharedGoalStep(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        IN_PROGRESS = "in_progress", "In progress"
+        DONE = "done", "Done"
+        SKIPPED = "skipped", "Skipped"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="steps")
+    milestone = models.ForeignKey(
+        SharedGoalMilestone, on_delete=models.SET_NULL, null=True, blank=True, related_name="steps"
+    )
+    title = models.CharField(max_length=120)
+    description = models.CharField(max_length=500, blank=True)
+    start_date = models.DateField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    order = models.IntegerField(default=0)
+    version = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+
+    class Meta:
+        db_table = "shared_goal_steps"
+        ordering = ["order", "id"]
+
+
+class SharedGoalStepAssignment(models.Model):
+    class Status(models.TextChoices):
+        ASKED = "asked", "Asked"
+        ACCEPTED = "accepted", "Accepted"
+        DECLINED = "declined", "Declined"
+        COUNTERED = "countered", "Countered"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    step = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="assignments")
+    membership = models.ForeignKey(SharedGoalMembership, on_delete=models.CASCADE, related_name="step_assignments")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.ASKED)
+    counter_start = models.DateField(null=True, blank=True)
+    counter_due = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=500, blank=True)
+    task = models.ForeignKey("journal.Task", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    asked_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "shared_goal_step_assignments"
+        constraints = [models.UniqueConstraint(fields=["step", "membership"], name="uq_goal_step_member")]
+
+
+class SharedGoalStepDependency(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    blocker = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="outgoing_dependencies")
+    blocked = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="incoming_dependencies")
+
+    class Meta:
+        db_table = "shared_goal_step_dependencies"
+        constraints = [
+            models.UniqueConstraint(fields=["blocker", "blocked"], name="uq_goal_step_dependency"),
+            models.CheckConstraint(
+                condition=~models.Q(blocker=models.F("blocked")), name="goal_step_no_self_dependency"
+            ),
+        ]

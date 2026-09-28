@@ -22,7 +22,7 @@ from apps.journal.models import Task
 from apps.pii.testsupport import neural_ran
 from apps.tenants.models import Tenant, User
 
-from . import digest, envelope, projection, services
+from . import access, digest, envelope, projection, services
 from .models import (
     Friendship,
     NeighborProfile,
@@ -175,7 +175,8 @@ class TaskLinkageTest(TestCase):
         result = services.add_mission_task(self.a, self.a.user, str(self.mission.id), title="Prep gym bag")
         task = Task.objects.get(id=result["task_id"])
         self.assertEqual(task.tenant_id, self.a.id)  # the caller's OWN task
-        self.assertEqual(task.related_ref["object_id"], str(self.mission.id))
+        self.assertEqual(task.related_ref["object_type"], "SharedGoalStep")
+        self.assertTrue(access.project_steps(self.mission).filter(id=task.related_ref["object_id"]).exists())
         self.assertEqual(task.pii_receipts["title"], {"state": "bypass", "writer": "background"})
         self.assertTrue(SharedGoalUpdate.objects.filter(shared_goal=self.mission, kind="task_added").exists())
 
@@ -198,7 +199,7 @@ class TaskLinkageTest(TestCase):
         self.assertEqual(task.title, "Walk with [PERSON_1]")
         self.assertEqual(task.pii_receipts["title"]["state"], "placeholder")
 
-    def test_near_limit_mission_task_truncates_after_authoring_without_partial_token(self):
+    def test_near_project_title_limit_preserves_authored_placeholder(self):
         self.a.layer1_placeholder_writes = True
         self.a.pii_entity_map = {"[PERSON_1]": {"name": "Amy"}}
         self.a.save(update_fields=["layer1_placeholder_writes", "pii_entity_map"])
@@ -210,13 +211,13 @@ class TaskLinkageTest(TestCase):
                 self.a,
                 self.a.user,
                 str(self.mission.id),
-                title="x" * 250 + " Amy!",
+                title="x" * 114 + " Amy!",
             )
 
         task = Task.objects.get(id=result["task_id"])
-        self.assertEqual(task.title, "x" * 250 + " ")
+        self.assertEqual(task.title, "x" * 114 + " [PERSON_1]!")
         self.assertLessEqual(len(task.title), Task._meta.get_field("title").max_length)
-        self.assertNotIn("[PERSON", task.title)
+        self.assertNotIn("Amy", task.title)
 
 
 class ProposeApproveTest(TestCase):

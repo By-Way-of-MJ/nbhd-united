@@ -15,7 +15,7 @@ import logging
 
 from django.utils import timezone
 
-from .models import SharedGoalMembership
+from . import access
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +35,16 @@ def run_weekly_mission_digest(now=None) -> dict:
     now = now or timezone.now()
     window = iso_week(now)
     sent = 0
-    memberships = SharedGoalMembership.objects.filter(status="active", shared_goal__status="active").select_related(
-        "shared_goal", "tenant", "tenant__user"
+    memberships = (
+        access.mission_memberships()
+        .filter(status="active", shared_goal__status="active")
+        .select_related("shared_goal", "tenant", "tenant__user")
     )
     for membership in memberships:
         # Compare-and-set: claim this (member, window) exactly once (rowcount 1).
         claimed = (
-            SharedGoalMembership.objects.filter(id=membership.id)
+            access.mission_memberships()
+            .filter(id=membership.id)
             .exclude(last_digest_window=window)
             .update(last_digest_window=window)
         )

@@ -43,7 +43,21 @@ from pathlib import Path
 from django.test import SimpleTestCase
 
 # Cross-tenant, frozen-content models. Manager access allowed ONLY in access.py.
-CROSS_TENANT_MODELS = frozenset({"SharedLesson", "FriendMessage", "SharedGoal", "LessonShareGrant"})
+CROSS_TENANT_MODELS = frozenset(
+    {
+        "SharedLesson",
+        "FriendMessage",
+        "SharedGoal",
+        "LessonShareGrant",
+        "SharedGoalMembership",
+        "SharedGoalUpdate",
+        "PendingGoalAction",
+        "SharedGoalStep",
+        "SharedGoalMilestone",
+        "SharedGoalStepAssignment",
+        "SharedGoalStepDependency",
+    }
+)
 
 # Private, one-way per-viewer curation (Bounded Neighborhood; brief §4.5). Not
 # cross-tenant *content*, but "whom you keep close" is a private preference that
