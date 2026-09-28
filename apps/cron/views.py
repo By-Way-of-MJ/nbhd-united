@@ -269,6 +269,7 @@ TASK_MAP = {
     "scrub_shared_lesson": "apps.friends.tasks.scrub_shared_lesson_task",
     # Neighborhood: weekly Mission digest (one warm nudge per member, idempotent)
     "mission_weekly_digest": "apps.friends.tasks.mission_weekly_digest_task",
+    "project_due_nudges": "apps.friends.tasks.project_due_nudges_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)

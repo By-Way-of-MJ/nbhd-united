@@ -1288,10 +1288,40 @@ def project_assignments(goal):
     return SharedGoalStepAssignment.objects.filter(step__shared_goal=goal, membership__shared_goal=goal)
 
 
+def my_open_project_asks(tenant):
+    """Unanswered asks addressed to ``tenant`` on open steps of active projects it has
+    joined (an invitee answers the invitation first)."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(
+        membership__tenant_id=_tenant_id(tenant),
+        membership__status="active",
+        status="asked",
+        step__status__in=["open", "in_progress"],
+        step__shared_goal__status="active",
+    )
+
+
+def my_linked_step_tasks(membership):
+    """This member's own accepted step assignments that carry a private journal Task."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(membership=membership, status="accepted", task__isnull=False)
+
+
 def project_dependencies(goal):
     from .models import SharedGoalStepDependency
 
     return SharedGoalStepDependency.objects.filter(blocker__shared_goal=goal, blocked__shared_goal=goal)
+
+
+def _own_goal_title(viewer, goal_id):
+    """Title of the VIEWER's own journal Goal (never another tenant's)."""
+    if not goal_id:
+        return None
+    from apps.journal.models import Goal
+
+    return Goal.objects.filter(id=goal_id, tenant_id=_tenant_id(viewer)).values_list("title", flat=True).first()
 
 
 def project_snapshot(goal, *, viewer):
@@ -1299,11 +1329,19 @@ def project_snapshot(goal, *, viewer):
 
     Pure projection cannot lazily read a Task. The caller has checked membership.
     """
-    members = list(mission_memberships().filter(shared_goal=goal).values("id", "tenant_id", "role", "status", "muted"))
+    members = list(
+        mission_memberships()
+        .filter(shared_goal=goal)
+        .values("id", "tenant_id", "role", "status", "muted", "linked_goal_id")
+    )
     profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
+    membership_by_tenant = {m["tenant_id"]: m["id"] for m in members}
     for member in members:
         if member["tenant_id"] != _tenant_id(viewer):
             member.pop("muted")
+            member.pop("linked_goal_id")
+        else:
+            member["linked_goal_title"] = _own_goal_title(viewer, member["linked_goal_id"])
         profile = profiles.get(member.pop("tenant_id"))
         member.update(
             handle=profile.handle if profile else None,
@@ -1319,8 +1357,14 @@ def project_snapshot(goal, *, viewer):
         "target_date": goal.target_date,
         "members": members,
         "milestones": list(project_milestones(goal).values("id", "title", "target_date", "order", "reached_at")),
-        "steps": list(
-            project_steps(goal).values(
+        # Tenant ids never leave the server: who completed a step is reported as their
+        # membership id in this project.
+        "steps": [
+            {
+                **{k: v for k, v in row.items() if k != "completed_by_id"},
+                "completed_by_membership_id": membership_by_tenant.get(row["completed_by_id"]),
+            }
+            for row in project_steps(goal).values(
                 "id",
                 "milestone_id",
                 "title",
@@ -1333,7 +1377,7 @@ def project_snapshot(goal, *, viewer):
                 "order",
                 "version",
             )
-        ),
+        ],
         "assignments": list(
             project_assignments(goal).values(
                 "id", "step_id", "membership_id", "status", "counter_start", "counter_due", "note", "responded_at"

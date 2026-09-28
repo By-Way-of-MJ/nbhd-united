@@ -556,6 +556,10 @@ class SharedGoalMembership(models.Model):
     role = models.CharField(max_length=8, default="member")  # owner | member
     status = models.CharField(max_length=8, default="active")  # invited | active | left | declined
     muted = models.BooleanField(default=False)
+    # Projects v2 §11.1: this member's OWN Horizons goal the project serves. Private to
+    # the member (stripped from every other member's plan payload). A plain UUID, not a
+    # FK: journal.Goal is tenant-RLS data; ownership is validated at write time.
+    linked_goal_id = models.UUIDField(null=True, blank=True)
     commitment = models.CharField(max_length=200, blank=True)  # "what I'll do"
     # Idempotency for the weekly digest — compare-and-set per (member, iso-week).
     last_digest_window = models.CharField(max_length=24, blank=True)
@@ -764,6 +768,11 @@ class SharedGoalStepAssignment(models.Model):
     task = models.ForeignKey("journal.Task", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     asked_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
     responded_at = models.DateTimeField(null=True, blank=True)
+    # The due date this owner was last reminded about — one "due tomorrow" push per due
+    # date, claimed with a compare-and-set so overlapping cron runs never double-send.
+    due_nudged_for = models.DateField(null=True, blank=True)
+    # When this member was last asked (orders the Neighborhood decision moments).
+    asked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "shared_goal_step_assignments"

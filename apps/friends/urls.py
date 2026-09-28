@@ -133,6 +133,7 @@ urlpatterns = [
 
 urlpatterns += [
     path("missions/<uuid:mission_id>/plan/", project_views.PlanView.as_view()),
+    path("missions/<uuid:mission_id>/membership/", project_views.MembershipView.as_view()),
     path("missions/<uuid:mission_id>/steps/", project_views.StepsView.as_view()),
     path("missions/<uuid:mission_id>/steps/<uuid:step_id>/", project_views.StepView.as_view()),
     path("missions/<uuid:mission_id>/milestones/", project_views.MilestonesView.as_view()),
