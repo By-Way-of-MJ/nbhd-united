@@ -18,7 +18,7 @@ const CRONS_FILE = path.join(dir, "nbhd-crons.json");
 process.env.NBHD_INTERNAL_API_KEY = KEY;
 process.env.NBHD_CRONS_FILE = CRONS_FILE;
 
-const { isSafeJob, buildAddArgs, sameCron, reconcileOnce, msToDuration, atFireMs, readSignedJobs } = await import("./nbhd-cron-sync.mjs");
+const { isSafeJob, buildAddArgs, sameCron, reconcileOnce, msToDuration, atFireMs, readSignedJobs, stateRow, reportState } = await import("./nbhd-cron-sync.mjs");
 
 function signDoc(jobs, { badSig = false, tamper = false } = {}) {
   const signed = JSON.stringify(jobs);
@@ -372,4 +372,52 @@ test("pinned 9.4 source registers each emitted flag; negative light context is e
   assert.ok(!options.includes('"--no-light-context"'));
   assert.ok(source.includes('.option("--no-light-context", "Disable lightweight bootstrap context for agent jobs")'));
   assert.ok(source.includes("lightContext: opts.lightContext === true ? true : void 0"));
+});
+
+test("stateRow: keeps timing metadata, drops the payload", () => {
+  const row = stateRow({
+    id: "j1", name: "Morning", enabled: true, declarationKey: "nbhd:7",
+    schedule: { kind: "cron", expr: "0 7 * * *", tz: "Asia/Tokyo" },
+    state: { nextRunAtMs: 1000, runningAtMs: 900, lastError: "x" },
+    payload: { kind: "agentTurn", message: "private text" },
+  });
+  assert.deepEqual(row, {
+    id: "j1", name: "Morning", enabled: true, declarationKey: "nbhd:7",
+    schedule: { kind: "cron", expr: "0 7 * * *", tz: "Asia/Tokyo" },
+    state: { nextRunAtMs: 1000, runningAtMs: 900 },
+  });
+  assert.ok(!JSON.stringify(row).includes("private text"));
+});
+
+test("reportState: writes every enabled job (all owners), then only on change or heartbeat", async () => {
+  const jobs = [
+    { id: "a", name: "memory-core", schedule: { kind: "every", everyMs: 60000 }, state: { nextRunAtMs: 5 }, payload: { kind: "systemEvent" } },
+    { id: "b", name: "r", declarationKey: "nbhd:2", schedule: { kind: "at", at: "2030-01-01T00:00:00Z" }, state: {}, payload: { kind: "agentTurn", message: "secret" } },
+  ];
+  const run = async () => JSON.stringify({ jobs });
+  const writes = [];
+  const write = async (_p, body) => { writes.push(JSON.parse(body)); };
+  let t = 1_000_000;
+  const now = () => t;
+
+  assert.equal(await reportState({ run, write, now }), true);
+  assert.equal(writes[0].v, 1);
+  assert.equal(writes[0].writtenAtMs, 1_000_000);
+  assert.deepEqual(writes[0].jobs.map((j) => j.id), ["a", "b"]);
+  assert.ok(!JSON.stringify(writes[0]).includes("secret"));
+
+  t += 10_000; // unchanged, inside heartbeat → no write
+  assert.equal(await reportState({ run, write, now }), false);
+  t += 60_000; // unchanged, heartbeat due → write
+  assert.equal(await reportState({ run, write, now }), true);
+  jobs[0].state.runningAtMs = 7; t += 1_000; // changed → write immediately
+  assert.equal(await reportState({ run, write, now }), true);
+  assert.equal(writes.length, 3);
+});
+
+test("reportState: a failed cron list writes nothing (old file ages out)", async () => {
+  let wrote = false;
+  const ok = await reportState({ run: async () => { throw new Error("gateway down"); }, write: async () => { wrote = true; } });
+  assert.equal(ok, false);
+  assert.equal(wrote, false);
 });

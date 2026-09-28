@@ -67,9 +67,9 @@ def _batch_return_len(tasks, **kwargs):
 class ApplyPendingConfigsImageTests(TestCase):
     def setUp(self):
         self.client = APIClient()
-        self.gateway = self.enterContext(
-            patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []})
-        )
+        self.enterContext(patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []}))
+        # Cron-state reads go through list_tenant_crons (gateway on 5.28, state file on 9.4).
+        self.gateway = self.enterContext(patch("apps.cron.gateway_client.list_tenant_crons", return_value={"jobs": []}))
 
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)

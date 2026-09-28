@@ -177,6 +177,21 @@ def _get_gateway_token(tenant: Tenant, *, metadata_only: bool = False) -> str:
     return token
 
 
+def list_tenant_crons(tenant: Tenant, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read-only ``cron.list`` that works on every OpenClaw version.
+
+    9.4 gates the gateway ``cron.list`` (``trusted operational run instance
+    required``), so for those tenants read the in-container helper's state file
+    instead. Returns the gateway's ``{"jobs": [...]}`` shape and raises
+    ``GatewayError`` on failure either way. The file holds ENABLED jobs only.
+    """
+    from apps.cron.share_cron_sync import read_container_cron_jobs, tenant_uses_file_cron_sync
+
+    if tenant_uses_file_cron_sync(tenant):
+        return {"jobs": read_container_cron_jobs(tenant)}
+    return invoke_gateway_tool(tenant, "cron.list", args or {})
+
+
 def invoke_gateway_tool(
     tenant: Tenant,
     tool: str,

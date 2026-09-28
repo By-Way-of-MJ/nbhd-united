@@ -29,6 +29,10 @@ from apps.cron.share_cron_sync import build_signed_crons_doc
 
 IMAGE = "nbhdunited.azurecr.io/nbhd-openclaw:2026.9.4-8ceb89f"
 MANIFEST = "sha256:c244ff686863c1e9e4fc9fc55d1fac3b6a746e76039a9632db8ae082a0f21ddc"
+# A helper change not yet in a pushed image: overlay the repo's helper onto IMAGE
+# (docker create/cp/commit) and pass the local tag here. The source-hash check
+# below still proves the booted helper is the repo's.
+LOCAL_IMAGE = os.environ.get("OC94_BOOT_LOCAL_IMAGE", "")
 NAME = "nbhd-oc94-r7-prestaged-boot"
 FIXTURES = Path("apps/orchestrator/fixtures/openclaw_94_cron_contract")
 
@@ -38,8 +42,10 @@ def docker(*args, **kwargs):
 
 
 def main():
-    identity = json.loads(docker("image", "inspect", IMAGE))[0]
-    assert IMAGE.split(":")[0] + "@" + MANIFEST in identity["RepoDigests"]
+    image = LOCAL_IMAGE or IMAGE
+    identity = json.loads(docker("image", "inspect", image))[0]
+    if not LOCAL_IMAGE:
+        assert IMAGE.split(":")[0] + "@" + MANIFEST in identity["RepoDigests"]
     cases = [
         json.loads((FIXTURES / "round_six" / (name + ".json")).read_text()) for name in ("cron-tz", "at-utc-stable")
     ]
@@ -81,7 +87,7 @@ def main():
         "OPENCLAW_STATE_DIR=/tmp/oc94-state",
         "-e",
         "NBHD_INTERNAL_API_KEY=local-contract-token",
-        IMAGE,
+        image,
     )
     try:
         # Copy BEFORE starting the unchanged entrypoint; there is no manual add/reconcile.
@@ -127,8 +133,13 @@ def main():
             files[source] = sha256(docker("exec", NAME, "cat", image_path)).hexdigest()
             assert files[source] == sha256(Path(source).read_bytes()).hexdigest()
         assert docker("exec", NAME, "cat", "/tmp/oc94-boot/nbhd-crons.json") == signed
+        # The helper's readback for Django (9.4 gates Django's own cron.list).
+        state = json.loads(docker("exec", NAME, "cat", "/tmp/oc94-boot/nbhd-cron-state.json"))
+        assert {j.get("declarationKey") for j in state["jobs"]} >= {"nbhd:700", "nbhd:701"}
+        assert all("payload" not in j for j in state["jobs"])
         output = {
-            "image": IMAGE,
+            "image": image,
+            "baseImage": os.environ.get("OC94_BOOT_BASE_IMAGE") or (IMAGE if LOCAL_IMAGE else None),
             "manifest": MANIFEST,
             "imageId": identity["Id"],
             "sources": files,
@@ -140,6 +151,7 @@ def main():
             "declarations": json.loads(json.loads(signed)["signed"]),
             "polls": polls,
             "stableIds": ids[0],
+            "stateReadback": state,
         }
         (FIXTURES / "prestaged-boot.json").write_text(json.dumps(output, indent=2) + "\n")
         print("PASS: unchanged real entrypoint installed two pre-staged jobs; IDs stable across two polls")

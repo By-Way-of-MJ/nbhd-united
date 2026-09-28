@@ -17,7 +17,11 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from apps.cron.gateway_client import GatewayError
-from apps.orchestrator.hibernation import _capture_tenant_cron_schedules, wake_hibernated_tenant
+from apps.orchestrator.hibernation import (
+    _capture_tenant_cron_schedules,
+    _cron_active_or_imminent,
+    wake_hibernated_tenant,
+)
 from apps.orchestrator.tool_policy import OPENCLAW_CURRENT_VERSION, openclaw_version_for_image_tag
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
@@ -454,6 +458,8 @@ class CaptureTenantCronSchedulesFallbackTest(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-fallback-test"
         self.tenant.container_fqdn = "oc-fallback-test.internal"
+        # Gateway cron.list path; 9.4 reads the state file (see Oc94CronStateReadbackTest).
+        self.tenant.openclaw_version = "2026.5.28"
         self.tenant.save()
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
@@ -540,3 +546,58 @@ class CaptureTenantCronSchedulesFallbackTest(TestCase):
 
         self.assertEqual(result, [])
         mock_invoke.assert_not_called()
+
+
+class Oc94CronStateReadbackTest(TestCase):
+    """9.4 gates the gateway cron.list, so hibernation reads the in-container
+    helper's ``nbhd-cron-state.json``. Before this, every 9.4 tenant answered
+    ``cron_state_unknown`` forever and was never hibernated or image-bumped."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="OC94 State", telegram_chat_id=987654321)
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-oc94-state"
+        self.tenant.container_fqdn = "oc-oc94-state.internal"
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save()
+
+    def _state(self, jobs, *, age_seconds=5):
+        import json
+        import time
+
+        written = int((time.time() - age_seconds) * 1000)
+        return json.dumps({"v": 1, "writtenAtMs": written, "jobs": jobs}).encode()
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_idle_tenant_is_hibernatable(self, mock_download, mock_invoke):
+        far = int(timezone.now().timestamp() * 1000) + 6 * 3600 * 1000
+        mock_download.return_value = self._state(
+            [{"id": "a", "enabled": True, "schedule": {"kind": "cron"}, "state": {"nextRunAtMs": far}}]
+        )
+        self.assertIsNone(_cron_active_or_imminent(self.tenant))
+        mock_invoke.assert_not_called()  # never touches the gated gateway path
+        mock_download.assert_called_once_with(str(self.tenant.id), "nbhd-cron-state.json")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_running_cron_still_defers(self, mock_download):
+        now_ms = int(timezone.now().timestamp() * 1000)
+        mock_download.return_value = self._state(
+            [{"id": "a", "enabled": True, "schedule": {"kind": "cron"}, "state": {"runningAtMs": now_ms - 1000}}]
+        )
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_in_flight")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_stale_or_missing_state_stays_unknown(self, mock_download):
+        mock_download.return_value = self._state([], age_seconds=600)
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+        mock_download.return_value = None
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+        mock_download.return_value = b"{not json"
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_capture_uses_state_file(self, mock_download):
+        jobs = [{"id": "a", "name": "Morning", "enabled": True, "schedule": {"kind": "cron", "expr": "0 7 * * *"}}]
+        mock_download.return_value = self._state(jobs)
+        self.assertEqual(_capture_tenant_cron_schedules(self.tenant), jobs)

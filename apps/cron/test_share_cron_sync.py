@@ -299,3 +299,34 @@ class ReconcileRoutingTest(TestCase):
             regenerate_tenant_crons(t)
         put.assert_not_called()
         self.assertTrue(invoke.called)
+
+
+class ListTenantCronsRoutingTest(TestCase):
+    """Read-only cron.list: 9.4 reads the helper's state file, 5.28 keeps the gateway."""
+
+    def _state(self, jobs):
+        import json
+        import time
+
+        return json.dumps({"v": 1, "writtenAtMs": int(time.time() * 1000), "jobs": jobs}).encode()
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_9_4_reads_state_file(self, mock_download, mock_invoke):
+        from apps.cron.gateway_client import list_tenant_crons
+
+        t = create_tenant(display_name="v", telegram_chat_id=810301)
+        t.openclaw_version = "2026.9.4"
+        mock_download.return_value = self._state([{"id": "a", "enabled": True}])
+        self.assertEqual(list_tenant_crons(t), {"jobs": [{"id": "a", "enabled": True}]})
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_5_28_uses_gateway(self, mock_invoke):
+        from apps.cron.gateway_client import list_tenant_crons
+
+        t = create_tenant(display_name="v", telegram_chat_id=810302)
+        t.openclaw_version = "2026.5.28"
+        mock_invoke.return_value = {"jobs": []}
+        self.assertEqual(list_tenant_crons(t, {"includeDisabled": False}), {"jobs": []})
+        mock_invoke.assert_called_once_with(t, "cron.list", {"includeDisabled": False})

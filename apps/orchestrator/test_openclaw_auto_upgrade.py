@@ -253,6 +253,7 @@ class EligibilityTests(TestCase):
 class SweepHookTests(TestCase):
     def setUp(self):
         self.enterContext(patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []}))
+        self.enterContext(patch("apps.cron.gateway_client.list_tenant_crons", return_value={"jobs": []}))
         self.hibernate = self.enterContext(
             patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
         )

@@ -142,9 +142,9 @@ def _capture_tenant_cron_schedules(tenant: Tenant) -> list[dict]:
         return []
 
     try:
-        from apps.cron.gateway_client import invoke_gateway_tool
+        from apps.cron.gateway_client import list_tenant_crons
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        result = list_tenant_crons(tenant, {"includeDisabled": False})
         data = result.get("details", result) if isinstance(result, dict) else result
         jobs = data.get("jobs", []) if isinstance(data, dict) else data if isinstance(data, list) else []
 
@@ -332,13 +332,13 @@ def _next_cron_within_window(
     to fire from our perspective", which is the right conservative
     answer here.
     """
-    from apps.cron.gateway_client import invoke_gateway_tool
+    from apps.cron.gateway_client import list_tenant_crons
     from apps.orchestrator.services import _extract_cron_jobs
 
     if window_seconds is None:
         window_seconds = _cron_hold_seconds()
 
-    result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+    result = list_tenant_crons(tenant, {"includeDisabled": False})
     jobs = _extract_cron_jobs(result)
 
     if not jobs:
@@ -390,11 +390,11 @@ def _cron_active_or_imminent(
     Both hibernation and image replacement must defer for this cycle;
     unknown cron state is not permission to stop the container.
     """
-    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.orchestrator.services import _extract_cron_jobs
 
     try:
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        result = list_tenant_crons(tenant, {"includeDisabled": False})
         jobs = _extract_cron_jobs(result)
     except GatewayError:
         logger.warning(
