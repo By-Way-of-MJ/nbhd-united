@@ -5940,6 +5940,75 @@ class RuntimeProposeMissionTaskView(APIView):
         )
 
 
+_PROJECT_EGRESS_TEXT_FIELDS = frozenset({"title", "goal", "name", "owner", "my_linked_goal"})
+
+
+class RuntimeProjectsContextView(KnownValueResponseGuardMixin, APIView):
+    """GET runtime/<tid>/projects/ — the tid's OWN shared projects (Projects v2).
+
+    Other members' text arrives fenced as untrusted data; their notes never arrive.
+    Reading this marks the next 15 minutes of proposals as "based on project text"."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "friends_projects_runtime_response"
+    pii_egress_text_fields = _PROJECT_EGRESS_TEXT_FIELDS
+
+    def get(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.runtime_context(tenant))
+
+
+class RuntimeProjectDraftView(APIView):
+    """POST runtime/<tid>/project-drafts/ — the assistant saves a PRIVATE starter plan
+    for its own human. Shares nothing; the human publishes (or not) from the app."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        record_runtime_write_activity(tenant)
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.create_draft(tenant, request.data), status=status.HTTP_201_CREATED)
+
+
+class RuntimeProjectProposeView(APIView):
+    """POST runtime/<tid>/projects/<mission_id>/propose/ — the assistant SUGGESTS
+    changes. A proposal only: the human approves in the app; the assistant cannot."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id, mission_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        record_runtime_write_activity(tenant)
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.propose(tenant, mission_id, request.data), status=status.HTTP_201_CREATED)
+
+
 # ── Document information-keeping (provenance ledger + keep manifest + forget) ─
 #
 # Backs the nbhd-document-keep plugin's three tools. The keep endpoint VALIDATES

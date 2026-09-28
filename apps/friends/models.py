@@ -792,3 +792,52 @@ class SharedGoalStepDependency(models.Model):
                 condition=~models.Q(blocker=models.F("blocked")), name="goal_step_no_self_dependency"
             ),
         ]
+
+
+class ProjectDraft(models.Model):
+    """A PRIVATE starter plan the user's own assistant wrote (Projects v2 P1c).
+
+    Visible only to ``tenant``. Nothing is shared, invited or asked until the user
+    publishes it from the app; the payload is a validated ``ProjectDraftSpec``."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="project_drafts")
+    payload = models.JSONField(default=dict)
+    source = models.CharField(max_length=10, default="chat")  # chat | template
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    published_goal = models.ForeignKey(SharedGoal, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    class Meta:
+        db_table = "friends_project_drafts"
+        indexes = [models.Index(fields=["tenant", "created_at"])]
+
+
+class PendingProjectAction(models.Model):
+    """The user's assistant SUGGESTS project changes; nothing happens until the user
+    approves (Projects v2 §4, §6.1). Own-side changes apply with the user's own
+    authority; ``ask_member`` is sent as the user's request and the member answers."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        PARTIAL = "partial", "Partly applied"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="pending_project_actions")
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="+")
+    payload = models.JSONField(default=dict)  # validated ProjectProposalSpec
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    # The assistant read other members' text shortly before proposing (§6.3): the
+    # card says so, and approval must come from the app, never the same chat turn.
+    from_tainted_turn = models.BooleanField(default=False)
+    result = models.JSONField(default=dict, blank=True)  # per-change outcome after approval
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "friends_pending_project_actions"
+        indexes = [models.Index(fields=["tenant", "status"])]

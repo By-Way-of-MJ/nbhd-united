@@ -141,6 +141,20 @@ urlpatterns += [
     path("missions/<uuid:mission_id>/dependencies/", project_views.DependenciesView.as_view()),
     path("missions/<uuid:mission_id>/dependencies/<uuid:dependency_id>/", project_views.DependencyView.as_view()),
 ]
+urlpatterns += [
+    path("project-drafts/", project_views.DraftsView.as_view()),
+    path("project-drafts/<uuid:draft_id>/", project_views.DraftView.as_view()),
+    path("project-drafts/<uuid:draft_id>/publish/", project_views.DraftPublishView.as_view()),
+    path("project-proposals/", project_views.ProposalsView.as_view()),
+]
+for action in ("approve", "reject"):
+    urlpatterns.append(
+        path(
+            f"project-proposals/<uuid:proposal_id>/{action}/",
+            project_views.ProposalActionView.as_view(),
+            {"action": action},
+        )
+    )
 for action in ("ask", "respond", "complete", "reopen"):
     urlpatterns.append(
         path(
