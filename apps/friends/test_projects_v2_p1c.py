@@ -166,7 +166,7 @@ class AssistantSurfaceTests(TestCase):
         runtime = self.runtime(self.a)
         for url in [
             f"/api/v1/friends/project-proposals/{pid}/approve/",
-            f"/api/v1/friends/project-drafts/",
+            "/api/v1/friends/project-drafts/",
             f"/api/v1/friends/missions/{self.goal.id}/steps/{self.mine.id}/complete/",
         ]:
             self.assertIn(runtime.post(url, {}, format="json").status_code, [401, 403])
