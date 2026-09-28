@@ -222,21 +222,12 @@ def run_due_nudges(now=None) -> dict:
     from apps.common.tenant_tz import tenant_tz
 
     from . import access
-    from .models import SharedGoalStepAssignment
     from .project_flags import projects_v2_enabled
 
     now = now or timezone.now()
     sent = claimed = 0
     with access.backstop_service_context():
-        rows = SharedGoalStepAssignment.objects.filter(
-            status="accepted",
-            membership__status="active",
-            membership__muted=False,
-            step__status__in=["open", "in_progress"],
-            step__due_date__isnull=False,
-            step__shared_goal__status="active",
-        ).select_related("step", "step__shared_goal", "membership", "membership__user", "membership__tenant")
-        for row in rows:
+        for row in access.due_nudge_candidates():
             tenant = row.membership.tenant
             if not projects_v2_enabled(tenant):
                 continue
@@ -244,14 +235,7 @@ def run_due_nudges(now=None) -> dict:
             due = row.step.due_date
             if local.hour != NUDGE_LOCAL_HOUR or due != local.date() + timedelta(days=1):
                 continue
-            if row.due_nudged_for == due:
-                continue
-            won = (
-                SharedGoalStepAssignment.objects.filter(id=row.id)
-                .exclude(due_nudged_for=due)
-                .update(due_nudged_for=due)
-            )
-            if not won:
+            if row.due_nudged_for == due or not access.claim_due_nudge(row.id, due):
                 continue
             claimed += 1
             body = f"“{_short(row.step.title)}” is due tomorrow"

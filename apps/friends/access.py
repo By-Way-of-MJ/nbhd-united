@@ -1302,6 +1302,30 @@ def my_open_project_asks(tenant):
     )
 
 
+def due_nudge_candidates():
+    """Accepted owners of open, dated steps in active projects (the hourly
+    "due tomorrow" sweep narrows by each owner's local time)."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(
+        status="accepted",
+        membership__status="active",
+        membership__muted=False,
+        step__status__in=["open", "in_progress"],
+        step__due_date__isnull=False,
+        step__shared_goal__status="active",
+    ).select_related("step", "step__shared_goal", "membership", "membership__user", "membership__tenant")
+
+
+def claim_due_nudge(assignment_id, due) -> bool:
+    """Compare-and-set: True only for the one run that records this due date."""
+    from .models import SharedGoalStepAssignment
+
+    return bool(
+        SharedGoalStepAssignment.objects.filter(id=assignment_id).exclude(due_nudged_for=due).update(due_nudged_for=due)
+    )
+
+
 def my_linked_step_tasks(membership):
     """This member's own accepted step assignments that carry a private journal Task."""
     from .models import SharedGoalStepAssignment
