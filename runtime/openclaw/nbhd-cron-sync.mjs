@@ -25,7 +25,7 @@
 //      and agent-created crons are never touched.
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -41,6 +41,11 @@ const POLL_MS = Number(process.env.NBHD_CRON_SYNC_POLL_MS || 25000);
 
 const CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH || "/home/node/.openclaw/openclaw.json";
 const CRONS_FILE = process.env.NBHD_CRONS_FILE || path.join(path.dirname(CONFIG_PATH), "nbhd-crons.json");
+const STATE_FILE = process.env.NBHD_CRON_STATE_FILE || path.join(path.dirname(CONFIG_PATH), "nbhd-cron-state.json");
+// Rewrite an unchanged state file at most this often. Django treats a file older
+// than its staleness limit (apps/cron/share_cron_sync.py) as "cron state unknown",
+// so this is the heartbeat that proves the helper is alive.
+const STATE_HEARTBEAT_MS = Number(process.env.NBHD_CRON_STATE_HEARTBEAT_MS || 60000);
 const OC_BIN = process.env.OPENCLAW_BIN || "openclaw";
 const KEY = process.env.NBHD_INTERNAL_API_KEY || "";
 
@@ -278,11 +283,55 @@ export async function reconcileOnce({ run = oc } = {}) {
   return { applied, removed, skipped, ok: true };
 }
 
+// Cron STATE readback for Django. 9.4 gates Django's cron.list too, so the
+// hibernation sweep, image rollout, and at-cron wake backstop can no longer see
+// what is scheduled or running — and treat "unknown" as "never stop this
+// container". This helper already has the ungated operator CLI, so after each
+// pass it writes a metadata-only snapshot of every ENABLED job (all owners, not
+// just nbhd:*) to the share. No payloads: message text never leaves SQLite.
+export function stateRow(job) {
+  if (!job || typeof job !== "object") return null;
+  const s = job.schedule && typeof job.schedule === "object" ? job.schedule : {};
+  const st = job.state && typeof job.state === "object" ? job.state : {};
+  const schedule = { kind: s.kind };
+  for (const k of ["expr", "tz", "everyMs", "at", "atMs"]) if (s[k] != null) schedule[k] = s[k];
+  const state = {};
+  for (const k of ["nextRunAtMs", "runningAtMs", "lastRunAtMs"]) if (Number.isFinite(st[k])) state[k] = st[k];
+  const row = { id: job.id ?? job.jobId, name: job.name, enabled: job.enabled !== false, schedule, state };
+  if (typeof job.declarationKey === "string") row.declarationKey = job.declarationKey;
+  return row;
+}
+
+let lastStateBody = null;
+let lastStateWriteMs = 0;
+
+export async function reportState({ run = oc, write = writeFile, now = Date.now } = {}) {
+  let rows;
+  try {
+    const doc = JSON.parse(await run(["cron", "list", "--json"]));
+    const jobs = Array.isArray(doc) ? doc : (doc && Array.isArray(doc.jobs) ? doc.jobs : null);
+    if (!jobs) { warn("cron list returned no jobs array — state not reported"); return false; }
+    rows = jobs.map(stateRow).filter(Boolean);
+  } catch (e) {
+    // Leave the old file to age out: Django reads a stale file as "unknown".
+    warn("cron list failed, state not reported:", e && e.message);
+    return false;
+  }
+  const body = JSON.stringify(rows);
+  const t = now();
+  if (body === lastStateBody && t - lastStateWriteMs < STATE_HEARTBEAT_MS) return false;
+  await write(STATE_FILE, JSON.stringify({ v: 1, writtenAtMs: t, jobs: rows }));
+  lastStateBody = body;
+  lastStateWriteMs = t;
+  return true;
+}
+
 async function main() {
   const once = process.argv.includes("--once");
   if (once) {
     const r = await reconcileOnce();
     if (r.ok) log(`synced: applied=${r.applied} removed=${r.removed} skipped=${r.skipped}`);
+    try { await reportState(); } catch (e) { warn("state report threw:", e && e.message ? e.message : e); }
     return;
   }
   log(`starting poll loop (every ${POLL_MS}ms), file=${CRONS_FILE}`);
@@ -295,6 +344,7 @@ async function main() {
     } catch (e) {
       warn("reconcile pass threw:", e && e.message ? e.message : e);
     }
+    try { await reportState(); } catch (e) { warn("state report threw:", e && e.message ? e.message : e); }
     await new Promise((res) => setTimeout(res, POLL_MS));
   }
 }

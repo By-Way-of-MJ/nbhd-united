@@ -1478,7 +1478,7 @@ def ensure_at_cron_wakes_task() -> dict:
     import logging
     import time as _time
 
-    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.cron.pending_at_views import _at_fires_at_ms
     from apps.cron.publish import publish_task
     from apps.orchestrator.hibernation import _CRON_WAKE_LEAD_SECONDS
@@ -1500,7 +1500,7 @@ def ensure_at_cron_wakes_task() -> dict:
     for tenant in tenants:
         totals["tenants"] += 1
         try:
-            list_result = invoke_gateway_tool(tenant, "cron.list", {})
+            list_result = list_tenant_crons(tenant)
         except GatewayError:
             totals["skipped"] += 1
             continue

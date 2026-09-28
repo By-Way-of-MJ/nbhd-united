@@ -24,6 +24,11 @@ from hashlib import sha256
 logger = logging.getLogger(__name__)
 
 _CRONS_FILE = "nbhd-crons.json"
+_STATE_FILE = "nbhd-cron-state.json"
+# The helper rewrites an unchanged state file every 60s and polls every ~25s, so
+# three minutes means it has missed at least two heartbeats. Older than this is
+# "cron state unknown" — the same answer a failed live cron.list gave.
+CRON_STATE_MAX_AGE_SECONDS = 180
 
 
 def tenant_uses_file_cron_sync(tenant) -> bool:
@@ -158,3 +163,37 @@ def write_tenant_crons_file(tenant) -> int:
     _put_share_file(str(tenant.id), _CRONS_FILE, data=data, ensure_dirs=False)
     logger.info("write_tenant_crons_file: wrote %d managed cron(s) for tenant %s", count, tenant.id)
     return count
+
+
+def read_container_cron_jobs(tenant) -> list[dict]:
+    """The container's ENABLED cron jobs, from the helper's state readback.
+
+    9.4 gates Django's ``cron.list`` along with every other cron.* call, so the
+    in-container helper reports each pass to ``nbhd-cron-state.json`` (metadata
+    only: id, name, enabled, schedule, state timing — never payloads). Raises
+    ``GatewayError`` when the file is absent, unreadable, or stale, so callers
+    keep their existing "cron state unknown" handling.
+    """
+    import time
+
+    from apps.cron.gateway_client import GatewayError
+    from apps.orchestrator.azure_client import download_workspace_file_binary
+
+    try:
+        raw = download_workspace_file_binary(str(tenant.id), _STATE_FILE)
+    except Exception as exc:
+        raise GatewayError(f"cron state file unreadable for tenant {tenant.id}") from exc
+    if raw is None:
+        raise GatewayError(f"no cron state file for tenant {tenant.id}", unavailable=True)
+    try:
+        doc = json.loads(raw)
+        written_at_ms = int(doc["writtenAtMs"])
+        jobs = doc["jobs"]
+    except (ValueError, TypeError, KeyError) as exc:
+        raise GatewayError(f"cron state file malformed for tenant {tenant.id}") from exc
+    if not isinstance(jobs, list):
+        raise GatewayError(f"cron state file malformed for tenant {tenant.id}")
+    age_seconds = time.time() - written_at_ms / 1000
+    if age_seconds > CRON_STATE_MAX_AGE_SECONDS:
+        raise GatewayError(f"cron state file stale for tenant {tenant.id} ({int(age_seconds)}s old)")
+    return jobs

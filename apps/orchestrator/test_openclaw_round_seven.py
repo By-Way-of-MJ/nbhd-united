@@ -409,6 +409,10 @@ class RealBootFixtureTests(SimpleTestCase):
         root = ROOT.parent.parent
         for source, digest in capture["sources"].items():
             self.assertEqual(sha256((root / source).read_bytes()).hexdigest(), digest)
+        # The helper's readback that replaces Django's gated cron.list: timing, no payloads.
+        state = capture["stateReadback"]
+        self.assertTrue({"nbhd:700", "nbhd:701"} <= {j.get("declarationKey") for j in state["jobs"]})
+        self.assertTrue(all("payload" not in j and "nextRunAtMs" in j["state"] for j in state["jobs"]))
         for declaration in capture["declarations"]:
             self.assertFalse(preservation_reasons(declaration))
             for poll in capture["polls"]:

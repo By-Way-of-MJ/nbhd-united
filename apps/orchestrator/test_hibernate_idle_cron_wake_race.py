@@ -51,6 +51,7 @@ class HibernateIdleCronWakeRaceTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = f"oc-race-{suffix}"
         tenant.container_fqdn = f"oc-race-{suffix}.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.last_message_at = timezone.now() - timedelta(hours=3)
         tenant.save()
         return tenant
@@ -203,6 +204,7 @@ class HibernateIdleImminentCronTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = f"oc-imm-{suffix}"
         tenant.container_fqdn = f"oc-imm-{suffix}.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.last_message_at = timezone.now() - timedelta(hours=3)
         tenant.save()
         return tenant
@@ -310,6 +312,7 @@ class CronActiveOrImminentTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = "oc-cron-defer"
         tenant.container_fqdn = "oc-cron-defer.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.save()
         return tenant
 
