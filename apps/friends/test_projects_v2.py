@@ -150,6 +150,257 @@ class ProjectAPITests(TestCase):
             self.assertEqual(self.client.patch(url, data, format="json").status_code, 400)
         self.assertEqual(self.client.delete(url).status_code, 204)
 
+    def _edit_cases(self):
+        # Creator, caller, assignments (member/status), expected edit permission.
+        return [
+            (self.b, self.b, [], True),
+            (self.b, self.b, [(self.member_b, "asked")], True),
+            (self.b, self.b, [(self.member_a, "countered")], True),
+            (self.b, self.b, [(self.member_a, "declined")], True),
+            (self.b, self.b, [(self.member_a, "asked")], False),
+            (self.b, self.b, [(self.member_a, "accepted")], False),
+            (self.a, self.b, [(self.member_b, "accepted")], True),
+            (self.a, self.b, [(self.member_b, "asked")], False),
+            (self.a, self.b, [(self.member_b, "countered")], False),
+            (self.a, self.b, [(self.member_b, "declined")], False),
+            (self.a, self.b, [], False),
+            (self.b, self.a, [(self.member_b, "asked")], True),
+            (self.b, self.a, [(self.member_b, "accepted")], True),
+            (self.b, self.b, [(self.member_b, "accepted"), (self.member_a, "asked")], True),
+        ]
+
+    def _editable_step_fixture(self, creator, assignments):
+        step = projects.create_step(creator, creator.user, self.goal.id, {"title": "Edit rights"})
+        for member, status in assignments:
+            SharedGoalStepAssignment.objects.create(step=step, membership=member, status=status, asked_by=self.a)
+        return step
+
+    def test_step_patch_and_delete_edit_rights_matrix(self):
+        for creator, actor, assignments, allowed in self._edit_cases():
+            for method in ["patch", "delete"]:
+                with self.subTest(creator=creator.id, actor=actor.id, assignments=assignments, method=method):
+                    step = self._editable_step_fixture(creator, assignments)
+                    response = getattr(self.jwt(actor), method)(
+                        self.base + f"steps/{step.id}/", {"title": "Changed", "version": 0}, format="json"
+                    )
+                    self.assertEqual(response.status_code, (200 if method == "patch" else 204) if allowed else 403)
+                    if not allowed:
+                        self.assertEqual(str(response.data["detail"]), "Ask the step's owner to change it.")
+                        step.refresh_from_db()
+                        self.assertEqual((step.title, step.version), ("Edit rights", 0))
+
+    def test_dependency_delete_uses_blocked_step_edit_rights_matrix(self):
+        for creator, actor, assignments, allowed in self._edit_cases():
+            with self.subTest(creator=creator.id, actor=actor.id, assignments=assignments):
+                blocked = self._editable_step_fixture(creator, assignments)
+                # Caller owns the blocker AND created the edge: neither grants deletion.
+                blocker = projects.create_step(actor, actor.user, self.goal.id, {"title": "Blocker"})
+                edge = projects.dependency_write(
+                    actor, self.goal.id, {"blocker_id": str(blocker.id), "blocked_id": str(blocked.id)}
+                )
+                response = self.jwt(actor).delete(self.base + f"dependencies/{edge.id}/")
+                self.assertEqual(response.status_code, 204 if allowed else 403)
+                if not allowed:
+                    self.assertEqual(str(response.data["detail"]), "Ask the step's owner to change it.")
+                    self.assertTrue(access.project_dependencies(self.goal).filter(id=edge.id).exists())
+
+    def test_creator_cannot_edit_after_asking_another_member_even_if_they_left(self):
+        step = self._editable_step_fixture(self.b, [(self.member_a, "asked")])
+        services.leave_mission(self.a, self.goal.id)
+        self.assertEqual(
+            self.jwt(self.b).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 403
+        )
+
+    def test_milestone_patch_delete_creator_or_project_owner(self):
+        for creator, actor, allowed in [(self.b, self.b, True), (self.b, self.a, True), (self.a, self.b, False)]:
+            for method in ["patch", "delete"]:
+                with self.subTest(creator=creator.id, actor=actor.id, method=method):
+                    milestone = projects.milestone_write(creator, self.goal.id, {"title": "Harvest"})
+                    response = getattr(self.jwt(actor), method)(
+                        self.base + f"milestones/{milestone.id}/", {"title": "Changed"}, format="json"
+                    )
+                    self.assertEqual(response.status_code, (200 if method == "patch" else 204) if allowed else 403)
+                    if not allowed:
+                        milestone.refresh_from_db()
+                        self.assertEqual(milestone.title, "Harvest")
+                        self.assertIn("milestone's creator", str(response.data["detail"]))
+
+    def test_regular_member_can_create_steps_milestones_and_dependencies(self):
+        client = self.jwt(self.b)
+        milestone = client.post(self.base + "milestones/", {"title": "Harvest"}, format="json")
+        self.assertEqual(milestone.status_code, 201)
+        step = client.post(
+            self.base + "steps/", {"title": "Plant", "milestone_id": milestone.data["milestone_id"]}, format="json"
+        )
+        self.assertEqual(step.status_code, 201)
+        other = self.step()
+        edge = client.post(
+            self.base + "dependencies/",
+            {"blocker_id": str(other.id), "blocked_id": step.data["step_id"]},
+            format="json",
+        )
+        self.assertEqual(edge.status_code, 201)
+
+    def test_accepted_owner_patch_mirrors_only_own_task_title_and_dates(self):
+        step = self.step(start_date="2026-10-01", due_date="2026-10-05", description="Shared description")
+        self.ask(step)
+        b = self.accept(step)
+        self.ask(step, self.a)
+        a = self.accept(step, self.a)
+        task_a, task_b = Task.objects.get(id=a.task_id), Task.objects.get(id=b.task_id)
+        task_b.description = "Private description"
+        task_b.save(update_fields=["description"])
+        description_receipt = task_b.pii_receipts["description"]
+        client = self.jwt(self.b)
+        url = self.base + f"steps/{step.id}/"
+        for version, fields in enumerate(
+            [
+                {"title": "  Plant\u200b  seeds ", "start_date": "2026-10-02", "due_date": "2026-10-06"},
+                {"start_date": "2026-10-03"},
+                {"due_date": None},
+                {"title": "Water"},
+            ]
+        ):
+            if version == 1:
+                # A start-only edit still restores the shared due date in my Task.
+                task_b.due_date = None
+                task_b.save(update_fields=["due_date"])
+            response = client.patch(url, {"version": version, **fields}, format="json")
+            self.assertEqual(response.status_code, 200, response.data)
+            step.refresh_from_db()
+            task_b.refresh_from_db()
+            task_a.refresh_from_db()
+            self.assertEqual((task_b.title, task_b.due_date), (step.title, step.due_date))
+            self.assertEqual(task_b.description, "Private description")
+            self.assertEqual(task_b.pii_receipts["description"], description_receipt)
+            self.assertEqual(task_b.pii_receipts["title"]["state"], "bypass")
+            self.assertEqual((task_a.title, str(task_a.due_date)), ("Dig", "2026-10-05"))
+        self.assertEqual(step.status, "open")
+
+    def test_project_owner_patch_does_not_mirror_another_members_task(self):
+        step = self.step(due_date="2026-10-05")
+        self.ask(step)
+        assignment = self.accept(step)
+        response = self.client.patch(
+            self.base + f"steps/{step.id}/", {"version": 0, "title": "Changed", "due_date": None}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        task = Task.objects.get(id=assignment.task_id)
+        self.assertEqual((task.title, str(task.due_date)), ("Dig", "2026-10-05"))
+
+    def test_mirror_never_follows_a_foreign_tenant_task_link(self):
+        step = self.step()
+        self.ask(step)
+        assignment = self.accept(step)
+        foreign = Task.objects.create(tenant=self.a, title="Private")
+        SharedGoalStepAssignment.objects.filter(id=assignment.id).update(task=foreign)
+        response = self.jwt(self.b).patch(
+            self.base + f"steps/{step.id}/", {"version": 0, "title": "Changed", "due_date": "2026-10-05"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        foreign.refresh_from_db()
+        self.assertEqual((foreign.title, foreign.due_date), ("Private", None))
+
+    def test_mirror_title_uses_authoring_receipt_and_preserves_private_description(self):
+        from apps.pii.authoring import AuthoredText
+
+        step = self.step()
+        self.ask(step)
+        assignment = self.accept(step)
+        receipt = {"state": "test-authored"}
+        with patch("apps.pii.authoring.author_text", return_value=AuthoredText("Meet [PERSON_1]", receipt)) as author:
+            response = self.jwt(self.b).patch(
+                self.base + f"steps/{step.id}/", {"version": 0, "title": "Meet a person"}, format="json"
+            )
+        self.assertEqual(response.status_code, 200)
+        author.assert_called_once()
+        self.assertEqual(author.call_args.args, (self.b, "Meet a person"))
+        task = Task.objects.get(id=assignment.task_id)
+        self.assertEqual(task.title, "Meet [PERSON_1]")
+        self.assertEqual(task.pii_receipts["title"], receipt)
+
+    def test_patch_rechecks_rights_version_and_task_link_after_authoring(self):
+        from apps.pii.authoring import AuthoredText
+
+        for changed in ["rights", "version", "task_link"]:
+            with self.subTest(changed=changed):
+                step = self.step()
+                self.ask(step)
+                assignment = self.accept(step)
+                original_task_id = assignment.task_id
+
+                def author(*args, changed=changed, assignment=assignment, step=step, **kwargs):
+                    if changed == "rights":
+                        SharedGoalStepAssignment.objects.filter(id=assignment.id).update(status="declined")
+                    elif changed == "version":
+                        SharedGoalStep.objects.filter(id=step.id).update(version=1)
+                    else:
+                        SharedGoalStepAssignment.objects.filter(id=assignment.id).update(task=None)
+                    return AuthoredText("Changed", {})
+
+                with patch("apps.pii.authoring.author_text", side_effect=author):
+                    response = self.jwt(self.b).patch(
+                        self.base + f"steps/{step.id}/", {"version": 0, "title": "Changed"}, format="json"
+                    )
+                self.assertEqual(response.status_code, 403 if changed == "rights" else 409)
+                step.refresh_from_db()
+                self.assertEqual(step.title, "Dig")
+                self.assertEqual(Task.objects.get(id=original_task_id).title, "Dig")
+
+    def test_stale_or_invalid_patch_does_not_author_or_sync_private_task(self):
+        step = self.step()
+        self.ask(step)
+        assignment = self.accept(step)
+        for data, code in [({"version": 9, "title": "Changed"}, 409), ({"version": 0, "due_date": "bad"}, 400)]:
+            with patch("apps.pii.authoring.author_text") as author:
+                response = self.jwt(self.b).patch(self.base + f"steps/{step.id}/", data, format="json")
+            self.assertEqual(response.status_code, code)
+            author.assert_not_called()
+        task = Task.objects.get(id=assignment.task_id)
+        self.assertEqual((task.title, task.due_date), ("Dig", None))
+
+    def test_plan_mute_preferences_are_visible_only_to_their_member(self):
+        SharedGoalMembership.objects.filter(shared_goal=self.goal).update(muted=True)
+        step = self.step()
+        self.ask(step)
+        self.accept(step)
+        self.ask(step, self.a)
+        self.accept(step, self.a)
+        for tenant, member in [(self.a, self.member_a), (self.b, self.member_b)]:
+            response = self.jwt(tenant).get(self.base + "plan/")
+            self.assertEqual(response.status_code, 200)
+            for row in response.data["members"] + response.data["steps"][0]["owners"]:
+                if row["id"] == str(member.id):
+                    self.assertIs(row["muted"], True)
+                else:
+                    self.assertNotIn("muted", row)
+
+    def test_counter_offer_flow_requires_authorized_edit_then_reask_and_accept(self):
+        step = projects.create_step(self.b, self.b.user, self.goal.id, {"title": "Plant"})
+        projects.ask(self.b, self.b.user, self.goal.id, step.id, [str(self.member_a.id)])
+        projects.respond(self.a, self.a.user, self.goal.id, step.id, {"answer": "dates", "due": "2026-10-05"})
+        step.refresh_from_db()
+        self.assertIsNone(step.due_date)
+        self.assertEqual(Task.objects.count(), 0)
+        response = self.jwt(self.b).patch(
+            self.base + f"steps/{step.id}/", {"version": 0, "due_date": "2026-10-05"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        projects.ask(self.b, self.b.user, self.goal.id, step.id, [str(self.member_a.id)])
+        assignment = projects.respond(self.a, self.a.user, self.goal.id, step.id, {"answer": "yes"})
+        self.assertEqual(str(Task.objects.get(id=assignment.task_id).due_date), "2026-10-05")
+
+    def test_asking_someone_does_not_grant_step_edit_rights(self):
+        step = self.step()
+        projects.ask(self.b, self.b.user, self.goal.id, step.id, [str(self.member_a.id)])
+        projects.respond(self.a, self.a.user, self.goal.id, step.id, {"answer": "dates", "due": "2026-10-05"})
+        self.assertEqual(
+            self.jwt(self.b)
+            .patch(self.base + f"steps/{step.id}/", {"version": 0, "due_date": "2026-10-05"}, format="json")
+            .status_code,
+            403,
+        )
+
     def test_ask_requires_consent_and_accept_mints_once(self):
         step = self.step()
         self.ask(step)

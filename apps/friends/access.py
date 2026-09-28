@@ -1233,7 +1233,8 @@ def bond_by_counterpart(viewer_tenant, edges) -> dict:
 
 
 # Projects v2. Callers authenticate membership before loading a plan. Every write
-# takes the goal lock first, so counts, dependencies and assignments share a lock.
+# takes the goal lock before changing the plan. Existing Task mirrors lock the
+# caller's Task before the goal, matching the journal completion receiver.
 def mission_memberships():
     return SharedGoalMembership.objects.all()
 
@@ -1293,11 +1294,16 @@ def project_dependencies(goal):
     return SharedGoalStepDependency.objects.filter(blocker__shared_goal=goal, blocked__shared_goal=goal)
 
 
-def project_snapshot(goal):
-    """Eager control-plane data only. Pure projection cannot lazily read a Task."""
+def project_snapshot(goal, *, viewer):
+    """Eager control-plane data; mute preferences are private to the viewer.
+
+    Pure projection cannot lazily read a Task. The caller has checked membership.
+    """
     members = list(mission_memberships().filter(shared_goal=goal).values("id", "tenant_id", "role", "status", "muted"))
     profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
     for member in members:
+        if member["tenant_id"] != _tenant_id(viewer):
+            member.pop("muted")
         profile = profiles.get(member.pop("tenant_id"))
         member.update(
             handle=profile.handle if profile else None,

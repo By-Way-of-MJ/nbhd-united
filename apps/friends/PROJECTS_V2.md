@@ -11,20 +11,39 @@ uses the existing comma-list helper (empty denies all; exact `*` enables all).
 | --- | --- | --- |
 | GET | `missions/<id>/plan/` | Active project member |
 | POST | `missions/<id>/steps/` | Active member |
-| PATCH, DELETE | `missions/<id>/steps/<step_id>/` | Active member; PATCH requires integer `version` |
+| PATCH, DELETE | `missions/<id>/steps/<step_id>/` | Authorized step editor (below); PATCH requires integer `version` |
 | POST | `missions/<id>/steps/<step_id>/ask/` | Active member; `membership_ids` must identify active members or valid invitees of this project |
 | POST | `missions/<id>/steps/<step_id>/respond/` | Asked member; `answer`: yes, dates, smaller, no |
 | POST | `missions/<id>/steps/<step_id>/complete/` | Active, accepted step owner |
 | POST | `missions/<id>/steps/<step_id>/reopen/` | Active, accepted step owner |
 | POST | `missions/<id>/milestones/` | Active member |
-| PATCH, DELETE | `missions/<id>/milestones/<milestone_id>/` | Active member |
+| PATCH, DELETE | `missions/<id>/milestones/<milestone_id>/` | Active milestone creator or project owner |
 | POST | `missions/<id>/dependencies/` | Active member; `blocker_id`, `blocked_id` from this project |
-| DELETE | `missions/<id>/dependencies/<dependency_id>/` | Active member |
+| DELETE | `missions/<id>/dependencies/<dependency_id>/` | Authorized editor of the edge's **blocked** step |
 
 The plan contains member identity (`id`, `handle`, `display_name`, `hue`, role,
-status, mute preference), `my_membership_id`, `my_role`, ordered milestones and
+status), `my_membership_id`, `my_role`, ordered milestones and
 steps, assignment states/counters, and dependency edges. Private Task fields and
-IDs are excluded. No journal rows are read by the projection.
+IDs are excluded. Only the caller's membership includes `muted`; it is absent from
+other members, including their identity in step owners. No journal rows are read
+by the projection.
+
+Step PATCH and DELETE require active membership and at least one of:
+
+- The caller is an accepted owner of the step.
+- The caller created the step and **no other member** has an `asked` or `accepted`
+  assignment on it. A self-ask does not remove creator rights; other members'
+  `countered` and `declined` assignments do not block them. Outstanding asks or
+  acceptances still block creator rights after that member leaves.
+- The caller has project membership role `owner`.
+
+Otherwise the API returns 403: "Ask the step's owner to change it."
+Deleting a dependency uses these same rights on its blocked step; creating the
+edge or owning its blocker grants no additional deletion rights. Milestone PATCH
+and DELETE require the milestone's creator or a project owner, with active
+membership. Any active member may still create steps, milestones and dependencies.
+Project ownership alone does not authorize step completion or reopening: those
+actions still require an accepted step assignment.
 
 Step inputs are `title`, `description`, `start_date`, `due_date`, `milestone_id`,
 `order`, and `status` (open/in_progress). Completion and reopen use their own
@@ -36,8 +55,22 @@ Creation returns the object's ID, with version for steps; DELETE returns 204.
 Responding `yes` creates exactly one private Task for that accepted owner.
 `dates` requires `start` or `due`; `smaller` requires a note up to 200 characters;
 other notes permit 500. Counteroffers record proposed dates without moving the
-shared schedule. A member can apply agreed dates through step PATCH and re-ask;
-the assignee must still accept. Declined assignments remain as history but do
+shared schedule. The app must drive this dates counter-offer flow:
+
+1. The asked member POSTs `respond/` with `{"answer":"dates","start":"2026-10-03","due":"2026-10-05"}`
+   (at least one date). This records a `countered` assignment and creates no Task.
+2. The asker PATCHes the step with the current `version` and the agreed
+   `start_date`/`due_date`. Being the asker grants no editing privilege: they must
+   satisfy the step edit rules above. A creator can edit after this counter only
+   if no other `asked`/`accepted` assignment blocks them; a project owner can edit.
+   If the asker lacks rights, an authorized editor must make this change. A 409
+   requires reloading the plan and reviewing the current dates before retrying.
+3. The asker POSTs `ask/` with that member's `membership_ids`. This resets the
+   countered assignment to `asked` and clears its counter dates and note.
+4. The member POSTs `respond/` with `{"answer":"yes"}`. Only then is their private
+   Task minted, using the agreed step title and due date.
+
+Declined assignments remain as history but do
 not count as owners. Repeated asks preserve accepted owners and outstanding
 asks. Invitees can receive an ask but must join before responding. Neither asks nor counters create a Task. Notes never enter activity payloads.
 
@@ -51,7 +84,14 @@ The receiver uses a savepoint and service RLS context, and cannot raise into
 Task.save. Re-saving already-done work does not undo a shared reopen. Completing
 or reopening through the project changes only the caller's private Task. Other
 owners' Tasks remain private and independent. Leaving or deleting a step keeps
-private Tasks. Completion/unblock/milestone events are control-plane updates;
+private Tasks. When an accepted owner PATCHes a title, only their linked Task's
+title is updated through journal text authoring. A start/due PATCH syncs the
+resulting due date to that same Task (journal Tasks have no start date). Clearing
+the due date clears it in their Task. Other owners' Tasks and private descriptions
+are untouched; a project owner without an accepted assignment changes no Task.
+The write locks the caller's Task before the project, then rechecks membership,
+edit rights, version and assignment link before changing either row.
+Completion/unblock/milestone events are control-plane updates;
 P1a adds no pushes or scheduling.
 
 `plan_projection.py` documents calendar-day math precisely. Slack is the signed
@@ -88,7 +128,7 @@ new creation limits. The migration is idempotent and its data reversal is a no-o
 The access module remains the primary application boundary. Migration 0015 adds
 FORCE RLS with named `app_user` policies on all four new tables: active project
 members can read, an unset/foreign/invited tenant fails closed, and trusted service
-context supports the receiver. `check_friends_rls` includes them. Deployment must
-also retain those four tables in `apps/tenants/management/commands/disable_rls.py`
-(`RLS_KEEP_ENABLED`). That boot-time integration remains outstanding and must be
-completed before deployment.
+context supports the receiver. `check_friends_rls` includes them. All eight friends
+backstop tables are exempt from the boot-time `disable_rls` sweep through
+`RLS_KEEP_ENABLED`; the regression test checks the complete `FRIENDS_TABLES` set
+and verifies enforcement remains enabled after the sweep.

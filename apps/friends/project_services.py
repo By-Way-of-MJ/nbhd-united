@@ -88,12 +88,38 @@ def _validate_step(goal, fields, step=None):
         raise ValidationError("Use reopen to change completion.")
 
 
+def _assert_step_editor(goal, member, step):
+    """Return the caller's accepted assignment, if any, after checking edit rights.
+
+    A creator retains control until another member is asked or accepts. Historical
+    declined/countered assignments do not reserve editing rights for that member.
+    Call under the project lock before mutating; PATCH also checks before authoring.
+    """
+    assignments = access.project_assignments(goal).filter(step=step)
+    own = assignments.filter(membership=member, status="accepted").first()
+    if own or member.role == "owner":
+        return own
+    if (
+        step.created_by_id == member.tenant_id
+        and not assignments.filter(status__in=["asked", "accepted"]).exclude(membership=member).exists()
+    ):
+        return None
+    raise PermissionDenied("Ask the step's owner to change it.")
+
+
+def _check_step_version(step, data):
+    if type(data.get("version")) is not int:
+        raise ValidationError("version is required and must be an integer.")
+    if data["version"] != step.version:
+        raise Conflict({"detail": Conflict.default_detail, "version": step.version})
+
+
 def get_plan(tenant, mission_id):
     from apps.common.tenant_tz import tenant_tz
 
     goal, member = services._assert_mission_member(tenant, mission_id)
     plan = plan_projection.build_plan(
-        access.project_snapshot(goal), today=timezone.now().astimezone(tenant_tz(tenant)).date()
+        access.project_snapshot(goal, viewer=tenant), today=timezone.now().astimezone(tenant_tz(tenant)).date()
     )
     plan.update(my_membership_id=str(member.id), my_role=member.role)
     return plan
@@ -112,28 +138,64 @@ def create_step(tenant, user, mission_id, data):
     return step
 
 
-@transaction.atomic
 def patch_step(tenant, mission_id, step_id, data):
-    goal, _ = access.lock_project(tenant, mission_id)
+    from apps.journal.models import Task
+    from apps.pii.authoring import author_text, truncate_placeholder_safe
+
+    goal, member = services._assert_mission_member(tenant, mission_id)
     step = _row(access.project_steps(goal), step_id)
-    if type(data.get("version")) is not int:
-        raise ValidationError("version is required and must be an integer.")
-    if data["version"] != step.version:
-        raise Conflict({"detail": Conflict.default_detail, "version": step.version})
+    assignment = _assert_step_editor(goal, member, step)
+    _check_step_version(step, data)
     fields = _fields(data)
     _validate_step(goal, fields, step)
-    for key, value in fields.items():
-        setattr(step, key, value)
-    step.version += 1
-    step.save()
-    _refresh_milestones(goal, tenant, None)
-    return step
+    mirror = bool({"title", "start_date", "due_date"} & fields.keys())
+    linked_task_id = assignment.task_id if assignment and mirror else None
+    # Journal authoring may do external work. Prepare before taking either lock.
+    authored_title = (
+        author_text(
+            tenant, fields["title"], seam="friends.project.local_task.update", writer="background", field="title"
+        )
+        if linked_task_id and "title" in fields
+        else None
+    )
+    with transaction.atomic():
+        # Same order as completion and Task.save's synchronous receiver.
+        task = (
+            Task.objects.select_for_update().filter(id=linked_task_id, tenant=tenant).first()
+            if linked_task_id
+            else None
+        )
+        goal, member = access.lock_project(tenant, mission_id)
+        step = _row(access.project_steps(goal), step_id)
+        assignment = _assert_step_editor(goal, member, step)
+        _check_step_version(step, data)
+        if mirror and (assignment.task_id if assignment else None) != linked_task_id:
+            raise Conflict()
+        _validate_step(goal, fields, step)
+        for key, value in fields.items():
+            setattr(step, key, value)
+        step.version += 1
+        step.save()
+        if task:
+            update_fields = ["updated_at"]
+            if {"start_date", "due_date"} & fields.keys():
+                task.due_date = step.due_date
+                update_fields.append("due_date")
+            if authored_title:
+                task.title = truncate_placeholder_safe(authored_title.text, Task._meta.get_field("title").max_length)
+                task.pii_receipts = {**(task.pii_receipts or {}), "title": authored_title.receipt}
+                update_fields.extend(["title", "pii_receipts"])
+            task.save(update_fields=update_fields)
+        _refresh_milestones(goal, tenant, None)
+        return step
 
 
 @transaction.atomic
 def delete_step(tenant, mission_id, step_id):
-    goal, _ = access.lock_project(tenant, mission_id)
-    _row(access.project_steps(goal), step_id).delete()
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    _assert_step_editor(goal, member, step)
+    step.delete()
     _refresh_milestones(goal, tenant, None)
 
 
@@ -311,9 +373,11 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False):
 
 @transaction.atomic
 def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=False):
-    goal, _ = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id)
     if milestone_id:
         milestone = _row(access.project_milestones(goal), milestone_id)
+        if member.role != "owner" and milestone.created_by_id != tenant.id:
+            raise PermissionDenied("Ask the milestone's creator or a project owner to change it.")
         if delete:
             milestone.delete()
             return None
@@ -331,9 +395,11 @@ def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=
 
 @transaction.atomic
 def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
-    goal, _ = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id)
     if dependency_id:
-        _row(access.project_dependencies(goal), dependency_id).delete()
+        edge = _row(access.project_dependencies(goal), dependency_id)
+        _assert_step_editor(goal, member, _row(access.project_steps(goal), edge.blocked_id))
+        edge.delete()
         return None
     blocker = _row(access.project_steps(goal), data.get("blocker_id"))
     blocked = _row(access.project_steps(goal), data.get("blocked_id"))
