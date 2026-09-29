@@ -177,3 +177,21 @@ class ProfilePhotoTests(TestCase):
 
     def test_url_helper(self):
         self.assertIsNone(access.photo_url(NeighborProfile(photo_version=None)))
+
+    def test_admin_action_removes_a_reported_photo(self):
+        from django.contrib.admin.sites import site
+
+        from .admin import ContentReportAdmin
+
+        self.upload(self.a, _jpeg())
+        self.client_for(self.b).post(
+            "/api/v1/friends/report/",
+            {"target_kind": "profile_photo", "target_id": str(self.pa.id), "reason": "x"},
+            format="json",
+        )
+        admin = ContentReportAdmin(ContentReport, site)
+        admin.message_user = lambda *a, **k: None
+        admin.remove_reported_photo(None, ContentReport.objects.all())
+        self.pa.refresh_from_db()
+        self.assertIsNone(self.pa.photo_version)
+        self.assertFalse(NeighborPhoto.objects.filter(profile=self.pa).exists())
