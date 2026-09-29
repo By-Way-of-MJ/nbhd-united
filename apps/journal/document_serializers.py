@@ -94,7 +94,21 @@ class DocumentListSerializer(_RehydrateFieldMixin, serializers.ModelSerializer):
 
 class DocumentAppendSerializer(serializers.Serializer):
     content = serializers.CharField()
-    time = serializers.CharField(required=False, allow_blank=True, default="")
+    time = serializers.RegexField(r"\A\d{2}:\d{2}\Z", required=False, trim_whitespace=False)
+
+
+class DocumentBlockReplaceSerializer(serializers.Serializer):
+    index = serializers.IntegerField()
+    original = serializers.CharField(allow_blank=True, trim_whitespace=False)
+    replacement = serializers.CharField(allow_blank=True, trim_whitespace=False)
+
+    def validate(self, attrs):
+        # DRF ordinarily coerces numeric strings/floats; this wire contract is
+        # an integer index and exact strings, including all whitespace.
+        for field, expected in (("index", int), ("original", str), ("replacement", str)):
+            if type(self.initial_data[field]) is not expected:
+                raise serializers.ValidationError({field: f"Must be a {expected.__name__}."})
+        return attrs
 
 
 class DocumentCreateSerializer(serializers.Serializer):

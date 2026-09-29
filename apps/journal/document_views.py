@@ -15,11 +15,15 @@ from rest_framework.views import APIView
 
 from apps.common.cache import tenant_cache
 from apps.common.llm_contracts import today_in_tenant_tz
+from apps.common.tenant_tz import tenant_tz
+from apps.pii.redactor import rehydrate_for_tenant
 from apps.tenants.models import Tenant
 
+from .blocks import split_markdown_blocks
 from .document_authoring import get_or_create_authored_document, merge_field_receipt, set_field_receipt
 from .document_serializers import (
     DocumentAppendSerializer,
+    DocumentBlockReplaceSerializer,
     DocumentCreateSerializer,
     DocumentListSerializer,
     DocumentSerializer,
@@ -363,6 +367,86 @@ def _synthesize_goals_markdown(tenant: Tenant) -> str:
     return "# Goals\n\n" + "\n\n".join(sections) + "\n"
 
 
+def _typed_document_write_guard(tenant, kind):
+    """Reject markdown writes to documents rendered from typed lifecycle rows."""
+    if kind in {"tasks", "goal"} and getattr(tenant, "experimental_typed_journal_lifecycle", False):
+        return Response(
+            {
+                "error": "typed_lifecycle_readonly",
+                "detail": (
+                    "Tasks and goals are managed as typed records. Update them via "
+                    "/api/v1/journal/tasks/<id>/ or /api/v1/journal/goals/<id>/, "
+                    "not by editing this document."
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+    return None
+
+
+class DocumentBlockReplaceView(APIView):
+    """POST .../documents/<kind>/<slug>/blocks/replace/ — compare and replace."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, kind: str, slug: str):
+        tenant = _get_tenant(request.user)
+        guard = _typed_document_write_guard(tenant, kind)
+        if guard is not None:
+            return guard
+        _validate_slug(kind, slug)
+        serializer = DocumentBlockReplaceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        index = data["index"]
+
+        def matching_blocks(doc):
+            blocks = split_markdown_blocks(doc.markdown)
+            if 0 <= index < len(blocks) and rehydrate_for_tenant(tenant, blocks[index]) == data["original"]:
+                return blocks
+            return None
+
+        def conflict(doc):
+            return Response(
+                {"error": "block_changed", "document": DocumentSerializer(doc, context={"tenant": tenant}).data},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        try:
+            doc = Document.objects.get(tenant=tenant, kind=kind, slug=slug)
+        except Document.DoesNotExist:
+            raise Http404("Document not found.")
+        if matching_blocks(doc) is None:
+            return conflict(doc)
+
+        # Detection can call out of process: author ONLY the replacement outside
+        # atomic, then repeat the comparison under the lock before changing text.
+        authored = _author_owner_document(
+            tenant, data["replacement"], seam="journal.document.block_replace", field="markdown"
+        )
+        with transaction.atomic():
+            try:
+                doc = Document.objects.select_for_update().get(pk=doc.pk, tenant=tenant)
+            except Document.DoesNotExist:
+                raise Http404("Document not found.")
+            blocks = matching_blocks(doc)
+            if blocks is None:
+                return conflict(doc)
+            replacement = authored.text
+            if replacement and not replacement.endswith("\n") and index < len(blocks) - 1:
+                replacement += "\n\n"
+            blocks[index] = replacement
+            doc.markdown = "".join(blocks)
+            doc.pii_receipts = merge_field_receipt(
+                doc.pii_receipts, "markdown", authored.receipt, stored_text=doc.markdown
+            )
+            # PATCH uses model.save too: retain its post_save hooks (memory sync,
+            # cache/envelope refresh and extraction resolution). Memory sync runs
+            # after commit.
+            doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+        return Response(DocumentSerializer(doc, context={"tenant": tenant}).data)
+
+
 class DocumentDetailView(APIView):
     """GET/PATCH/DELETE /api/v1/journal/documents/<kind>/<slug>/"""
 
@@ -416,27 +500,10 @@ class DocumentDetailView(APIView):
         markdown = request.data.get("markdown")
         title = request.data.get("title")
 
-        # Typed-lifecycle guard: when the flag is on, tasks/goal docs are
-        # rendered from typed rows on GET (DocumentDetailView.get), so a
-        # markdown write here would be silently discarded on the next read.
-        # Reject it instead of losing the user's edit — point them at the
-        # typed write endpoints (apps/journal/lifecycle_views.py).
-        if (
-            markdown is not None
-            and kind in {"tasks", "goal"}
-            and getattr(tenant, "experimental_typed_journal_lifecycle", False)
-        ):
-            return Response(
-                {
-                    "error": "typed_lifecycle_readonly",
-                    "detail": (
-                        "Tasks and goals are managed as typed records. Update them via "
-                        "/api/v1/journal/tasks/<id>/ or /api/v1/journal/goals/<id>/, "
-                        "not by editing this document."
-                    ),
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
+        if markdown is not None:
+            guard = _typed_document_write_guard(tenant, kind)
+            if guard is not None:
+                return guard
 
         doc = _get_or_create_document(tenant, kind, slug)
         # Re-author owner input before persisting. The client round-trips
@@ -555,7 +622,7 @@ class DocumentAppendView(APIView):
             # Re-read under a row lock to serialise concurrent appends and
             # prevent a lost-update when two writers hit the same document.
             doc = Document.objects.select_for_update().get(pk=doc.pk)
-            time_str = data.get("time") or timezone.now().strftime("%H:%M")
+            time_str = data.get("time") or timezone.now().astimezone(tenant_tz(tenant)).strftime("%H:%M")
             entry_block = f"\n\n### {time_str}{format_author_suffix(request.user.display_name)}\n{content}\n"
             doc.markdown = (doc.markdown or "").rstrip() + entry_block
             # Merge under the SAME lock as the text: the receipt is re-read from
