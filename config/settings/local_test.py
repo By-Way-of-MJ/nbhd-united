@@ -14,6 +14,8 @@ LOCAL_TEST_CHAT_TIMEOUT = 840
 LOCAL_TEST_LLM_URL = "http://127.0.0.1:11434/v1"
 LOCAL_TEST_LLM_MODEL = "qwen3.8:27b-obliterated-q8"
 LOCAL_TEST_LLM_TIMEOUT = 600
+# Core narration: no Gemini key here, so meditations render with the existing mock voice.
+LOCAL_TEST_CORE_MOCK_TTS = True
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 SAUTAI_M2M_BASE_URL = "http://127.0.0.1:8000"
