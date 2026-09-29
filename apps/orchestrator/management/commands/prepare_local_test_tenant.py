@@ -12,6 +12,7 @@ from django.core.management import call_command
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from apps.core.models import CoreProfile
 from apps.fuel.models import FuelProfile
 from apps.orchestrator.services import update_tenant_config
 from apps.tenants.models import Tenant, User
@@ -99,11 +100,13 @@ class Command(BaseCommand):
             raise CommandError("Provisioning did not reach active")
         tenant.container_fqdn = "127.0.0.1:19443"
         tenant.internal_api_key = settings.NBHD_INTERNAL_API_KEY
-        # Yuki uses Fuel (her sautai plan shows as Fuel Tonight; meals + workouts), so her local
-        # tenant has the pillar on, as her Settings toggle would: flag + profile. Idempotent.
+        # Yuki lives on her account: Fuel (her sautai plan shows as Fuel Tonight; meals + workouts) and
+        # Core (daily meditation). Pillars on as her Settings toggles would: flag + profile. Idempotent.
         tenant.fuel_enabled = True
-        tenant.save(update_fields=["container_fqdn", "internal_api_key", "fuel_enabled", "updated_at"])
+        tenant.core_enabled = True
+        tenant.save(update_fields=["container_fqdn", "internal_api_key", "fuel_enabled", "core_enabled", "updated_at"])
         FuelProfile.objects.get_or_create(tenant=tenant)
+        CoreProfile.objects.get_or_create(tenant=tenant)
         update_tenant_config(str(tenant.id))
         self.stdout.write(
             json.dumps(
