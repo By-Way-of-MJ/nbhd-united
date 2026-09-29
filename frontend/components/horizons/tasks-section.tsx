@@ -22,9 +22,12 @@ function TaskRow({ task, goal, dueSoon = false }: { task: JournalTask; goal?: st
   return (
     <li className="border-b border-os-hairline py-2">
       <div className="flex min-h-[44px] items-start gap-2 sm:gap-3">
-        <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center">
+        <label className="relative flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center">
           <input type="checkbox" aria-label={`${done ? "Reopen" : "Complete"} ${task.title}`} checked={done} disabled={busy} onChange={() => void toggle()}
-            className="h-[18px] w-[18px] cursor-pointer accent-os-done" />
+            className="os-task-checkbox" />
+          <svg aria-hidden="true" className="os-task-check pointer-events-none absolute h-3 w-3" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2 6l2.5 2.5L10 3" />
+          </svg>
         </label>
         <div className="min-w-0 flex-1 py-2.5">
           <p className={`break-words text-sm leading-relaxed ${done ? "text-os-done line-through" : "text-os-ink"}`}>{task.title}</p>

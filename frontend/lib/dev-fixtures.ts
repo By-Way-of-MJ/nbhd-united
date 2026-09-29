@@ -10,6 +10,7 @@
  * `?fixture=legacy` for a tenant without the web redesign (old shell).
  * `?fixture=journal-conflict` rejects the first block write with the 409 contract;
  * `?fixture=task-failure` rejects the first complete/reopen to check rollback.
+ * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
  * Journal/task writes are in-memory only and reset on a full reload.
  */
 
@@ -269,6 +270,14 @@ function bodyOf(init?: RequestInit): Record<string, unknown> {
 /** Returns a fixture response for `path`, or undefined to fall through to the network. */
 // Mutable in-memory fixtures exercise writes without a backend. Reload resets them.
 const dailyMarkdown = "# A little room for today\n\n### 07:40 — Yuki\nTook the long way to coffee. The city was unusually quiet, and I had time to notice.\n\n## Morning Report\nA clear morning, a little breathing room. Your first meeting is at **10:00**.\n\n## Today’s notes\n- [x] Sent the revised kitchen measurements\n- [ ] Ask about the counter template visit\n\n### 12:15\nAn easy run by the river. Less about the pace, more about getting outside.\n";
+const longDayMarkdown = dailyMarkdown + [
+  ["13:30", "Lunch outside, away from the screen. The afternoon felt easier after a real pause."],
+  ["14:45", "Finished the first draft. There are still rough edges, but the shape is finally there."],
+  ["16:10", "A call with a friend. We made a small plan for the weekend and left the rest open."],
+  ["18:20", "Walked home by the river. The light changed while I was crossing the bridge."],
+  ["20:30", "Dinner, a little music, and a tidy kitchen. Nothing urgent needs to follow me into tonight."],
+  ["22:10", "Last thought of a long day: leave a little room for tomorrow. Time to put the notebook down."],
+].map(([time, body]) => `\n### ${time} — Yuki\n${body}\n`).join("");
 const journalDocuments = new Map<string, string>();
 let conflictShown = false;
 let taskFailureShown = false;
@@ -409,7 +418,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
   if (doc) {
     const [, kind, slug, action] = doc;
     const bodies: Record<string, string> = {
-      daily: dailyMarkdown,
+      daily: new URLSearchParams(window.location.search).get("fixture") === "journal-long" ? longDayMarkdown : dailyMarkdown,
       project: "Kitchen first, then the back porch.\n\n## Milestones\n\n- [x] Demo and haul-away\n- [ ] Counter template, fabricator Friday\n",
       goal: "Base-building block: four days a week, mostly zone 2.\n",
       weekly: "## Wins\n\n- Four sessions\n\n## Lessons\n\n- Reflect weekly, not daily\n",

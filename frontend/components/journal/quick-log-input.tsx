@@ -13,7 +13,7 @@ export function QuickLogInput({ onSubmit, isPending, writeFirst = false }: Quick
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!content.trim()) return;
+    if (!content.trim() || isPending) return;
     try {
       await onSubmit(content.trim());
       setContent("");
@@ -24,6 +24,23 @@ export function QuickLogInput({ onSubmit, isPending, writeFirst = false }: Quick
     <>
       {writeFirst ? <p className="mb-2 text-xs leading-relaxed text-os-faint">Write something. It lands in today’s page with the time.</p> : null}
     <form data-os-quick-log onSubmit={handleSubmit} className="flex gap-2">
+      {writeFirst ? (
+        <textarea
+          placeholder="Write something…"
+          aria-label="Write something"
+          rows={Math.min(4, content.split("\n").length)}
+          value={content}
+          disabled={isPending}
+          onChange={(event) => setContent(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+          className="os-write-input min-h-[44px] min-w-0 flex-1 resize-none px-3 py-2 text-base leading-relaxed text-os-ink placeholder:text-os-faint"
+        />
+      ) : (
       <input
         type="text"
         placeholder={writeFirst ? "Write something…" : "Quick log entry..."}
@@ -32,6 +49,7 @@ export function QuickLogInput({ onSubmit, isPending, writeFirst = false }: Quick
         aria-label={writeFirst ? "Write something" : "Quick log entry"}
         className={`${writeFirst ? "min-w-0 " : ""}min-h-[44px] flex-1 rounded-panel border border-border bg-surface px-3 py-2 text-sm placeholder:text-ink-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent`}
       />
+      )}
       <button
         type="submit"
         disabled={isPending || !content.trim()}

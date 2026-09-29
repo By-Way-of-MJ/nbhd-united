@@ -36,6 +36,7 @@ export default function JournalPage() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [viewKey, setViewKey] = useState(0);
+  const [revealLatestOnLoad, setRevealLatestOnLoad] = useState(false);
 
   // Recent entries from sidebar tree
   const { data: tree } = useSidebarTreeQuery();
@@ -52,11 +53,12 @@ export default function JournalPage() {
     [queryClient],
   );
 
-  const handleNavigate = (kind: string, slug: string) => {
+  const handleNavigate = (kind: string, slug: string, revealLatest = false) => {
     setMobileSidebarOpen(false);
     // If already on this document, do not increment viewKey — that would
     // force-remount DocumentView and silently discard any in-progress draft.
     if (kind === activeKind && slug === activeSlug) return;
+    setRevealLatestOnLoad(revealLatest);
     setActiveKind(kind);
     setActiveSlug(slug);
     window.location.hash = `${kind}/${slug}`;
@@ -128,6 +130,7 @@ export default function JournalPage() {
           className="view-transition-enter min-h-0 flex-1"
         >
           <DocumentView
+            revealLatestOnLoad={revealLatestOnLoad}
             kind={activeKind}
             slug={activeSlug}
             onNavigate={handleNavigate}
