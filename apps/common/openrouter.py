@@ -90,11 +90,14 @@ def local_llm() -> tuple[str, str] | None:
     production and CI settings always return ``None`` and keep OpenRouter. A configured value that is
     not plain-HTTP loopback with an explicit port (or has no model) fails loudly, never silently.
     """
-    url = str(getattr(settings, "LOCAL_TEST_LLM_URL", "") or "").strip()
-    if not url:
+    url = getattr(settings, "LOCAL_TEST_LLM_URL", "")
+    # Only a real string counts: tests that patch ``settings`` with a mock must keep the OpenRouter path.
+    if not isinstance(url, str) or not url.strip():
         return None
+    url = url.strip()
     parts = urlsplit(url)
-    model = str(getattr(settings, "LOCAL_TEST_LLM_MODEL", "") or "").strip()
+    model = getattr(settings, "LOCAL_TEST_LLM_MODEL", "")
+    model = model.strip() if isinstance(model, str) else ""
     if (
         parts.scheme != "http"
         or parts.hostname not in {"127.0.0.1", "localhost"}
