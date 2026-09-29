@@ -205,10 +205,18 @@ class ProjectAPITests(TestCase):
                     self.assertTrue(access.project_dependencies(self.goal).filter(id=edge.id).exists())
 
     def test_creator_cannot_edit_after_asking_another_member_even_if_they_left(self):
-        step = self._editable_step_fixture(self.b, [(self.member_a, "asked")])
+        # Cleo (a plain member) creates the step and it is asked of Aya; Aya — the only
+        # owner — leaves, so ownership passes to Ben (joined first), not to Cleo.
+        projects.add_members(self.a, self.goal.id, [str(_edge(self.a, self.c).id)])
+        services.join_mission(self.c, self.c.user, self.goal.id)
+        step = self._editable_step_fixture(self.c, [(self.member_a, "asked")])
         services.leave_mission(self.a, self.goal.id)
         self.assertEqual(
-            self.jwt(self.b).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 403
+            self.jwt(self.c).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 403
+        )
+        # The member who inherited ownership can.
+        self.assertEqual(
+            self.jwt(self.b).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 200
         )
 
     def test_milestone_patch_delete_creator_or_project_owner(self):

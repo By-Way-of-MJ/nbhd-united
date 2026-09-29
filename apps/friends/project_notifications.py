@@ -98,11 +98,15 @@ def _members(goal, *, ids=None, statuses=("active",)):
 # ── Events ───────────────────────────────────────────────────────────────────
 
 
-def notify_project_invite(goal, actor_tenant) -> None:
+def notify_project_invite(goal, actor_tenant, *, membership_ids=None) -> None:
+    """``membership_ids`` limits the push to people just invited (adding people later
+    must not re-ping earlier invitations)."""
+    ids = list(membership_ids) if membership_ids is not None else None
+
     def fn():
         body = f"{_name(actor_tenant.id)} invited you to “{_short(goal.title)}”"
         _deliver(
-            _members(goal, statuses=("invited",)),
+            _members(goal, ids=ids, statuses=("invited",)),
             ptype="project_invite",
             body=body,
             mission_id=goal.id,
