@@ -5,7 +5,7 @@
     "apps/cron/suspension.py": "605f92aad51de33075f875ec318a94cfbc650438cf120b932f20f1823002da33",
     "apps/orchestrator/cron_reconcile.py": "8c2bff293a8a220be5dadb1260ca9d039496a1a814e740714482d958c1987b01",
     "apps/orchestrator/hibernation.py": "732d3e999766b7037baa7cb3c9832cd5aa03ad1cf8e8574998a9b3f85f0997cd",
-    "apps/orchestrator/tasks.py": "f956b4fd16a1d82413bf91c9c201c692a73c8dcb4903b5139ac60abc2951980f",
+    "apps/orchestrator/tasks.py": "b2330081fde77c6793d2ac33212f4a2ff0041d80679a08e466208ac6f5443b1d",
     "apps/router/container_updates.py": "57f9ad2edf42673d41e134e07f0acff87b6e9932b001aed2db838e20954e1701",
     "runtime/openclaw/chmod-audit-baseline.txt": "0a60a19c4764b8505d1be2a0f0d479463597200a67e2e1ea43600f2c3dc22ed1",
     "runtime/openclaw/claude-settings.json": "614e293f08fb4da96c49ef51b2e7eb9fcd2ee59e0af36c234128445797100a9f",
