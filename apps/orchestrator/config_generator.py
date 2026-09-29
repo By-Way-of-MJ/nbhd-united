@@ -438,8 +438,11 @@ def _prepare_cron_prompt(prompt: str, tenant: Tenant) -> str:
         "reconcile-time context only and may be hours or days old. Never use it to "
         "reason about 'today', 'this morning', 'earlier today', or whether the user "
         "has already done something today.\n"
-        "Before claiming the user has or hasn't done something today, verify against "
-        "today's daily note and journal entries. When mentioning future events, "
+        "Completion requires a Core meditation or Fuel workout marked done with completed_at, "
+        "a task marked done, or the user's explicit confirmation of that activity. "
+        "Elapsed calendar events and assistant-written daily-note lines are not proof; people skip plans. "
+        "If unconfirmed, say 'planned' or 'on the calendar', or ask; do not claim it was done or skipped. "
+        "When mentioning future events, "
         "compute exact days from the authoritative live clock (or the USER.md "
         "fallback): event date minus today = X days from now. Never say 'tomorrow' "
         "unless the math confirms exactly 1 day away.\n\n"
@@ -533,6 +536,9 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     'unavailable" for the weather section in step 10 and continue — do not let this '
     "block the rest of the briefing.\n"
     "2. Check their calendar for today's events and upcoming 48hrs\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Check for important unread emails or messages\n"
     "4. Load recent journal context — what happened yesterday, any carry-over tasks?\n"
     "5. Load the user's goals (`nbhd_document_get` with kind='goal', slug='goals') for active goals context.\n"
@@ -774,6 +780,9 @@ _EVENING_CHECKIN_PROMPT = (
     "happen before step 6 — the Journal app reads this section, so if it is empty the "
     "user will see nothing in their Journal tomorrow. Use this structure:\n"
     "### What got done today?\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "- Cross-reference morning priorities with tasks document — note completed items.\n"
     "- ✅ Item (brief description)\n\n"
     "### Goal progress\n"
@@ -953,6 +962,9 @@ _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE = (
     "Steps:\n"
     "1. Load journal context (`nbhd_journal_context`) and recent memory files\n"
     "2. {calendar_step}\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Review the tasks and goals loaded above. Check which tasks are open vs completed. "
     "If a **North Star** section is present in your loaded context, weigh the week against it — "
     "does this week move the user toward it? Let that frame the highlights, one line at most.\n"
@@ -1022,9 +1034,12 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "call `nbhd_session_mark_processed` with `{skipped: true, skip_reason: '<reason>'}` instead.\n"
     "Distillation is SILENT — do NOT send the user a message about it. Continue to Step 1.\n\n"
     "**Step 1 — Scan for anything that needs attention (in priority order):**\n"
-    "Use the daily note, tasks, and goals loaded above as your ground truth.\n"
+    "Use the daily note to avoid repeat messages; use live task and goal records for status.\n"
     "1. Memory files — anything you noted to follow up on?\n"
     "2. Calendar — any events in the next 2-3 hours? (`nbhd_calendar_list_events`)\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Recent journal context — anything unfinished? (`nbhd_journal_context`)\n"
     "4. Pending lessons — any waiting for approval? (`nbhd_lessons_pending`)\n"
     "5. Yesterday's cross-pillar signals — call `nbhd_yesterdays_signals`. "
@@ -1041,7 +1056,7 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "For each item that seems worth mentioning:\n"
     "- Is it already in the morning-report section? → skip it\n"
     "- Is it already in the heartbeat-log section? → skip it\n"
-    "- Was it marked done or addressed anywhere in the note? → skip it\n"
+    "- Was it already addressed in a message, with no new verified status? → skip it\n"
     "- Is it genuinely new information the user hasn't seen today? → keep it\n\n"
     "**Step 3 — Act.**\n"
     "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP. "

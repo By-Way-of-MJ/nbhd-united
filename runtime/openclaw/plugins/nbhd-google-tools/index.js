@@ -293,6 +293,9 @@ export default function register(api) {
     name: "nbhd_calendar_list_events",
     description:
       "List upcoming Google Calendar events for the tenant (read-only). " +
+      'Calendar entries are plans, even after their end time; never write "done", "banked", ' +
+      '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done ' +
+      "for that activity, or the user confirms it. " +
       "PREFER `window_kind` (server resolves the date range in the tenant's tz) " +
       "over hand-computing `time_min`/`time_max` from the `[Now: ...]` header — the " +
       "latter drifts near midnight in the user's local time. " +

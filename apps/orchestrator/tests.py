@@ -698,6 +698,29 @@ class ConfigGeneratorTest(TestCase):
         # And told NOT to enumerate stable days
         self.assertIn("Sunny all day", prompt)
 
+    def test_calendar_prompts_require_completion_evidence(self):
+        jobs = build_cron_seed_jobs(self.tenant) + [_build_heartbeat_cron(self.tenant)]
+        expected = {"Morning Briefing", "Evening Check-in", "Heartbeat Check-in", "Week Ahead Review"}
+        checked = set()
+        for job in jobs:
+            if job["name"] not in expected:
+                continue
+            checked.add(job["name"])
+            with self.subTest(job=job["name"]):
+                prompt = job["payload"]["message"]
+                self.assertIn("Core meditation or Fuel workout marked done with completed_at", prompt)
+                self.assertIn("a task marked done, or the user's explicit confirmation of that activity", prompt)
+                self.assertIn("Elapsed calendar events and assistant-written daily-note lines are not proof", prompt)
+                self.assertIn("say 'planned' or 'on the calendar', or ask", prompt)
+                self.assertIn("do not claim it was done or skipped", prompt)
+                self.assertIn("Calendar entries are plans, even after their end time", prompt)
+                self.assertIn('never write "done", "banked", "already done", or ✅ unless', prompt)
+                self.assertIn("for that activity, or the user confirms it", prompt)
+                self.assertNotIn("verify against today's daily note and journal entries", prompt)
+                self.assertNotIn("daily note, tasks, and goals loaded above as your ground truth", prompt)
+                self.assertNotIn("Was it marked done or addressed anywhere in the note?", prompt)
+        self.assertEqual(checked, expected)
+
     def test_morning_briefing_prompt_has_intraday_section_template(self):
         prompt = self._morning_briefing_prompt()
         self.assertIn("**Intraday:**", prompt)

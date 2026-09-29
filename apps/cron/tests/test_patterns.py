@@ -359,6 +359,34 @@ class CalendarSourceArbitrationPatternTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Cron Calendar", telegram_chat_id=838383)
 
+    def test_calendar_patterns_require_completion_evidence(self):
+        cases = [
+            ("daily_briefing", {}),
+            ("domain_summary", {"query_tool": "nbhd_calendar_list_events", "render_block": "calendar_summary"}),
+            ("domain_summary", {"query_tool": "nbhd_datebook_read", "render_block": "calendar_summary"}),
+            ("quote_user_intent", {"text": "Check my plans", "refresh_facts_via": "nbhd_calendar_list_events"}),
+            ("quote_user_intent", {"text": "Check my plans", "refresh_facts_via": "nbhd_calendar_get_freebusy"}),
+            ("quote_user_intent", {"text": "Check my plans", "refresh_facts_via": "nbhd_datebook_read"}),
+        ]
+        for ready in (False, True):
+            self._set_datebook_ready(ready)
+            for pattern, raw_payload in cases:
+                with self.subTest(ready=ready, pattern=pattern, payload=raw_payload):
+                    handler = get_handler(pattern)
+                    data = handler.build_oc_data(
+                        handler.validate_payload(raw_payload),
+                        tenant=self.tenant,
+                        name="Calendar check",
+                        schedule=_RECURRING_SCHEDULE,
+                    )
+                    message = data["payload"]["message"]
+                    self.assertIn("Calendar entries are plans, even after their end time", message)
+                    self.assertIn('never write "done", "banked", "already done", or ✅ unless', message)
+                    self.assertIn("Core meditation, Fuel workout, or task is marked done", message)
+                    self.assertIn("for that activity, or the user confirms it", message)
+                    if pattern == "quote_user_intent":
+                        self.assertTrue(message.endswith("VERBATIM USER INTENT:\nCheck my plans"))
+
     def _set_datebook_ready(self, ready: bool) -> None:
         self.tenant.datebook_manifest_ok = ready
         self.tenant.datebook_enabled = ready
