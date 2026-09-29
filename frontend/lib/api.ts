@@ -2757,3 +2757,45 @@ export function regenerateInviteCode(circleId: string): Promise<{ circle_id: str
 export function fetchDatebookAgenda(days = 7): Promise<import("@/lib/types").DatebookAgenda> {
   return apiFetch<import("@/lib/types").DatebookAgenda>(`/api/v1/datebook/agenda/?days=${days}`);
 }
+
+export interface TaskFilters {
+  status?: "open" | "done";
+  completed_after?: string;
+}
+
+export function fetchTasks(filters: TaskFilters = {}): Promise<import("./types").JournalTask[]> {
+  return apiFetch(`/api/v1/journal/tasks/?${new URLSearchParams({ ...filters })}`, { cache: "no-store" });
+}
+
+export function createTask(data: { title: string; due_date?: string | null; parent_goal_id?: string | null }): Promise<import("./types").JournalTask> {
+  return apiFetch("/api/v1/journal/tasks/", { method: "POST", body: JSON.stringify(data) });
+}
+
+export interface BlockReplacement { index: number; original: string; replacement: string }
+
+export class JournalBlockConflict extends Error {
+  readonly status = 409;
+  constructor(public document: DocumentResponse) {
+    super("This part changed while you were editing");
+    this.name = "JournalBlockConflict";
+  }
+}
+
+export async function replaceDocumentBlock(kind: string, slug: string, data: BlockReplacement): Promise<DocumentResponse> {
+  try {
+    return await apiFetch(`/api/v1/journal/documents/${kind}/${slug}/blocks/replace/`, { method: "POST", body: JSON.stringify(data) });
+  } catch (error) {
+    // apiFetch preserves the HTTP status and raw response body in Error.message.
+    if (error instanceof Error && (error as Error & { status?: number }).status === 409) {
+      let body;
+      try { body = JSON.parse(error.message); } catch { /* Other 409 guards are ordinary errors. */ }
+      if (body?.error === "block_changed" && typeof body.document?.markdown === "string") throw new JournalBlockConflict(body.document);
+    }
+    throw error;
+  }
+}
+
+/** Goal labels for tasks, including goals outside the active Horizons list. */
+export function fetchTaskGoals(): Promise<Array<{ id: string; title: string }>> {
+  return apiFetch("/api/v1/journal/goals/");
+}

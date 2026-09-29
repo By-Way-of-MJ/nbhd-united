@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useRef, useEffect, useCallback } from "react";
 import clsx from "clsx";
 import { useQueryClient } from "@tanstack/react-query";
@@ -8,6 +9,7 @@ import { fetchDocument } from "@/lib/api";
 import { todayISO } from "@/lib/journal-date";
 import {
   useSidebarTreeQuery,
+  useTenantQuery,
   useDeleteDocumentMutation,
   useClearDocumentMutation,
   useCreateDocumentMutation,
@@ -74,6 +76,8 @@ function SectionIcon({ kind }: { kind: string }) {
 }
 
 export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggle, recentEntries }: SidebarProps) {
+  const { data: tenant } = useTenantQuery();
+  const openSky = !!tenant?.web_redesign;
   const queryClient = useQueryClient();
   const { data: tree, isLoading } = useSidebarTreeQuery();
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -255,7 +259,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
 
       {/* Primary nav */}
       <div className="px-2 py-1 space-y-0.5">
-        {PRIMARY_NAV.map((item) => {
+        {PRIMARY_NAV.filter((item) => !openSky || item.kind !== "tasks").map((item) => {
           const isActive = activeKind === item.kind;
           const Icon = item.icon;
           const slug = item.kind === "daily" ? todayISO() : item.kind;
@@ -281,6 +285,8 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
           );
         })}
       </div>
+
+      {openSky ? <Link href="/horizons" className="mx-5 mb-4 flex min-h-[44px] items-center text-xs leading-relaxed text-os-accent">Tasks and goals live in Horizons</Link> : null}
 
       {/* Scrollable content: Recent + user documents */}
       <div className="flex-1 overflow-y-auto px-2 py-2 border-t border-white/[0.03] mt-1.5 custom-scrollbar">

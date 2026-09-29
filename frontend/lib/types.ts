@@ -1423,3 +1423,18 @@ export type DatebookAgenda =
       items: AgendaItem[];
       truncated: boolean;
     };
+
+/** Owner typed task API (/journal/tasks/). */
+export interface JournalTask {
+  id: string;
+  title: string;
+  description: string;
+  pillar: string;
+  status: "open" | "done" | "archived";
+  due_date: string | null;
+  completed_at: string | null;
+  parent_goal_id: string | null;
+  related_ref: string;
+  created_at: string;
+  updated_at: string;
+}

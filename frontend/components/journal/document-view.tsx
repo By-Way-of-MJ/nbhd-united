@@ -4,6 +4,7 @@ import clsx from "clsx";
 import dynamic from "next/dynamic";
 import { type MouseEvent, type TouchEvent as ReactTouchEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
+import { DailyBlocks } from "@/components/journal/daily-blocks";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { type Editor } from "@tiptap/react";
 import { MarkdownHelpSheet } from "@/components/journal/markdown-help-sheet";
@@ -13,6 +14,7 @@ import { DocumentHeader } from "@/components/journal/document-header";
 import { CurrentStatusCard } from "@/components/journal/current-status-card";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  useTenantQuery,
   useDocumentQuery,
   useJournalStatusQuery,
   useUpdateDocumentMutation,
@@ -118,6 +120,8 @@ function SaveStatusIndicator({ status }: { status: SaveStatus }) {
 }
 
 export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: DocumentViewProps) {
+  const { data: tenant } = useTenantQuery();
+  const blockMode = !!tenant?.web_redesign && kind === "daily";
   const [editing, setEditing] = useState(false);
   const [draft, setDraftState] = useState("");
   // Mirror of `draft` readable synchronously — the editor debounces its
@@ -338,7 +342,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
   const handleQuickLog = async (content: string) => {
     await appendMutation.mutateAsync({
       kind,
-      slug,
+      slug: blockMode ? todayISO() : slug,
       content,
     });
   };
@@ -474,12 +478,13 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
         showSavedIndicator={savedIndicator}
         onToggleSidebar={onToggleSidebar}
         readOnly={typedManaged}
+        blockMode={blockMode}
       />
 
       {/* Content */}
       <div className="flex-1 overflow-x-hidden overflow-y-auto">
         {/* Live current-status surface — read-only, beside the editable log. */}
-        {kind === "daily" && !editing ? <CurrentStatusCard /> : null}
+        {kind === "daily" && !editing && !blockMode ? <CurrentStatusCard /> : null}
         {editing && isMobile !== true ? (
           <div className="p-4 lg:p-8">
             {/* Premium writing surface */}
@@ -502,6 +507,8 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
               </p>
             )}
           </div>
+        ) : blockMode ? (
+          <DailyBlocks key={slug} document={doc} slug={slug} />
         ) : (
           <div
             data-os-document-body
@@ -553,6 +560,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
             {kind === "daily" ? (
               <div className="min-w-0 flex-1">
                 <QuickLogInput
+                  writeFirst={blockMode}
                   onSubmit={handleQuickLog}
                   isPending={appendMutation.isPending}
                 />
@@ -560,7 +568,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
             ) : (
               <div className="flex-1" />
             )}
-            {!typedManaged && <PencilButton onClick={handleEdit} />}
+            {!typedManaged && !blockMode && <PencilButton onClick={handleEdit} />}
           </div>
           {appendMutation.isError && (
             <p className="mt-1 text-xs text-rose-text">Failed to add entry.</p>
@@ -572,6 +580,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
       {kind === "daily" && !editing && isMobile !== true && (
         <div className="border-t border-white/[0.04] px-4 py-2.5 lg:px-6 lg:py-3">
           <QuickLogInput
+            writeFirst={blockMode}
             onSubmit={handleQuickLog}
             isPending={appendMutation.isPending}
           />

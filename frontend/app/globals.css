@@ -1018,3 +1018,15 @@ html.open-sky [data-os-fuel] [data-os-tab][data-active="true"] { color: var(--os
 html.open-sky [data-os-fuel] [data-os-tab] > .absolute { background: var(--os-accent); }
 html.open-sky [data-os-fuel] [data-os-surface] > button.absolute:focus-visible { outline-offset: -2px; }
 html.open-sky [data-os-journal] input[type="checkbox"]:checked { accent-color: var(--os-done); }
+
+/* Daily blocks remain unboxed; only the active textarea is an edit surface. */
+html.open-sky .os-journal-block + .os-journal-block { border-top: 1px solid var(--os-hairline); }
+html.open-sky .os-journal-block .prose { color: var(--os-muted); font-size: 0.9375rem; line-height: 1.85; }
+html.open-sky .os-journal-block .os-label { color: var(--os-accent); }
+html.open-sky .os-journal-block .contains-task-list { list-style-type: disc; padding-left: 1.5em; }
+html.open-sky .os-journal-block a { cursor: pointer; }
+html.open-sky .os-journal-block[data-block-kind="entry"] .prose { color: var(--os-ink); }
+html.open-sky .os-journal-blocks .os-btn-text:disabled { opacity: 0.45; cursor: not-allowed; }
+@media (max-width: 639px) {
+  html.open-sky [data-os-block-header] > .flex:first-child { flex-basis: auto; }
+}
