@@ -526,8 +526,14 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
             # within the same OpenClaw family, checked against the LIVE Azure
             # image (``image_only_update_allowed``) — a family jump is a
             # migration, not a refresh.
+            #
+            # Only on a CRON wake: it runs ~4 min ahead of the cron, so nobody is
+            # waiting on the image pull + first boot. A wake for a person's
+            # message stays a plain wake (MJ 2026-09-29); that tenant upgrades at
+            # its next cron wake.
             needs_image_refresh = (
-                desired_tag != "latest"
+                cron_wake
+                and desired_tag != "latest"
                 and current_tag != desired_tag
                 and desired_tag != (tenant.image_refresh_blocked_tag or "")
                 and image_rollout_allowed(tenant.id)

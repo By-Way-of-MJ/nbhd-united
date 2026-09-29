@@ -77,7 +77,7 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         self.tenant.container_image_tag = "oldsha456"
         self.tenant.save(update_fields=["container_image_tag"])
 
-        result = wake_hibernated_tenant(self.tenant)
+        result = wake_hibernated_tenant(self.tenant, cron_wake=True)
 
         self.assertTrue(result)
         mock_update_image.assert_called_once_with(
@@ -241,7 +241,7 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
             return original_update(queryset, **updates)
 
         with patch.object(QuerySet, "update", autospec=True, side_effect=stale_once):
-            result = wake_hibernated_tenant(self.tenant)
+            result = wake_hibernated_tenant(self.tenant, cron_wake=True)
 
         self.assertTrue(result)
         self.assertEqual(image_write_attempts, 2)
@@ -394,7 +394,7 @@ class WakeConfigSchemaSyncTest(TestCase):
         )
         self.tenant.refresh_from_db()
 
-        result = wake_hibernated_tenant(self.tenant)
+        result = wake_hibernated_tenant(self.tenant, cron_wake=True)
 
         self.assertTrue(result)
         mock_update_image.assert_called_once()
@@ -649,23 +649,32 @@ class WakeImageRefreshSafetyTest(TestCase):
 
     @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     def test_refresh_schedules_health_check_with_previous_image(self, _guard):
-        self.assertTrue(wake_hibernated_tenant(self.tenant))
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
         self.update_image.assert_called_once_with("oc-safety", "test.azurecr.io/nbhd-openclaw:2026.9.4-newsha1")
         [call] = self._verify_calls()
         self.assertEqual(call.args[1:], (str(self.tenant.id), "2026.9.4-newsha1", self.OLD_IMAGE, 1))
         self.assertEqual(call.kwargs["delay_seconds"], 240)
 
     @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    def test_wake_for_a_message_never_refreshes(self, _guard):
+        """Nobody waits on an image pull: only cron wakes (~4 min lead) refresh."""
+        self.assertTrue(wake_hibernated_tenant(self.tenant))
+        self.update_image.assert_not_called()
+        self.assertEqual(self._verify_calls(), [])
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.container_image_tag, "2026.9.4-oldsha1")
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     def test_blocked_tag_is_not_retried(self, _guard):
         self.tenant.image_refresh_blocked_tag = "2026.9.4-newsha1"
         self.tenant.save(update_fields=["image_refresh_blocked_tag"])
-        self.assertTrue(wake_hibernated_tenant(self.tenant))
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
         self.update_image.assert_not_called()
         self.assertEqual(self._verify_calls(), [])
 
     @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=False)
     def test_family_jump_is_not_a_wake_refresh(self, _guard):
-        self.assertTrue(wake_hibernated_tenant(self.tenant))
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
         self.update_image.assert_not_called()
 
     def _app(self, latest, ready):
