@@ -15,7 +15,15 @@ class NeighborProfileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = NeighborProfile
-        fields = ("handle", "display_name", "bio", "avatar_hue")
+        fields = ("handle", "display_name", "bio", "avatar_hue", "photo_url")
+        read_only_fields = ("photo_url",)
+
+    photo_url = serializers.SerializerMethodField()
+
+    def get_photo_url(self, profile):
+        from .access import photo_url
+
+        return photo_url(profile)
 
     def validate_handle(self, value):
         tenant = self.context["tenant"]

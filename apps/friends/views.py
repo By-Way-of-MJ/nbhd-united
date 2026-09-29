@@ -11,11 +11,12 @@ from __future__ import annotations
 from django.conf import settings
 from rest_framework import status
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import circles, services
+from . import access, circles, services
 from .serializers import InviteCreateSerializer, NeighborProfileSerializer, WaveCreateSerializer
 from .throttling import AdoptDayThrottle, MessageSendHourThrottle, WaveSendDayThrottle
 
@@ -105,6 +106,54 @@ class ProfileView(FriendsView):
         return Response(serializer.data)
 
 
+class ProfilePhotoView(FriendsView):
+    """POST (multipart ``photo``) / DELETE /api/v1/friends/profile/photo/ — set,
+    replace or remove MY profile photo. Uploads are cleaned and safety-checked
+    before anything is stored (``apps/friends/photos.py``)."""
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        from . import photos
+
+        tenant = self.get_tenant(request)
+        profile = services.ensure_neighbor_profile(tenant, request.user)
+        upload = request.FILES.get("photo")
+        raw = upload.read(photos.MAX_UPLOAD_BYTES + 1) if upload else b""
+        return Response({"photo_url": photos.set_photo(profile, raw)})
+
+    def delete(self, request):
+        from . import photos
+
+        tenant = self.get_tenant(request)
+        profile = services.ensure_neighbor_profile(tenant, request.user)
+        photos.remove_photo(profile)
+        return Response({"photo_url": None})
+
+
+class PhotoView(FriendsView):
+    """GET /api/v1/friends/photos/<profile_id>/?v=<n> — a person's photo bytes, only
+    for someone ``access.can_view_photo`` allows. Anyone else (or a missing photo)
+    gets the same 404, so the endpoint never reveals who has a photo."""
+
+    def get(self, request, profile_id):
+        from django.http import HttpResponse
+
+        from . import access
+        from .models import NeighborProfile
+
+        tenant = self.get_tenant(request)
+        profile = NeighborProfile.objects.filter(id=profile_id).first()
+        row = access.photo_bytes(profile_id) if profile and access.can_view_photo(tenant, profile) else None
+        if not row:
+            raise NotFound("No photo.")
+        image, content_type = row
+        response = HttpResponse(bytes(image), content_type=content_type)
+        current = str(request.query_params.get("v", "")) == str(profile.photo_version)
+        response["Cache-Control"] = "private, max-age=31536000, immutable" if current else "private, max-age=60"
+        return response
+
+
 class InviteCreateView(FriendsView):
     """POST /api/v1/friends/invites/ — mint a wave link/QR token."""
 
@@ -160,6 +209,7 @@ def _wave_result(edge, viewer_tenant) -> dict:
         "display_name": profile.display_name if profile else (getattr(other.user, "display_name", None) or "Neighbor"),
         "handle": profile.handle if profile else None,
         "avatar_hue": profile.avatar_hue if profile else 210,
+        "photo_url": access.photo_url(profile),
     }
 
 
