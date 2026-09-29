@@ -2,10 +2,10 @@
   "revision": "bd8abe4ea79196cf19eb44c3422b84309cb1b34c",
   "files": {
     "apps/cron/share_cron_sync.py": "7a3179159b98afca8c4aa79f9390971dc7b9f7516ab1ca45c895362fff6043ee",
-    "apps/cron/suspension.py": "9fef2ed3f2e5ec0c8dec0289e1ebeb5f7bb36e1beb46d739d7925431b9008e90",
+    "apps/cron/suspension.py": "605f92aad51de33075f875ec318a94cfbc650438cf120b932f20f1823002da33",
     "apps/orchestrator/cron_reconcile.py": "8c2bff293a8a220be5dadb1260ca9d039496a1a814e740714482d958c1987b01",
     "apps/orchestrator/hibernation.py": "732d3e999766b7037baa7cb3c9832cd5aa03ad1cf8e8574998a9b3f85f0997cd",
-    "apps/orchestrator/tasks.py": "2298ea8f2325158616179140481931b32c5a12664538669bc9233c9c9768b996",
+    "apps/orchestrator/tasks.py": "f956b4fd16a1d82413bf91c9c201c692a73c8dcb4903b5139ac60abc2951980f",
     "apps/router/container_updates.py": "57f9ad2edf42673d41e134e07f0acff87b6e9932b001aed2db838e20954e1701",
     "runtime/openclaw/chmod-audit-baseline.txt": "0a60a19c4764b8505d1be2a0f0d479463597200a67e2e1ea43600f2c3dc22ed1",
     "runtime/openclaw/claude-settings.json": "614e293f08fb4da96c49ef51b2e7eb9fcd2ee59e0af36c234128445797100a9f",

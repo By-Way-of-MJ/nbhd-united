@@ -999,6 +999,7 @@ class ImageUpdateCronRestoreTest(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-test-container"
         self.tenant.container_fqdn = "oc-test.internal.example.io"
+        self.tenant.openclaw_version = "2026.5.28"  # gateway snapshot/restore path
         self.tenant.save()
 
     @patch("apps.cron.publish.publish_task")

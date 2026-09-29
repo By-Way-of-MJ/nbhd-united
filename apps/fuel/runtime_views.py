@@ -2641,6 +2641,19 @@ def _manage_fuel_cron(tenant, plan, action="create"):
     except FuelProfile.DoesNotExist:
         pass
 
+    # 9.4 gates the gateway cron.* calls below. The signed crons file carries the
+    # same canonical set (share_cron_sync._fuel_jobs → _desired_fuel_crons), and
+    # the in-container helper removes any nbhd:fuel:* job no longer in it, so
+    # republishing covers create, update and remove.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    if tenant_uses_file_cron_sync(tenant):
+        try:
+            write_tenant_crons_file(tenant)
+        except Exception:
+            logger.exception("Fuel cron %s: crons file publish failed for tenant %s (best-effort)", action, tenant.id)
+        return
+
     try:
         if action in ("create", "remove", "update"):
             # Sweep existing _fuel:* cron(s) before (re)creating. "create" is

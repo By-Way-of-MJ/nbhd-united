@@ -17,7 +17,8 @@ class FuelWelcomeActivationTransitionTest(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "fresh-fuel-container"
         self.tenant.container_fqdn = "fresh-fuel.example.com"
-        self.tenant.save(update_fields=["status", "container_id", "container_fqdn"])
+        self.tenant.openclaw_version = "2026.5.28"  # gateway welcome path; 9.4 is test_welcome_reconcile
+        self.tenant.save(update_fields=["status", "container_id", "container_fqdn", "openclaw_version"])
 
         self.client = APIClient()
         token = RefreshToken.for_user(self.tenant.user).access_token

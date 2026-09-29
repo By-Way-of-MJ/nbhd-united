@@ -34,6 +34,8 @@ _SCHEDULE_TARGET = "apps.cron.services.create_typed_cron"
 class WorkoutCongratsTriggerTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Congrats Test", telegram_chat_id=800900)
+        self.tenant.openclaw_version = "2026.5.28"  # gateway cron.add path
+        self.tenant.save(update_fields=["openclaw_version"])
         self.user = self.tenant.user
         self.client = APIClient()
         refresh = RefreshToken.for_user(self.user)

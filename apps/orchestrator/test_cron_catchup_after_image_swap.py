@@ -153,6 +153,7 @@ class RestoreFiresMissedCronsTests(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-catchup-test"
         self.tenant.container_fqdn = "oc-catchup-test.internal"
+        self.tenant.openclaw_version = "2026.5.28"  # gateway path; 9.4 is Oc94PostImageRestoreTests
         # restore_crons_after_image_update_task has a dual path; this test
         # asserts the legacy gateway sequence (cron.list → cron.add → ...).
         # Pin canonical=False so migration 0067's default flip doesn't make
@@ -278,3 +279,23 @@ class RestoreFiresMissedCronsTests(TestCase):
 
         run_calls = [c for c in mock_invoke.call_args_list if c.args[1] == "cron.run"]
         self.assertEqual(len(run_calls), 2)
+
+
+class Oc94PostImageRestoreTests(TestCase):
+    """9.4 gates the gateway cron.*: the post-image restore republishes the signed file."""
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=7)
+    def test_republishes_file_and_skips_gateway_restore(self, mock_write, mock_invoke):
+        from apps.orchestrator.tasks import restore_crons_after_image_update_task
+
+        tenant = create_tenant(display_name="Restore94", telegram_chat_id=909494)
+        tenant.container_id = "oc-restore94"
+        tenant.openclaw_version = "2026.9.4"
+        tenant.cron_jobs_snapshot = {"jobs": [{"name": "Morning Briefing"}], "snapshot_at": timezone.now().isoformat()}
+        tenant.save(update_fields=["container_id", "openclaw_version", "cron_jobs_snapshot"])
+
+        restore_crons_after_image_update_task(str(tenant.id))
+
+        mock_write.assert_called_once()
+        mock_invoke.assert_not_called()

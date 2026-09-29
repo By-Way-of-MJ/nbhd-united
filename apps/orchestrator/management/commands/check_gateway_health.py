@@ -138,12 +138,14 @@ class Command(BaseCommand):
             return False
 
     def _check_tools_invoke(self, tenant: Tenant) -> bool:
-        self.stdout.write("\n5. tools/invoke works (cron.list)")
-        from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+        # 9.4 gates the gateway cron.list; list_tenant_crons reads the
+        # container's cron-state readback there instead.
+        self.stdout.write("\n5. cron state readable (cron.list / 9.4 state file)")
+        from apps.cron.gateway_client import GatewayError, list_tenant_crons
         from apps.orchestrator.services import _extract_cron_jobs
 
         try:
-            result = invoke_gateway_tool(tenant, "cron.list", {})
+            result = list_tenant_crons(tenant)
             job_count = len(_extract_cron_jobs(result) or [])
             self.stdout.write(f"   returned {job_count} jobs")
             self.stdout.write(self.style.SUCCESS("   PASS"))

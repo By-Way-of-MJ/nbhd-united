@@ -110,6 +110,8 @@ class ObserveDeliveryTest(TestCase):
 class RunCronFireSuiteTest(TestCase):
     def setUp(self):
         self.tenant = _synthetic_tenant()
+        self.tenant.openclaw_version = "2026.5.28"  # gateway cron.add path this suite mocks
+        self.tenant.save(update_fields=["openclaw_version"])
         self.settings_ctx = override_settings(EVAL_JOURNEY_TENANT_ID=str(self.tenant.id))
         self.settings_ctx.enable()
         self.addCleanup(self.settings_ctx.disable)

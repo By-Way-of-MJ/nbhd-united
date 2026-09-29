@@ -632,14 +632,22 @@ class ProfileView(APIView):
                                 tenant.id,
                             )
 
+                        from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
                         try:
-                            result = apply_or_defer_gateway_call(
-                                tenant,
-                                _sync_cron_timezones,
-                                label="profile.timezone.cron_sweep",
-                            )
-                            if result is DEFERRED:
-                                applied_state = "pending"
+                            if tenant_uses_file_cron_sync(tenant):
+                                # 9.4 gates the gateway cron.* sweep. Move the
+                                # canonical rows instead; each save republishes
+                                # the signed crons file (works while hibernated).
+                                _sync_cron_row_timezones(tenant, request.user.timezone)
+                            else:
+                                result = apply_or_defer_gateway_call(
+                                    tenant,
+                                    _sync_cron_timezones,
+                                    label="profile.timezone.cron_sweep",
+                                )
+                                if result is DEFERRED:
+                                    applied_state = "pending"
                         except Exception:
                             logger.exception(
                                 "Failed to sync cron timezones for tenant %s",
@@ -651,6 +659,27 @@ class ProfileView(APIView):
         response_data = dict(serializer.data)
         response_data["applied"] = applied_state
         return Response(response_data)
+
+
+def _sync_cron_row_timezones(tenant, new_tz: str) -> int:
+    """Point every recurring (``kind:"cron"``) CronJob row at ``new_tz``.
+
+    ``at`` schedules are absolute instants and ``every`` has no clock, so only
+    cron expressions move. Typed rows keep ``data.schedule`` through the derive
+    signal. Returns the number of rows changed.
+    """
+    from apps.cron.models import CronJob
+
+    changed = 0
+    for row in CronJob.objects.filter(tenant=tenant, data__schedule__kind="cron"):
+        schedule = dict((row.data or {}).get("schedule") or {})
+        if schedule.get("tz") == new_tz:
+            continue
+        row.data = {**row.data, "schedule": {**schedule, "tz": new_tz}}
+        row.save(update_fields=["data"])
+        changed += 1
+    logger.info("Moved %d cron row timezone(s) to %s for tenant %s", changed, new_tz, tenant.id)
+    return changed
 
 
 def _do_hard_delete(user) -> None:

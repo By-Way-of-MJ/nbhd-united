@@ -6426,7 +6426,8 @@ class ManageFuelCronGateTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Cron Gate", telegram_chat_id=800777)
         self.tenant.fuel_enabled = True
-        self.tenant.save(update_fields=["fuel_enabled"])
+        self.tenant.openclaw_version = "2026.5.28"  # gateway path; see test_9_4_publishes_signed_file
+        self.tenant.save(update_fields=["fuel_enabled", "openclaw_version"])
         self.plan = WorkoutPlan.objects.create(
             tenant=self.tenant,
             name="My Plan",
@@ -6460,6 +6461,20 @@ class ManageFuelCronGateTests(TestCase):
         self.assertIn("cron.add", tools)
         add_call = next(c for c in mock_invoke.call_args_list if c.args[1] == "cron.add")
         self.assertEqual(add_call.args[2], {"job": {"name": "_fuel:My Plan"}})
+
+    @patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=1)
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_9_4_publishes_signed_file(self, mock_invoke, mock_write):
+        """9.4 gates the gateway cron.*; the signed file carries the Fuel set."""
+        from apps.fuel.runtime_views import _manage_fuel_cron
+
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save(update_fields=["openclaw_version"])
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False)
+        for action in ("create", "update", "remove"):
+            _manage_fuel_cron(self.tenant, self.plan, action=action)
+        self.assertEqual(mock_write.call_count, 3)
+        mock_invoke.assert_not_called()
 
     @patch("apps.orchestrator.config_generator.build_fuel_workout_cron", return_value={"name": "_fuel:My Plan"})
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
