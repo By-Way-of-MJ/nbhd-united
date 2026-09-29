@@ -206,7 +206,7 @@ export function TodayCheckIn() {
     return (
       <section
         aria-label="Today's check-in"
-        className="rounded-panel border border-border bg-surface-elevated/60 px-4 py-3 mb-5 flex items-center justify-between gap-3"
+        data-os-surface className="rounded-panel border border-border bg-surface-elevated/60 px-4 py-3 mb-5 flex items-center justify-between gap-3"
       >
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
           <span className="font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-emerald-text bg-emerald-bg rounded-full px-2 py-1 shrink-0">
@@ -252,7 +252,7 @@ export function TodayCheckIn() {
   return (
     <section
       aria-label="Daily check-in"
-      className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5 mb-5 sm:mb-6 animate-reveal-1"
+      data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5 mb-5 sm:mb-6 animate-reveal-1"
     >
       <header className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2 min-w-0">
@@ -452,7 +452,7 @@ function FieldShell({
 }) {
   return (
     <div
-      className={`rounded-xl border bg-surface px-3 ${compact ? "py-2" : "py-2.5"} transition ${
+      data-os-field className={`rounded-xl border bg-surface px-3 ${compact ? "py-2" : "py-2.5"} transition ${
         logged ? "border-emerald-text/40" : "border-border focus-within:border-accent"
       }`}
     >

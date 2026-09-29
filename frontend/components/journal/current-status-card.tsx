@@ -132,7 +132,7 @@ export function CurrentStatusCard() {
   };
 
   return (
-    <div className="mx-4 mt-4 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-4 lg:mx-6 lg:mt-6 lg:p-5">
+    <div data-os-current-status className="mx-4 mt-4 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-4 lg:mx-6 lg:mt-6 lg:p-5">
       <div className="mb-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.12em] text-ink-faint/60">
         Current status
         <span className="normal-case tracking-normal text-ink-faint/40">· as of now</span>

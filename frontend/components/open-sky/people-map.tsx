@@ -225,6 +225,7 @@ export function PeopleMap({
             />
             <span
               aria-hidden="true"
+              data-os-map-label={side}
               className={`pointer-events-none absolute flex flex-col ${SIDE_CLASS[side]} ${
                 showName ? "" : "hidden group-hover:flex group-focus-visible:flex"
               }`}
