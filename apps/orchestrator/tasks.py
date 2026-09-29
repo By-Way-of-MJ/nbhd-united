@@ -292,6 +292,12 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
         )
         return
 
+    # A tag whose refresh already failed its boot health check (and was
+    # reverted) is not retried automatically; see verify_wake_image_refresh_task.
+    if desired_tag == (tenant.image_refresh_blocked_tag or ""):
+        logger.info("apply_single_tenant_image: %s is blocked for tenant %s — skipping", desired_tag, tenant_id[:8])
+        return
+
     # Phase 1: Snapshot current cron state before the restart wipes SQLite.
     # 9.4 skips it: the gateway list is gated and the post-image restore
     # republishes the signed file instead of replaying a snapshot.
@@ -328,6 +334,13 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
     # Phase 2: Update the container image.
     desired_image = f"{django_settings.AZURE_ACR_SERVER}/nbhd-openclaw:{desired_tag}"
     version_changed = False
+    # The image Azure is serving now, for the boot health check's revert.
+    try:
+        from apps.orchestrator.hibernation import _live_openclaw_image
+
+        previous_image = _live_openclaw_image(tenant.container_id)
+    except Exception:
+        previous_image = None
     try:
         update_container_image(tenant.container_id, desired_image)
         # Keep openclaw_version (config SCHEMA) in lockstep with the image we
@@ -378,6 +391,24 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
 
     # Phase 3: Schedule post-restart cron restore (90s for container startup).
     from apps.cron.publish import publish_task as publish_qstash_task
+
+    # Same-family bumps must prove the new revision boots, or go back to the
+    # previous image (2026-09-28: Kiho's traffic moved to a revision that never
+    # started). A family change is a migration with its own rollback.
+    if previous_image and not version_changed:
+        from apps.orchestrator.hibernation import WAKE_IMAGE_VERIFY_DELAY_SECONDS
+
+        try:
+            publish_qstash_task(
+                "verify_wake_image_refresh",
+                tenant_id,
+                desired_tag,
+                previous_image,
+                1,
+                delay_seconds=WAKE_IMAGE_VERIFY_DELAY_SECONDS,
+            )
+        except Exception:
+            logger.warning("Failed to schedule image health check for %s", tenant_id[:8], exc_info=True)
 
     try:
         publish_qstash_task(
