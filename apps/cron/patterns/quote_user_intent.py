@@ -29,6 +29,7 @@ from apps.billing.constants import DEEPSEEK_FLASH_MODEL
 
 from . import register_handler
 from .base import (
+    CALENDAR_READ_TOOLS,
     DATEBOOK_CALENDAR_READ_TOOL,
     PatternHandler,
     PatternPayload,
@@ -133,6 +134,13 @@ class QuoteUserIntentHandler(PatternHandler):
                 "follow-up crons.\n\n"
                 f"VERBATIM USER INTENT:\n{text}"
             )
+
+        if refresh_tool in CALENDAR_READ_TOOLS:
+            message = (
+                'Calendar entries are plans, even after their end time; never write "done", "banked", '
+                '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+                "for that activity, or the user confirms it.\n\n"
+            ) + message
 
         return {
             "name": name,

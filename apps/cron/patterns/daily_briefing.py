@@ -160,6 +160,9 @@ class DailyBriefingHandler(PatternHandler):
             "  - To mention today's calendar, you MUST call "
             f"{calendar_instruction} and quote event titles/times "
             "as returned. Do not paraphrase times.\n"
+            '  - Calendar entries are plans, even after their end time; never write "done", "banked", '
+            '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+            "for that activity, or the user confirms it.\n"
             "  - Every factual claim in the briefing must trace to a tool "
             "result from this turn. Anything you can't ground via a tool "
             "call, omit.\n"

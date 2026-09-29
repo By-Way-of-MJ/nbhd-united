@@ -29,6 +29,7 @@ from apps.billing.constants import DEEPSEEK_FLASH_MODEL
 
 from . import register_handler
 from .base import (
+    CALENDAR_READ_TOOLS,
     DATEBOOK_CALENDAR_READ_TOOL,
     PatternHandler,
     PatternPayload,
@@ -147,6 +148,13 @@ class DomainSummaryHandler(PatternHandler):
             "turn — your job is to summarize, not to mutate state.\n\n"
             f"QUERY ARGS:\n{payload.query_args}"
         )
+
+        if query_tool in CALENDAR_READ_TOOLS:
+            message += "\n\n" + (
+                'Calendar entries are plans, even after their end time; never write "done", "banked", '
+                '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+                "for that activity, or the user confirms it.\n"
+            )
 
         return {
             "name": name,

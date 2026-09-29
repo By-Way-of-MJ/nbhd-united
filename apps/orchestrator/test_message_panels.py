@@ -37,9 +37,9 @@ class MorningPanelPromptTests(SimpleTestCase):
         for message, digest in (
             (
                 _build_morning_briefing_prompt(self.tenant),
-                "971a2d208ea892278913a5781da5bc41977e6c72500ba79fa68b4235a98d8ccd",
+                "434babe5bb7620dfcd5e0638f4453ba16a5ff23e661e8adf4b757ad4c5567439",
             ),
-            (self.typed()["message"], "ba590434878b1fbb42708f7e6e816eb758a4b70774d13aa1db812d6cd91245c5"),
+            (self.typed()["message"], "beb27e0cd02da4431fc5c0122bd60d1def48b50d28fea13bda78d6839fc51a0c"),
         ):
             self.assertEqual(hashlib.sha256(message.encode()).hexdigest(), digest)
             self.assertNotIn("attach panels", message)
