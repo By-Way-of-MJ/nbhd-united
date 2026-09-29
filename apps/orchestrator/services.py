@@ -2457,6 +2457,14 @@ def sync_heartbeat_cron(
     if not tenant.container_fqdn:
         return "ok"
 
+    # 9.4 gates the gateway cron.*. The heartbeat is a system CronJob row that
+    # update_tenant_config already adds/updates/reaps from build_cron_seed_jobs
+    # (refresh_system_cron_rows_from_seed); the signed crons file carries it.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
+    if tenant_uses_file_cron_sync(tenant):
+        return "ok"
+
     # Fetch existing jobs if not provided
     if existing_by_name is None:
         try:

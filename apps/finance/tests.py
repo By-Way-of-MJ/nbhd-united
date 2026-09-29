@@ -1792,7 +1792,8 @@ class FinanceWelcomeIdempotencyTests(TestCase):
 
         self.tenant = create_tenant(display_name="Idem", telegram_chat_id=900250)
         self.tenant.container_fqdn = "oc-test.example.com"
-        self.tenant.save(update_fields=["container_fqdn"])
+        self.tenant.openclaw_version = "2026.5.28"  # gateway path; 9.4 is covered in test_welcome_reconcile
+        self.tenant.save(update_fields=["container_fqdn", "openclaw_version"])
         self._patch = _patch
 
     def _fresh_welcome_cron(self):

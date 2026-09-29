@@ -293,32 +293,37 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
         return
 
     # Phase 1: Snapshot current cron state before the restart wipes SQLite.
-    try:
-        from apps.cron.gateway_client import invoke_gateway_tool
-        from apps.orchestrator.services import _extract_cron_jobs
+    # 9.4 skips it: the gateway list is gated and the post-image restore
+    # republishes the signed file instead of replaying a snapshot.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
-        jobs = _extract_cron_jobs(result)
-        if jobs is not None:
-            Tenant.objects.filter(id=tenant_id).update(
-                cron_jobs_snapshot={
-                    "jobs": jobs,
-                    "snapshot_at": timezone.now().isoformat(),
-                    "trigger": "pre-image-update",
-                    "image_tag": desired_tag,
-                },
-            )
-            logger.info(
-                "Pre-image cron snapshot saved for tenant %s (%d jobs)",
+    if not tenant_uses_file_cron_sync(tenant):
+        try:
+            from apps.cron.gateway_client import invoke_gateway_tool
+            from apps.orchestrator.services import _extract_cron_jobs
+
+            result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
+            jobs = _extract_cron_jobs(result)
+            if jobs is not None:
+                Tenant.objects.filter(id=tenant_id).update(
+                    cron_jobs_snapshot={
+                        "jobs": jobs,
+                        "snapshot_at": timezone.now().isoformat(),
+                        "trigger": "pre-image-update",
+                        "image_tag": desired_tag,
+                    },
+                )
+                logger.info(
+                    "Pre-image cron snapshot saved for tenant %s (%d jobs)",
+                    tenant_id[:8],
+                    len(jobs),
+                )
+        except Exception:
+            logger.warning(
+                "Pre-image cron snapshot failed for tenant %s (proceeding — will fall back to seed)",
                 tenant_id[:8],
-                len(jobs),
+                exc_info=True,
             )
-    except Exception:
-        logger.warning(
-            "Pre-image cron snapshot failed for tenant %s (proceeding — will fall back to seed)",
-            tenant_id[:8],
-            exc_info=True,
-        )
 
     # Phase 2: Update the container image.
     desired_image = f"{django_settings.AZURE_ACR_SERVER}/nbhd-openclaw:{desired_tag}"
@@ -601,6 +606,17 @@ def restore_crons_after_image_update_task(tenant_id: str) -> None:
 
     tenant = Tenant.objects.filter(id=tenant_id).select_related("user").first()
     if not tenant or not tenant.container_id:
+        return
+
+    # 9.4 gates every gateway cron.* call below. The new container rebuilds its
+    # crons at boot from the signed file (Postgres rows + the Fuel set), so
+    # republish it once. Not covered: firing crons missed while the container
+    # was down — 9.4 has no Django-reachable run-now (see CONTINUITY_oc94_*).
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    if tenant_uses_file_cron_sync(tenant):
+        count = write_tenant_crons_file(tenant)
+        logger.info("Post-image cron restore for tenant %s: republished %d crons (9.4)", tenant_id[:8], count)
         return
 
     snapshot = getattr(tenant, "cron_jobs_snapshot", None)

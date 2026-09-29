@@ -1391,9 +1391,11 @@ def verify_gateway_tools(request):
         return JsonResponse({"ok": True, "skipped": True, "reason": "no active tenants with containers"})
 
     try:
-        from apps.cron.gateway_client import invoke_gateway_tool
+        from apps.cron.gateway_client import list_tenant_crons
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
+        # 9.4 gates the gateway cron.list; list_tenant_crons reads the container's
+        # cron-state readback there, so a healthy 9.4 tenant passes.
+        list_tenant_crons(tenant, {"includeDisabled": True})
         logger.info("verify_gateway_tools: cron.list succeeded for tenant %s", str(tenant.id)[:8])
         return JsonResponse({"ok": True, "tenant": str(tenant.id)[:8], "cron_tool": "available"})
     except Exception as exc:

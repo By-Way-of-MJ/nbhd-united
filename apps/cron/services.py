@@ -313,6 +313,22 @@ def _push_at_cron_immediately(tenant: Tenant, cron: CronJob) -> None:
     and our ``cron_changed`` hook learns of the fire/delete.
     """
     from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    # 9.4 gates the gateway cron.add; publish the signed crons file (which
+    # includes this committed row) for the in-container helper, as gate.py does.
+    # A failed write raises GatewayError so callers keep their rollback contract.
+    if tenant_uses_file_cron_sync(tenant):
+        try:
+            write_tenant_crons_file(tenant)
+        except Exception as exc:
+            logger.exception(
+                "Immediate at-cron file publish failed (tenant=%s cron=%s)",
+                str(tenant.id)[:8],
+                cron.name,
+            )
+            raise GatewayError(f"crons file publish failed for tenant {tenant.id}") from exc
+        return
 
     try:
         result = invoke_gateway_tool(tenant, "cron.add", {"job": cron.data})
