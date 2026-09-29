@@ -9,6 +9,10 @@ if os.environ.get("AZURE_MOCK") != "true":
 LOCAL_TEST_ROOT = os.environ["LOCAL_TEST_ROOT"]
 # Local model turns outlast the 120 s fleet default; stay below yuki_local's 900 s poll.
 LOCAL_TEST_CHAT_TIMEOUT = 840
+# Django-side LLM features (e.g. Core meditation compose) use basecamp's loopback Ollama here instead
+# of OpenRouter (no cloud keys exist in this stack). Only this settings module defines these.
+LOCAL_TEST_LLM_URL = "http://127.0.0.1:11434/v1"
+LOCAL_TEST_LLM_MODEL = "qwen3.8:27b-obliterated-q8"
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", "testserver"]
 EMAIL_BACKEND = "django.core.mail.backends.dummy.EmailBackend"
 SAUTAI_M2M_BASE_URL = "http://127.0.0.1:8000"
