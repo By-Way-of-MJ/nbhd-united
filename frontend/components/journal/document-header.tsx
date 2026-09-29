@@ -38,6 +38,7 @@ interface DocumentHeaderProps {
   /** Typed-lifecycle docs (tasks/goal) are managed via typed records; hide the
    *  markdown Edit affordance so users aren't offered a write the backend 409s. */
   readOnly?: boolean;
+  blockMode?: boolean;
 }
 
 export function DocumentHeader({
@@ -54,6 +55,7 @@ export function DocumentHeader({
   showSavedIndicator,
   onToggleSidebar,
   readOnly,
+  blockMode = false,
 }: DocumentHeaderProps) {
   const { data: doc } = useDocumentQuery(kind, slug);
   const handleDateNav = (days: number) => {
@@ -61,7 +63,7 @@ export function DocumentHeader({
   };
 
   return (
-    <div data-os-document-header className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.04] px-3 py-2.5 sm:px-4 sm:py-3 lg:px-6 lg:py-4">
+    <div data-os-document-header data-os-block-header={blockMode || undefined} className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.04] px-3 py-2.5 sm:px-4 sm:py-3 lg:px-6 lg:py-4">
       <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
         {/* Sidebar toggle — integrated into header on mobile */}
         {onToggleSidebar && (
@@ -172,7 +174,7 @@ export function DocumentHeader({
       </div>
 
       {/* Edit/Save buttons — hidden on mobile when not editing (pencil FAB handles edit) */}
-      {(isMobile !== true || editing) && (
+      {(isMobile !== true || editing || blockMode) && (
         <div className="flex items-center gap-2">
           {editing ? (
             <>
@@ -192,7 +194,14 @@ export function DocumentHeader({
                 Cancel
               </button>
             </>
-          ) : readOnly ? null : (
+          ) : readOnly ? null : blockMode ? (
+            <details className="relative">
+              <summary aria-label="Journal options" className="os-btn-text flex min-w-[44px] cursor-pointer list-none items-center justify-center text-xl">…</summary>
+              <div className="absolute right-0 top-full z-20 min-w-[210px] rounded-lg border border-os-hairline bg-os-surface-solid p-2">
+                <button type="button" className="os-btn-text w-full px-3 text-left" onClick={onEdit}>Edit source (markdown)</button>
+              </div>
+            </details>
+          ) : (
             <button
               type="button"
               onClick={onEdit}

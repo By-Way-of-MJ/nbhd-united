@@ -1018,3 +1018,55 @@ html.open-sky [data-os-fuel] [data-os-tab][data-active="true"] { color: var(--os
 html.open-sky [data-os-fuel] [data-os-tab] > .absolute { background: var(--os-accent); }
 html.open-sky [data-os-fuel] [data-os-surface] > button.absolute:focus-visible { outline-offset: -2px; }
 html.open-sky [data-os-journal] input[type="checkbox"]:checked { accent-color: var(--os-done); }
+
+/* Daily blocks remain unboxed; only the active textarea is an edit surface. */
+html.open-sky .os-journal-block + .os-journal-block { border-top: 1px solid var(--os-hairline); }
+html.open-sky .os-journal-block-content .prose { color: var(--os-muted); font-size: 0.9375rem; line-height: 1.85; }
+html.open-sky .os-journal-block-content .os-label { color: var(--os-accent); }
+html.open-sky .os-journal-block-content .contains-task-list { list-style-type: disc; padding-left: 1.5em; }
+html.open-sky .os-journal-block a { cursor: pointer; }
+html.open-sky .os-journal-block-content[data-block-kind="entry"] .prose { color: var(--os-ink); }
+html.open-sky .os-journal-blocks .os-btn-text:disabled { opacity: 0.45; cursor: not-allowed; }
+@media (max-width: 639px) {
+  html.open-sky [data-os-block-header] > .flex:first-child { flex-basis: auto; }
+}
+
+
+/* A real checkbox with quiet Open Sky chrome; its label supplies the 44px target. */
+html.open-sky .os-task-checkbox {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid color-mix(in srgb, var(--os-ink) 50%, transparent);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+html.open-sky .os-task-checkbox:checked { border-color: var(--os-done); }
+html.open-sky .os-task-check { color: var(--os-done); opacity: 0; }
+html.open-sky .os-task-checkbox:checked + .os-task-check { opacity: 1; }
+html.open-sky .os-task-checkbox:focus-visible { outline: 2px solid var(--os-accent); outline-offset: 3px; }
+html.open-sky .os-task-checkbox:disabled { cursor: wait; }
+html.open-sky .os-journal-blocks [role="alert"] > .os-label { color: var(--os-accent); }
+html.open-sky .os-write-input {
+  border: 0;
+  border-bottom: 1px solid var(--os-ring);
+  border-radius: 0;
+  background: transparent;
+  max-height: 8rem;
+  overflow-y: auto;
+}
+html.open-sky [data-os-block-scroll] { scroll-padding-block: 1rem; }
+@media (max-width: 767px) {
+  /* Keep enough trailing scroll space for the measured composer plus the
+     floating phone nav (70px tall, 12px inset, and a little breathing room). */
+  html.open-sky [data-os-block-scroll] {
+    padding-bottom: calc(var(--os-write-bar-height, 96px) + 96px + env(safe-area-inset-bottom));
+    scroll-padding-bottom: calc(var(--os-write-bar-height, 96px) + 96px + env(safe-area-inset-bottom));
+  }
+}
+@media (forced-colors: active) {
+  html.open-sky .os-task-checkbox { border-color: ButtonText; }
+  html.open-sky .os-task-checkbox:checked { border-color: Highlight; }
+  html.open-sky .os-task-check { color: Highlight; }
+}

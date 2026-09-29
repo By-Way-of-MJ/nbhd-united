@@ -8,7 +8,15 @@
  * `localStorage.nbhd_access_token` to any string (the fixture API ignores it).
  * Append `?fixture=empty` to a page URL to render empty states, or
  * `?fixture=legacy` for a tenant without the web redesign (old shell).
+ * `?fixture=journal-conflict` rejects the first block write with the 409 contract;
+ * `?fixture=task-failure` rejects the first complete/reopen to check rollback.
+ * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
+ * Journal/task writes are in-memory only and reset on a full reload.
  */
+
+import { splitJournalBlocks } from "./journal-blocks";
+import { localMonday } from "./horizons-tasks";
+import type { JournalTask } from "./types";
 
 type Json = unknown;
 
@@ -20,7 +28,7 @@ function empty(): boolean {
 function isoDay(offset: number): string {
   const d = new Date();
   d.setDate(d.getDate() + offset);
-  return d.toISOString().slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 function isoAt(offset: number, hour: number, minute = 0): string {
@@ -260,6 +268,28 @@ function bodyOf(init?: RequestInit): Record<string, unknown> {
 }
 
 /** Returns a fixture response for `path`, or undefined to fall through to the network. */
+// Mutable in-memory fixtures exercise writes without a backend. Reload resets them.
+const dailyMarkdown = "# A little room for today\n\n### 07:40 — Yuki\nTook the long way to coffee. The city was unusually quiet, and I had time to notice.\n\n## Morning Report\nA clear morning, a little breathing room. Your first meeting is at **10:00**.\n\n## Today’s notes\n- [x] Sent the revised kitchen measurements\n- [ ] Ask about the counter template visit\n\n### 12:15\nAn easy run by the river. Less about the pace, more about getting outside.\n";
+const longDayMarkdown = dailyMarkdown + [
+  ["13:30", "Lunch outside, away from the screen. The afternoon felt easier after a real pause."],
+  ["14:45", "Finished the first draft. There are still rough edges, but the shape is finally there."],
+  ["16:10", "A call with a friend. We made a small plan for the weekend and left the rest open."],
+  ["18:20", "Walked home by the river. The light changed while I was crossing the bridge."],
+  ["20:30", "Dinner, a little music, and a tidy kitchen. Nothing urgent needs to follow me into tonight."],
+  ["22:10", "Last thought of a long day: leave a little room for tomorrow. Time to put the notebook down."],
+].map(([time, body]) => `\n### ${time} — Yuki\n${body}\n`).join("");
+const journalDocuments = new Map<string, string>();
+let conflictShown = false;
+let taskFailureShown = false;
+let fixtureTasks: JournalTask[] = [
+  { id: "t1", title: "Book the counter template visit", due_date: isoDay(-1), parent_goal_id: null, status: "open" },
+  { id: "t2", title: "Make room for an easy long run", due_date: isoDay(2), parent_goal_id: "g1", status: "open" },
+  { id: "t3", title: "Try the route with a friend", due_date: null, parent_goal_id: "g1", status: "open" },
+  { id: "t4", title: "Choose a local 10k", due_date: null, parent_goal_id: "g1", status: "done" },
+  { id: "t5", title: "Send the revised kitchen measurements", due_date: null, parent_goal_id: null, status: "done" },
+].map((task) => ({ description: "", pillar: "", related_ref: "", created_at: isoAt(-7, 9), updated_at: isoAt(0, 9), ...task, status: task.status as JournalTask["status"], completed_at: task.status === "done" ? localMonday() : null }));
+let pendingSuggestions = [{ id: "suggestion-1", kind: "task", text: "Find a quiet café for a writing morning", confidence: "0.85", source_date: isoDay(-1), created_at: isoAt(-1, 20) }];
+
 export function fixtureResponse(path: string, init?: RequestInit): Json | undefined {
   const method = (init?.method ?? "GET").toUpperCase();
   const url = new URL(path, "http://fixture.local");
@@ -384,21 +414,69 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
       { kind: "ideas", label: "Ideas", items: [] },
     ]);
   }
-  const doc = p.match(/^\/api\/v1\/journal\/documents\/([^/]+)\/([^/]+)\/$/);
-  if (doc && method === "GET") {
-    const [, kind, slug] = doc;
+  const doc = p.match(/^\/api\/v1\/journal\/documents\/([^/]+)\/([^/]+)\/(append\/|blocks\/replace\/)?$/);
+  if (doc) {
+    const [, kind, slug, action] = doc;
     const bodies: Record<string, string> = {
-      daily: "## Morning\n\nTook the long way to coffee and noticed the city was unusually quiet. Sent the revised kitchen measurements.\n\n## Evening\n\n- [x] Push day\n- [ ] Book the counter template visit\n",
-      project: "Kitchen first, then the back porch.\n\n## Milestones\n\n- [x] Demo and haul-away\n- [x] Cabinets ordered\n- [ ] Counter template, fabricator Friday\n",
+      daily: new URLSearchParams(window.location.search).get("fixture") === "journal-long" ? longDayMarkdown : dailyMarkdown,
+      project: "Kitchen first, then the back porch.\n\n## Milestones\n\n- [x] Demo and haul-away\n- [ ] Counter template, fabricator Friday\n",
       goal: "Base-building block: four days a week, mostly zone 2.\n",
       weekly: "## Wins\n\n- Four sessions\n\n## Lessons\n\n- Reflect weekly, not daily\n",
     };
-    return json({
-      id: `doc-${kind}-${slug}`, kind, slug,
-      title: kind === "daily" ? slug : slug.replace(/-/g, " ").replace(/^\w/, (c) => c.toUpperCase()),
-      markdown: isEmpty ? "" : bodies[kind] ?? "",
-      created_at: isoAt(-1, 8), updated_at: isoAt(0, 8),
-    });
+    const key = `${kind}/${slug}`;
+    const document = () => ({ id: `doc-${kind}-${slug}`, kind, slug, title: slug, markdown: journalDocuments.get(key) ?? (isEmpty ? "" : bodies[kind] ?? ""), created_at: isoAt(-1, 8), updated_at: isoAt(0, 8) });
+    if (method === "POST" && action === "blocks/replace/") {
+      const body = bodyOf(init);
+      let blocks = splitJournalBlocks(document().markdown);
+      const index = Number(body.index);
+      if (!conflictShown && new URLSearchParams(window.location.search).get("fixture") === "journal-conflict") {
+        conflictShown = true;
+        blocks[index] += "A new detail arrived from your assistant.\n";
+        journalDocuments.set(key, blocks.join(""));
+        blocks = splitJournalBlocks(document().markdown);
+      }
+      if (blocks[index] === undefined || blocks[index] !== body.original) {
+        throw Object.assign(new Error(JSON.stringify({ error: "block_changed", document: document() })), { status: 409 });
+      }
+      let replacement = String(body.replacement);
+      if (replacement && index < blocks.length - 1 && !replacement.endsWith("\n")) replacement += "\n\n";
+      blocks[index] = replacement;
+      journalDocuments.set(key, blocks.join(""));
+    } else if (method === "POST" && action === "append/") {
+      const time = new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+      journalDocuments.set(key, `${document().markdown}\n\n### ${time} — Yuki\n${bodyOf(init).content}\n`);
+    } else if (method === "PATCH") {
+      journalDocuments.set(key, String(bodyOf(init).markdown ?? document().markdown));
+    }
+    return json(document());
+  }
+  if (p === "/api/v1/journal/goals/") return json(isEmpty ? [] : [{ id: "g1", title: "Run a 10k" }]);
+  if (p === "/api/v1/journal/tasks/") {
+    if (method === "POST") {
+      const body = bodyOf(init);
+      const created: JournalTask = { id: `task-${fixtureTasks.length + 1}`, title: String(body.title), due_date: body.due_date ? String(body.due_date) : null, parent_goal_id: body.parent_goal_id ? String(body.parent_goal_id) : null, status: "open", completed_at: null, description: "", pillar: "", related_ref: "", created_at: isoAt(0, 9), updated_at: isoAt(0, 9) };
+      fixtureTasks = [...fixtureTasks, created];
+      return json(created);
+    }
+    const status = url.searchParams.get("status");
+    const after = url.searchParams.get("completed_after");
+    return json(isEmpty ? [] : fixtureTasks.filter((task) => (!status || task.status === status) && (!after || (task.completed_at && new Date(task.completed_at) >= new Date(after)))));
+  }
+  const taskAction = p.match(/^\/api\/v1\/journal\/tasks\/([^/]+)\/(complete|reopen)\/$/);
+  if (taskAction && method === "POST") {
+    if (!taskFailureShown && new URLSearchParams(window.location.search).get("fixture") === "task-failure") {
+      taskFailureShown = true;
+      throw Object.assign(new Error("Task update failed (fixture)."), { status: 503 });
+    }
+    fixtureTasks = fixtureTasks.map((task) => task.id === taskAction[1] ? { ...task, status: taskAction[2] === "complete" ? "done" : "open", completed_at: taskAction[2] === "complete" ? new Date().toISOString() : null } : task);
+    return json(fixtureTasks.find((task) => task.id === taskAction[1]));
+  }
+  const extraction = p.match(/^\/api\/v1\/journal\/extractions\/([^/]+)\/(approve|dismiss)\/$/);
+  if (extraction && method === "POST") {
+    const suggestion = pendingSuggestions.find((item) => item.id === extraction[1]);
+    if (suggestion && extraction[2] === "approve") fixtureResponse("/api/v1/journal/tasks/", { method: "POST", body: JSON.stringify({ title: suggestion.text }) });
+    pendingSuggestions = pendingSuggestions.filter((item) => item.id !== extraction[1]);
+    return json({ status: "ok" });
   }
   if (p === "/api/v1/journal/status/") {
     return json({
@@ -424,7 +502,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
         ],
         created_at: "2026-08-10T00:00:00Z", updated_at: isoAt(-2, 8),
       }],
-      pending_extractions: [],
+      pending_extractions: isEmpty ? [] : pendingSuggestions,
       weekly_pulse: isEmpty ? [] : [{ week_start: isoDay(-11), week_end: isoDay(-5), week_rating: "thumbs-up", top_win: "Four sessions and no skipped mornings" }],
       weekly_documents: [],
       mood_trend: isEmpty ? [] : Array.from({ length: 14 }, (_, i) => ({ date: isoDay(-13 + i), mood: ["steady", "good", "low", "good"][i % 4], energy: String(5 + (i % 4)) })),

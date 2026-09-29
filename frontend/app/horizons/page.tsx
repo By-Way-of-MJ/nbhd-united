@@ -3,6 +3,8 @@
 import dynamic from "next/dynamic";
 import { useEffect, useState, type ReactNode } from "react";
 
+import { TasksSection } from "@/components/horizons/tasks-section";
+import { openTaskCounts } from "@/lib/horizons-tasks";
 import { GoalCard } from "@/components/goal-card";
 import { MoodTrendSparkline } from "@/components/horizons/mood-trend-sparkline";
 import { NorthStarSection } from "@/components/horizons/north-star-section";
@@ -16,7 +18,7 @@ import {
   isEngagementDemoEnabled,
   subscribeToEngagementDemoFlag,
 } from "@/lib/engagement/flag";
-import { useHorizonsQuery } from "@/lib/queries";
+import { useHorizonsQuery, useTenantQuery, useTasksQuery } from "@/lib/queries";
 
 function QuietSection({
   title,
@@ -88,6 +90,10 @@ function HorizonsSkeleton() {
 }
 
 export default function HorizonsPage() {
+  const { data: tenant } = useTenantQuery();
+  const openSky = !!tenant?.web_redesign;
+  const tasks = useTasksQuery({ status: "open" }, openSky);
+  const counts = openTaskCounts(tasks.data ?? []);
   const [engagementDemoEnabled, setEngagementDemoEnabled] = useState(false);
   const { data, isLoading, error } = useHorizonsQuery();
   const [showAllInsights, setShowAllInsights] = useState(false);
@@ -138,6 +144,8 @@ export default function HorizonsPage() {
         </p>
       </div>
 
+      {openSky ? <TasksSection goals={data.goals} /> : null}
+
       {engagementDemoEnabled ? <PillarsTodayCard delay={80} /> : null}
 
       <NorthStarSection items={data.north_star ?? []} delay={80} />
@@ -155,7 +163,10 @@ export default function HorizonsPage() {
         {data.goals.length > 0 ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6">
             {data.goals.map((goal) => (
-              <GoalCard key={goal.id} goal={goal} />
+              openSky ? <div key={goal.id}>
+                <GoalCard goal={goal} />
+                {tasks.data ? <p className="px-5 pb-3 text-xs text-os-faint">{counts.get(goal.id) ?? 0} open tasks</p> : null}
+              </div> : <GoalCard key={goal.id} goal={goal} />
             ))}
           </div>
         ) : (
@@ -169,10 +180,10 @@ export default function HorizonsPage() {
       </QuietSection>
 
       {data.pending_extractions.length > 0 ? (
-        <QuietSection title="Waiting on you" delay={300}>
+        <QuietSection title={openSky ? "From your journal" : "Waiting on you"} delay={300}>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-3">
             {data.pending_extractions.map((extraction) => (
-              <PendingGoal key={extraction.id} extraction={extraction} />
+              <PendingGoal key={extraction.id} extraction={extraction} openSky={openSky} />
             ))}
           </div>
         </QuietSection>

@@ -27,6 +27,7 @@ import {
 } from "@/lib/types";
 import {
   appendToDocument,
+  fetchTaskGoals, fetchTasks, createTask, replaceDocumentBlock, type TaskFilters, type BlockReplacement,
   bulkDeleteCronJobs,
   bulkUpdateForeground,
   cancelPendingReminder,
@@ -346,6 +347,7 @@ export function useCompleteTaskMutation() {
     // reappearing from the stale `max-age=10` browser cache.
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
   });
 }
@@ -357,6 +359,7 @@ export function useReopenTaskMutation() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["horizons"] }),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
   });
 }
@@ -366,7 +369,10 @@ export function useCreateGoalTaskMutation() {
   return useMutation({
     mutationFn: createGoalTask,
     meta: { skipErrorToast: true },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["journal-tasks"] });
+      return queryClient.invalidateQueries({ queryKey: ["horizons"] });
+    },
   });
 }
 
@@ -395,6 +401,7 @@ export function useApproveExtractionMutation() {
     mutationFn: approveExtraction,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["horizons"] });
+      void queryClient.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
   });
 }
@@ -2847,4 +2854,37 @@ export function useRegenerateInviteCodeMutation() {
       void qc.invalidateQueries({ queryKey: ["circles"] });
     },
   });
+}
+
+export function useTasksQuery(filters: TaskFilters = {}, enabled = true) {
+  return useQuery({ queryKey: ["journal-tasks", filters], queryFn: () => fetchTasks(filters), enabled: enabled && isLoggedIn(), staleTime: 30_000 });
+}
+
+export function useCreateTaskMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createTask,
+    meta: { skipErrorToast: true },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
+      void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["horizons"] });
+    },
+  });
+}
+
+export function useReplaceDocumentBlockMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kind, slug, data }: { kind: string; slug: string; data: BlockReplacement }) => replaceDocumentBlock(kind, slug, data),
+    meta: { skipErrorToast: true },
+    onSuccess: (document, { kind, slug }) => {
+      qc.setQueryData(["document", kind, slug], document);
+      void qc.invalidateQueries({ queryKey: ["sidebar-tree"] });
+    },
+  });
+}
+
+export function useTaskGoalsQuery() {
+  return useQuery({ queryKey: ["task-goals"], queryFn: fetchTaskGoals, enabled: isLoggedIn(), staleTime: 60_000 });
 }
