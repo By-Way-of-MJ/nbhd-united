@@ -492,6 +492,8 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
     # container reads it — otherwise the just-deployed image boots against a
     # stale-schema config and crash-loops on "agents.defaults: Invalid input".
     version_synced = False
+    # Set when step 1 swapped the image; step 6 schedules its health check.
+    refreshed_from_image = None
 
     # 1. The claimant wakes the container. A concurrent caller skips Azure and
     # joins the same follow-up path below.
@@ -508,6 +510,7 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
                 wake_container_app,
             )
             from apps.orchestrator.image_rollout import image_rollout_allowed
+            from apps.orchestrator.runtime_guard import image_only_update_allowed
             from apps.orchestrator.tool_policy import openclaw_version_for_image_tag
 
             desired_tag = getattr(django_settings, "OPENCLAW_IMAGE_TAG", "latest") or "latest"
@@ -517,16 +520,30 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
             # and a hibernated tenant waking must NOT auto-jump onto a not-yet-
             # verified image (e.g. 2026.9.4, which bricks without the mount/oc-state
             # retrofit) unless it's explicitly opted in. Default allows nobody.
+            #
+            # Two more guards: never retry a tag whose refresh already failed its
+            # health check here (``image_refresh_blocked_tag``), and only swap
+            # within the same OpenClaw family, checked against the LIVE Azure
+            # image (``image_only_update_allowed``) — a family jump is a
+            # migration, not a refresh.
             needs_image_refresh = (
-                desired_tag != "latest" and current_tag != desired_tag and image_rollout_allowed(tenant.id)
+                desired_tag != "latest"
+                and current_tag != desired_tag
+                and desired_tag != (tenant.image_refresh_blocked_tag or "")
+                and image_rollout_allowed(tenant.id)
+                and image_only_update_allowed(tenant, desired_tag)
             )
 
             if needs_image_refresh:
+                # Remember what is running now, so the post-wake health check can
+                # put it back if the new image never becomes ready.
+                previous_image = _live_openclaw_image(tenant.container_id)
                 # update_container_image bakes the EmptyDir mount into the same
                 # revision as the image bump, so a single restart lands both.
                 registry = getattr(django_settings, "AZURE_ACR_SERVER", "nbhdunited.azurecr.io")
                 desired_image = f"{registry}/nbhd-openclaw:{desired_tag}"
                 update_container_image(tenant.container_id, desired_image)
+                refreshed_from_image = previous_image
 
                 # Keep openclaw_version (config SCHEMA) in lockstep with the image
                 # we just deployed. Fleet version bumps skip hibernated tenants, so
@@ -648,8 +665,100 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
     except Exception:
         logger.exception("idle_wake: failed to schedule cron resume for %s", tid)
 
+    # 6. A refreshed image must prove it boots. The entrypoint gives the gateway
+    # up to 3 minutes; check after that and put the old image back if it never
+    # became ready (the 2026-09-28 Kiho case: a new revision that could not
+    # start while the user's traffic pointed at it).
+    if refreshed_from_image:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task(
+                "verify_wake_image_refresh",
+                str(tenant.id),
+                tenant.container_image_tag,
+                refreshed_from_image,
+                1,
+                delay_seconds=WAKE_IMAGE_VERIFY_DELAY_SECONDS,
+            )
+        except Exception:
+            logger.exception("idle_wake: failed to schedule image health check for %s", tid)
+
     logger.info("idle_wake: tenant %s wake initiated", tid)
     return True
+
+
+# Entrypoint gateway budget is 3 min after `doctor --fix`; allow boot + probe.
+WAKE_IMAGE_VERIFY_DELAY_SECONDS = 240
+WAKE_IMAGE_VERIFY_RETRY_SECONDS = 180
+WAKE_IMAGE_VERIFY_ATTEMPTS = 2
+
+
+def _live_openclaw_image(container_id: str) -> str | None:
+    """The ``openclaw`` container image Azure is actually serving (not the DB tag)."""
+    from django.conf import settings as django_settings
+
+    from apps.orchestrator.azure_client import get_container_client
+
+    app = get_container_client().container_apps.get(django_settings.AZURE_RESOURCE_GROUP, container_id)
+    for container in app.template.containers:
+        if container.name == "openclaw":
+            return container.image
+    return None
+
+
+def verify_wake_image_refresh_task(tenant_id: str, refreshed_tag: str, previous_image: str, attempt: int = 1) -> dict:
+    """Health check for a wake-time image refresh; reverts a refresh that never boots.
+
+    Ready means Azure's latest revision is also its latest READY revision. Not
+    ready after ``WAKE_IMAGE_VERIFY_ATTEMPTS`` checks ⇒ push ``previous_image``
+    back, record ``refreshed_tag`` in ``image_refresh_blocked_tag`` so no later
+    wake retries it, and log an error for the operator.
+    """
+    import re
+
+    from django.conf import settings as django_settings
+
+    from apps.orchestrator.azure_client import get_container_client, is_mock, update_container_image
+
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if tenant is None or not tenant.container_id or is_mock():
+        return {"status": "skipped"}
+    tid = str(tenant.id)[:8]
+    if tenant.container_image_tag != refreshed_tag:
+        return {"status": "superseded"}
+
+    app = get_container_client().container_apps.get(django_settings.AZURE_RESOURCE_GROUP, tenant.container_id)
+    if app.latest_revision_name and app.latest_revision_name == app.latest_ready_revision_name:
+        logger.info("wake_image_verify: %s ready on %s", tid, refreshed_tag[:18])
+        return {"status": "ready"}
+
+    if attempt < WAKE_IMAGE_VERIFY_ATTEMPTS:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "verify_wake_image_refresh",
+            str(tenant.id),
+            refreshed_tag,
+            previous_image,
+            attempt + 1,
+            delay_seconds=WAKE_IMAGE_VERIFY_RETRY_SECONDS,
+        )
+        logger.warning("wake_image_verify: %s not ready on %s (attempt %d)", tid, refreshed_tag[:18], attempt)
+        return {"status": "retry"}
+
+    update_container_image(tenant.container_id, previous_image)
+    match = re.fullmatch(r"[^/]+/nbhd-openclaw:([^/@]+)(?:@sha256:[0-9a-f]{64})?", previous_image or "")
+    Tenant.objects.filter(pk=tenant.pk).update(
+        container_image_tag=match[1] if match else "",
+        image_refresh_blocked_tag=refreshed_tag,
+    )
+    logger.error(
+        "wake_image_verify: %s never became ready on %s — reverted to previous image and blocked the tag",
+        tid,
+        refreshed_tag[:18],
+    )
+    return {"status": "reverted"}
 
 
 # ---------------------------------------------------------------------------

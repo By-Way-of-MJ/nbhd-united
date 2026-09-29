@@ -206,6 +206,13 @@ class Tenant(models.Model):
         default="",
         help_text="Current OpenClaw container image tag (git SHA)",
     )
+    image_refresh_blocked_tag = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="OpenClaw image tag whose wake-time refresh failed its health check and was reverted; "
+        "the wake path will not try this tag again",
+    )
     openclaw_version = models.CharField(
         max_length=20,
         default=OPENCLAW_CURRENT_VERSION,
