@@ -10,8 +10,8 @@ from apps.journal.models import Goal
 from . import access, services
 from . import project_services as projects
 from .models import PendingProjectAction, SharedGoal, SharedGoalMembership
-from .test_projects_v2_p1b import _PushCapture
 from .test_pr6 import _edge, _profile, _tenant
+from .test_projects_v2_p1b import _PushCapture
 
 
 @override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
@@ -22,7 +22,9 @@ class ProjectRound2Tests(TestCase):
             _profile(tenant, name)
         self.ab = _edge(self.a, self.b)
         self.ac = _edge(self.a, self.c)
-        self.goal = services.create_mission(self.a, self.a.user, member_friendship_ids=[str(self.ab.id)], title="Garden")
+        self.goal = services.create_mission(
+            self.a, self.a.user, member_friendship_ids=[str(self.ab.id)], title="Garden"
+        )
         services.join_mission(self.b, self.b.user, self.goal.id)
 
     def client_for(self, tenant):
@@ -89,7 +91,10 @@ class ProjectRound2Tests(TestCase):
 
     def test_owner_deletes_for_everyone(self):
         PendingProjectAction.objects.create(
-            tenant=self.b, shared_goal=self.goal, payload={"summary": "x", "changes": []}, expires_at=self.goal.created_at
+            tenant=self.b,
+            shared_goal=self.goal,
+            payload={"summary": "x", "changes": []},
+            expires_at=self.goal.created_at,
         )
         response = self.client_for(self.a).post(f"/api/v1/friends/missions/{self.goal.id}/delete/")
         self.assertEqual(response.status_code, 200)
@@ -99,7 +104,9 @@ class ProjectRound2Tests(TestCase):
         self.assertEqual(PendingProjectAction.objects.get(shared_goal=self.goal).status, "expired")
         for tenant in (self.a, self.b):
             self.assertEqual(list(access.missions_for(tenant, include_invited=True)), [])
-            self.assertEqual(self.client_for(tenant).get(f"/api/v1/friends/missions/{self.goal.id}/plan/").status_code, 404)
+            self.assertEqual(
+                self.client_for(tenant).get(f"/api/v1/friends/missions/{self.goal.id}/plan/").status_code, 404
+            )
 
     def test_a_member_cannot_delete(self):
         response = self.client_for(self.b).post(f"/api/v1/friends/missions/{self.goal.id}/delete/")
