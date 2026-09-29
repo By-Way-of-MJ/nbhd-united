@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from django.conf import settings
@@ -82,6 +83,35 @@ def _looks_usable(data: dict) -> bool:
     return isinstance(content, str) and bool(content.strip())
 
 
+def local_llm() -> tuple[str, str] | None:
+    """Local-test only: ``(chat_url, model)`` for basecamp's loopback Ollama, else ``None``.
+
+    Only ``config.settings.local_test`` defines ``LOCAL_TEST_LLM_URL`` / ``LOCAL_TEST_LLM_MODEL``, so
+    production and CI settings always return ``None`` and keep OpenRouter. A configured value that is
+    not plain-HTTP loopback with an explicit port (or has no model) fails loudly, never silently.
+    """
+    url = getattr(settings, "LOCAL_TEST_LLM_URL", "")
+    # Only a real string counts: tests that patch ``settings`` with a mock must keep the OpenRouter path.
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    parts = urlsplit(url)
+    model = getattr(settings, "LOCAL_TEST_LLM_MODEL", "")
+    model = model.strip() if isinstance(model, str) else ""
+    if (
+        parts.scheme != "http"
+        or parts.hostname not in {"127.0.0.1", "localhost"}
+        or not parts.port
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or not model
+    ):
+        raise RuntimeError("LOCAL_TEST_LLM_URL must be http://127.0.0.1:<port>/... with LOCAL_TEST_LLM_MODEL set")
+    return url.rstrip("/") + "/chat/completions", model
+
+
 def chat_completion(
     models: str | list[str],
     messages: list[dict[str, Any]],
@@ -112,13 +142,29 @@ def chat_completion(
         Exception: the last error encountered if every candidate fails (so the
             caller's existing error handling still fires).
     """
+    local = local_llm()
     key = api_key if api_key is not None else getattr(settings, "OPENROUTER_API_KEY", "")
-    if not key:
+    if not key and local is None:
         raise RuntimeError("OPENROUTER_API_KEY not configured")
 
     candidates = [m for m in ([models] if isinstance(models, str) else list(models)) if m]
     if not candidates:
         raise ValueError("chat_completion requires at least one model")
+    if local is not None:
+        # Local test stack: one call to the loopback model; no cloud fallbacks, no key, no health rows.
+        url, local_model = local
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"model": local_model, "messages": messages, **body_params},
+            # The local model is far slower than the cloud; the stack sets a generous floor.
+            timeout=max(timeout, int(getattr(settings, "LOCAL_TEST_LLM_TIMEOUT", 0) or 0)),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not _looks_usable(data):
+            raise NoUsableChoicesError(f"Local model returned no usable choices for {candidates[0]}")
+        return data, candidates[0]
 
     last_error: Exception | None = None
     for model_id in candidates:
