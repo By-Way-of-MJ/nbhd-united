@@ -26,7 +26,7 @@ from django.conf import settings
 from pydantic import ValidationError
 
 from apps.billing.constants import DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL, GEMMA_MODEL
-from apps.common.openrouter import NoUsableChoicesError, chat_completion
+from apps.common.openrouter import NoUsableChoicesError, chat_completion, local_llm
 from apps.core import render
 from apps.core.lesson import INTENTIONS, TRADITIONS, MeditationLesson, MeditationManifest, normalize_teaching_slug
 
@@ -488,7 +488,7 @@ def author_manifest(signals: dict, *, voice: str = "", model: str = "", tenant=N
     (carrying every candidate's failure reason for diagnosis).
     """
     api_key = getattr(settings, "OPENROUTER_API_KEY", "") or ""
-    if not api_key:
+    if not api_key and local_llm() is None:
         raise ComposeError("OPENROUTER_API_KEY not configured")
     target_seconds = _target_seconds_from_signals(signals)
     from apps.pii.egress import append_entity_legend, redact_known_values

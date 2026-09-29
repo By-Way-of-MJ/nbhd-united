@@ -689,8 +689,11 @@ def render_meditation(session: MeditationSession) -> None:
 
     api_key = getattr(settings, "GEMINI_API_KEY", "") or ""
     concurrency = int(getattr(settings, "CORE_RENDER_CONCURRENCY", 4) or 4)
+    # Local test stack only (no cloud keys): render with the existing mock narration so sessions
+    # still reach ready. Only config.settings.local_test sets LOCAL_TEST_CORE_MOCK_TTS.
+    mock_tts = not api_key and bool(getattr(settings, "LOCAL_TEST_CORE_MOCK_TTS", False))
 
-    if not api_key:
+    if not api_key and not mock_tts:
         # Config error — terminal; a retry won't conjure a key. Surface clearly.
         logger.error("render_meditation: session %s has no GEMINI_API_KEY configured", sid[:8])
         _fail(session, "GEMINI_API_KEY not configured")
@@ -702,7 +705,8 @@ def render_meditation(session: MeditationSession) -> None:
             tenant=session.tenant,
             voice=voice,
             model=model,
-            api_key=api_key,
+            api_key=api_key or None,
+            mock=mock_tts,
             concurrency=concurrency,
             deadline_seconds=float(getattr(settings, "CORE_RENDER_DEADLINE_SECONDS", render.DEFAULT_RENDER_DEADLINE_S)),
             want_ogg=True,
