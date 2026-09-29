@@ -933,14 +933,18 @@ def hibernate_idle_tenants_task() -> dict:
         else:
             failed += 1
 
+    suspended_hibernated, suspended_failed = _hibernate_idle_suspended_tenants(cutoff)
+
     logger.info(
         "hibernate_idle_tenants: hibernated=%d failed=%d skipped_cron_wake=%d skipped_imminent_cron=%d "
-        "auto_upgrading=%d",
+        "auto_upgrading=%d suspended_hibernated=%d suspended_failed=%d",
         hibernated,
         failed,
         skipped_cron_wake,
         skipped_imminent_cron,
         auto_upgrading,
+        suspended_hibernated,
+        suspended_failed,
     )
     return {
         "hibernated": hibernated,
@@ -948,7 +952,70 @@ def hibernate_idle_tenants_task() -> dict:
         "skipped_cron_wake": skipped_cron_wake,
         "skipped_imminent_cron": skipped_imminent_cron,
         "auto_upgrading": auto_upgrading,
+        "suspended_hibernated": suspended_hibernated,
+        "suspended_failed": suspended_failed,
     }
+
+
+def _hibernate_idle_suspended_tenants(cutoff) -> tuple[int, int]:
+    """Put idle, awake SUSPENDED tenants' containers back to sleep.
+
+    Suspension deactivates revisions once but leaves ``hibernated_at`` NULL,
+    so any later wake (e.g. a message from the suspended user) left the box
+    running forever — the active-only pass above never looks at it. Seen in
+    prod 2026-09-29: four suspended tenants up 168/168h, some since July.
+
+    No cron capture, gateway call, or cron-aware wake here: suspension
+    already disabled the tenant's crons, and ``wake_for_cron_task`` refuses
+    non-ACTIVE tenants anyway. Stamping ``hibernated_at`` puts the tenant on
+    the normal wake-on-message path; reactivation clears it.
+    """
+    import logging
+
+    from django.db import transaction
+    from django.db.models import Q
+    from django.utils import timezone
+
+    from apps.orchestrator.azure_client import hibernate_container_app
+    from apps.tenants.models import Tenant
+
+    logger = logging.getLogger(__name__)
+
+    with transaction.atomic():
+        candidates = list(
+            Tenant.objects.filter(
+                status=Tenant.Status.SUSPENDED,
+                container_id__gt="",
+                hibernated_at__isnull=True,
+            )
+            .filter(Q(last_message_at__lt=cutoff) | Q(last_message_at__isnull=True, provisioned_at__lt=cutoff))
+            .select_for_update(skip_locked=True)
+        )
+
+    hibernated = failed = 0
+    for tenant in candidates:
+        tid = str(tenant.id)[:8]
+        # Re-check after the lock is released: a reactivation or fresh message
+        # may have landed since the claim.
+        tenant.refresh_from_db(fields=["status", "hibernated_at", "last_message_at"])
+        if tenant.status != Tenant.Status.SUSPENDED or tenant.hibernated_at:
+            continue
+        if tenant.last_message_at and tenant.last_message_at >= cutoff:
+            continue
+        try:
+            hibernate_container_app(tenant.container_id)
+        except Exception:
+            logger.exception("hibernate_idle_tenants: failed to hibernate suspended tenant %s", tid)
+            failed += 1
+            continue
+        # Compare-and-set so a concurrent reactivation (status → ACTIVE) wins.
+        Tenant.objects.filter(pk=tenant.pk, status=Tenant.Status.SUSPENDED, hibernated_at__isnull=True).update(
+            hibernated_at=timezone.now(),
+            cron_wake_at=None,
+        )
+        logger.info("hibernate_idle_tenants: hibernated suspended tenant %s", tid)
+        hibernated += 1
+    return hibernated, failed
 
 
 def refresh_user_md_fleet_task() -> dict:
