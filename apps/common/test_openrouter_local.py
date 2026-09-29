@@ -51,6 +51,14 @@ class LocalLLMSeamTests(SimpleTestCase):
         self.assertEqual(used, "openrouter/a/b")
         healthy.assert_not_called()
 
+    @override_settings(
+        LOCAL_TEST_LLM_URL="http://127.0.0.1:11434/v1", LOCAL_TEST_LLM_MODEL="m", LOCAL_TEST_LLM_TIMEOUT=600
+    )
+    def test_local_timeout_floor(self):
+        with mock.patch.object(openrouter.requests, "post", return_value=_resp(OK)) as post:
+            openrouter.chat_completion("openrouter/a/b", [{"role": "user", "content": "x"}], timeout=45)
+        self.assertEqual(post.call_args.kwargs["timeout"], 600)
+
     def test_rejects_anything_but_plain_loopback(self):
         for url in (
             "https://127.0.0.1:11434/v1",

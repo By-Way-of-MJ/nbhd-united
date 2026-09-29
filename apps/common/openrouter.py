@@ -154,7 +154,8 @@ def chat_completion(
             url,
             headers={"Content-Type": "application/json"},
             json={"model": local_model, "messages": messages, **body_params},
-            timeout=timeout,
+            # The local model is far slower than the cloud; the stack sets a generous floor.
+            timeout=max(timeout, int(getattr(settings, "LOCAL_TEST_LLM_TIMEOUT", 0) or 0)),
         )
         resp.raise_for_status()
         data = resp.json()
