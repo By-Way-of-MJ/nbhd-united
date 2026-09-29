@@ -180,7 +180,7 @@ export default function FriendsPage() {
         />
       ) : null}
 
-      <div className="space-y-6">
+      <div data-os-neighborhood className="space-y-6">
         {isLoading ? (
           <>
             <SectionCardSkeleton lines={2} />
@@ -194,6 +194,8 @@ export default function FriendsPage() {
                   {pendingShares.map((share) => (
                     <div
                       key={share.id}
+                      data-os-approval
+                      data-os-row
                       className="flex items-start gap-3 rounded-xl border border-border bg-surface/60 p-3"
                     >
                       <div className="min-w-0 flex-1">
@@ -438,8 +440,8 @@ function NeighborRow({
   onMessage: () => void;
 }) {
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-border bg-surface/60 p-3">
-      <span className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(neighbor.avatar_hue)} aria-hidden />
+    <div data-os-row className="flex items-center gap-3 rounded-xl border border-border bg-surface/60 p-3">
+      <span data-os-avatar data-initial={neighbor.display_name.slice(0, 1)} className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(neighbor.avatar_hue)} aria-hidden />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-ink">{neighbor.display_name}</p>
         <p className="truncate text-xs text-ink-faint">@{neighbor.handle}</p>
@@ -470,9 +472,9 @@ function ThreadRow({ thread, onOpen }: { thread: ChatThread; onOpen: () => void 
     <button
       type="button"
       onClick={onOpen}
-      className="flex min-h-[44px] w-full items-center gap-3 rounded-xl border border-border bg-surface/60 p-3 text-left transition hover:bg-surface-hover"
+      data-os-row className="flex min-h-[44px] w-full items-center gap-3 rounded-xl border border-border bg-surface/60 p-3 text-left transition hover:bg-surface-hover"
     >
-      <span className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(thread.avatar_hue)} aria-hidden />
+      <span data-os-avatar data-initial={thread.display_name.slice(0, 1)} className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(thread.avatar_hue)} aria-hidden />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
           <p className="truncate text-sm font-medium text-ink">{thread.display_name}</p>

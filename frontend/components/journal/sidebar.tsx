@@ -191,7 +191,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
 
   if (collapsed) {
     return (
-      <div className="flex flex-col items-center border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl py-4 w-12">
+      <div data-os-journal-rail className="flex flex-col items-center border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl py-4 w-12">
         <button
           type="button"
           onClick={onToggle}
@@ -220,7 +220,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
   });
 
   return (
-    <nav aria-label="Journal sidebar" className="flex h-full w-full lg:w-[15rem] flex-col border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl">
+    <nav data-os-journal-rail aria-label="Journal sidebar" className="flex h-full w-full lg:w-[15rem] flex-col border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.04] px-4 py-4">
         <div data-os-legacy-title>
@@ -242,7 +242,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
       </div>
 
       {/* New Entry */}
-      <div className="px-3 py-3">
+      <div data-os-new-entry className="px-3 py-3">
         <button
           type="button"
           onClick={() => onNavigate("daily", todayISO())}
@@ -262,6 +262,8 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
           return (
             <button
               key={item.kind}
+              data-os-nav-item
+              data-active={isActive}
               type="button"
               onMouseEnter={() => prefetchDocument(item.kind, slug)}
               onFocus={() => prefetchDocument(item.kind, slug)}
@@ -293,6 +295,8 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
                 return (
                   <button
                     key={entry.slug}
+                    data-os-nav-item
+                    data-active={isActive}
                     type="button"
                     onClick={() => onNavigate("daily", entry.slug)}
                     onMouseEnter={() => prefetchDocument("daily", entry.slug)}

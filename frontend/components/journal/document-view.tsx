@@ -483,7 +483,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
         {editing && isMobile !== true ? (
           <div className="p-4 lg:p-8">
             {/* Premium writing surface */}
-            <div className="rounded-2xl border border-white/[0.04] bg-white/[0.015] shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)] overflow-hidden">
+            <div data-os-document-body className="rounded-2xl border border-white/[0.04] bg-white/[0.015] shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)] overflow-hidden">
               <MarkdownEditor
                 value={draft}
                 onChange={setDraft}
@@ -504,6 +504,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
           </div>
         ) : (
           <div
+            data-os-document-body
             className={clsx(
               "bg-white/[0.01] transition-all duration-300",
               isMobile === true

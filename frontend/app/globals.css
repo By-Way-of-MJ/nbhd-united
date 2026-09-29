@@ -746,3 +746,275 @@ html.open-sky [data-os-graph] {
   mask-image: linear-gradient(to bottom, transparent, #000 14%, #000 82%, transparent), linear-gradient(to right, transparent, #000 6%, #000 94%, transparent);
   mask-composite: intersect;
 }
+
+/* Fuel, Neighborhood management and Journal: finish the legacy component skin.
+   Hooks are inert outside this gate; dialogs/menus retain their object surfaces. */
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) {
+  --accent: var(--os-accent);
+  --accent-hi: var(--os-accent);
+  --accent-hover: var(--os-accent);
+  --amber-text: var(--os-muted);
+  --amber-bg: transparent;
+  --amber-border: var(--os-hairline);
+  --rose-text: var(--os-ink);
+  --rose-bg: transparent;
+  --rose-border: var(--os-ring);
+  --emerald-text: var(--os-done);
+  --emerald-bg: transparent;
+  --status-amber-text: var(--os-muted);
+  --status-amber-bg: transparent;
+  --status-emerald-text: var(--os-done);
+  --status-emerald-bg: transparent;
+  --font-headline: var(--font-body);
+  --font-mono: var(--font-body);
+  font-variant-numeric: tabular-nums;
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) :is(button, a, input, select, textarea):focus-visible {
+  outline: 2px solid var(--os-accent);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+/* Same outline capsule as os-btn; row and icon buttons stay plain. */
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) button.rounded-full:not([data-os-row]),
+html.open-sky [data-os-new-entry] button {
+  min-height: 44px;
+  border: 1px solid var(--os-accent-line);
+  border-radius: 999px;
+  background: transparent;
+  background-image: none;
+  color: var(--os-accent);
+  box-shadow: none;
+  filter: none;
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) button.rounded-full:hover,
+html.open-sky [data-os-new-entry] button:hover {
+  background: var(--os-accent-soft);
+  box-shadow: none;
+}
+html.open-sky [data-os-fuel] {
+  /* Category metadata uses these variables, including inside SVG charts. */
+  --color-violet-400: var(--os-muted);
+  --color-amber-400: var(--os-muted);
+  --color-pink-400: var(--os-muted);
+  --color-teal-400: var(--os-muted);
+  --color-slate-400: var(--os-muted);
+  --color-blue-400: var(--os-muted);
+  --color-purple-400: var(--os-muted);
+}
+html.open-sky [data-os-fuel] :is([data-os-surface], [data-os-day]),
+html.open-sky [data-os-neighborhood] > section {
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-left-width: 0 !important; /* Legacy inline category stripe. */
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  padding: 1.25rem 0;
+}
+html.open-sky [data-os-fuel] [data-os-day] { min-width: 0; }
+html.open-sky [data-os-fuel] :is([data-os-row], [data-os-session], [data-os-rest]),
+html.open-sky [data-os-neighborhood] [data-os-row] {
+  min-width: 0;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0.875rem 0;
+}
+html.open-sky [data-os-fuel] [data-os-session]:first-child { border-top: 0; }
+html.open-sky [data-os-fuel] [data-os-session] button > div {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+html.open-sky [data-os-fuel] [data-os-category-mark] { display: none; }
+html.open-sky [data-os-fuel] [data-os-field] {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-hairline);
+  border-radius: 0;
+  padding-inline: 0;
+}
+html.open-sky [data-os-fuel] [data-os-calendar-day] {
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-radius: 0;
+}
+html.open-sky [data-os-fuel] :is(.uppercase, [data-os-label]),
+html.open-sky [data-os-neighborhood] > section > header > h2,
+html.open-sky [data-os-journal] .uppercase {
+  font-family: var(--font-body), sans-serif;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--os-label);
+}
+html.open-sky [data-os-fuel] .uppercase.text-accent { color: var(--os-accent); }
+html.open-sky [data-os-fuel] .uppercase.text-emerald-text { color: var(--os-done); }
+html.open-sky [data-os-fuel] [data-os-surface] h3 {
+  font-family: var(--font-serif), Georgia, serif;
+  font-size: 1.75rem;
+  font-weight: 400;
+}
+html.open-sky [data-os-neighborhood] { margin-top: 2.5rem; }
+html.open-sky [data-os-neighborhood] > section > p {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+}
+html.open-sky [data-os-neighborhood] [data-os-avatar] {
+  display: grid;
+  place-items: center;
+  background: transparent !important; /* User hue remains intact in the old skin. */
+  border: 1px solid var(--os-ring);
+  color: var(--os-muted);
+  font-size: 0.8125rem;
+}
+html.open-sky [data-os-neighborhood] [data-os-avatar]::after { content: attr(data-initial); }
+html.open-sky [data-os-neighborhood] [data-os-row] > .min-w-0 > .flex { flex-wrap: wrap; gap: 0 0.5rem; }
+
+/* Journal: an unboxed text rail, upright serif date, and hairline writing field. */
+html.open-sky [data-os-journal-rail] {
+  background: transparent;
+  border-color: var(--os-hairline);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.open-sky [data-os-journal-rail] [data-os-nav-item] {
+  position: relative;
+  min-height: 44px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--os-muted);
+}
+html.open-sky [data-os-journal-rail] [data-os-nav-item][data-active="true"] { color: var(--os-ink); }
+html.open-sky [data-os-journal-rail] .active-glow-left::before,
+html.open-sky [data-os-journal-rail] [data-os-nav-item][data-active="true"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.875rem;
+  bottom: 0.875rem;
+  width: 1px;
+  background: var(--os-accent);
+  box-shadow: none;
+}
+html.open-sky [data-os-nav-item] > svg,
+html.open-sky [data-os-new-entry] svg,
+html.open-sky [data-os-current-orbit] svg { display: none; }
+html.open-sky [data-os-journal-rail] [class*="text-ink-faint/"] { color: var(--os-faint); }
+html.open-sky [data-os-journal-rail] .border-b,
+html.open-sky [data-os-journal-rail] .border-t { border-color: var(--os-hairline); }
+html.open-sky [data-os-document-header] { border-color: var(--os-hairline); }
+html.open-sky [data-os-document-header] .font-display {
+  font-family: var(--font-serif), Georgia, serif;
+  font-weight: 400;
+  font-size: clamp(1.5rem, 2.1vw, 2rem);
+  line-height: 1.15;
+  letter-spacing: 0;
+}
+html.open-sky [data-os-document-header] button.rounded-xl {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 999px;
+  color: var(--os-accent);
+}
+html.open-sky [data-os-document-header] label:focus-within {
+  outline: 2px solid var(--os-accent);
+  outline-offset: 3px;
+}
+html.open-sky [data-os-current-orbit] { color: var(--os-accent) !important; }
+html.open-sky [data-os-document-header] span.rounded-full { border: 0; background: transparent; }
+html.open-sky :is([data-os-current-status], [data-os-document-body]) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-inline: 0;
+}
+html.open-sky [data-os-current-status] { margin-bottom: 1.5rem; }
+html.open-sky [data-os-current-status] .normal-case { color: var(--os-faint); }
+html.open-sky [data-os-current-status] li { border-bottom: 1px solid var(--os-hairline); min-height: 44px; }
+html.open-sky [data-os-current-status] .truncate { white-space: normal; overflow-wrap: anywhere; }
+html.open-sky [data-os-current-status] button:not([aria-pressed="true"]):hover > span { border-color: var(--os-accent); }
+html.open-sky [data-os-quick-log] input {
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-ring);
+  border-radius: 0;
+  padding-inline: 0;
+}
+@media (max-width: 639px) {
+  html.open-sky [data-os-neighborhood] [data-os-approval] { flex-wrap: wrap; }
+  html.open-sky [data-os-neighborhood] [data-os-approval] > .min-w-0 { flex-basis: 100%; }
+  html.open-sky [data-os-document-header] { padding-inline: 0; }
+  html.open-sky [data-os-document-header] > .flex:first-child { flex-basis: 100%; }
+  html.open-sky [data-os-document-header] > .flex:first-child > .flex { min-width: 0; gap: 0; flex-wrap: wrap; }
+  html.open-sky [data-os-journal] { height: calc(100dvh - 15rem); }
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) .bg-accent.text-white {
+  box-shadow: none !important;
+  border: 1px solid var(--os-accent-line);
+}
+html.open-sky [data-os-fuel] button.rounded-full:has(> svg:only-child) { min-width: 44px; }
+html.open-sky [data-os-fuel] [data-os-filter] {
+  background: transparent !important;
+  border-color: var(--os-hairline) !important;
+  color: var(--os-muted);
+}
+html.open-sky [data-os-fuel] [data-os-filter][data-active="true"] {
+  border-color: var(--os-accent-line) !important;
+  color: var(--os-accent);
+}
+/* Trend direction is information, not a completed action. */
+html.open-sky [data-os-fuel] [data-os-surface] .text-emerald-text:not(.uppercase) { color: var(--os-muted); }
+html.open-sky [data-os-fuel] svg path[fill^="url("] { fill: none; }
+html.open-sky [data-os-fuel] svg path[stroke^="var(--color-"] { stroke: var(--os-ink); }
+html.open-sky [data-os-fuel] svg circle[fill^="var(--color-"] { fill: var(--os-accent); }
+html.open-sky [data-os-welcome] {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-hairline);
+  border-radius: 0;
+  padding-left: 0;
+  padding-top: 0;
+  padding-bottom: 1.25rem;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.open-sky [data-os-welcome] h2 { color: var(--os-label); font-weight: 600; }
+html.open-sky [data-os-welcome] > button { top: -0.5rem; right: 0; }
+html.open-sky [data-os-journal-rail] button:has(> span) > svg { display: none; }
+
+/* Keep edge labels inside the phone viewport without clipping names. */
+@media (max-width: 639px) {
+  html.open-sky [data-os-map-label="right"] {
+    left: auto;
+    right: 100%;
+    padding: 0 0.25rem 0 0;
+    align-items: flex-end;
+    text-align: right;
+  }
+  html.open-sky [data-os-map-label="left"] {
+    right: auto;
+    left: 100%;
+    padding: 0 0 0 0.25rem;
+    align-items: flex-start;
+    text-align: left;
+  }
+}
+
+html.open-sky [data-os-fuel] [data-os-day] header button { margin-right: 0; }
+html.open-sky [data-os-fuel] [data-os-tab][data-active="true"] { color: var(--os-accent); }
+html.open-sky [data-os-fuel] [data-os-tab] > .absolute { background: var(--os-accent); }
+html.open-sky [data-os-fuel] [data-os-surface] > button.absolute:focus-visible { outline-offset: -2px; }
+html.open-sky [data-os-journal] input[type="checkbox"]:checked { accent-color: var(--os-done); }

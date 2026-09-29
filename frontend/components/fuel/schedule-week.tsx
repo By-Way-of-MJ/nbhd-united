@@ -87,7 +87,7 @@ export function ScheduleWeek({ onAddSession, onOpenWorkout }: ScheduleWeekProps)
       ) : null}
 
       <div className="flex items-center justify-between gap-3">
-        <h2 className="font-headline text-base sm:text-lg font-semibold text-ink">Next 7 days</h2>
+        <h2 data-os-label className="font-headline text-base sm:text-lg font-semibold text-ink">Next 7 days</h2>
         {isLoading && data && (
           <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink-faint">syncing…</span>
         )}
@@ -145,7 +145,7 @@ interface DayCardProps {
 function DayCard({ iso, date, sessions, isToday, onAddSession, onOpenWorkout }: DayCardProps) {
   const dow = (date.getDay() + 6) % 7; // Mon = 0
   return (
-    <article
+    <article data-os-day
       className={`rounded-panel border border-border bg-card/95 backdrop-blur-md p-4 shadow-panel ${
         isToday ? "ring-1 ring-accent/30" : ""
       }`}
@@ -181,7 +181,7 @@ function DayCard({ iso, date, sessions, isToday, onAddSession, onOpenWorkout }: 
           <button
             type="button"
             onClick={() => onAddSession(iso)}
-            className="block w-full rounded-lg border border-dashed border-border px-3 py-3 text-xs text-ink-faint transition hover:bg-surface-hover hover:text-ink"
+            data-os-rest className="block w-full rounded-lg border border-dashed border-border px-3 py-3 text-xs text-ink-faint transition hover:bg-surface-hover hover:text-ink"
           >
             Rest day · tap to add
           </button>
@@ -230,7 +230,7 @@ function DayRow({ iso, date, sessions, onAddSession, onOpenWorkout }: DayRowProp
           ? `Add a session on ${date.toDateString()}`
           : `Open ${first.activity} on ${date.toDateString()}`
       }
-      className="group w-full flex items-center gap-3 rounded-lg border border-border bg-surface-elevated/70 px-3 py-2.5 text-left transition hover:border-border-strong hover:bg-surface-hover min-h-[56px]"
+      data-os-row className="group w-full flex items-center gap-3 rounded-lg border border-border bg-surface-elevated/70 px-3 py-2.5 text-left transition hover:border-border-strong hover:bg-surface-hover min-h-[56px]"
     >
       <div className="flex flex-col items-center justify-center w-10 shrink-0 leading-none">
         <span className="font-mono text-[9px] uppercase tracking-[0.15em] text-ink-faint">
@@ -242,7 +242,7 @@ function DayRow({ iso, date, sessions, onAddSession, onOpenWorkout }: DayRowProp
       </div>
       {cat && (
         <span
-          className="h-9 w-0.5 rounded-full shrink-0"
+          data-os-category-mark className="h-9 w-0.5 rounded-full shrink-0"
           style={{ background: cat.accent, opacity: 0.7 }}
           aria-hidden="true"
         />
@@ -297,7 +297,7 @@ function DayRow({ iso, date, sessions, onAddSession, onOpenWorkout }: DayRowProp
 
 function NextUpSkeleton() {
   return (
-    <section
+    <section data-os-surface
       aria-busy="true"
       role="status"
       aria-label="Loading next workout"
@@ -406,7 +406,7 @@ function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
   };
 
   return (
-    <section
+    <section data-os-surface
       aria-label="Next workout"
       className="
         rounded-panel border border-border bg-card/95 p-4 sm:p-5 shadow-panel backdrop-blur-md
@@ -513,7 +513,7 @@ function SessionCard({ workout, onOpen }: SessionCardProps) {
 
   return (
     <div
-      className="group relative flex items-center gap-2.5 rounded-lg border border-border border-l-2 bg-surface/60 pl-3 pr-1 py-2 transition hover:bg-surface-hover"
+      data-os-session className="group relative flex items-center gap-2.5 rounded-lg border border-border border-l-2 bg-surface/60 pl-3 pr-1 py-2 transition hover:bg-surface-hover"
       style={accentBorder}
     >
       <button

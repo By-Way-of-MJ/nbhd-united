@@ -9,6 +9,7 @@ export function ProfileCard() {
   if (isPending) {
     return (
       <div
+        data-os-surface
         className="rounded-panel border border-border bg-surface-elevated p-4 mb-6"
         role="status"
         aria-busy="true"
@@ -32,7 +33,7 @@ export function ProfileCard() {
 
   if (profile.onboarding_status === "declined") {
     return (
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 mb-6">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 mb-6">
         <p className="text-sm text-ink-muted">
           Using general workouts. Chat with your assistant anytime to set up a personalized fitness profile.
         </p>
@@ -42,7 +43,7 @@ export function ProfileCard() {
 
   if (profile.onboarding_status === "in_progress") {
     return (
-      <div className="rounded-panel border border-accent/25 bg-accent/5 p-4 mb-6">
+      <div data-os-surface className="rounded-panel border border-accent/25 bg-accent/5 p-4 mb-6">
         <p className="text-sm text-ink-muted">
           Your fitness profile is being set up. Continue chatting with your assistant to complete it.
         </p>
@@ -52,7 +53,7 @@ export function ProfileCard() {
 
   // completed
   return (
-    <div className="rounded-panel border border-border bg-surface-elevated p-4 mb-6">
+    <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 mb-6">
       <div className="flex items-center gap-2 mb-3">
         <span className="text-accent text-[10px] font-bold uppercase tracking-[0.2em]">Profile</span>
       </div>

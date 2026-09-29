@@ -38,7 +38,7 @@ export default function FuelPage() {
   };
 
   return (
-    <div className="mx-auto py-2 sm:py-6 overflow-x-hidden">
+    <div data-os-fuel className="mx-auto py-2 sm:py-6 overflow-x-hidden">
       {/* Mobile: compact eyebrow + CTA on one row — saves ~140px above the fold */}
       <div className="sm:hidden flex items-center justify-between gap-3 mb-5">
         <span data-os-legacy-title className="text-accent text-xs font-bold uppercase tracking-[0.22em]">FUEL</span>
@@ -94,6 +94,8 @@ export default function FuelPage() {
           return (
             <button
               key={t.id}
+              data-os-tab
+              data-active={on}
               onClick={() => setTab(t.id)}
               className={`relative flex-1 sm:flex-none min-h-[44px] px-1.5 sm:px-4 py-3 text-sm whitespace-nowrap transition ${on ? "text-ink" : "text-ink-muted hover:text-ink"}`}
             >

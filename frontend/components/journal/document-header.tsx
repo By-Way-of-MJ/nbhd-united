@@ -61,7 +61,7 @@ export function DocumentHeader({
   };
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.04] px-3 py-2.5 sm:px-4 sm:py-3 lg:px-6 lg:py-4">
+    <div data-os-document-header className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.04] px-3 py-2.5 sm:px-4 sm:py-3 lg:px-6 lg:py-4">
       <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
         {/* Sidebar toggle — integrated into header on mobile */}
         {onToggleSidebar && (
@@ -96,7 +96,7 @@ export function DocumentHeader({
             <label className="relative cursor-pointer min-w-0 text-center">
               {/* Today indicator */}
               {isToday && (
-                <div className="flex items-center justify-center gap-1.5 text-signal-text text-[10px] font-semibold uppercase tracking-[0.12em] mb-1">
+                <div data-os-current-orbit className="flex items-center justify-center gap-1.5 text-signal-text text-[10px] font-semibold uppercase tracking-[0.12em] mb-1">
                   <svg viewBox="0 0 16 16" fill="currentColor" className="h-2.5 w-2.5">
                     <path d="M8 0L9 6l5-4-2.5 3.5L16 8l-4.5-.5L13 13l-3-2.5L6 13l1.5-5.5L3 8l4.5-2.5L5 2l4 4z" />
                   </svg>
@@ -109,6 +109,7 @@ export function DocumentHeader({
               </span>
               <input
                 type="date"
+                aria-label="Journal date"
                 className="absolute inset-0 cursor-pointer opacity-0"
                 value={slug}
                 max={todayISO()}

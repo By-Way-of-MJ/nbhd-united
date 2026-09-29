@@ -18,7 +18,7 @@ export function QuickLogInput({ onSubmit, isPending }: QuickLogInputProps) {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex gap-2">
+    <form data-os-quick-log onSubmit={handleSubmit} className="flex gap-2">
       <input
         type="text"
         placeholder="Quick log entry..."

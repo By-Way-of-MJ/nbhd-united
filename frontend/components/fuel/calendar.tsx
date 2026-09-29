@@ -138,7 +138,7 @@ export function Calendar({ onSelectDay }: CalendarProps) {
             <button
               key={i}
               onClick={() => onSelectDay(iso)}
-              className={`group relative min-h-[44px] sm:aspect-[1.15/1] rounded-md sm:rounded-lg border text-left p-1 sm:p-2 transition ${
+              data-os-calendar-day className={`group relative min-h-[44px] sm:aspect-[1.15/1] rounded-md sm:rounded-lg border text-left p-1 sm:p-2 transition ${
                 c.out
                   ? "border-white/[0.02] bg-transparent opacity-40"
                   : isToday
