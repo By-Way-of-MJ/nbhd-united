@@ -54,6 +54,9 @@ class NeighborProfile(models.Model):
     # fragile across reinstall, so consent lives server-side on the profile.
     accepted_terms_at = models.DateTimeField(null=True, blank=True)
     accepted_terms_version = models.CharField(max_length=20, blank=True, default="")
+    # Bumped on every new profile photo (None = no photo). The photo URL carries it,
+    # so a changed photo is a new URL and clients can cache each one forever.
+    photo_version = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -678,6 +681,25 @@ class CircleMembership(models.Model):
         return f"circle_member:{self.circle_id}:{self.tenant_id}"
 
 
+class NeighborPhoto(models.Model):
+    """One profile photo per person: a 512 px square JPEG, re-encoded on upload (so
+    no EXIF/location survives) and checked by the image safety check before it is
+    stored. Shown only to neighbors and people who share a circle or project; a
+    report hides it for the reporter. Cross-tenant data → its manager lives only in
+    ``access.py``."""
+
+    profile = models.OneToOneField(NeighborProfile, on_delete=models.CASCADE, primary_key=True, related_name="photo")
+    image = models.BinaryField()
+    content_type = models.CharField(max_length=32, default="image/jpeg")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "neighbor_photos"
+
+    def __str__(self) -> str:
+        return f"photo:{self.profile_id}"
+
+
 class ContentReport(models.Model):
     """MVP moderation: report + block + owner-unshare (design §2.10). No global
     queue at launch scale — shares are scoped + human-approved + identity-scrubbed,
@@ -692,10 +714,16 @@ class ContentReport(models.Model):
             ("shared_lesson", "Shared spark"),
             ("friend_message", "Chat"),
             ("general", "General / support"),  # Settings → Support "Report a concern" (no content id)
+            ("profile_photo", "Profile photo"),
         ],
     )
     shared_lesson = models.ForeignKey(SharedLesson, on_delete=models.CASCADE, null=True, blank=True)
     friend_message = models.ForeignKey(FriendMessage, on_delete=models.CASCADE, null=True, blank=True)
+    # A reported profile photo: the report is about the PERSON's photo, so it keeps
+    # hiding their photos from the reporter even after they change it.
+    photo_profile = models.ForeignKey(
+        NeighborProfile, on_delete=models.CASCADE, null=True, blank=True, related_name="+"
+    )
     reason = models.CharField(max_length=280)
     status = models.CharField(max_length=12, default="open")  # open | hidden | dismissed
     created_at = models.DateTimeField(auto_now_add=True)

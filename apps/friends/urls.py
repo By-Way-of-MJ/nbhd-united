@@ -34,6 +34,8 @@ from .views import (
     NeighborhoodView,
     NetworkCapabilitiesView,
     PendingSharesView,
+    PhotoView,
+    ProfilePhotoView,
     ProfileView,
     ReportView,
     ShareApproveView,
@@ -60,6 +62,8 @@ urlpatterns = [
     path("blocked/", BlockedListView.as_view(), name="friends-blocked"),
     path("consent/", ConsentView.as_view(), name="friends-consent"),
     path("profile/", ProfileView.as_view(), name="friends-profile"),
+    path("profile/photo/", ProfilePhotoView.as_view(), name="friends-profile-photo"),
+    path("photos/<uuid:profile_id>/", PhotoView.as_view(), name="friends-photo"),
     path("waves/", WaveCreateView.as_view(), name="friends-wave-create"),
     path(
         "waves/<uuid:friendship_id>/accept/",

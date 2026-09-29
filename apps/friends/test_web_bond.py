@@ -35,6 +35,7 @@ ALLOWED_NEIGHBOR_KEYS = {
     "handle",
     "display_name",
     "avatar_hue",
+    "photo_url",  # the person's own optional profile photo (neighbors may see it)
     "spark_count",
     "in_my_sky",
     "has_unread_thread",

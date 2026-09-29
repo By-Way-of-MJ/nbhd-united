@@ -68,6 +68,7 @@ def build_thread_page(viewer_tenant, thread, *, cursor, limit) -> tuple[list[dic
                 if m.sender_tenant_id in profiles
                 else "Neighbor",
                 "avatar_hue": profiles[m.sender_tenant_id].avatar_hue if m.sender_tenant_id in profiles else 210,
+                "photo_url": access.photo_url(profiles.get(m.sender_tenant_id)),
             },
             "created_at": m.created_at.isoformat(),
         }

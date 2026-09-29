@@ -144,11 +144,13 @@ def _profile_entry(tenant, profiles_by_id: dict) -> dict:
             "display_name": profile.display_name,
             "handle": profile.handle,
             "avatar_hue": profile.avatar_hue,
+            "photo_url": access.photo_url(profile),
         }
     return {
         "display_name": (getattr(tenant.user, "display_name", None) or "Neighbor"),
         "handle": None,
         "avatar_hue": 210,
+        "photo_url": None,
     }
 
 
@@ -191,6 +193,7 @@ def list_neighborhood(tenant) -> dict:
             "display_name": me.display_name,
             "bio": me.bio,
             "avatar_hue": me.avatar_hue,
+            "photo_url": access.photo_url(me),
         },
         "neighbors": neighbors,
         "pending_incoming": pending_incoming,
@@ -478,6 +481,7 @@ def _profile_public(profile) -> dict:
         "handle": profile.handle if profile else None,
         "display_name": profile.display_name if profile else "Neighbor",
         "avatar_hue": profile.avatar_hue if profile else 210,
+        "photo_url": access.photo_url(profile),
     }
 
 
@@ -580,6 +584,7 @@ def neighborhood_home(tenant, since=None) -> dict:
             "display_name": me.display_name,
             "bio": me.bio,
             "avatar_hue": me.avatar_hue,
+            "photo_url": access.photo_url(me),
             "accepted_terms_at": me.accepted_terms_at.isoformat() if me.accepted_terms_at else None,
             "accepted_terms_version": me.accepted_terms_version,
             "needs_consent": me.accepted_terms_version != FRIENDS_TERMS_VERSION,
@@ -1012,6 +1017,7 @@ def list_wormholes(viewer_tenant, warpable=None) -> list[dict]:
                 "display_name": profile.display_name if profile else "Neighbor",
                 "handle": profile.handle if profile else None,
                 "avatar_hue": profile.avatar_hue if profile else 210,
+                "photo_url": access.photo_url(profile),
                 "spark_count": target["spark_count"],
                 "new_since_last_visit": target["new_since_last_visit"],
                 "in_my_sky": in_my_sky,
@@ -1472,6 +1478,7 @@ def list_threads(tenant) -> list[dict]:
                 "display_name": profile.display_name if profile else "Neighbor",
                 "handle": profile.handle if profile else None,
                 "avatar_hue": profile.avatar_hue if profile else 210,
+                "photo_url": access.photo_url(profile),
                 "unread": access.unread_count(thread, membership.last_read_seq, tenant.id),
                 "last_message": (last.text[:80] if last else ""),
                 "last_message_at": thread.last_message_at,

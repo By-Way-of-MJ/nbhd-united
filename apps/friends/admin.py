@@ -15,12 +15,13 @@ class ContentReportAdmin(admin.ModelAdmin):
         "target_kind",
         "shared_lesson",
         "friend_message",
+        "photo_profile",
         "reason",
         "created_at",
         "resolved_at",
     )
     ordering = ("-created_at",)
-    actions = ("mark_hidden", "mark_dismissed")
+    actions = ("mark_hidden", "mark_dismissed", "remove_reported_photo")
 
     def has_add_permission(self, request):
         return False
@@ -32,6 +33,18 @@ class ContentReportAdmin(admin.ModelAdmin):
     def mark_hidden(self, request, queryset):
         updated = queryset.update(status="hidden", resolved_at=timezone.now())
         self.message_user(request, f"Marked {updated} report(s) hidden.")
+
+    @admin.action(description="Remove the reported profile photo (for everyone)", permissions=["change"])
+    def remove_reported_photo(self, request, queryset):
+        from . import access
+
+        removed = 0
+        for report in queryset.filter(target_kind="profile_photo").select_related("photo_profile"):
+            if report.photo_profile and report.photo_profile.photo_version:
+                access.delete_photo(report.photo_profile)
+                removed += 1
+        queryset.filter(target_kind="profile_photo").update(status="hidden", resolved_at=timezone.now())
+        self.message_user(request, f"Removed {removed} photo(s); they now show as initials.")
 
     @admin.action(description="Mark dismissed", permissions=["change"])
     def mark_dismissed(self, request, queryset):

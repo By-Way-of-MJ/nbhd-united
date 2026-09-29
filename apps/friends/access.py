@@ -45,6 +45,7 @@ from .models import (
     FriendThread,
     FriendThreadMembership,
     LessonShareGrant,
+    NeighborPhoto,
     NeighborProfile,
     SharedGoal,
     SharedGoalMembership,
@@ -1371,6 +1372,7 @@ def project_snapshot(goal, *, viewer):
             handle=profile.handle if profile else None,
             display_name=profile.display_name if profile else "Neighbor",
             hue=profile.avatar_hue if profile else 210,
+            photo_url=photo_url(profile),
         )
     return {
         "mission_id": goal.id,
@@ -1498,3 +1500,68 @@ def my_neighbor_edges_by_handle(tenant) -> dict:
         if profile.handle:
             out[profile.handle.lower()] = other[str(profile.tenant_id)]
     return out
+
+
+# ── Profile photos — NeighborPhoto.objects confined here ────────────────────
+
+
+def photo_url(profile) -> str | None:
+    """The versioned URL clients fetch a person's photo from, or None (no photo).
+    A new photo is a new version, so each URL is safe to cache forever."""
+    version = getattr(profile, "photo_version", None)
+    if not profile or not version:
+        return None
+    return f"/api/v1/friends/photos/{profile.id}/?v={version}"
+
+
+def save_photo(profile, jpeg: bytes) -> int:
+    """Store (or replace) my photo and bump the version. Returns the new version."""
+    with transaction.atomic():
+        NeighborPhoto.objects.update_or_create(profile=profile, defaults={"image": jpeg, "content_type": "image/jpeg"})
+        profile.photo_version = (profile.photo_version or 0) + 1
+        profile.save(update_fields=["photo_version", "updated_at"])
+    return profile.photo_version
+
+
+def delete_photo(profile) -> None:
+    """Remove my photo (the bytes too, not just the pointer)."""
+    with transaction.atomic():
+        NeighborPhoto.objects.filter(profile=profile).delete()
+        profile.photo_version = None
+        profile.save(update_fields=["photo_version", "updated_at"])
+
+
+def photo_bytes(profile_id):
+    return NeighborPhoto.objects.filter(profile_id=profile_id).values_list("image", "content_type").first()
+
+
+def _blocked_between(a_id, b_id) -> bool:
+    return Friendship.objects.filter(pair_key=compute_pair_key(a_id, b_id), status=Friendship.Status.BLOCKED).exists()
+
+
+def can_view_photo(viewer, profile) -> bool:
+    """Who sees a person's photo: themselves; an accepted neighbor; or someone who
+    shares an active circle or project with them. Never after a block (either way)
+    and never once the viewer has reported that person's photo."""
+    viewer_id, owner_id = _tenant_id(viewer), profile.tenant_id
+    if viewer_id == owner_id:
+        return True
+    if _blocked_between(viewer_id, owner_id):
+        return False
+    if ContentReport.objects.filter(
+        reporter_tenant_id=viewer_id, target_kind="profile_photo", photo_profile=profile
+    ).exists():
+        return False
+    if are_neighbors(viewer_id, owner_id):
+        return True
+    my_circles = CircleMembership.objects.filter(tenant_id=viewer_id, status="active").values_list(
+        "circle_id", flat=True
+    )
+    if CircleMembership.objects.filter(tenant_id=owner_id, status="active", circle_id__in=my_circles).exists():
+        return True
+    my_projects = SharedGoalMembership.objects.filter(
+        tenant_id=viewer_id, status="active", shared_goal__status="active"
+    ).values_list("shared_goal_id", flat=True)
+    return SharedGoalMembership.objects.filter(
+        tenant_id=owner_id, status__in=["active", "invited"], shared_goal_id__in=my_projects
+    ).exists()
