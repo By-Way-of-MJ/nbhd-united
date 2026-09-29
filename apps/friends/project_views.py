@@ -46,6 +46,31 @@ class StepView(ProjectView):
         return Response(status=204)
 
 
+class MembersView(ProjectView):
+    """POST more of my neighbors into a project I started (they get an invitation)."""
+
+    def post(self, request, mission_id):
+        invited = projects.add_members(
+            self.get_tenant(request), mission_id, self.data(request).get("member_friendship_ids")
+        )
+        return Response({"invited": len(invited)}, status=201)
+
+
+class ProjectDeleteView(ProjectView):
+    """POST: an owner deletes the project for everyone."""
+
+    def post(self, request, mission_id):
+        projects.delete_project(self.get_tenant(request), mission_id)
+        return Response({"mission_id": str(mission_id), "status": "abandoned"})
+
+
+class LinkedProjectsView(ProjectView):
+    """GET my projects linked to my own Horizons goals."""
+
+    def get(self, request):
+        return Response(projects.linked_projects(self.get_tenant(request)))
+
+
 class StepActionView(ProjectView):
     def post(self, request, mission_id, step_id, action):
         tenant = self.get_tenant(request)

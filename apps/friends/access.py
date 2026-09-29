@@ -1454,6 +1454,15 @@ def my_project_proposals(tenant):
     return PendingProjectAction.objects.filter(tenant_id=_tenant_id(tenant))
 
 
+def expire_project_proposals(goal):
+    """A deleted project's pending assistant suggestions (every member's) expire."""
+    from .models import PendingProjectAction
+
+    PendingProjectAction.objects.filter(shared_goal=goal, status="pending").update(
+        status="expired", resolved_at=timezone.now()
+    )
+
+
 def create_project_draft(tenant, **fields):
     from .models import ProjectDraft
 

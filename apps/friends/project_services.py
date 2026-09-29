@@ -121,8 +121,103 @@ def get_plan(tenant, mission_id):
     plan = plan_projection.build_plan(
         access.project_snapshot(goal, viewer=tenant), today=timezone.now().astimezone(tenant_tz(tenant)).date()
     )
-    plan.update(my_membership_id=str(member.id), my_role=member.role)
+    plan.update(
+        my_membership_id=str(member.id),
+        my_role=member.role,
+        # Invitations are checked against the creator's neighbors, so only the
+        # creator (while an owner) can add people.
+        can_invite=member.role == "owner" and goal.created_by_id == tenant.id,
+    )
     return plan
+
+
+MAX_PROJECT_PEOPLE = 12
+
+
+@transaction.atomic
+def add_members(tenant, mission_id, friendship_ids):
+    """Invite more of MY neighbors into a project I started. They still choose to
+    join; a push goes only to the people invited now. Returns the new invitations."""
+    from apps.tenants.models import Tenant
+
+    if not isinstance(friendship_ids, list) or not friendship_ids or len(friendship_ids) > MAX_PROJECT_PEOPLE:
+        raise ValidationError("member_friendship_ids must be a non-empty list.")
+    goal, member = access.lock_project(tenant, mission_id)
+    if member.role != "owner" or goal.created_by_id != tenant.id:
+        raise PermissionDenied("Only the person who started the project can add people.")
+    edges = [access.assert_neighbors(tenant, value) for value in friendship_ids]
+    other_ids = {e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in edges}
+    existing = {m.tenant_id: m for m in access.mission_memberships().filter(shared_goal=goal)}
+    live = sum(m.status in {"active", "invited"} for m in existing.values())
+    invited = []
+    for other in Tenant.objects.select_related("user").filter(id__in=other_ids).order_by("id"):
+        current = existing.get(other.id)
+        if current and current.status in {"active", "invited"}:
+            continue
+        if live >= MAX_PROJECT_PEOPLE:
+            raise ValidationError(f"A project can have up to {MAX_PROJECT_PEOPLE} people.")
+        if current:
+            current.status, current.left_at = "invited", None
+            current.save(update_fields=["status", "left_at"])
+        else:
+            current = access.mission_memberships().create(
+                shared_goal=goal, tenant=other, user=other.user, role="member", status="invited"
+            )
+        invited.append(current.id)
+        live += 1
+    if invited:
+        from .project_notifications import notify_project_invite
+
+        notify_project_invite(goal, tenant, membership_ids=invited)
+    return invited
+
+
+@transaction.atomic
+def delete_project(tenant, mission_id):
+    """An owner removes the project for everyone. Rows stay — the project turns
+    ``abandoned`` and every membership ``left`` — so nobody's own journal Tasks are
+    touched, and it drops out of lists, plans, nudges and assistant context, which
+    all read active memberships only."""
+    goal, member = access.lock_project(tenant, mission_id)
+    if member.role != "owner":
+        raise PermissionDenied("Only a project owner can delete it.")
+    access.mission_memberships().filter(shared_goal=goal, status__in=["active", "invited"]).update(
+        status="left", left_at=timezone.now()
+    )
+    access.set_mission_status(goal, "abandoned")
+    access.expire_project_proposals(goal)
+
+
+def linked_projects(tenant):
+    """My projects linked to one of MY Horizons goals, for that goal's card in
+    Horizons: progress plus my own next open step."""
+    out = []
+    for member in access.my_active_project_memberships(tenant).filter(linked_goal_id__isnull=False):
+        goal = member.shared_goal
+        steps = list(access.project_steps(goal).values("id", "title", "status", "start_date", "due_date"))
+        mine = set(
+            access.project_assignments(goal)
+            .filter(membership=member, status="accepted")
+            .values_list("step_id", flat=True)
+        )
+        open_mine = sorted(
+            (s for s in steps if s["id"] in mine and s["status"] in {"open", "in_progress"}),
+            key=lambda s: (s["due_date"] or s["start_date"] or date.max, s["title"]),
+        )
+        nxt = open_mine[0] if open_mine else None
+        out.append(
+            {
+                "mission_id": str(goal.id),
+                "title": goal.title,
+                "linked_goal_id": str(member.linked_goal_id),
+                "done_count": sum(s["status"] == "done" for s in steps),
+                "total": len(steps),
+                "next_step": (
+                    {"id": str(nxt["id"]), "title": nxt["title"], "due_date": nxt["due_date"]} if nxt else None
+                ),
+            }
+        )
+    return out
 
 
 @transaction.atomic
