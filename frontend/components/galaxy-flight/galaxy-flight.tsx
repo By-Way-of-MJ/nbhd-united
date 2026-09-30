@@ -23,7 +23,7 @@ import {
 } from "@/lib/galaxy-flight/camera";
 import { connectedIndices, layoutGalaxy } from "@/lib/galaxy-flight/layout";
 
-import { FlightRenderer } from "./renderer";
+import { FlightRenderer, type Rect } from "./renderer";
 
 /**
  * Chart your galaxy — the Open Sky flight through your lessons, matching the
@@ -122,6 +122,11 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const mapRef = useRef<HTMLCanvasElement>(null);
   const noteRef = useRef<HTMLInputElement>(null);
+  // UI blocks the star labels must stay clear of (measured each frame — four rects, cheap).
+  const headerRef = useRef<HTMLDivElement>(null);
+  const controlsRef = useRef<HTMLDivElement>(null);
+  const mapBoxRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
   const sim = useRef<Sim>({
     cam: { x: 0, y: 0, z: 0 },
     vx: 0,
@@ -273,6 +278,13 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
         }
       }
 
+      const origin = canvas.getBoundingClientRect();
+      const keepOut: Rect[] = [];
+      for (const el of [headerRef.current, controlsRef.current, mapBoxRef.current, panelRef.current]) {
+        if (!el) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) keepOut.push({ x: r.left - origin.left, y: r.top - origin.top, w: r.width, h: r.height });
+      }
       renderer.draw(ctx, dpr, {
         cam: s.cam,
         view: s.view,
@@ -282,6 +294,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
         still,
         quiet: s.phase.kind === "landed",
         font: s.font,
+        keepOut,
       });
       if (s.phase.kind === "flying" && renderer.nearestIndex !== shownNear) {
         shownNear = renderer.nearestIndex;
@@ -428,7 +441,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
       />
 
       {/* Header */}
-      <div className="absolute inset-x-4 top-[calc(20px+env(safe-area-inset-top,0px))] z-10 flex items-center justify-between gap-4 md:inset-x-8 md:top-6">
+      <div ref={headerRef} className="absolute inset-x-4 top-[calc(20px+env(safe-area-inset-top,0px))] z-10 flex items-center justify-between gap-4 md:inset-x-8 md:top-6">
         <div className="flex min-w-0 flex-col gap-1">
           <Eyebrow>Chart your galaxy</Eyebrow>
           <span className="truncate font-serif text-[22px] leading-tight text-white md:text-[28px]">
@@ -445,7 +458,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
 
       {/* Flight controls */}
       {flying ? (
-        <div className="absolute inset-x-0 bottom-[calc(24px+env(safe-area-inset-bottom,0px))] flex flex-col items-center gap-3 px-4 md:bottom-[34px] md:gap-[14px]">
+        <div ref={controlsRef} className="absolute inset-x-0 bottom-[calc(24px+env(safe-area-inset-bottom,0px))] flex flex-col items-center gap-3 px-4 md:bottom-[34px] md:gap-[14px]">
           <span className="max-w-full truncate text-[13px] text-os-muted" aria-live="polite">{status}</span>
           <div className="flex gap-[26px]">
             <FlightButton
@@ -482,7 +495,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
 
       {/* Corner map */}
       {mapOpen && flying ? (
-        <div className="gf-map">
+        <div ref={mapBoxRef} className="gf-map">
           <Eyebrow>Map</Eyebrow>
           <canvas
             ref={mapRef}
@@ -496,7 +509,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
 
       {/* Landing panel */}
       {landed ? (
-        <section className="gf-panel" aria-label="Landed on a lesson">
+        <section ref={panelRef} className="gf-panel" aria-label="Landed on a lesson">
           <Eyebrow style={{ color: `rgb(${laid.clusters[landed.cluster].rgb})` }}>{laid.clusters[landed.cluster].label} · Landed</Eyebrow>
           <p className="m-0 font-serif text-[24px] leading-[1.2] text-white md:text-[30px]">{landed.star.text}</p>
           {landed.star.context ? <p className="m-0 text-[14px] leading-[1.6] text-os-muted">{landed.star.context}</p> : null}

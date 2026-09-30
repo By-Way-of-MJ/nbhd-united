@@ -23,6 +23,26 @@ export interface FrameState {
   quiet: boolean;
   /** Font family for labels (the page's body font). */
   font: string;
+  /** Screen rects (canvas px) that labels must stay clear of: header, controls, map, panel. */
+  keepOut: Rect[];
+}
+
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const LABEL_H = 14;
+const KEEP_OUT_PAD = 8;
+
+function hitsKeepOut(x: number, y: number, tw: number, zones: Rect[]): boolean {
+  const l = x - tw / 2 - KEEP_OUT_PAD, r = x + tw / 2 + KEEP_OUT_PAD, t = y - KEEP_OUT_PAD, b = y + LABEL_H + KEEP_OUT_PAD;
+  for (const z of zones) {
+    if (l < z.x + z.w && r > z.x && t < z.y + z.h && b > z.y) return true;
+  }
+  return false;
 }
 
 const NEBULA_W = 512, NEBULA_H = 320;
@@ -134,8 +154,9 @@ export class FlightRenderer {
       ctx.font = `400 12px ${s.font}`;
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
-      // Nearest first; a label that would sit on another is skipped, and one
-      // near the edge is nudged inward so it never reads cut off.
+      // Nearest first; a label that would sit on another label or on the UI
+      // (header, controls, map) is skipped, and one near the edge is nudged
+      // inward so it never reads cut off.
       const placed: { x: number; y: number; w: number }[] = [];
       let shown = 0;
       for (const k of close) {
@@ -146,7 +167,8 @@ export class FlightRenderer {
         const tw = ctx.measureText(txt).width;
         const x = Math.min(w - tw / 2 - 8, Math.max(tw / 2 + 8, q.x));
         const y = q.y + 14;
-        if (y > h - 18 || placed.some((p) => Math.abs(p.y - y) < 16 && Math.abs(p.x - x) < (p.w + tw) / 2 + 12)) continue;
+        if (y > h - 18 || hitsKeepOut(x, y, tw, s.keepOut)) continue;
+        if (placed.some((p) => Math.abs(p.y - y) < 16 && Math.abs(p.x - x) < (p.w + tw) / 2 + 12)) continue;
         placed.push({ x, y, w: tw });
         shown++;
         const a = Math.min(0.85, (LABEL_RANGE - q.dz) / 900);
