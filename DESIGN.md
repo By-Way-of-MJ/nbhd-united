@@ -349,3 +349,19 @@ The logged-in app for tenants with `web_redesign` (per-tenant gate `WEB_REDESIGN
 - Text contrast: ink `#E2E8F0`, muted α .80, faint α .62, labels α .78 (raised on iOS after "hard to read" — keep them).
 - Navigation: desktop 240 px text rail (current = white + accent tick), tablet icon rail, phone web = floating capsule bar (Overview, Log, People, More) with 12 px labels, safe areas and `100dvh`.
 - Charts: 1.5 px near-white line / thin bars, accent only for latest point or goal met, dashed hairline goal, no fills.
+
+### Living universe public home
+
+The public home uses the approved Open Sky photo composition, scoped to
+`components/landing/living-universe.css`. Instrument Serif pairs with the existing
+body font. Local `--universe-*` tokens define its near-black canvas (`#030407`),
+white text, lavender outline CTAs and dark photo scrims; app tokens are unchanged.
+NASA/ESA images live in `public/space/` with desktop and 1200px mobile JPEGs.
+The hero is preloaded, other images load lazily, and reduced motion disables all
+photo drift, rotation, twinkles and entrance motion. Captions remain readable over
+scrims. The footer stays in document flow so all sections remain visible.
+
+The public home remains visible when signed in, with “Open my NBHD” links to
+`/overview`. Installed PWAs launch at `/overview` with the existing `/` identity.
+Horizons project and legacy goal links use Journal document hashes; Journal
+follows those hashes on navigation and browser Back.

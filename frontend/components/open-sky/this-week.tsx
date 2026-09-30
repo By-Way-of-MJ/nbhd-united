@@ -131,7 +131,8 @@ export function ThisWeekCard({ enabled }: { enabled: boolean }) {
 
   return (
     <OpenSkySection
-      id="this-week"
+      id="week"
+      className="md:col-span-2"
       label="This week"
       trailing={freshness ? <span className="text-[0.8125rem] text-os-muted">{freshness}</span> : undefined}
     >
