@@ -1971,7 +1971,7 @@ class RuntimeDailyNotesView(KnownValueResponseGuardMixin, APIView):
                 "tenant_id": str(tenant.id),
                 "date": str(d),
                 "markdown": doc.markdown,
-                "sections": parse_daily_sections(doc.markdown),
+                "sections": parse_daily_sections(doc.markdown, template=get_default_template(tenant=tenant)),
             },
             status=200,
         )
@@ -2070,6 +2070,7 @@ class RuntimeDailyNoteAppendView(APIView):
             field="markdown",
         )
         content = authored.text
+        template = get_default_template(tenant=tenant)
 
         with transaction.atomic():
             # Re-read under a row lock so concurrent appends are serialised
@@ -2082,6 +2083,7 @@ class RuntimeDailyNoteAppendView(APIView):
                     tenant=tenant,
                     markdown=md,
                     section_slug=section_slug_str,
+                    template=template,
                 )
                 doc.markdown = upsert_markdown_section(md, heading, content)
             else:
@@ -2113,7 +2115,7 @@ class RuntimeDailyNoteAppendView(APIView):
             "tenant_id": str(tenant.id),
             "date": str(d),
             "markdown": doc.markdown,
-            "sections": parse_daily_sections(doc.markdown),
+            "sections": parse_daily_sections(doc.markdown, template=template),
         }
         if date_attribution_warning:
             response_payload["date_attribution_warning"] = date_attribution_warning
