@@ -7,6 +7,10 @@ from .development import *  # noqa: F403,F401
 if os.environ.get("AZURE_MOCK") != "true":
     raise RuntimeError("The local test stack cannot use Azure")
 LOCAL_TEST_ROOT = os.environ["LOCAL_TEST_ROOT"]
+# .env.local-test is generated from .env.example, whose blank OPENCLAW_JOURNAL_PLUGIN_PATH overrides the base
+# default and silently drops the assistant's journal/task/calendar tools ("plugin not found"). Use the image
+# path; configure_gateway maps /opt/nbhd/plugins/* to this checkout's runtime plugins.
+OPENCLAW_JOURNAL_PLUGIN_PATH = OPENCLAW_JOURNAL_PLUGIN_PATH or "/opt/nbhd/plugins/nbhd-journal-tools"  # noqa: F405
 # Local model turns outlast the 120 s fleet default; stay below yuki_local's 900 s poll.
 LOCAL_TEST_CHAT_TIMEOUT = 840
 # Django-side LLM features (e.g. Core meditation compose) use basecamp's loopback Ollama here instead
