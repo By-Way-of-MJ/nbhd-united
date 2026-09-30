@@ -698,6 +698,15 @@ html.open-sky .glow-purple-hover:hover { box-shadow: none; }
   50% { opacity: calc(var(--os-a, 0.3) * 0.35); }
 }
 .os-twinkle { animation: os-twinkle 6s ease-in-out infinite; }
+/* A new line of text settling in (the constellation's chosen lesson). */
+@keyframes os-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.os-fade-in { animation: os-fade-in 700ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .os-fade-in { animation: none; }
+}
 
 /* Open Sky: legacy filled-accent buttons (`bg-accent text-white`, 41 sites) become
    the outline capsule — class-level, no per-page edits. Non-button accent fills
@@ -733,19 +742,6 @@ html.open-sky main .font-display { font-family: var(--font-serif), Georgia, seri
   }
 }
 
-/* Constellation under Open Sky: the legacy graph sits below the sky as a framed panel. */
-html.open-sky [data-os-graph] {
-  margin-top: 0;
-  border-radius: 16px;
-  overflow: hidden;
-}
-/* Full-bleed sky art: soft on every edge (fades into the page sky). */
-.os-sky-fade {
-  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 14%, #000 82%, transparent), linear-gradient(to right, transparent, #000 6%, #000 94%, transparent);
-  -webkit-mask-composite: source-in;
-  mask-image: linear-gradient(to bottom, transparent, #000 14%, #000 82%, transparent), linear-gradient(to right, transparent, #000 6%, #000 94%, transparent);
-  mask-composite: intersect;
-}
 
 /* Fuel, Neighborhood management and Journal: finish the legacy component skin.
    Hooks are inert outside this gate; dialogs/menus retain their object surfaces. */

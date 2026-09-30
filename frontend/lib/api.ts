@@ -32,6 +32,7 @@ import {
   ProvisioningStatus,
   WeeklyReview,
   Lesson,
+  LessonSearchResult,
   ConstellationData,
   CreditsResponse,
 } from "@/lib/types";
@@ -1314,6 +1315,11 @@ export function dismissLesson(id: number): Promise<Lesson> {
 
 export function deleteLesson(id: number): Promise<void> {
   return apiFetch<void>(`/api/v1/lessons/${id}/`, { method: "DELETE" });
+}
+
+/** GET /api/v1/lessons/search/?q=… — approved lessons ranked by meaning (embeddings). */
+export function searchLessons(q: string, limit = 20): Promise<LessonSearchResult[]> {
+  return apiFetch<LessonSearchResult[]>(`/api/v1/lessons/search/?q=${encodeURIComponent(q)}&limit=${limit}`);
 }
 
 export function fetchConstellation(): Promise<ConstellationData> {

@@ -3,9 +3,10 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ConstellationSky } from "@/components/open-sky/constellation-sky";
+import { OpenSkyConstellation } from "@/components/open-sky/night-sky";
 import { useConstellationQuery, useDeleteLessonMutation, usePendingLessonsQuery, useTenantQuery } from "@/lib/queries";
 import { isPlayEnabled } from "@/lib/constellation-game/flag";
+import { withTagClusters } from "@/lib/constellation-data";
 import {
   ConstellationData,
   ConstellationNode,
@@ -100,22 +101,6 @@ function buildGraphData(data: ConstellationData): GraphData {
   const tagEdges: GraphEdge[] = nodes.flatMap((n) => n.tags.map((t) => ({ source: n.id, target: `tag:${t}`, type: "TAGGED_WITH" as const })));
   const refinesEdges: GraphEdge[] = detectRefines(nodes).map((r) => ({ source: r.from, target: r.to, type: "REFINES" as const }));
   return { nodes: [...lessonNodes, ...clusterNodes, ...evidenceNodes, ...tagNodes], edges: [...clusterEdges, ...similarEdges, ...evidenceEdges, ...tagEdges, ...refinesEdges], kindColors: KIND_COLORS, relColors: REL_COLORS };
-}
-
-// ── Tag-based clustering fallback ────────────────────────────────────────────
-
-function clusterByTags(nodes: ConstellationNode[]): { clusters: ConstellationData["clusters"]; clusterMap: Map<number, number> } {
-  if (nodes.length === 0) return { clusters: [], clusterMap: new Map() };
-  const tagCounts = new Map<string, number>();
-  for (const n of nodes) for (const t of n.tags) tagCounts.set(t, (tagCounts.get(t) || 0) + 1);
-  const seedTags = [...tagCounts.entries()].filter(([, c]) => c >= 2).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([t]) => t);
-  if (seedTags.length < 2) { seedTags.length = 0; seedTags.push(...[...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([t]) => t)); }
-  const clusterMap = new Map<number, number>();
-  for (const n of nodes) { const idx = n.tags.findIndex((t) => seedTags.includes(t)); if (idx >= 0) clusterMap.set(n.id, seedTags.indexOf(n.tags[idx])); }
-  for (const n of nodes) { if (!clusterMap.has(n.id) && seedTags.length > 0) clusterMap.set(n.id, n.id % seedTags.length); }
-  const counts = new Map<number, number>(); const tagSets = new Map<number, Set<string>>();
-  for (const [nid, cid] of clusterMap) { counts.set(cid, (counts.get(cid) || 0) + 1); const nd = nodes.find((x) => x.id === nid); if (nd) { const s = tagSets.get(cid) || new Set<string>(); nd.tags.forEach((t) => s.add(t)); tagSets.set(cid, s); } }
-  return { clusters: seedTags.map((tag, i) => ({ id: i, label: tag.charAt(0).toUpperCase() + tag.slice(1).replace(/_/g, " "), count: counts.get(i) || 0, tags: [...(tagSets.get(i) || [])].slice(0, 5) })).filter((c) => c.count > 0), clusterMap };
 }
 
 // ── Graph layout ─────────────────────────────────────────────────────────────
@@ -367,11 +352,16 @@ function Inspector({ node, neighbors, onClose, onJump, onDelete, deleting }: { n
 const EMPTY_CONSTELLATION: ConstellationData = { nodes: [], edges: [], affinity_edges: [], clusters: [] };
 
 export default function ConstellationPage() {
+  const { data: tenant } = useTenantQuery();
+  if (!tenant) return <div className="flex items-center justify-center py-20"><p className="text-sm text-ink-muted">Loading your constellation...</p></div>;
+  // Open Sky: the whole page is one night sky. Everyone else keeps the graph.
+  return tenant?.web_redesign ? <OpenSkyConstellation /> : <ConstellationGraph />;
+}
+
+function ConstellationGraph() {
   const { data: rawData = EMPTY_CONSTELLATION, isLoading, error: queryError } = useConstellationQuery();
   const { data: pendingLessons = [] } = usePendingLessonsQuery();
   const deleteLesson = useDeleteLessonMutation();
-  const { data: tenant } = useTenantQuery();
-  const openSky = !!tenant?.web_redesign;
   const loading = isLoading;
   const error = queryError instanceof Error ? queryError.message : queryError ? "Failed to load constellation." : "";
   const pendingCount = pendingLessons.length;
@@ -380,11 +370,7 @@ export default function ConstellationPage() {
   const [playEnabled, setPlayEnabled] = useState(false);
   useEffect(() => setPlayEnabled(isPlayEnabled()), []);
 
-  const effectiveData = useMemo(() => {
-    if (rawData.clusters.length > 0 || !(rawData.nodes.length > 0 && rawData.nodes.every((n) => n.cluster_id == null))) return rawData;
-    const { clusters, clusterMap } = clusterByTags(rawData.nodes);
-    return { ...rawData, nodes: rawData.nodes.map((n) => { const cid = clusterMap.get(n.id); return cid != null ? { ...n, cluster_id: cid } : n; }), clusters };
-  }, [rawData]);
+  const effectiveData = useMemo(() => withTagClusters(rawData), [rawData]);
 
   const graphData = useMemo(() => buildGraphData(effectiveData), [effectiveData]);
   const [kindFilter, setKindFilter] = useState<Set<GraphNodeKind>>(new Set(["Lesson", "Cluster"]));
@@ -599,14 +585,7 @@ export default function ConstellationPage() {
   if (loading) return <div className="flex items-center justify-center py-20"><p className="text-sm text-ink-muted">Loading your constellation...</p></div>;
 
   return (
-    <>
-    {openSky ? (
-      <>
-        <ConstellationSky data={effectiveData} playEnabled={playEnabled} />
-        <h2 id="all-lessons" className="os-label os-hairline-top mt-12 mb-4 pt-4">All lessons</h2>
-      </>
-    ) : null}
-    <div data-os-graph={openSky ? "" : undefined} className="flex flex-col flex-1 -mt-4 relative text-[#E2E8F0]" style={{ background: "#04070b", minHeight: openSky ? "640px" : "calc(100vh - 120px)" }}>
+    <div className="flex flex-col flex-1 -mt-4 relative text-[#E2E8F0]" style={{ background: "#04070b", minHeight: "calc(100vh - 120px)" }}>
       {/* Stage — flex child for real dimensions */}
       <section ref={stageRef} className="flex-1 relative overflow-hidden min-h-[500px] cursor-grab active:cursor-grabbing select-none"
         onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp} onWheel={onWheel}
@@ -640,9 +619,8 @@ export default function ConstellationPage() {
             </div>)}
           </div>
           {/* Mobile Play entry — the toolbar below (with the desktop Play link) is
-              hidden on phones, so surface a tappable Play CTA here on small screens.
-              Open Sky already has the "Fly in" ghost button above the sky. */}
-          {playEnabled && !openSky && (
+              hidden on phones, so surface a tappable Play CTA here on small screens. */}
+          {playEnabled && (
             <Link
               href="/constellation/play"
               title="Fly your galaxy (beta)"
@@ -658,7 +636,7 @@ export default function ConstellationPage() {
             <span className="h-4 w-px bg-white/10 mx-0.5" />
             <button type="button" onClick={() => setPositions(baseLayout)} title="Relayout" className="px-2.5 h-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.36-2.64L3 16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 21v-5h5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.36 2.64L21 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M21 3v5h-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>Relayout</button>
-            {playEnabled && !openSky && (
+            {playEnabled && (
               <Link href="/constellation/play" title="Fly your galaxy (beta)" className="px-2.5 h-7 rounded-full text-accent hover:text-accent-hover hover:bg-accent/15 text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
                 <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 1.4l6.2 3.6L2 8.6z" fill="currentColor" /></svg>Play
               </Link>
@@ -781,6 +759,5 @@ export default function ConstellationPage() {
         <style jsx>{`@keyframes slide-in { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } } .animate-slide-in { animation: slide-in 260ms ease-out both; }`}</style>
       </section>
     </div>
-    </>
   );
 }

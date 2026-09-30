@@ -561,6 +561,11 @@ export interface Lesson {
   created_at: string;
 }
 
+/** GET /api/v1/lessons/search/ — a lesson ranked by meaning (cosine similarity, 0–1). */
+export interface LessonSearchResult extends Lesson {
+  similarity: number | null;
+}
+
 export interface ConstellationNode {
   id: number;
   text: string;
