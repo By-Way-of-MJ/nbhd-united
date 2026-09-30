@@ -121,11 +121,19 @@ let bodyWeight: { id: string; date: string; weight_kg: string; created_at: strin
   created_at: isoAt(-i * 2, 8),
 }));
 
-function workout(id: string, offset: number, activity: string, status: string, category: string, minutes: number) {
+function workout(
+  id: string,
+  offset: number,
+  activity: string,
+  status: string,
+  category: string,
+  minutes: number,
+  time: [number, number] | null = [18, 30],
+) {
   return {
     id,
     date: isoDay(offset),
-    scheduled_at: isoAt(offset, 18, 30),
+    scheduled_at: time ? isoAt(offset, time[0], time[1]) : null,
     window_start_at: null,
     window_end_at: null,
     status,
@@ -151,6 +159,9 @@ const workouts = [
   workout("w-2", -2, "Deadlift 5×5", "done", "strength", 55),
   workout("w-3", 0, "Back squat 5×5", "planned", "strength", 50),
   workout("w-4", 2, "Easy long run", "planned", "cardio", 60),
+  workout("w-5", 0, "Morning mobility", "done", "mobility", 20, [7, 0]),
+  workout("w-6", -2, "Pull-ups and rows", "planned", "strength", 35, null),
+  workout("w-7", 4, "Tempo intervals", "planned", "cardio", 45, [6, 30]),
 ];
 
 const feed = [
