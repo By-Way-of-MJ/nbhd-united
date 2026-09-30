@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import type { GalaxyData, GalaxyStar, StarStage } from "../constellation-game/encounter-logic";
-import { connectedIndices, depthFor, layoutGalaxy, stageGlow, stageSize, Z_MIN } from "./layout";
+import { connectedIndices, depthFor, layoutGalaxy, stageGlow, stageSize } from "./layout";
 
 function star(id: number, cluster: number | null, stage: StarStage = "proto", xy?: [number, number]): GalaxyStar {
   return {
@@ -55,16 +55,34 @@ test("stars sit inside their cluster and within the corridor depth", () => {
   const g = layoutGalaxy(galaxy());
   for (const s of g.stars) {
     const c = g.clusters[s.cluster];
-    assert.ok(Math.abs(s.x - c.cx) < 260, `x offset too large for ${s.star.id}`);
+    assert.ok(Math.abs(s.x - c.cx) < 280, `x offset too large for ${s.star.id}`);
     assert.ok(Math.abs(s.y - c.cy) < 200, `y offset too large for ${s.star.id}`);
-    assert.ok(s.z >= Z_MIN && s.z <= g.depth, `z out of range for ${s.star.id}`);
+    assert.ok(s.z >= 0 && s.z < g.depth, `z out of range for ${s.star.id}`);
   }
-  assert.equal(g.depth, depthFor(61));
+  assert.equal(g.depth, depthFor(61, 6));
 });
 
-test("depth grows with the galaxy but never below the floor", () => {
+test("clusters line the corridor at ascending depths and sit close around the flight axis", () => {
+  const g = layoutGalaxy(galaxy());
+  const band = g.depth / g.clusters.length;
+  g.clusters.forEach((c, i) => {
+    assert.ok(Math.abs(c.cz - (i + 0.5) * band) < 1e-6, `cluster ${i} band centre`);
+    const off = Math.sqrt(c.cx * c.cx + c.cy * c.cy);
+    assert.ok(off >= 80 && off <= 300, `cluster ${i} is ${off.toFixed(0)} off the axis`);
+  });
+  // A cluster's stars reach both sides of the axis, so you pass through it, not beside it.
+  const first = g.stars.filter((s) => s.cluster === 0);
+  assert.ok(first.some((s) => s.x < 0) && first.some((s) => s.x > 0), "cluster 0 does not straddle the axis");
+  // Most of a cluster's stars stay inside its own band (a little overlap is by design).
+  const inBand = first.filter((s) => Math.abs(s.z - g.clusters[0].cz) <= band * 0.75 || Math.abs(s.z - g.clusters[0].cz) >= g.depth - band * 0.75).length;
+  assert.ok(inBand >= first.length * 0.8, `${inBand}/${first.length} in band`);
+});
+
+test("depth grows with the galaxy and its cluster count, never below the floor", () => {
   assert.equal(depthFor(10), 3600);
-  assert.equal(depthFor(250), 5000);
+  assert.equal(depthFor(10, 8), 7200);
+  assert.equal(depthFor(250, 8), 7200);
+  assert.equal(depthFor(400, 8), 8800);
 });
 
 test("stage drives size and brightness; unknown stages fall back to proto", () => {

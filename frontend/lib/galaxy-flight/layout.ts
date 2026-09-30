@@ -1,11 +1,13 @@
 /**
  * Chart your galaxy — star placement. Pure, deterministic, no DOM.
  *
- * Every star is a real lesson from GET /api/v1/lessons/galaxy/. Clusters get a
- * centroid on a flattened spiral (x wide, y shallow — a galactic plane), each
- * lesson sits inside its cluster (real x/y when the backend has them, else a
- * seeded ring) and depth comes from a hash of the id, so the same galaxy always
- * lays out the same way and the corner map matches what you fly through.
+ * Every star is a real lesson from GET /api/v1/lessons/galaxy/. The flight is a
+ * looping corridor along z; each cluster owns a band of that corridor and sits
+ * around the flight path (a centroid a little off the axis, stars spread across
+ * it) so you fly beside and through one constellation after another. Within a
+ * cluster a lesson sits at its real x/y when the backend has them, else on a
+ * seeded ring; depth comes from a hash of the id. Deterministic: the same galaxy
+ * always lays out the same way and the corner map matches what you fly through.
  */
 import type { GalaxyData, GalaxyStar, StarStage } from "../constellation-game/encounter-logic";
 import { hsh } from "../sky-art/noise";
@@ -18,6 +20,8 @@ export interface FlightCluster {
   rgb: string;
   cx: number;
   cy: number;
+  /** Centre of the cluster's band along the corridor. */
+  cz: number;
   count: number;
 }
 
@@ -60,8 +64,11 @@ export const UNSORTED_TINT = "236,240,255";
 export const STAGE_SIZE: Record<StarStage, number> = { proto: 1, ignited: 1.45, radiant: 2, supernova: 2.7 };
 export const STAGE_GLOW: Record<StarStage, number> = { proto: 0.72, ignited: 0.86, radiant: 1, supernova: 1 };
 
-export const Z_MIN = 200;
 const GOLDEN_ANGLE = 2.399963;
+/** How far a cluster's centroid sits off the flight axis (min..max). */
+const OFF_AXIS_MIN = 120, OFF_AXIS_MAX = 280;
+/** A cluster's band overlaps its neighbours a little so there is never a gap. */
+const BAND_OVERLAP = 1.25;
 
 export function stageSize(stage: string): number {
   return STAGE_SIZE[stage as StarStage] ?? STAGE_SIZE.proto;
@@ -71,9 +78,9 @@ export function stageGlow(stage: string): number {
   return STAGE_GLOW[stage as StarStage] ?? STAGE_GLOW.proto;
 }
 
-/** Corridor length grows with the galaxy so a big one never feels crowded. */
-export function depthFor(count: number): number {
-  return Math.max(3600, count * 20);
+/** Corridor length: room for every cluster to be flown through, more for big galaxies. */
+export function depthFor(count: number, clusterCount = 1): number {
+  return Math.max(3600, clusterCount * 900, count * 22);
 }
 
 function clusterKey(s: GalaxyStar): string {
@@ -90,22 +97,24 @@ export function layoutGalaxy(data: GalaxyData): FlightGalaxy {
   // Stable order: by cluster id, unsorted last.
   const keys = [...groups.keys()].sort((a, b) => (a === "other" ? 1 : b === "other" ? -1 : Number(a) - Number(b)));
 
+  const depth = depthFor(stars.length, keys.length);
+  const band = keys.length ? depth / keys.length : depth;
   const clusters: FlightCluster[] = keys.map((key, i) => {
     const members = groups.get(key) ?? [];
     const a = i * GOLDEN_ANGLE + 0.9;
-    const r = 220 + 150 * Math.sqrt(i);
+    const r = OFF_AXIS_MIN + (OFF_AXIS_MAX - OFF_AXIS_MIN) * hsh(i, 3, 9);
     return {
       key,
       id: key === "other" ? null : Number(key),
       label: members.find((m) => m.cluster_label)?.cluster_label || "Unsorted",
       rgb: key === "other" ? UNSORTED_TINT : CLUSTER_TINTS[i % CLUSTER_TINTS.length],
       cx: Math.cos(a) * r,
-      cy: Math.sin(a) * r * 0.5,
+      cy: Math.sin(a) * r * 0.7,
+      cz: (i + 0.5) * band,
       count: members.length,
     };
   });
 
-  const depth = depthFor(stars.length);
   const placed: PlacedStar[] = [];
   clusters.forEach((c, ci) => {
     const members = [...(groups.get(c.key) ?? [])].sort((a, b) => a.id - b.id);
@@ -114,7 +123,8 @@ export function layoutGalaxy(data: GalaxyData): FlightGalaxy {
     const haveXY = xs.length === members.length && ys.length === members.length && members.length >= 2;
     const minX = haveXY ? Math.min(...xs) : 0, maxX = haveXY ? Math.max(...xs) : 1;
     const minY = haveXY ? Math.min(...ys) : 0, maxY = haveXY ? Math.max(...ys) : 1;
-    const spread = 150 + 14 * Math.sqrt(members.length);
+    // Wide enough to reach across the axis, so the cluster surrounds you as you pass.
+    const spread = 170 + 16 * Math.sqrt(members.length);
     members.forEach((m, mi) => {
       const seed = m.id | 0;
       let ox: number, oy: number;
@@ -130,7 +140,7 @@ export function layoutGalaxy(data: GalaxyData): FlightGalaxy {
       // A little seeded jitter so grid-like inputs still read as a cloud.
       ox += (hsh(seed, mi, 11) - 0.5) * 50;
       oy += (hsh(seed, mi, 13) - 0.5) * 30;
-      const z = Z_MIN + hsh(seed, ci, 3) * (depth - Z_MIN);
+      const z = (((c.cz + (hsh(seed, ci, 3) - 0.5) * band * BAND_OVERLAP) % depth) + depth) % depth;
       placed.push({
         star: m,
         index: placed.length,

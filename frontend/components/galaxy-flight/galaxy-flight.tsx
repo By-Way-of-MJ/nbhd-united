@@ -9,8 +9,10 @@ import "./galaxy-flight.css";
 import { createStarNote, fetchStarNotes } from "@/lib/api";
 import type { GalaxyData } from "@/lib/constellation-game/encounter-logic";
 import {
+  type AutoPath,
+  autoPose,
+  buildAutoPath,
   type Cam,
-  type Point3,
   type View,
   focalFor,
   goalFor,
@@ -42,20 +44,27 @@ interface Sim {
   vy: number;
   vz: number;
   target: number | null;
-  goal: Point3 | null;
+  /** The curve the autopilot (or a landing approach) is flying, if any. */
+  auto: AutoPath | null;
   phase: Phase;
-  landStart: number;
   keys: Set<KeyAction>;
   view: View;
   last: number;
   font: string;
+  /** Smoothed 0..1 "going fast" factor that drives the dust streaks. */
+  streak: number;
 }
 
-const DRIFT_VZ = 70;
-const MAX_VZ = 360;
-const MIN_VZ = -160;
-const LATERAL = 240;
-const VERTICAL = 180;
+/** Idle cruise: a steady push forward into the star field (world units / s). */
+const DRIFT_VZ = 240;
+const MAX_VZ = 720;
+const MIN_VZ = -200;
+const THROTTLE = 420;
+const LATERAL = 300;
+const VERTICAL = 220;
+/** Speed above which the dust starts to streak, and where it streaks fully. */
+const STREAK_FROM = DRIFT_VZ + 120;
+const STREAK_FULL = 1800;
 
 function useMedia(query: string): boolean {
   return useSyncExternalStore(
@@ -133,13 +142,13 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
     vy: 0,
     vz: DRIFT_VZ,
     target: null,
-    goal: null,
+    auto: null,
     phase: { kind: "flying" },
-    landStart: 0,
     keys: new Set(),
     view: { w: 1, h: 1, focal: 1 },
     last: 0,
     font: "sans-serif",
+    streak: 0,
   });
   const reducedRef = useRef(reduced);
   useEffect(() => {
@@ -156,15 +165,18 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
   // ── flight commands ────────────────────────────────────────────────────
   const flyTo = useCallback((idx: number) => {
     const s = sim.current;
-    const st = laid.stars[idx];
-    s.goal = goalFor(st, s.cam, laid.depth);
+    const goal = goalFor(laid.stars[idx], s.cam, laid.depth);
     if (reducedRef.current) {
-      s.cam = { ...s.goal };
-      s.goal = null;
+      s.cam = goal;
+      s.auto = null;
       s.target = null;
       setTarget(null);
       return;
     }
+    // A wide swing past the neighbours, then ease in.
+    s.auto = buildAutoPath(s.cam, goal, s.last, { bulge: 0.3, minDur: 1.8, maxDur: 5, seed: idx });
+    s.vx = 0;
+    s.vy = 0;
     s.target = idx;
     setTarget(idx);
   }, [laid]);
@@ -175,7 +187,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
     s.vy = 0;
     s.vz = 0;
     s.target = null;
-    s.goal = null;
+    s.auto = null;
     setTarget(null);
   }, []);
 
@@ -184,17 +196,18 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
     if (s.phase.kind !== "flying") return;
     const idx = s.target ?? renderer.nearestIndex;
     if (idx == null) return;
-    s.goal = goalFor(laid.stars[idx], s.cam, laid.depth);
+    const goal = goalFor(laid.stars[idx], s.cam, laid.depth);
     s.target = null;
     setTarget(null);
     if (reducedRef.current) {
-      s.cam = { ...s.goal };
-      s.goal = null;
+      s.cam = goal;
+      s.auto = null;
       s.phase = { kind: "landed", idx };
       setPhase(s.phase);
       return;
     }
-    s.landStart = s.last;
+    // Straight in, short, slowing to a stop.
+    s.auto = buildAutoPath(s.cam, goal, s.last, { bulge: 0, minDur: 0.8, maxDur: 2, seed: idx });
     s.phase = { kind: "landing", idx };
     setPhase(s.phase);
   }, [laid, renderer]);
@@ -244,39 +257,40 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
       s.last = t;
       const still = reducedRef.current;
       const cam = s.cam;
+      const prevZ = cam.z;
 
       if (s.phase.kind === "flying") {
-        if (s.target != null && s.goal) {
-          const g = s.goal, k = Math.min(1, dt * 1.6), kz = Math.min(1, dt * 1.3);
-          cam.x += (g.x - cam.x) * k;
-          cam.y += (g.y - cam.y) * k;
-          cam.z += (g.z - cam.z) * kz;
+        if (s.auto) {
+          const { pose, done } = autoPose(s.auto, t);
+          s.cam = pose;
+          if (done) s.auto = null;
         } else {
           const K = s.keys;
           const tx = (K.has("left") ? -LATERAL : 0) + (K.has("right") ? LATERAL : 0);
           const ty = (K.has("up") ? -VERTICAL : 0) + (K.has("down") ? VERTICAL : 0);
           s.vx += (tx - s.vx) * Math.min(1, dt * 6);
           s.vy += (ty - s.vy) * Math.min(1, dt * 6);
-          if (K.has("faster")) s.vz = Math.min(MAX_VZ, s.vz + 220 * dt);
-          if (K.has("slower")) s.vz = Math.max(MIN_VZ, s.vz - 220 * dt);
+          if (K.has("faster")) s.vz = Math.min(MAX_VZ, s.vz + THROTTLE * dt);
+          if (K.has("slower")) s.vz = Math.max(MIN_VZ, s.vz - THROTTLE * dt);
           cam.x += s.vx * dt;
           cam.y += s.vy * dt;
           cam.z += s.vz * dt;
           if (!still && K.size === 0) cam.x += Math.sin(t / 9) * 6 * dt;
         }
-      } else if (s.phase.kind === "landing" && s.goal) {
-        const g = s.goal, k = Math.min(1, dt * 4);
-        cam.x += (g.x - cam.x) * k;
-        cam.y += (g.y - cam.y) * k;
-        cam.z += (g.z - cam.z) * k;
-        const far = Math.abs(g.x - cam.x) + Math.abs(g.y - cam.y) + Math.abs(g.z - cam.z);
-        if (far < 12 || t - s.landStart > 1.8) {
-          s.cam = { ...g };
-          s.goal = null;
+      } else if (s.phase.kind === "landing" && s.auto) {
+        const { pose, done } = autoPose(s.auto, t);
+        s.cam = pose;
+        if (done) {
+          s.auto = null;
           s.phase = { kind: "landed", idx: s.phase.idx };
           setPhase(s.phase);
         }
       }
+      // Dust streaks follow how fast we are really moving, smoothed so a single
+      // jump (take-off nudge, instant autopilot) never flashes a streak.
+      const speed = dt > 0 ? Math.abs(s.cam.z - prevZ) / dt : 0;
+      const wantStreak = still ? 0 : Math.max(0, Math.min(1, (speed - STREAK_FROM) / (STREAK_FULL - STREAK_FROM)));
+      s.streak += (wantStreak - s.streak) * Math.min(1, dt * 5);
 
       const origin = canvas.getBoundingClientRect();
       const keepOut: Rect[] = [];
@@ -295,6 +309,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
         quiet: s.phase.kind === "landed",
         font: s.font,
         keepOut,
+        streak: s.streak,
       });
       if (s.phase.kind === "flying" && renderer.nearestIndex !== shownNear) {
         shownNear = renderer.nearestIndex;
@@ -355,9 +370,9 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
     if (STEER_ACTIONS.has(a)) {
       if (s.phase.kind !== "flying") return;
       s.keys.add(a);
-      if (s.target != null) {
+      if (s.target != null || s.auto) {
         s.target = null;
-        s.goal = null;
+        s.auto = null;
         setTarget(null);
       }
       return;
@@ -501,7 +516,7 @@ export function GalaxyFlight({ galaxy }: { galaxy: GalaxyData }) {
             ref={mapRef}
             onClick={onMapClick}
             role="img"
-            aria-label="Map of your galaxy. Click a star to fly to it."
+            aria-label="Map of your galaxy from above: the flight path runs left to right. Click a star to fly to it."
             className="h-[100px] w-full cursor-pointer md:h-[112px]"
           />
         </div>
