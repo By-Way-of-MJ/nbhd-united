@@ -302,6 +302,8 @@ TASK_MAP = {
     # Delete disabled internal one-shot rows after 24 hours. The gateway has
     # already auto-deleted these jobs; this bounds control-plane residue.
     "cleanup_internal_crons": "apps.cron.tasks.cleanup_internal_crons_task",
+    # Daily 30-day retention for the metadata-only RuntimeWriteEvent feed.
+    "purge_runtime_write_events": "apps.router.tasks.purge_runtime_write_events_task",
     # Daily infra cost refresh from Azure billing
     "refresh_infra_costs": "apps.billing.tasks.refresh_infra_costs_task",
     # Monthly donation ledger — records each paying subscriber's revenue-%
