@@ -8,9 +8,9 @@ from django.test import TestCase, override_settings
 from apps.cron.models import CronJob
 from apps.cron.services import proactive_suggestions_enabled
 from apps.orchestrator.config_generator import (
-    _MORNING_BRIEFING_LEGACY_WEATHER_STEP,
     _MORNING_BRIEFING_PROACTIVE_DEFER_LINE,
     _MORNING_BRIEFING_PROMPT_TEMPLATE,
+    _MORNING_BRIEFING_WEATHER_STEP,
     _PROACTIVE_SUGGESTIONS_BLOCK,
     _WEEK_AHEAD_REVIEW_LEGACY_TRAVEL_LINE,
     _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE,
@@ -77,9 +77,7 @@ class ProactiveSuggestionsPromptTests(TestCase):
     @patch("apps.orchestrator.config_generator.datebook_delivery_ready", return_value=False)
     def test_flag_off_seed_messages_are_byte_identical_to_previous_bodies(self, _mock_ready):
         fixed_now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
-        expected_morning_body = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(
-            weather_step=_MORNING_BRIEFING_LEGACY_WEATHER_STEP.format(location="UTC")
-        )
+        expected_morning_body = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=_MORNING_BRIEFING_WEATHER_STEP)
         expected_week_body = _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE.format(
             travel_line=_WEEK_AHEAD_REVIEW_LEGACY_TRAVEL_LINE,
             calendar_step="Check the calendar for the upcoming 7 days (`nbhd_calendar_list_events`)",

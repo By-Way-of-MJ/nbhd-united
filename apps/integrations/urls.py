@@ -64,6 +64,7 @@ from .runtime_views import (
     RuntimeTaskSkipView,
     RuntimeUsageReportView,
     RuntimeUserMemoryView,
+    RuntimeWeatherBriefingView,
     RuntimeWeeklyReviewsView,
     RuntimeWorkspaceDetailView,
     RuntimeWorkspaceListView,
@@ -176,6 +177,11 @@ urlpatterns = [
         "runtime/<uuid:tenant_id>/daily-note/append/",
         RuntimeDailyNoteAppendView.as_view(),
         name="runtime-daily-note-append",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/weather/briefing/",
+        RuntimeWeatherBriefingView.as_view(),
+        name="runtime-weather-briefing",
     ),
     path(
         "runtime/<uuid:tenant_id>/long-term-memory/",

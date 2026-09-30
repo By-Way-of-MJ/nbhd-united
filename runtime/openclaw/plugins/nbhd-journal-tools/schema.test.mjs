@@ -526,3 +526,17 @@ test("journal manifest declares panelsEnabled as a default-off boolean", () => {
   assert.equal(manifest.configSchema.properties.panelsEnabled.type, "boolean");
   assert.equal(manifest.configSchema.properties.panelsEnabled.default, false);
 });
+
+test("nbhd_weather_briefing is registered, declared, takes only an optional date, and demands VERBATIM relay", () => {
+  const tools = collectTools();
+  const tool = tools.nbhd_weather_briefing;
+  assert.ok(tool, "nbhd_weather_briefing should be registered");
+  assert.deepEqual(Object.keys(tool.parameters.properties), ["date"]);
+  assert.ok(!Array.isArray(tool.parameters.required) || tool.parameters.required.length === 0, "date is optional");
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.match(tool.description, /VERBATIM/);
+  assert.match(tool.description, /writes? the daily note's `weather` section/i);
+  assert.match(tool.description, /never describe weather from any other source/i);
+  const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  assert.ok(manifest.contracts.tools.includes("nbhd_weather_briefing"), "manifest declares the tool");
+});

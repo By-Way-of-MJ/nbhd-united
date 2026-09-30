@@ -10,7 +10,6 @@ from apps.orchestrator.config_generator import (
     _HEARTBEAT_CHECKIN_PROMPT,
     _HEARTBEAT_CONTEXTUAL_LOCATION_RULE,
     _MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK,
-    _MORNING_BRIEFING_LEGACY_WEATHER_STEP,
     _MORNING_BRIEFING_PROMPT_TEMPLATE,
     _MORNING_BRIEFING_WEATHER_STEP,
     _build_evening_checkin_prompt,
@@ -30,19 +29,12 @@ _PINNED_CONTEXTUAL_LOCATION_CONFIRM_ASK_BLOCK = (
     "city, fresh match or recorded=home=stated. No sensors/third-party/guesses."
 )
 _PINNED_MORNING_BRIEFING_WEATHER_STEP = (
-    "1. Weather city: check `## Right now` in USER.md — if it shows a fresh Current location, "
-    "get today's weather with `web_search` for that city. The value below is a SNAPSHOT of "
-    "the home base taken when this job was created and may be stale; use it only if "
-    "`## Right now` shows nothing fresher. SNAPSHOT home base: {location}. Get the weather "
-    'with `web_search` for "<city> weather forecast today" (a follow-up search for tomorrow '
-    "is fine). Do NOT use web_fetch, curl, or exec — none of those "
-    "are available; web_search is the only weather tool you have.\n"
-)
-_PINNED_MORNING_BRIEFING_LEGACY_WEATHER_STEP = (
-    '1. Get today\'s weather with `web_search` for "{location} weather forecast today" '
-    '(a follow-up search — e.g. "{location} weather tomorrow" — is fine if the first '
-    "result doesn't cover tomorrow). Do NOT use web_fetch, curl, or exec — none of those "
-    "are available; web_search is the only weather tool you have.\n"
+    "1. Weather: call `nbhd_weather_briefing` ONCE (no arguments). It reads the user's "
+    "location itself (fresh Current location, else the profile), fetches the forecast, "
+    "and already writes the daily note's weather section. Keep its `message_line` for "
+    "step 11. If the tool is not available in this session, treat the weather as "
+    "unavailable. NEVER use web_search, web_fetch, curl, or exec for weather, and never "
+    "describe weather from memory or from any other source.\n"
 )
 
 
@@ -122,20 +114,15 @@ class ContextualLocationPromptEmissionTest(TestCase):
                 prompt = _build_morning_briefing_prompt(self.tenant)
 
                 self.assertIn(_MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK, prompt)
-                self.assertIn(
-                    _MORNING_BRIEFING_WEATHER_STEP.format(location="UTC"),
-                    prompt,
-                )
+                self.assertIn(_MORNING_BRIEFING_WEATHER_STEP, prompt)
 
     def test_morning_briefing_situation_on_without_ready_tour_is_byte_identical(self):
         for tour_enabled in (False, True):
             with self.subTest(tour_enabled=tour_enabled):
                 self._set_flag(True)
                 self._set_tour(enabled=tour_enabled)
-                weather_step = _MORNING_BRIEFING_WEATHER_STEP.format(location="UTC")
-
                 prompt = _build_morning_briefing_prompt(self.tenant)
-                expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=weather_step)
+                expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=_MORNING_BRIEFING_WEATHER_STEP)
 
                 self.assertEqual(prompt.encode(), expected.encode())
                 self.assertNotIn(_MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK, prompt)
@@ -144,8 +131,7 @@ class ContextualLocationPromptEmissionTest(TestCase):
         self._set_flag(False)
         self._set_tour(enabled=False)
         tour_off_prompt = _build_morning_briefing_prompt(self.tenant)
-        weather_step = _MORNING_BRIEFING_LEGACY_WEATHER_STEP.format(location="UTC")
-        expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=weather_step)
+        expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=_MORNING_BRIEFING_WEATHER_STEP)
 
         self._set_tour(enabled=True, readiness_field="places_search_manifest_ok")
         tour_on_prompt = _build_morning_briefing_prompt(self.tenant)
@@ -169,10 +155,6 @@ class ContextualLocationPromptEmissionTest(TestCase):
         self.assertEqual(
             _MORNING_BRIEFING_WEATHER_STEP.encode(),
             _PINNED_MORNING_BRIEFING_WEATHER_STEP.encode(),
-        )
-        self.assertEqual(
-            _MORNING_BRIEFING_LEGACY_WEATHER_STEP.encode(),
-            _PINNED_MORNING_BRIEFING_LEGACY_WEATHER_STEP.encode(),
         )
 
     def test_block_is_compact_and_keeps_consent_privacy_and_dedup_contracts(self):
