@@ -674,6 +674,47 @@ class RuntimeWriteActivity(models.Model):
         db_table = "runtime_write_activity"
 
 
+class RuntimeWriteEvent(models.Model):
+    """One assistant (runtime) write to an item the app can open — metadata only.
+
+    Feeds the iOS "Since you were last here" links. ``ref`` carries only the ids /
+    slug / date needed to open the item, never user text; titles are resolved
+    at read time from the live row through the owner-read path. Rows older than
+    ``RUNTIME_WRITE_EVENT_RETENTION`` are purged daily.
+    """
+
+    class Kind(models.TextChoices):
+        JOURNAL_DOC = "journal_doc"
+        FUEL = "fuel"
+        HORIZONS_GOAL = "horizons_goal"
+        CALENDAR = "calendar"
+
+    class Verb(models.TextChoices):
+        CREATED = "created"
+        UPDATED = "updated"
+
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="runtime_write_events",
+    )
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    ref = models.JSONField(default=dict)
+    verb = models.CharField(max_length=12, choices=Verb.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "runtime_write_events"
+        indexes = [
+            models.Index(fields=["tenant", "-created_at"], name="rwe_tenant_created_idx"),
+            models.Index(fields=["created_at"], name="rwe_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"RuntimeWriteEvent({self.kind}/{self.verb}, tenant={self.tenant_id})"
+
+
 class AppChatMessage(models.Model):
     """A single rich-client (iOS/web) chat turn: the user's message and the
     assistant's reply, persisted so the client can POLL for the reply.

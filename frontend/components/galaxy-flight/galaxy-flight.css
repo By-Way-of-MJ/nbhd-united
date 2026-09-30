@@ -1,0 +1,65 @@
+/* Chart your galaxy (Open Sky flight) — the few things Tailwind can't express
+   responsively inline: the landing panel's fade and the corner map's placement. */
+.gf-root {
+  animation: gf-in 700ms ease-out both;
+}
+@keyframes gf-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gf-root { animation: none; }
+}
+
+/* Landing panel: a bottom sheet on phones, a right-hand column on wider screens. */
+.gf-panel {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  max-height: 74dvh;
+  overflow-y: auto;
+  padding: 40px 20px calc(24px + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(180deg, rgba(3, 4, 7, 0), rgba(3, 4, 7, 0.92) 20%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+@media (min-width: 768px) {
+  .gf-panel {
+    inset-inline: auto 0;
+    top: 0;
+    bottom: 0;
+    width: 440px;
+    max-height: none;
+    padding: 72px 44px 40px 72px;
+    background: linear-gradient(90deg, rgba(3, 4, 7, 0), rgba(3, 4, 7, 0.88) 18%);
+    justify-content: center;
+    gap: 16px;
+  }
+}
+
+/* Corner map: bottom-right on desktop; under the header on phones so it never
+   sits on the Land / Map buttons. */
+.gf-map {
+  position: absolute;
+  right: 16px;
+  top: calc(84px + env(safe-area-inset-top, 0px));
+  width: 176px;
+  border-radius: 14px;
+  border: 1px solid var(--os-hairline);
+  background: rgba(3, 4, 7, 0.72);
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+@media (min-width: 768px) {
+  .gf-map {
+    top: auto;
+    right: 32px;
+    bottom: 34px;
+    width: 220px;
+    padding: 12px;
+    gap: 8px;
+  }
+}

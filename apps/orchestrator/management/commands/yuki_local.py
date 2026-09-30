@@ -4,7 +4,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -23,6 +25,9 @@ from apps.tenants.models import Tenant
 BASE = "http://127.0.0.1:18080"
 STATE = Path(settings.BASE_DIR) / "deploy/local-test/.state"
 CONFIRM = "Yes, please go ahead."
+GATEWAY_PORT = "19443"
+# Her assistant's real system routines (config_generator.build_cron_seed_jobs), by CLI name.
+ROUTINES = {"morning": "Morning Briefing", "evening": "Evening Check-in"}
 
 
 class Failure(Exception):
@@ -102,6 +107,9 @@ class Command(BaseCommand):
         chat_plan.add_argument("--week")
         chat_plan.add_argument("--must-mention", action="append", default=[])
         subcommands.add_parser("tonight")
+        routine = subcommands.add_parser("routine")
+        routine.add_argument("which", choices=sorted(ROUTINES))
+        routine.add_argument("--timeout-seconds", type=int, default=1500)
 
     def handle(self, *args, **options):
         action = options["action"]
@@ -110,6 +118,7 @@ class Command(BaseCommand):
             "link": {"linked": False},
             "chat-plan": {"proof": "chat-plan", "status": "failed", "week": options.get("week")},
             "tonight": {"proof": "tonight", "status": "failed"},
+            "routine": {"proof": "routine", "routine": options.get("which"), "status": "failed"},
         }[action]
         try:
             if action == "chat-plan":
@@ -131,6 +140,8 @@ class Command(BaseCommand):
                 self.client = client
                 if action == "signup":
                     result = self.signup()
+                elif action == "routine":
+                    result = self.routine(options["which"], options["timeout_seconds"])
                 else:
                     self.login(self.account())
                     self.tenant_gate()
@@ -145,6 +156,95 @@ class Command(BaseCommand):
             self.stdout.write(json.dumps({**failure, **details}))
             raise SystemExit(1) from None
         self.stdout.write(json.dumps(result, ensure_ascii=False))
+
+    def routine(self, which, timeout_seconds):
+        """Run one of her assistant's real system routines NOW on the local gateway.
+
+        The job is the product's own (build_cron_seed_jobs: same prompt and tools, e.g. the Morning
+        Briefing that fills her daily note's assistant sections), minus the pinned cloud model so it
+        inherits the local gateway's Ollama default. Local seeding is a mock no-op and 07:00/21:00 never
+        fall inside the nightly window, so the lane adds the job (idempotent declaration key; replaced
+        each run so its date line is current) and runs it via the operator CLI. The gateway token goes
+        only into the CLI's environment and is never printed.
+        """
+        from apps.cron.gateway_client import get_gateway_token_for_tenant
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+
+        tenant = Tenant.objects.get(id=self.tid)
+        name = ROUTINES[which]
+        job = next((j for j in build_cron_seed_jobs(tenant) if j.get("name") == name), None)
+        payload = (job or {}).get("payload") or {}
+        schedule = (job or {}).get("schedule") or {}
+        if payload.get("kind") != "agentTurn" or not payload.get("message") or schedule.get("kind") != "cron":
+            raise Failure("routine_unavailable")
+        cli = (
+            os.environ.get("LOCAL_TEST_OPENCLAW_BIN")
+            or shutil.which("openclaw")
+            or str(Path.home() / ".local/bin/openclaw")
+        )
+        env = {**os.environ, "OPENCLAW_GATEWAY_TOKEN": get_gateway_token_for_tenant(tenant)}
+        key = f"yuki-local:{which}"
+
+        def run(args, timeout=120):
+            done = subprocess.run(
+                [cli, "cron", *args, "--port", GATEWAY_PORT, "--json"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            try:
+                body = json.loads(done.stdout or "{}")
+            except ValueError:
+                body = {}
+            if done.returncode != 0 or not isinstance(body, dict):
+                raise Failure("gateway_cli_failed", step=args[0])
+            return body
+
+        for old in run(["list"]).get("jobs") or []:
+            if old.get("declarationKey") == key:
+                run(["rm", str(old["id"])])
+        added = run(
+            [
+                "add",
+                "--name",
+                name,
+                "--cron",
+                schedule["expr"],
+                "--tz",
+                schedule.get("tz") or "",
+                "--session",
+                job.get("sessionTarget") or "isolated",
+                "--message",
+                payload["message"],
+                "--declaration-key",
+                key,
+                "--no-deliver",
+            ]
+        )
+        job_id = added.get("id") or (added.get("job") or {}).get("id")
+        if not job_id:
+            raise Failure("routine_add_failed")
+        queued = run(["run", str(job_id)])
+        run_id = queued.get("runId")
+        if not queued.get("enqueued") or not run_id:
+            raise Failure("routine_not_enqueued")
+        # The local model takes ~15 min for a briefing; poll the job's run history for this run.
+        started = time.monotonic()
+        while time.monotonic() - started < timeout_seconds:
+            time.sleep(20)
+            entries = run(["runs", "--id", str(job_id)]).get("entries") or []
+            done = next((e for e in entries if e.get("runId") == run_id and e.get("action") == "finished"), None)
+            if done:
+                return {
+                    "proof": "routine",
+                    "routine": which,
+                    "job": name,
+                    "status": "done" if done.get("status") == "ok" else "failed",
+                    "detail": str(done.get("errorReason") or done.get("completionStatus") or "")[:80],
+                    "seconds": round(int(done.get("durationMs") or 0) / 1000),
+                }
+        raise Failure("routine_timeout", seconds=timeout_seconds)
 
     def account(self):
         path = STATE / "yuki-account.json"

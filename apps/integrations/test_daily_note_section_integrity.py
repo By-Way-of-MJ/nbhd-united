@@ -1,10 +1,11 @@
 """Regression tests for scoped markdown section writes."""
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
 from apps.journal.models import Document, NoteTemplate
+from apps.journal.services import DEFAULT_TEMPLATE_SECTIONS, parse_daily_sections
 from apps.tenants.models import Tenant
 from apps.tenants.test_utils import seed_internal_key
 
@@ -272,3 +273,108 @@ class MarkdownSectionIntegrityTest(TestCase):
             "## Custom Insights\nUnknown section content",
             response.data["markdown"],
         )
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class DailySectionSlugRoundTripTest(TestCase):
+    """The slug a read returns must be the slug a write resolves."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="slug-roundtrip", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status=Tenant.Status.ACTIVE)
+        seed_internal_key(self.tenant)
+        self.client = APIClient()
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+        self.get_url = f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/"
+        self.append_url = f"/api/v1/integrations/runtime/{self.tenant.id}/daily-note/append/"
+        self.date = "2026-07-27"
+
+    def _note(self, sections):
+        body = "# 2026-07-27\n" + "".join(f"\n## {title}\nold {title}\n" for title in sections)
+        return Document.objects.create(
+            tenant=self.tenant,
+            kind=Document.Kind.DAILY,
+            slug=self.date,
+            title=self.date,
+            markdown=body,
+        )
+
+    def _read(self):
+        response = self.client.get(self.get_url, {"date": self.date}, **self.headers)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.data["sections"]
+
+    def _write(self, slug, content="new content"):
+        response = self.client.post(
+            self.append_url,
+            {"content": content, "date": self.date, "section_slug": slug},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return response.data["markdown"]
+
+    def _headings(self, markdown):
+        return [line for line in markdown.splitlines() if line.startswith("## ")]
+
+    def test_every_default_section_round_trips_without_appending(self):
+        titles = [section["title"] for section in DEFAULT_TEMPLATE_SECTIONS]
+        self._note(titles)
+        for section in self._read():
+            markdown = self._write(section["slug"], content=f"new {section['slug']}")
+            self.assertEqual(self._headings(markdown), [f"## {title}" for title in titles])
+            self.assertIn(f"## {section['title']}\nnew {section['slug']}\n", markdown)
+
+    def test_read_reports_template_slugs_for_template_titles(self):
+        self._note([section["title"] for section in DEFAULT_TEMPLATE_SECTIONS])
+        self.assertEqual(
+            [section["slug"] for section in self._read()],
+            [section["slug"] for section in DEFAULT_TEMPLATE_SECTIONS],
+        )
+
+    def test_apostrophe_slug_variants_update_todays_focus(self):
+        self._note(["Today's Focus"])
+        for slug in ("today's-focus", "todays-focus", "Today's Focus", "focus"):
+            markdown = self._write(slug, content=f"via {slug}")
+            self.assertEqual(self._headings(markdown), ["## Today's Focus"])
+            self.assertIn(f"## Today's Focus\nvia {slug}\n", markdown)
+
+    def test_tenant_custom_template_with_apostrophe_title_round_trips(self):
+        NoteTemplate.objects.create(
+            tenant=self.tenant,
+            slug="custom",
+            name="Custom",
+            is_default=True,
+            sections=[{"slug": "dads-corner", "title": "Dad's Corner", "content": "", "source": "agent"}],
+        )
+        self._note(["Dad's Corner"])
+        sections = self._read()
+        self.assertEqual(sections[0]["slug"], "dads-corner")
+        for slug in ("dads-corner", "dad's-corner"):
+            markdown = self._write(slug)
+            self.assertEqual(self._headings(markdown), ["## Dad's Corner"])
+
+    def test_non_template_heading_slug_round_trips(self):
+        self._note(["Sam's Notes & Ideas"])
+        slug = self._read()[0]["slug"]
+        self.assertEqual(slug, "sams-notes-ideas")
+        markdown = self._write(slug)
+        self.assertEqual(self._headings(markdown), ["## Sam's Notes & Ideas"])
+
+    def test_unknown_slug_fallback_never_produces_apostrophe_s(self):
+        self._note([])
+        markdown = self._write("sam's-notes")
+        self.assertIn("## Sam's Notes\n", markdown)
+        self.assertNotIn("'S", markdown)
+
+
+class ParseDailySectionsSlugTest(SimpleTestCase):
+    def test_template_and_non_template_slugs(self):
+        markdown = (
+            "# d\n\n## Today's Focus\na\n\n## News & Interests\nb\n\n## Dad's Corner / Misc\nc\n\n## Weather\nd\n"
+        )
+        slugs = [section["slug"] for section in parse_daily_sections(markdown)]
+        self.assertEqual(slugs, ["focus", "news", "dads-corner-misc", "weather"])

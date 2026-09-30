@@ -87,6 +87,9 @@ DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
     # "one tool is teaching the model badly" from "the whole cron surface is".
     "cron": frozenset({"tz_missing", "dow_source", "schedule_kind", "pattern"}),
     "datebook": frozenset({"origin", "image_before_config"}),
+    # iOS "since you were last here" counters: reason_code is shown/tap/dismiss;
+    # `kind` is the RuntimeWriteEvent kind enum. Never an id or a title.
+    "activity_since": frozenset({"kind"}),
     # Wave 1 money-truth fixes. Deliberately shape-only: an account nickname, a
     # balance, or an APR value never appears here — `bound` and `*_count` say
     # WHICH WAY the input was wrong and HOW MANY rows were involved, which is all

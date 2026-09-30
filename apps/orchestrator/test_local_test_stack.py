@@ -278,6 +278,9 @@ class CheckoutPortabilityTests(SimpleTestCase):
         adapter = (directory / "openclaw-paths.mjs").read_text()
         self.assertNotIn("/worktrees/", adapter)
         self.assertIn("new URL('./.state/', import.meta.url)", adapter)
+        # Seatbelt blocks setuid /bin/ps; the adapter answers OpenClaw's own start identity so cron can start.
+        self.assertIn("pid-alive-", adapter)
+        self.assertIn("if (pid === process.pid) return", adapter)
 
         launcher = runpy.run_path(str(directory / "run.py"), run_name="local_test_run")["main"]
         with tempfile.TemporaryDirectory() as home:
@@ -470,6 +473,109 @@ class YukiLocalTests(TestCase):
             for action in ("signup", "link", "chat-plan", "tonight"):
                 self.assertEqual(self.run_helper(action, success=False)["reason"], "local_stack_required")
         self.factory.assert_not_called()
+
+    def routine_cli(self, run_status="ok", existing=True):
+        """Fake operator CLI: list (with an old copy of the job), rm, add, run, runs."""
+        import subprocess
+
+        calls = []
+
+        def fake(argv, env, **kwargs):
+            calls.append((argv, env))
+            action = argv[2]
+            body = {
+                "list": {"jobs": [{"id": "old", "declarationKey": "yuki-local:morning"}] if existing else []},
+                "rm": {"ok": True},
+                "add": {"id": "job-1"},
+                "run": {"ok": True, "enqueued": True, "runId": "run-1"},
+                "runs": {
+                    "entries": [
+                        {"runId": "run-0", "action": "finished", "status": "ok", "durationMs": 1},
+                        {
+                            "runId": "run-1",
+                            "action": "finished",
+                            "status": run_status,
+                            "errorReason": "timeout" if run_status != "ok" else "",
+                            "completionStatus": "succeeded" if run_status == "ok" else "failed",
+                            "durationMs": 650000,
+                        },
+                    ]
+                },
+            }[action]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+        seed = [
+            {
+                "name": "Morning Briefing",
+                "schedule": {"kind": "cron", "expr": "0 7 * * *", "tz": "Asia/Tokyo"},
+                "sessionTarget": "isolated",
+                "payload": {"kind": "agentTurn", "message": "Current date and time: fixture. Morning briefing."},
+                "delivery": {"mode": "none"},
+                "model": "openrouter/deepseek/deepseek-v4-flash-0731",
+            }
+        ]
+        for context in (
+            patch.object(self.helper.subprocess, "run", side_effect=fake),
+            patch("apps.orchestrator.config_generator.build_cron_seed_jobs", return_value=seed),
+            patch("apps.cron.gateway_client.get_gateway_token_for_tenant", return_value="fixture-gateway-token"),
+        ):
+            context.__enter__()
+            self.addCleanup(context.__exit__, None, None, None)
+        return calls
+
+    def run_routine(self, success=True):
+        import io
+
+        from django.core.management import call_command
+
+        self.stdout = io.StringIO()
+        if success:
+            call_command("yuki_local", "routine", "morning", stdout=self.stdout)
+        else:
+            with self.assertRaises(SystemExit):
+                call_command("yuki_local", "routine", "morning", stdout=self.stdout)
+        line = self.stdout.getvalue().strip()
+        self.assertNotIn("fixture-gateway-token", line)
+        return json.loads(line)
+
+    def test_routine_runs_the_real_job_on_the_local_model_and_waits_for_its_run(self):
+        calls = self.routine_cli()
+        result = self.run_routine()
+        self.assertEqual(
+            result,
+            {
+                "proof": "routine",
+                "routine": "morning",
+                "job": "Morning Briefing",
+                "status": "done",
+                "detail": "succeeded",
+                "seconds": 650,
+            },
+        )
+        actions = [argv[2] for argv, _ in calls]
+        self.assertEqual(actions, ["list", "rm", "add", "run", "runs"])
+        add = calls[2][0]
+        self.assertIn("Current date and time: fixture. Morning briefing.", add)
+        self.assertEqual(add[add.index("--declaration-key") + 1], "yuki-local:morning")
+        self.assertEqual(add[add.index("--cron") + 1], "0 7 * * *")
+        self.assertNotIn("--model", add)  # inherits the local Ollama default; the cloud pin would be rejected
+        self.assertEqual(calls[3][0][3], "job-1")
+        for argv, env in calls:
+            self.assertEqual(env["OPENCLAW_GATEWAY_TOKEN"], "fixture-gateway-token")
+            self.assertNotIn("fixture-gateway-token", argv)
+            self.assertEqual(argv[argv.index("--port") + 1], "19443")
+        self.factory.assert_called()  # same local-stack gate as every other subcommand
+
+    def test_routine_reports_a_failed_run(self):
+        self.routine_cli(run_status="error", existing=False)
+        result = self.run_routine()
+        self.assertEqual((result["status"], result["detail"]), ("failed", "timeout"))
+
+    def test_routine_refuses_missing_local_root(self):
+        calls = self.routine_cli()
+        with override_settings(LOCAL_TEST_ROOT=""):
+            self.assertEqual(self.run_routine(success=False)["reason"], "local_stack_required")
+        self.assertEqual(calls, [])
 
     def test_link_checks_real_persisted_row(self):
         from django.utils import timezone
