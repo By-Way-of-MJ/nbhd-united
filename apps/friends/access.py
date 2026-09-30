@@ -1233,6 +1233,89 @@ def bond_by_counterpart(viewer_tenant, edges) -> dict:
     }
 
 
+# ── Reach: friends-of-friends as nameless COUNTS (web Neighborhood glimmers) ──
+# "N people you don't know are one step away through Kiho". The accessor returns
+# ONLY coarse buckets — never ids, names or exact counts — so a small network
+# can't be pinpointed. Below the smallest bucket the answer is null.
+
+REACH_BUCKETS = (100, 50, 25, 10, 5, 3)
+_REACH_GONE_STATUSES = (Tenant.Status.SUSPENDED, Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED)
+
+
+def reach_bucket(count: int) -> str | None:
+    """Largest threshold ≤ ``count`` as ``"<n>+"``; ``None`` for 0-2."""
+    for threshold in REACH_BUCKETS:
+        if count >= threshold:
+            return f"{threshold}+"
+    return None
+
+
+def _reach_visible(status, user_is_active, neighborhood_enabled) -> bool:
+    return status not in _REACH_GONE_STATUSES and bool(user_is_active) and bool(neighborhood_enabled)
+
+
+def reach_by_counterpart(viewer_tenant, edges) -> tuple[dict, str | None]:
+    """``({counterpart_tenant_id: bucket|None}, total_bucket|None)`` for the
+    viewer's ACCEPTED ``edges``, in two queries (blocks + one edge scan).
+
+    Reach through a friend = that friend's accepted neighbors, minus the viewer,
+    the viewer's own accepted neighbors, anyone in a blocked edge with the
+    viewer, and suspended/deleted/deactivated or Neighborhood-off accounts. A
+    friend who is themselves gone or has the Neighborhood off hides their
+    network: ``None``, and they add nothing to the total. The total buckets the
+    DEDUPED union across friends."""
+    viewer_id = _tenant_id(viewer_tenant)
+    counterparts = {
+        (e.addressee_id if e.requester_id == viewer_id else e.requester_id)
+        for e in edges
+        if e.status == Friendship.Status.ACCEPTED
+    }
+    if not counterparts:
+        return {}, None
+    excluded = counterparts | blocked_counterpart_ids(viewer_id) | {viewer_id}
+
+    # One scan: every accepted edge touching a counterpart — including the
+    # viewer↔counterpart edge itself, which carries the counterpart's own
+    # visibility — with both parties' account state joined in.
+    rows = Friendship.objects.filter(
+        Q(requester_id__in=counterparts) | Q(addressee_id__in=counterparts),
+        status=Friendship.Status.ACCEPTED,
+    ).values_list(
+        "requester_id",
+        "requester__status",
+        "requester__user__is_active",
+        "requester__neighborhood_enabled",
+        "addressee_id",
+        "addressee__status",
+        "addressee__user__is_active",
+        "addressee__neighborhood_enabled",
+    )
+    hidden: set = set()
+    through: dict = {cid: set() for cid in counterparts}
+    for r_id, r_status, r_active, r_nbhd, a_id, a_status, a_active, a_nbhd in rows:
+        parties = (
+            (r_id, _reach_visible(r_status, r_active, r_nbhd)),
+            (a_id, _reach_visible(a_status, a_active, a_nbhd)),
+        )
+        for (side, side_visible), (other, other_visible) in (parties, parties[::-1]):
+            if side not in counterparts:
+                continue
+            if not side_visible:
+                hidden.add(side)
+            elif other not in excluded and other_visible:
+                through[side].add(other)
+
+    union: set = set()
+    out: dict = {}
+    for cid in counterparts:
+        if cid in hidden:
+            out[cid] = None
+            continue
+        union |= through[cid]
+        out[cid] = reach_bucket(len(through[cid]))
+    return out, reach_bucket(len(union))
+
+
 # Projects v2. Callers authenticate membership before loading a plan. Every write
 # takes the goal lock before changing the plan. Existing Task mirrors lock the
 # caller's Task before the goal, matching the journal completion receiver.

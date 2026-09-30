@@ -370,6 +370,18 @@ class AbsorbedPurgeView(FriendsView):
         return Response({"id": str(item.id), "purged": True})
 
 
+class AbsorbedPurgeGroupView(FriendsView):
+    """POST /api/v1/friends/absorbed/purge-group/ {group_key} — tombstone every
+    item in one ledger group (the list's ``group_key``). Idempotent."""
+
+    def post(self, request):
+        tenant = self.get_tenant(request)
+        group_key = request.data.get("group_key")
+        if not isinstance(group_key, str) or not group_key.strip():
+            raise ValidationError({"group_key": "Required."})
+        return Response({"group_key": group_key, "purged": services.purge_absorbed_group(tenant, group_key.strip())})
+
+
 # ── Friend chat (1:1) — poll-is-truth, thread addressed by thread_id only ────
 
 

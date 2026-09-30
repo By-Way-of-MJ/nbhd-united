@@ -13,6 +13,7 @@ wave collides on the same row (see :func:`send_wave`).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from collections import Counter
@@ -540,6 +541,8 @@ def neighborhood_home(tenant, since=None) -> dict:
     )  # additive in_my_sky flag (Bounded Neighborhood; THE iOS flight contract)
     # Web Neighborhood line thickness: a qualitative bucket, never a count.
     bonds = access.bond_by_counterpart(tenant, edges)
+    # Friends-of-friends as nameless bucketed counts (null below 3 / hidden network).
+    reach, reach_total = access.reach_by_counterpart(tenant, edges)
 
     pending = list(
         Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.PENDING)
@@ -563,6 +566,7 @@ def neighborhood_home(tenant, since=None) -> dict:
                 "in_my_sky": edge.id in sky_ids,
                 "bond": bonds.get(cid, access.BOND_LIGHT),
                 "friends_since": (edge.responded_at or edge.created_at).date().isoformat(),
+                "reach": reach.get(cid),
                 "has_unread_thread": state.get("has_unread", False),
                 "thread_id": state.get("thread_id"),
             }
@@ -590,6 +594,7 @@ def neighborhood_home(tenant, since=None) -> dict:
             "needs_consent": me.accepted_terms_version != FRIENDS_TERMS_VERSION,
         },
         "neighbors": neighbors,
+        "reach_total": reach_total,
         "pending_in": pending_in,
         "pending_out": pending_out,
         "moments": moments,
@@ -1396,21 +1401,40 @@ def _log_absorbed(tenant, source_kind, source_id, from_tenant_id, label, *, circ
         pass  # already absorbed
 
 
+_ABSORBED_KIND_LABELS = {
+    AbsorbedItem.SourceKind.SHARED_LESSON: "shared spark",
+    AbsorbedItem.SourceKind.FRIEND_MESSAGE: "chat message",
+}
+
+
+def _absorbed_group_key(tenant_id, source_kind, from_tenant_id, circle_id) -> str:
+    """Opaque, stable key grouping ledger rows by (kind, sender, circle). Chat is
+    logged one row per message under the same neutral label, so the UI groups
+    them by this key. Salted with the viewer's id and hashed so it never reveals
+    a neighbor's tenant id or matches across viewers."""
+    raw = f"{tenant_id}:{source_kind}:{from_tenant_id}:{circle_id or ''}"
+    return f"{source_kind}-{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+
+
 def list_absorbed(tenant) -> list[dict]:
     """The transparency ledger — what the assistant absorbed (un-purged)."""
-    items = (
-        AbsorbedItem.objects.filter(tenant=tenant, purged_at__isnull=True)
-        .select_related("from_tenant")
-        .order_by("-absorbed_at")
+    items = list(AbsorbedItem.objects.filter(tenant=tenant, purged_at__isnull=True).order_by("-absorbed_at"))
+    handles = dict(
+        NeighborProfile.objects.filter(tenant_id__in={i.from_tenant_id for i in items}).values_list(
+            "tenant_id", "handle"
+        )
     )
     return [
         {
             "id": str(item.id),
             "source_kind": item.source_kind,
             "source_id": str(item.source_id),
-            "from_handle": _handle_for(item.from_tenant_id),
+            "from_handle": handles.get(item.from_tenant_id),
             "label": item.label,
             "absorbed_at": item.absorbed_at,
+            "created_at": item.absorbed_at,
+            "group_key": _absorbed_group_key(tenant.id, item.source_kind, item.from_tenant_id, item.circle_id),
+            "kind_label": _ABSORBED_KIND_LABELS.get(item.source_kind, item.source_kind),
         }
         for item in items
     ]
@@ -1426,6 +1450,23 @@ def purge_absorbed(tenant, absorbed_item_id) -> AbsorbedItem:
         item.purged_at = timezone.now()
         item.save(update_fields=["purged_at"])
     return item
+
+
+def purge_absorbed_group(tenant, group_key: str) -> int:
+    """Tombstone every un-purged item in one ``group_key`` (same per-item purge
+    semantics, applied to the group). Returns how many were purged; 0 is a no-op."""
+    ids = [
+        item_id
+        for item_id, kind, from_id, circle_id in AbsorbedItem.objects.filter(
+            tenant=tenant, purged_at__isnull=True
+        ).values_list("id", "source_kind", "from_tenant_id", "circle_id")
+        if _absorbed_group_key(tenant.id, kind, from_id, circle_id) == group_key
+    ]
+    if not ids:
+        return 0
+    return AbsorbedItem.objects.filter(id__in=ids, tenant=tenant, purged_at__isnull=True).update(
+        purged_at=timezone.now()
+    )
 
 
 def _handle_for(tenant_id) -> str | None:
