@@ -5855,6 +5855,77 @@ class _RuntimeCronCreateBase(KnownValueResponseGuardMixin, APIView):
         )
 
 
+class RuntimeCronListRemindersView(KnownValueResponseGuardMixin, APIView):
+    """GET /runtime/<tenant_id>/crons/reminders/?include_disabled=true"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "cron_list_runtime_response"
+    pii_egress_text_fields = _CRON_EGRESS_TEXT_FIELDS | {"name", "schedule"}
+
+    def get(self, request, tenant_id):
+        from apps.cron.services import list_user_crons
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        return Response(
+            {
+                "reminders": list_user_crons(
+                    tenant,
+                    include_disabled=request.query_params.get("include_disabled", "").lower() == "true",
+                )
+            }
+        )
+
+
+class RuntimeCronCancelReminderView(KnownValueResponseGuardMixin, APIView):
+    """POST /runtime/<tenant_id>/crons/cancel/ {cron_id, origin?}"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "cron_cancel_runtime_response"
+    pii_egress_text_fields = _CRON_EGRESS_TEXT_FIELDS | {"name", "schedule"}
+
+    def post(self, request, tenant_id):
+        from apps.actions.origin import verify_origin_stamp
+        from apps.cron.gateway_client import GatewayError
+        from apps.cron.models import CronJob
+        from apps.cron.services import TypedCronError, cancel_user_cron
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+        data = request.data if isinstance(request.data, dict) else {}
+        try:
+            result = cancel_user_cron(
+                tenant, data.get("cron_id"), origin_stamp=verify_origin_stamp(tenant, data.get("origin"))
+            )
+        except CronJob.DoesNotExist:
+            return Response({"error": "reminder_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        except TypedCronError as exc:
+            if exc.code == "assistant_updating":
+                return cron_fenced_response(assistant=True)
+            return Response({"error": exc.code, "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except GatewayError:
+            return Response(
+                {"error": "cancellation_not_propagated", "detail": "Retry the cancel call."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
+
 class RuntimeCronCreatePureReminderView(_RuntimeCronCreateBase):
     """POST /runtime/<tenant_id>/crons/pure_reminder/
 

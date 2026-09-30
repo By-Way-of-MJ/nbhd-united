@@ -12,10 +12,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import register from "./index.js";
 
-const CRON_CREATE_TOOLS = [
+const ORIGIN_STAMPED_TOOLS = [
   "nbhd_cron_create_pure_reminder",
   "nbhd_cron_create_quote_user_intent",
   "nbhd_cron_create_domain_summary",
+  "nbhd_cron_cancel_reminder",
 ];
 
 function collectTools(context = {}) {
@@ -33,9 +34,9 @@ function collectTools(context = {}) {
   return tools;
 }
 
-test("every cron-create tool declares _nbhd_origin as an optional schema property (2026.9.4 strict validation)", () => {
+test("every origin-stamped cron tool declares _nbhd_origin as an optional schema property (2026.9.4 strict validation)", () => {
   const tools = collectTools();
-  for (const name of CRON_CREATE_TOOLS) {
+  for (const name of ORIGIN_STAMPED_TOOLS) {
     assert.ok(tools[name], `${name} should be registered`);
     const params = tools[name].parameters;
     assert.equal(params.additionalProperties, false, `${name} keeps additionalProperties:false`);
@@ -50,4 +51,14 @@ test("every cron-create tool declares _nbhd_origin as an optional schema propert
       `${name} must keep _nbhd_origin optional (the hook supplies it)`,
     );
   }
+});
+
+test("reminder list and cancel schemas match manifest contracts", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const manifest = JSON.parse(await readFile(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  const tools = collectTools();
+  assert.deepEqual(Object.keys(tools).sort(), manifest.contracts.tools.slice().sort());
+  assert.equal(tools.nbhd_cron_list_reminders.parameters.properties.include_disabled.type, "boolean");
+  assert.deepEqual(tools.nbhd_cron_cancel_reminder.parameters.required, ["cron_id"]);
+  assert.equal(tools.nbhd_cron_cancel_reminder.parameters.properties.cron_id.type, "integer");
 });

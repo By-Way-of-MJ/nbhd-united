@@ -85,7 +85,18 @@ DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
     ),
     # "pattern" is the typed cron pattern (pure_reminder, ...) — it separates
     # "one tool is teaching the model badly" from "the whole cron surface is".
-    "cron": frozenset({"tz_missing", "dow_source", "schedule_kind", "pattern"}),
+    "cron": frozenset(
+        {
+            "tz_missing",
+            "dow_source",
+            "schedule_kind",
+            "pattern",
+            "cron_id",
+            "already_cancelled",
+            "origin_kind",
+            "origin_run_id",
+        }
+    ),
     "datebook": frozenset({"origin", "image_before_config"}),
     # iOS "since you were last here" counters: reason_code is shown/tap/dismiss;
     # `kind` is the RuntimeWriteEvent kind enum. Never an id or a title.

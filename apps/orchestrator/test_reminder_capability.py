@@ -328,3 +328,24 @@ class TypedCronsDefaultTest(TestCase):
             "/opt/nbhd/plugins/nbhd-automation-tools",
             plugins.get("load", {}).get("paths", []),
         )
+
+
+class ReminderCancellationVisibilityTest(TestCase):
+    def test_reminder_tools_are_available_through_the_default_plugin_policy(self):
+        import json
+        from pathlib import Path
+
+        tenant = create_tenant(display_name="Cancellation tools", telegram_chat_id=920005)
+        config = generate_openclaw_config(tenant)
+        self.assertIn("nbhd-automation-tools", config["plugins"]["allow"])
+        self.assertTrue(config["plugins"]["entries"]["nbhd-automation-tools"]["enabled"])
+        self.assertIn("group:plugins", config["tools"]["allow"])
+        manifest = json.loads(
+            (
+                Path(__file__).resolve().parents[2]
+                / "runtime/openclaw/plugins/nbhd-automation-tools/openclaw.plugin.json"
+            ).read_text()
+        )
+        for name in ("nbhd_cron_list_reminders", "nbhd_cron_cancel_reminder"):
+            self.assertIn(name, manifest["contracts"]["tools"])
+            self.assertNotIn(name, config["tools"].get("deny", []))

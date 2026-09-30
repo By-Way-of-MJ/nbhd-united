@@ -55,7 +55,7 @@ The native `message` tool also does not work in subscriber containers — `nbhd_
 
 Pick the right shape for the user's intent:
 
-- **Recurring task** — repeats on a pattern ("every weekday at 8am", "every Monday morning"). Use `schedule: {kind: "cron", expr: "...", tz: "..."}`. Counts toward the 10-task cap. Requires explicit approval before creation. Does **not** auto-delete — manage lifecycle via `cron remove`.
+- **Recurring task** — repeats on a pattern ("every weekday at 8am", "every Monday morning"). Use `schedule: {kind: "cron", expr: "...", tz: "..."}`. Counts toward the 10-task cap. Requires explicit approval before creation. Does **not** auto-delete — cancel via `nbhd_cron_list_reminders` then `nbhd_cron_cancel_reminder`.
 - **One-off reminder** — fires once at a specific moment ("remind me in 20 minutes", "ping me at 4pm today", "tomorrow morning"). Use `schedule: {kind: "at", at: "..."}`. Does NOT count toward the 10-task cap. Auto-deletes after firing. Lighter approval — confirm in text, no buttons needed.
 
 If the user's request is ambiguous, ask: *"Is this a one-time reminder or something you want me to repeat?"*
@@ -177,7 +177,7 @@ So:
 - Use `nbhd_cron_create_pure_reminder` (or the other typed tools) for "in N minutes/hours" — you can pass the duration straight through and never do offset arithmetic.
 - If you use raw `cron add`, you must compute the absolute time yourself and **always** include the user's offset (`+09:00`, `-04:00`, …). A bare timestamp is the one input nothing catches for you.
 
-The gateway auto-deletes one-off crons after they fire successfully — no cleanup needed from your side. If you need to cancel one before it fires, use `cron remove <name>`.
+The gateway auto-deletes one-off crons after they fire successfully — no cleanup needed from your side. If you need to cancel one before it fires, use `nbhd_cron_list_reminders` then `nbhd_cron_cancel_reminder` with the matching id.
 
 ### One-off caps (anti-abuse)
 
@@ -196,13 +196,13 @@ The runtime enforces hard rules at `cron add` time. Violating any of them return
 2. **`sessionTarget` in `{"isolated", "current", "session:<id>"}`** REQUIRES `payload.kind: "agentTurn"` (and `payload.message`). Otherwise: `isolated/current/session cron jobs require payload.kind="agentTurn"`.
 3. **`delivery.mode` MUST be `"none"` or `"webhook"` on this fleet.** If you omit `delivery` on an `isolated + agentTurn` job, OC defaults to `{mode: "announce"}` without a channel, and the server rejects with `delivery.channel is required when multiple channels are configured`. If you pass `{mode: "announce", channel: "telegram"}` it accepts at submit-time but fails at fire-time: `Telegram bot token missing for account "default"`. Always pass `{"mode": "none"}` and have the agent invoke `nbhd_send_to_user` itself.
 4. **`schedule.at`** without an explicit timezone offset is treated as UTC by the gateway — silently, with no error. Always include `+09:00`, `-04:00`, etc. Raw `cron add` also rejects relative durations (`"20m"`); only the typed `nbhd_cron_create_*` tools accept those. See [Two ways to schedule](#two-ways-to-schedule-and-what-each-one-accepts).
-5. **`kind:"at"` jobs auto-delete after a successful run; `kind:"cron"` and `kind:"every"` do not.** Manage recurring lifecycle via `cron remove`.
+5. **`kind:"at"` jobs auto-delete after a successful run; `kind:"cron"` and `kind:"every"` do not.** Cancel recurring reminders via `nbhd_cron_list_reminders` then `nbhd_cron_cancel_reminder`.
 6. **`schedule.everyMs` is MILLISECONDS**, and the runtime has no lower bound of its own — it will happily accept `3600` and fire a full agent turn every 3.6 seconds. Hourly is `3600000`, every 15 minutes is `900000`, daily is `86400000`. The typed tools reject anything under `60000`.
 
 ## Editing or disabling
 
 - Always explain what you're changing and why before doing it.
-- Present changes with approve/reject buttons (for recurring tasks).
+- Present schedule/content changes with approve/reject buttons (for recurring tasks). For a user-requested cancellation, use the list/cancel tools below; ask only if the match is ambiguous.
 - Never silently modify or disable a user's tasks.
 - One-off reminders are typically not edited — just cancel and create a new one.
 
@@ -232,3 +232,17 @@ The Background Tasks cron is invisible to the user by design:
 - ✅ Write to `memory/YYYY-MM-DD.md` via workspace file tools
 - ✅ May call `nbhd_journal_context` to read — but do not write back
 - ✅ Send `nbhd_send_to_user` ONLY for something urgent (not routine summaries)
+
+## Stop or cancel a chat reminder
+
+Use `nbhd_cron_list_reminders` to find the user's active reminders, then call
+`nbhd_cron_cancel_reminder` with the matching numeric `id`. Ask the user to choose
+if more than one reminder fits. Only after a successful cancel call, tell the
+user exactly which name and schedule were turned off. If the call fails, say
+cancellation was not confirmed and retry; never claim it stopped. To find a
+previously disabled reminder, list with `include_disabled: true`.
+
+These tools update the platform's canonical reminder store. Cancellation is
+reversible and excludes system and internal jobs. The change reaches OpenClaw
+through its normal sync/reconcile cycle, so a fire already in progress may
+still finish.
