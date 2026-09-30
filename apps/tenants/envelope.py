@@ -123,6 +123,23 @@ def _observation_age_seconds(now, observed_at) -> int:
     return max(0, int((now - observed_at).total_seconds()))
 
 
+def is_place_fresh(situation, now=None) -> bool:
+    """The ONE freshness rule for ``current_place_label``.
+
+    ``render_situation`` (USER.md ``## Right now``) and the programmatic
+    briefing weather (``apps.orchestrator.briefing_weather``) both decide
+    "is this place still where the user is?" with this predicate, so the
+    place the agent sees and the place the forecast is fetched for can never
+    disagree.
+    """
+    if situation is None:
+        return False
+    now = now or timezone.now()
+    label = (getattr(situation, "current_place_label", "") or "").strip()
+    observed_at = getattr(situation, "current_place_last_observed_at", None)
+    return bool(label and observed_at and now - observed_at <= PLACE_DECAY)
+
+
 def _format_place_observed_at(tenant: Tenant, observed_at, now) -> str:
     tz = tenant_tz(tenant)
     local_observed = observed_at.astimezone(tz)
@@ -178,11 +195,7 @@ def render_situation(tenant: Tenant) -> str:
 
     place_label = (situation.current_place_label or "").strip()
     place_age_s = _observation_age_seconds(now, situation.current_place_last_observed_at)
-    place_fresh = bool(
-        place_label
-        and situation.current_place_last_observed_at
-        and now - situation.current_place_last_observed_at <= PLACE_DECAY
-    )
+    place_fresh = is_place_fresh(situation, now)
     known_away = bool(place_label and place_label.casefold() != home.casefold())
     traveling = bool(place_fresh and known_away)
 

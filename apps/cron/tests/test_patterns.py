@@ -35,6 +35,9 @@ FORBIDDEN_MUTATION_TOOLS = frozenset(
         "nbhd_document_put",
         "nbhd_daily_note_set_section",
         "nbhd_daily_note_append",
+        # Writes the daily note's weather section server-side; only the
+        # Morning Briefing seed job may hold it.
+        "nbhd_weather_briefing",
         "nbhd_memory_update",
         # Destructive + irreversible, cascades to subtasks, and its confirm
         # handshake can only be satisfied by a human answering in conversation.

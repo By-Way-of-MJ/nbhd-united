@@ -11,6 +11,7 @@
       "nbhd_daily_note_get",
       "nbhd_daily_note_set_section",
       "nbhd_daily_note_append",
+      "nbhd_weather_briefing",
       "nbhd_memory_get",
       "nbhd_memory_update",
       "nbhd_journal_context",

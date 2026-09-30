@@ -686,6 +686,61 @@ class ConfigGeneratorTest(TestCase):
     def test_morning_briefing_prompt_degrades_gracefully_on_search_failure(self):
         prompt = self._morning_briefing_prompt()
         self.assertIn("Weather unavailable", prompt)
+        # Search lane honesty sentence: the model must never narrate weather it didn't get.
+        self.assertIn(
+            "If you could not get weather in step 1, write `Weather couldn't be fetched this morning.`", prompt
+        )
+        self.assertIn("never describe weather you didn't get", prompt)
+
+    # ── Programmatic weather lane (BRIEFING_WEATHER_TOOL_TENANT_IDS) ──
+
+    def _gated_morning_briefing_prompt(self) -> str:
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=str(self.tenant.id)):
+            return self._morning_briefing_prompt()
+
+    def test_gated_morning_briefing_uses_weather_tool_not_search(self):
+        """Weather is programmatic (apps/orchestrator/briefing_weather.py): the
+        prompt tells the model to call `nbhd_weather_briefing` once and relay
+        its `message_line` verbatim. It must not tell the model to search for
+        weather, fetch a URL, or compose weather itself."""
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("call `nbhd_weather_briefing` ONCE", prompt)
+        self.assertIn("VERBATIM", prompt)
+        self.assertIn("NEVER use web_search, web_fetch, curl, or exec for weather", prompt)
+        self.assertNotIn("weather forecast today", prompt)
+        self.assertNotIn("web_search is the only weather tool", prompt)
+        self.assertNotIn("api.open-meteo.com", prompt)
+        self.assertNotIn("SNAPSHOT home base", prompt)
+        # web_search stays for news.
+        self.assertIn("web_search", prompt)
+
+    def test_gated_morning_briefing_degrades_gracefully_when_tool_missing(self):
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("If the tool is not available in this session, treat the weather as unavailable", prompt)
+        self.assertIn("`Weather couldn't be fetched this morning.`", prompt)
+
+    def test_gated_morning_briefing_does_not_ask_model_to_write_weather_section(self):
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("**weather section:** already written by `nbhd_weather_briefing`", prompt)
+        self.assertNotIn("**Today:** temp range", prompt)
+        self.assertNotIn("**Intraday:**", prompt)
+        self.assertNotIn("temperature swing", prompt)
+        self.assertNotIn("Sunny all day", prompt)
+
+    def test_briefing_weather_gate_parser(self):
+        from apps.router.chat_gates import briefing_weather_tool_enabled
+
+        for raw, expected in (
+            ("", False),
+            (None, False),
+            ("*", True),
+            (str(self.tenant.id), True),
+            (f" , {str(self.tenant.id).upper()} , ", True),
+            ("00000000-0000-0000-0000-000000000000", False),
+            ("not-a-uuid,*x", False),
+        ):
+            with self.subTest(raw=raw), override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=raw):
+                self.assertIs(briefing_weather_tool_enabled(self.tenant), expected)
 
     def test_morning_briefing_prompt_has_intraday_threshold_rule(self):
         prompt = self._morning_briefing_prompt()

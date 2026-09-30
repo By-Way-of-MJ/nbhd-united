@@ -2072,21 +2072,15 @@ class RuntimeDailyNoteAppendView(APIView):
         content = authored.text
         template = get_default_template(tenant=tenant)
 
-        with transaction.atomic():
-            # Re-read under a row lock so concurrent appends are serialised
-            # and neither writer loses its entry (lost-update prevention).
-            doc = Document.objects.select_for_update().get(pk=doc.pk)
-            md = doc.markdown or ""
+        if section_slug_str:
+            doc = _upsert_authored_daily_section(tenant, doc, section_slug_str, authored, template=template)
+        else:
+            with transaction.atomic():
+                # Re-read under a row lock so concurrent appends are serialised
+                # and neither writer loses its entry (lost-update prevention).
+                doc = Document.objects.select_for_update().get(pk=doc.pk)
+                md = doc.markdown or ""
 
-            if section_slug_str:
-                heading = resolve_daily_section_heading(
-                    tenant=tenant,
-                    markdown=md,
-                    section_slug=section_slug_str,
-                    template=template,
-                )
-                doc.markdown = upsert_markdown_section(md, heading, content)
-            else:
                 # Quick-log append with timestamp
                 now = _tenant_now(tenant)
                 timestamp = now.strftime("%H:%M")
@@ -2094,13 +2088,13 @@ class RuntimeDailyNoteAppendView(APIView):
                 entry = f"- **{timestamp}** ({persona_name}) — {content}"
                 doc.markdown = md.rstrip() + "\n\n" + entry + "\n"
 
-            doc.pii_receipts = merge_field_receipt(
-                doc.pii_receipts,
-                "markdown",
-                authored.receipt,
-                stored_text=doc.markdown,
-            )
-            doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+                doc.pii_receipts = merge_field_receipt(
+                    doc.pii_receipts,
+                    "markdown",
+                    authored.receipt,
+                    stored_text=doc.markdown,
+                )
+                doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
 
         if section_slug_str == "energy-mood":
             from apps.journal.mood import bridge_daily_note_mood
@@ -2121,6 +2115,128 @@ class RuntimeDailyNoteAppendView(APIView):
             response_payload["date_attribution_warning"] = date_attribution_warning
 
         return Response(response_payload, status=status.HTTP_201_CREATED)
+
+
+def _upsert_authored_daily_section(
+    tenant: Tenant, doc: Document, section_slug: str, authored, *, template=None
+) -> Document:
+    """Lock the daily note, replace one ``##`` section with an authored fragment, fold the receipt.
+
+    The one section-write path for agent-authored daily-note sections: the
+    append view (``nbhd_daily_note_set_section``) and the programmatic weather
+    endpoint both go through here so locking, heading resolution and PII
+    receipt merging cannot drift between them.
+    """
+    with transaction.atomic():
+        # Re-read under a row lock so concurrent writers are serialised and
+        # neither loses its section (lost-update prevention).
+        doc = Document.objects.select_for_update().get(pk=doc.pk)
+        md = doc.markdown or ""
+        heading = resolve_daily_section_heading(
+            tenant=tenant,
+            markdown=md,
+            section_slug=section_slug,
+            template=template,
+        )
+        doc.markdown = upsert_markdown_section(md, heading, authored.text)
+        doc.pii_receipts = merge_field_receipt(
+            doc.pii_receipts,
+            "markdown",
+            authored.receipt,
+            stored_text=doc.markdown,
+        )
+        doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+    return doc
+
+
+def _write_daily_note_section(tenant: Tenant, d: date, section_slug: str, content: str, *, seam: str) -> Document:
+    """Get-or-create the day's note, PII-author ``content``, and set one section."""
+    slug = str(d)
+    doc, _created = get_or_create_authored_document(
+        tenant,
+        kind="daily",
+        slug=slug,
+        title=_default_title("daily", slug),
+        markdown_factory=lambda: _default_markdown("daily", slug, tenant=tenant),
+        seam="journal.daily_note.default_body.runtime",
+        defer_detection=True,
+    )
+    authored = _author_runtime_document(tenant, content, seam=seam, field="markdown")
+    return _upsert_authored_daily_section(tenant, doc, section_slug, authored)
+
+
+class RuntimeWeatherBriefingView(APIView):
+    """POST fetch the briefing weather programmatically and write the note's ``weather`` section.
+
+    Backs the ``nbhd_weather_briefing`` plugin tool. The model never composes
+    weather: Django resolves the location, calls Open-Meteo, renders fixed
+    strings (``apps.orchestrator.briefing_weather``), writes the section itself
+    and returns ``message_line`` for the model to relay VERBATIM. Non-ok
+    statuses are written too — the honest "no location" / "couldn't fetch"
+    line is the whole point. Idempotent per day.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        from apps.orchestrator.briefing_weather import (
+            fetch_briefing_weather,
+            weather_message_line,
+            weather_section_markdown,
+        )
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+
+        try:
+            explicit_date = _parse_iso_date(request.data.get("date"), field_name="date")
+        except ValueError as exc:
+            return Response(
+                {"error": "invalid_request", "detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        d = explicit_date or _tenant_today(tenant)
+
+        report = fetch_briefing_weather(tenant, on_date=d)
+        section_markdown = weather_section_markdown(report)
+        message_line = weather_message_line(report)
+        _write_daily_note_section(
+            tenant,
+            d,
+            "weather",
+            section_markdown,
+            seam="journal.daily_note.weather.runtime",
+        )
+        logger.info(
+            "briefing_weather_written tenant=%s date=%s status=%s source=%s",
+            str(tenant.id)[:8],
+            d,
+            report.status,
+            report.source,
+        )
+        return Response(
+            {
+                "tenant_id": str(tenant.id),
+                "date": str(d),
+                "status": report.status,
+                "source": report.source,
+                "unit": report.unit,
+                "location_label": report.location_label,
+                "message_line": message_line,
+                "section_markdown": section_markdown,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _upsert_markdown_section(md: str, heading: str, body: str) -> str:

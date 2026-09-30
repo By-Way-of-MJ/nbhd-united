@@ -46,6 +46,16 @@ def talk_route_enabled(tenant) -> bool:
     return _tenant_allowed(tenant, "TALK_ROUTE_TENANT_IDS")
 
 
+def briefing_weather_tool_enabled(tenant) -> bool:
+    """Morning Briefing weather via the ``nbhd_weather_briefing`` plugin tool.
+
+    Only safe for a tenant whose RUNNING OpenClaw image ships the tool — the
+    prompt refresh is fleet-wide but the image rolls per tenant. Ungated
+    tenants keep the web_search weather step.
+    """
+    return _tenant_allowed(tenant, "BRIEFING_WEATHER_TOOL_TENANT_IDS")
+
+
 def web_redesign_enabled(tenant) -> bool:
     """Open Sky web console (read by the frontend via /tenants/me/)."""
     return _tenant_allowed(tenant, "WEB_REDESIGN_TENANT_IDS")

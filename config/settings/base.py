@@ -323,6 +323,15 @@ TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
 # (empty = nobody, exact "*" = everyone). Container App env var name MUST match.
 WEB_REDESIGN_TENANT_IDS = env("WEB_REDESIGN_TENANT_IDS", default="")
 
+# Morning Briefing weather via the `nbhd_weather_briefing` plugin tool (Django
+# calls Open-Meteo; the model relays a verbatim line). Comma-separated tenant
+# UUIDs open individual tenants; the literal "*" opens it fleet-wide. Empty or
+# unset means nobody: ungated tenants keep the web_search weather step. Open a
+# tenant ONLY once its RUNNING OpenClaw image ships the tool — the prompt
+# refresh is fleet-wide but the image rolls per tenant. Container App env var
+# name MUST match.
+BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
+
 # Human-review gate for agent-authored scheduled tasks. Comma-separated tenant
 # UUIDs open individual tenants; the literal "*" opens the gate fleet-wide.
 # Empty/unset means nobody so every non-explicit configuration fails closed.

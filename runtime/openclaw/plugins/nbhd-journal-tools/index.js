@@ -462,6 +462,36 @@ export default function register(api) {
     { optional: true },
   );
 
+  // ── Weather: programmatic morning briefing ──────────────────────────
+  api.registerTool(wrap({
+      name: "nbhd_weather_briefing",
+      description:
+        "Fetch today's + tomorrow's forecast for the user's location and write the daily note's `weather` section. The NBHD runtime resolves the location itself (fresh Current location, else the profile city/coordinates), calls the weather service, and writes the section — you do NOT write the weather section and you do NOT search for weather. The response's `message_line` MUST be used VERBATIM as the weather line of the user message; never describe weather from any other source. When `status` is `no_location` or `unavailable`, `message_line` is the honest sentence to relay as-is. Optional `date` (YYYY-MM-DD) defaults to the user's local today.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          date: {
+            type: "string",
+            description: "ISO date (YYYY-MM-DD). Defaults to today in the user's timezone.",
+          },
+        },
+      },
+      async execute(_id, params) {
+        const input = asObject(params);
+        const payload = await callRuntime(api, {
+          path: tenantPath(api, "/weather/briefing/"),
+          method: "POST",
+          body: {
+            date: asTrimmedString(input.date) || undefined,
+          },
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
   // ── Daily Note: Append Log Entry (legacy-compatible) ─────────────────
   api.registerTool(wrap({
       name: "nbhd_daily_note_append",
