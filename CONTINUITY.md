@@ -1,9 +1,11 @@
 # Master Ledger
 
 ## Goal
-- Current worktree: prevent calendar plans and assistant-written daily notes from proving completion; commit locally on fix/calendar-not-proof-of-done.
+- Active: fleet reminder list/cancel on feat/assistant-cancel-reminder; local commits only.
+- Prior completed work: prevent calendar plans and assistant-written daily notes from proving completion; commit locally on fix/calendar-not-proof-of-done.
 - Deliver the small explicit OpenClaw 2026.9.4 migration on draft PR #1650, with explicit manual scope and conservative lossless prechecks; behavior equals main for tenants without an active migration record.
 ## Constraints / Assumptions
+- Active task supersedes inherited worktree scope: runtime/plugin changes authorized; no push/PR, no docker-gate, no AGENTS.md edits.
 - Work only in this worktree; no production calls, deployment or PR merge. No automatic rollback. Stage by path; never stash.
 - User’s rescope supersedes earlier lifecycle/image plans. Keep runtime/openclaw and automatic image/wake paths identical to main. Round 9 permits plain request-boundary reads of the indexed tenant fence; shared/background transports retain main behavior.
 ## Key decisions
@@ -15,6 +17,7 @@
 - Round 4 supersedes wake exception: hibernation, reconciliation and signed selector restored to main.
 - Follow-up: 9.4 lifecycle (croner vs croniter semantics, suspend, idle guards).
 ## State
+- Done (active worktree): assistant reminder list/cancel implemented and verified; local commit handoff on feat/assistant-cancel-reminder. 2911 backend tests exercised; corrected AST pin passes replay; only 2 known environment errors remain. 238 Node tests and Ruff pass.
 - Done (calendar fix): completion-evidence guards in cron prompts and calendar tools; 328 Django + 11 plugin tests pass; Ruff passes. Local commit only; prior migration status below is inherited.
 - Done: Round 9 lightweight entry-point fence replaces the heavy R8 fence. Retained takeover, atomic migration publication, numeric bounds, pre-staging and default-deny. All 1388 focused/contract tests PASS; ruff/format/migration drift PASS; full Docker gate PASS (9423 tests, 61 skips; frontend/config/security PASS).
 - Now: Round 9 validated and review-ready for draft PR #1650 on feat/openclaw-94-tenant-migration. Owned local resources cleaned. No production mutation.
@@ -22,6 +25,7 @@
 ## Task Map
 ```
 CONTINUITY.md
+  ├─ CONTINUITY_reminder-cancel.md (complete; local commit; @owner:codex)
   ├─ CONTINUITY_calendar-not-proof.md (complete; local commit; @owner:codex)
   ├─ CONTINUITY_openclaw-round-nine.md (complete; draft review)
   ├─ CONTINUITY_openclaw-round-eight.md (complete; draft review)
@@ -33,6 +37,7 @@ CONTINUITY.md
   └─ CONTINUITY_openclaw_94_migration.md (prior implementation/reviews; scope superseded)
 ```
 ## Active ledgers
+- CONTINUITY_reminder-cancel.md
 - CONTINUITY_calendar-not-proof.md
 - CONTINUITY_openclaw-round-nine.md
 - Existing unrelated ledgers: CONTINUITY_journal_shaping.md; CONTINUITY_cron_feed_redactor_subagent.md (status unconfirmed).

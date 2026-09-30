@@ -417,7 +417,7 @@ function cronJobIdFromContext(ctx, runId) {
 }
 
 function isOriginStampedTool(toolId) {
-  return toolId.startsWith("nbhd_cron_create_") || toolId.startsWith("nbhd_datebook_add_");
+  return toolId.startsWith("nbhd_cron_create_") || toolId === "nbhd_cron_cancel_reminder" || toolId.startsWith("nbhd_datebook_add_");
 }
 
 function originArgumentLocation(event) {

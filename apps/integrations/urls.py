@@ -15,9 +15,11 @@ from .runtime_views import (
     RuntimeCalendarEventsView,
     RuntimeCalendarFreeBusyView,
     RuntimeConstellationNotesView,
+    RuntimeCronCancelReminderView,
     RuntimeCronCreateDomainSummaryView,
     RuntimeCronCreatePureReminderView,
     RuntimeCronCreateQuoteUserIntentView,
+    RuntimeCronListRemindersView,
     RuntimeCronPhase2SummaryView,
     RuntimeCurrentStatusView,
     RuntimeDailyNoteAppendView,
@@ -371,6 +373,16 @@ urlpatterns = [
     ),
     # Typed cron creation (feat/cron-typed-patterns) — one endpoint per
     # agent-creatable pattern. See CONTINUITY_cron-typed-patterns.md.
+    path(
+        "runtime/<uuid:tenant_id>/crons/reminders/",
+        RuntimeCronListRemindersView.as_view(),
+        name="runtime-cron-list-reminders",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/crons/cancel/",
+        RuntimeCronCancelReminderView.as_view(),
+        name="runtime-cron-cancel-reminder",
+    ),
     path(
         "runtime/<uuid:tenant_id>/crons/pure_reminder/",
         RuntimeCronCreatePureReminderView.as_view(),
