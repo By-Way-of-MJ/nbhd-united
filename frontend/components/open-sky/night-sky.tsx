@@ -13,6 +13,7 @@ import {
   lightYearsLabel,
   matchLine,
   navHint,
+  orderMatches,
   poseFor,
   sourceLine,
   startIndex,
@@ -116,18 +117,20 @@ export function OpenSkyConstellation() {
   const q = debounced.trim();
   const search = useLessonSearchQuery(q);
   const settled = !!q && !!search.data && !search.isPlaceholderData && q === query.trim();
-  const matches = useMemo(() => (q && search.data ? filterSearchHits(search.data, known) : null), [q, search.data, known]);
-  const [matchIndex, setMatchIndex] = useState(0);
-  const matchKey = settled && matches ? `${q}|${matches.join(",")}` : "";
-  const lessonCluster = useMemo(() => {
-    const m = new Map<number, number>();
-    sky.clusters.forEach((c, i) => c.lessons.forEach((l) => m.set(l.id, i)));
+  // Where each lesson sits: its constellation's place in the Next order, and its own step within it.
+  const lessonWhere = useMemo(() => {
+    const m = new Map<number, { rank: number; lesson: number }>();
+    sky.clusters.forEach((c, i) => c.lessons.forEach((l, j) => m.set(l.id, { rank: i, lesson: j })));
     return m;
   }, [sky]);
+  // Best match first, then along the path, so "next match" doesn't zig-zag.
+  const matches = useMemo(() => (q && search.data ? orderMatches(filterSearchHits(search.data, known), lessonWhere) : null), [q, search.data, known, lessonWhere]);
+  const [matchIndex, setMatchIndex] = useState(0);
+  const matchKey = settled && matches ? `${q}|${matches.join(",")}` : "";
   const goLesson = useCallback((id: number) => {
-    const idx = lessonCluster.get(id);
-    if (idx != null) goCluster(idx, id);
-  }, [lessonCluster, goCluster]);
+    const at = lessonWhere.get(id);
+    if (at) goCluster(at.rank, id);
+  }, [lessonWhere, goCluster]);
   // A fresh result set travels to its best match.
   useEffect(() => {
     if (!matchKey || !matches?.length) return;
@@ -136,7 +139,7 @@ export function OpenSkyConstellation() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matchKey]);
   const searching = !!query.trim();
-  const matchClusters = matches ? new Set(matches.map((id) => lessonCluster.get(id))).size : 0;
+  const matchClusters = matches ? new Set(matches.map((id) => lessonWhere.get(id)?.rank)).size : 0;
   let status = "";
   if (searching) {
     if (search.isError) status = "Search isn't available right now";
@@ -152,6 +155,8 @@ export function OpenSkyConstellation() {
 
   // ── Canvas ─────────────────────────────────────────────────────────────
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const vignetteRef = useRef<HTMLDivElement>(null);
+  const domeRef = useRef<HTMLCanvasElement>(null);
   const [renderer] = useState(() => new NightSkyRenderer());
   const placed = useRef(false);
   const panelRef = useRef<HTMLElement>(null);
@@ -198,6 +203,7 @@ export function OpenSkyConstellation() {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
+    renderer.attachDome(domeRef.current);
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
     const applyReduce = () => {
       renderer.reduced = reduce.matches;
@@ -217,6 +223,9 @@ export function OpenSkyConstellation() {
         canvas.height = Math.round(h * dpr);
         renderer.compact = w < 640;
         renderer.invalidate();
+        // The dome vignette: static per size, so the compositor draws it instead of every canvas frame.
+        const diag = Math.hypot(w, h);
+        if (vignetteRef.current) vignetteRef.current.style.background = `radial-gradient(circle ${Math.round(diag * 0.565)}px at 50% 53%, rgba(3,4,8,0) ${Math.round(diag * 0.3)}px, rgba(3,4,8,0.9) ${Math.round(diag * 0.565)}px)`;
       }
     };
     const frame = (ms: number) => {
@@ -239,6 +248,7 @@ export function OpenSkyConstellation() {
       stop();
       document.removeEventListener("visibilitychange", onVis);
       reduce.removeEventListener("change", applyReduce);
+      renderer.attachDome(null);
     };
   }, [renderer]);
 
@@ -305,12 +315,14 @@ export function OpenSkyConstellation() {
   const prev = n ? sky.clusters[stepIndex(ci, -1, n)] : undefined;
   const next = n ? sky.clusters[stepIndex(ci, 1, n)] : undefined;
   const skyLabel = n
-    ? `A night sky of your lessons: ${countLine(sky.lessonCount, constellationCount)}. Older constellations sit farther away. Now showing ${cluster?.name}.`
+    ? `A night sky of your lessons: ${countLine(sky.lessonCount, constellationCount)}. Older constellations sit farther away; Next travels deeper. Now showing ${cluster?.name}.`
     : "A night sky, waiting for your first lessons.";
   const errorText = error ? (error instanceof Error ? error.message : "Couldn't load your constellation.") : "";
 
   return (
     <div className="relative h-full w-full overflow-hidden text-os-ink" style={{ background: "#030408" }}>
+      {/* The Milky Way, composited behind the sky canvas and moved by the renderer. */}
+      <canvas ref={domeRef} className="pointer-events-none absolute left-0 top-0 block" aria-hidden="true" />
       <canvas
         ref={canvasRef}
         role="img"
@@ -319,6 +331,7 @@ export function OpenSkyConstellation() {
         onMouseMove={onCanvasMove}
         className="absolute inset-0 block h-full w-full"
       />
+      <div ref={vignetteRef} className="pointer-events-none absolute inset-0" aria-hidden="true" />
       {/* Soft shade behind the words — no edges, just the sky getting darker. */}
       <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-[#030408]/70 to-transparent" aria-hidden="true" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-80 bg-gradient-to-t from-[#030408]/80 via-[#030408]/40 to-transparent" aria-hidden="true" />

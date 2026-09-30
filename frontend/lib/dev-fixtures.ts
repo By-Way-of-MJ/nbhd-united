@@ -11,6 +11,7 @@
  * `?fixture=journal-conflict` rejects the first block write with the 409 contract;
  * `?fixture=task-failure` rejects the first complete/reopen to check rollback.
  * `?fixture=logged-out` renders public pages without fixture authentication.
+ * `?fixture=big` gives /constellation a real-account-sized sky (263 lessons, 53 clusters).
  * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
  * Journal/task writes are in-memory only and reset on a full reload.
  */
@@ -397,6 +398,48 @@ const skyPending = [
   { id: 2952, text: "Leave the bike by the door and you'll ride it.", context: "", tags: [], cluster_id: null, cluster_label: "", source_type: "journal", source_ref: "", status: "pending", suggested_at: isoAt(-2, 9), approved_at: null, created_at: isoAt(-2, 9) },
 ];
 
+// `?fixture=big`: the shape of a real, active account — 263 lessons in 53
+// clusters, a few big ones (15–30) and many small ones (2–6), newest lessons
+// spread over a year but bunched in the last three months. Deterministic.
+const BIG_LABELS = ["Workout Planning", "Nutrition Tracking", "Juggling Projects And Life", "Sleep And Recovery", "Deep Work Habits", "Family Logistics", "Writing Practice", "Bill Payment Discipline", "App Store Identity Setup", "Crisis Response", "Morning Routine", "Client Communication", "Running Form", "Meal Prep", "Language Study", "Travel Planning", "Home Repairs", "Tax Season", "Hiring Conversations", "Code Review Habits", "Launch Week", "Saying No", "Friendship Upkeep", "Weekend Rest", "Commute Reading", "Garden Care", "Kids' Homework", "Pricing Decisions", "Inbox Zero", "Public Speaking", "Car Maintenance", "Anxiety Before Calls", "Budget Reviews", "Meeting Hygiene", "Learning Guitar", "Cooking For Friends", "Phone Boundaries", "Team Retros", "Moving House", "Doctor Visits", "Side Project Scope", "Rainy Day Plans", "Gift Giving", "Long Flights", "Back Pain", "Newsletter Writing", "Debugging Patience", "Coffee Limits", "Evening Walks", "Visa Paperwork", "Negotiating Rent", "Birthday Planning", "Stretching"];
+const BIG_SUBJECTS = ["the plan", "the first step", "the hard part", "the routine", "the list", "the next hour", "the small win", "the check-in"];
+const BIG_PATTERNS = [
+  "When you're tired, shrink {s} instead of skipping it.",
+  "Write {s} down the night before and it happens.",
+  "Protect {s} before the day gets loud.",
+  "Low energy days still count if {s} gets done.",
+  "Ask for help with {s} earlier than feels comfortable.",
+  "Sleep first; {s} goes better rested.",
+  "Say {s} out loud on Monday.",
+  "Finish {s} before opening anything new.",
+  "Exhausted is a signal to lower the bar for {s}, not to quit.",
+  "Review {s} on Sunday, not in a Thursday panic.",
+  "Make {s} small enough to start today.",
+  "Leave a gap after {s}.",
+];
+const bigSky = (() => {
+  const big = [30, 24, 19, 16, 15];
+  const small = [2, 3, 2, 4, 3, 6, 2, 3, 5, 2, 4, 3];
+  const sizes = BIG_LABELS.map((_, ci) => (ci < big.length ? big[ci] : small[(ci - big.length) % small.length] + (ci < big.length + 3 ? 1 : 0)));
+  const nodes = BIG_LABELS.flatMap((label, ci) => {
+    const r = ((ci * 2654435761) % 1000) / 1000;
+    // ~70% of clusters had their newest lesson in the last 3 months (bunched recent), the rest over the year.
+    const newest = ci % 10 < 7 ? Math.floor(90 * Math.pow(r, 1.8)) : 90 + Math.floor(275 * r);
+    return Array.from({ length: sizes[ci] }, (_, i) => {
+      const id = 5000 + ci * 40 + i;
+      const back = sizes[ci] - 1 - i;
+      const text = BIG_PATTERNS[(ci * 5 + i) % BIG_PATTERNS.length].replace("{s}", BIG_SUBJECTS[(ci + i) % BIG_SUBJECTS.length]);
+      return { id, text, context: "", tags: [label.toLowerCase()], cluster_id: ci + 1, cluster_label: label, source_type: SKY_SOURCES[(id * 5) % SKY_SOURCES.length], source_ref: "", x: null, y: null, created_at: isoAt(-(newest + back * (2 + (ci % 5)) + (back ? (id * 7) % 3 : 0)), 9) };
+    });
+  });
+  return { nodes, clusters: BIG_LABELS.map((label, ci) => ({ id: ci + 1, label, count: sizes[ci], tags: [label.toLowerCase()] })) };
+})();
+
+function bigFixture(): boolean {
+  if (typeof window === "undefined") return false;
+  return new URLSearchParams(window.location.search).get("fixture") === "big";
+}
+
 export function fixtureResponse(path: string, init?: RequestInit): Json | undefined {
   const method = (init?.method ?? "GET").toUpperCase();
   const url = new URL(path, "http://fixture.local");
@@ -648,6 +691,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     });
   }
   if (p === "/api/v1/lessons/constellation/") {
+    if (bigFixture()) return json({ ...bigSky, edges: [], affinity_edges: [] });
     return json({
       nodes: isEmpty ? [] : skyLessons,
       edges: [],
@@ -662,7 +706,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
     const limit = Number(url.searchParams.get("limit") ?? 10);
     const words = [q, ...(SKY_MEANING[q] ?? q.split(/\s+/))].filter((w) => w.length > 2);
-    const scored = skyLessons.map((l) => {
+    const scored = (bigFixture() ? bigSky.nodes : skyLessons).map((l) => {
       const text = l.text.toLowerCase();
       const hits = words.filter((w) => text.includes(w)).length;
       return { ...l, status: "approved", suggested_at: l.created_at, approved_at: l.created_at, similarity: hits ? Math.min(0.52, 0.36 + hits * 0.04 - (l.id % 5) * 0.01) : 0.1 + ((l.id * 37) % 13) / 100 };
