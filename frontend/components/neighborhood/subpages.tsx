@@ -172,7 +172,7 @@ export function ProfilePage() {
             <span className={labelCls}>Handle</span>
             <span className="flex items-center border-b border-os-ring focus-within:border-os-accent">
               <span className="text-os-faint" aria-hidden="true">@</span>
-              <input value={handle} onChange={(e) => setHandle(e.target.value.toLowerCase())} maxLength={30} autoCapitalize="none" autoCorrect="off" className={`${fieldCls} border-0 pl-1 focus:border-0`} />
+              <input value={handle} onChange={(e) => setHandle(e.target.value.toLowerCase())} maxLength={30} autoCapitalize="none" autoCorrect="off" className="min-h-[44px] w-full bg-transparent pl-1 text-[0.9375rem] text-os-ink outline-none placeholder:text-os-faint focus-visible:outline-none" />
             </span>
             {handleError ? <ErrorLine>{handleError}</ErrorLine> : null}
           </label>
