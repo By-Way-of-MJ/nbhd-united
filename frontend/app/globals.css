@@ -1070,3 +1070,9 @@ html.open-sky [data-os-block-scroll] { scroll-padding-block: 1rem; }
   html.open-sky .os-task-checkbox:checked { border-color: Highlight; }
   html.open-sky .os-task-check { color: Highlight; }
 }
+
+/* Overview notes use the same Markdown renderer as Journal, at reading size. */
+html.open-sky .os-assistant-prose .prose { font-size: 1.125rem; line-height: 1.65; color: var(--os-ink); max-width: none; }
+html.open-sky .os-assistant-prose .prose > :first-child { margin-top: 0; }
+html.open-sky .os-assistant-prose .prose > :last-child { margin-bottom: 0; }
+html.open-sky :is(#sleep, #weight, #week, #training, #north-star) { scroll-margin-top: 24px; }

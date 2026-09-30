@@ -29,3 +29,20 @@ export function openTaskCounts(tasks: readonly GroupableTask[]): Map<string, num
   }
   return counts;
 }
+
+/** Date-only ISO due dates sort chronologically: overdue, today, then future.
+ * Ties use oldest creation instant, then ID so API order cannot reshuffle them.
+ * Only undated tasks fill any remaining slots, also oldest first.
+ */
+export function topThreeTasks<T extends GroupableTask & { id: string; created_at: string }>(tasks: readonly T[]): T[] {
+  const oldest = (a: T, b: T) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id.localeCompare(b.id);
+  const open = tasks.filter((task) => task.status === "open");
+  const dated = open.filter((task) => task.due_date).sort((a, b) => a.due_date!.localeCompare(b.due_date!) || oldest(a, b));
+  const anytime = open.filter((task) => !task.due_date).sort(oldest);
+  return [...dated, ...anytime].slice(0, 3);
+}
+
+export function taskPage<T>(tasks: readonly T[], shown = 10): { items: T[]; total: number; more: number } {
+  const count = Math.max(0, Math.floor(shown));
+  return { items: tasks.slice(0, count), total: tasks.length, more: Math.min(10, Math.max(0, tasks.length - count)) };
+}

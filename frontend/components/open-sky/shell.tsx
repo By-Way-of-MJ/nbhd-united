@@ -19,7 +19,6 @@ import {
 } from "@/components/icons/constellation";
 import { OpenSkyStarfield } from "@/components/open-sky/starfield";
 import { OpenSkyPageHeader } from "@/components/open-sky/primitives";
-import { HorizonsSkyHeader } from "@/components/open-sky/horizons-sky";
 import { useMeQuery } from "@/lib/queries";
 import type { Tenant } from "@/lib/types";
 
@@ -73,7 +72,6 @@ export function openSkySections(tenant: Tenant | null | undefined): Section[] {
 const LEGACY_TITLES: { match: (p: string) => boolean; title: string; subtitle?: string }[] = [
   { match: (p) => p === "/journal", title: "Journal" },
   { match: (p) => p === "/constellation", title: "Constellation", subtitle: "The threads across your life." },
-  { match: (p) => p === "/horizons", title: "Horizons", subtitle: "Your goals, your momentum." },
   { match: (p) => p === "/fuel", title: "Fuel", subtitle: "Every session, on the calendar." },
   { match: (p) => p === "/core", title: "Core", subtitle: "A quiet ten minutes, whenever you need it." },
   { match: (p) => p === "/settings" || p.startsWith("/settings/"), title: "Settings", subtitle: "Manage your account, integrations, scheduled tasks, usage, and billing." },
@@ -86,7 +84,7 @@ function isActive(pathname: string, href: string) {
 
 function Wordmark({ compact = false }: { compact?: boolean }) {
   return (
-    <Link href="/overview" className="os-focus inline-flex items-center rounded-md text-os-ink" aria-label="NBHD — Overview">
+    <Link href="/" className="os-focus inline-flex items-center rounded-md text-os-ink" aria-label="NBHD home page">
       <span className={clsx("font-medium tracking-[0.32em] text-os-muted", compact ? "text-[0.75rem]" : "text-[0.8125rem]")}>
         {compact ? "N" : "N B H D"}
       </span>
@@ -178,6 +176,7 @@ function DesktopRail({ sections, pathname, onLogout }: { sections: Section[]; pa
         <p className="text-[0.8125rem] leading-relaxed text-os-faint">
           Talk to your assistant on iPhone, Telegram or LINE. This page is for looking and tidying.
         </p>
+        <Link href="/" className="os-focus flex min-h-[44px] items-center text-[0.8125rem] text-os-faint hover:text-os-accent">NBHD home page</Link>
         <AccountButton onLogout={onLogout} align="left-up" />
       </div>
     </aside>
@@ -231,7 +230,7 @@ function PhoneBar({ sections, pathname, onLogout }: { sections: Section[]; pathn
     ...(sections.some((s) => s.href === "/friends") ? [{ href: "/friends", label: "People", icon: IconNeighborhood }] : []),
   ];
   const primaryHrefs = new Set(primary.map((s) => s.href));
-  const rest = sections.filter((s) => !primaryHrefs.has(s.href));
+  const rest = [...sections.filter((s) => !primaryHrefs.has(s.href)), { href: "/", label: "Home page", icon: IconOverview }];
   const moreActive = rest.some((s) => isActive(pathname, s.href));
 
   return (
@@ -242,7 +241,7 @@ function PhoneBar({ sections, pathname, onLogout }: { sections: Section[]; pathn
           <div
             role="dialog"
             aria-label="More sections"
-            className="absolute inset-x-3 rounded-3xl border border-os-hairline bg-os-surface-solid p-3"
+            className="absolute inset-x-3 max-h-[calc(100dvh-120px)] overflow-y-auto rounded-3xl border border-os-hairline bg-os-surface-solid p-3"
             style={{ bottom: "calc(env(safe-area-inset-bottom) + 96px)" }}
           >
             <ul>
@@ -353,13 +352,7 @@ export function OpenSkyShell({
           className="min-h-0 flex-1 overflow-y-auto px-4 pb-32 pt-4 sm:px-6 md:px-10 md:pb-12 md:pt-8 lg:px-14"
         >
           <div className="mx-auto w-full max-w-[1100px]">
-            {legacyTitle ? (
-              legacyTitle.title === "Horizons" ? (
-                <HorizonsSkyHeader title={legacyTitle.title} subtitle={legacyTitle.subtitle} />
-              ) : (
-                <OpenSkyPageHeader title={legacyTitle.title} subtitle={legacyTitle.subtitle} />
-              )
-            ) : null}
+            {legacyTitle ? <OpenSkyPageHeader title={legacyTitle.title} subtitle={legacyTitle.subtitle} /> : null}
             <ErrorBoundary
               fallback={
                 <div className="os-hairline-top pt-4">

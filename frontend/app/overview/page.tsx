@@ -4,10 +4,11 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo } from "react";
 
+import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SleepBars, WeightLine, type SleepNight } from "@/components/open-sky/charts";
 import { OpenSkyPageHeader, OpenSkySection } from "@/components/open-sky/primitives";
 import { ThisWeekCard } from "@/components/open-sky/this-week";
-import type { AssistantCardRow, AssistantPanelRef } from "@/lib/api";
+import type { AssistantCardRow } from "@/lib/api";
 import {
   useAssistantCardsQuery,
   useBodyWeightQuery,
@@ -36,98 +37,31 @@ function hoursLabel(h: number): string {
   return `${whole}h ${String(mins).padStart(2, "0")}m`;
 }
 
-const PANEL_COPY: Record<string, { line: string; href: string }> = {
-  sleep: { line: "Sleep from Apple Health and your log", href: "/log" },
-  workout: { line: "Your planned session", href: "/fuel" },
-  schedule: { line: "From your calendar", href: "/overview#this-week" },
-  log_table: { line: "Your logged numbers", href: "/log" },
-  focus: { line: "A focus block", href: "/overview" },
-  timer: { line: "A timer", href: "/overview" },
+const PANEL_LINKS: Record<string, { label: string; href: string }> = {
+  sleep: { label: "Sleep", href: "#sleep" },
+  workout: { label: "Workout", href: "#training" },
+  schedule: { label: "Schedule", href: "#week" },
+  log_table: { label: "Body log", href: "/log" },
 };
 
-function PanelIcon({ kind }: { kind: string }) {
-  const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.5, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
-  switch (kind) {
-    case "sleep":
-      return (
-        <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true" {...common}>
-          <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" />
-        </svg>
-      );
-    case "workout":
-      return (
-        <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true" {...common}>
-          <path d="M3 10v4M6 8v8M18 8v8M21 10v4M6 12h12" />
-        </svg>
-      );
-    case "schedule":
-      return (
-        <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true" {...common}>
-          <rect x="3.5" y="5" width="17" height="15" rx="2.5" />
-          <path d="M3.5 10h17M8 3v4M16 3v4" />
-        </svg>
-      );
-    default:
-      return (
-        <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true" {...common}>
-          <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
-          <path d="M3.5 9.5h17M9.5 9.5v10" />
-        </svg>
-      );
-  }
-}
-
-function panelTitle(p: AssistantPanelRef): string {
-  if (p.title) return p.title;
-  return p.kind.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase());
-}
-
-function firstLine(text: string): string {
-  const line = text.split("\n").find((l) => l.trim()) ?? "";
-  return line.replace(/[*_`#>]/g, "").trim();
-}
-
 function AssistantCards({ cards, timeZone }: { cards: AssistantCardRow[]; timeZone: string }) {
-  if (cards.length === 0) return null;
-  const [latest, ...earlier] = cards;
-  const when = (iso: string) =>
-    new Intl.DateTimeFormat("en-GB", { timeZone, weekday: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
+  const latest = cards[0];
+  if (!latest) return null;
+  const when = new Intl.DateTimeFormat("en-GB", { timeZone, weekday: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(latest.created_at));
   return (
-    <OpenSkySection label="From your assistant" trailing={<span className="text-[0.8125rem] text-os-faint">{when(latest.created_at)}</span>}>
-      {latest.text ? <p className="mb-3 max-w-[62ch] text-[1.0625rem] leading-relaxed text-os-ink">{firstLine(latest.text)}</p> : null}
-      <ul className="grid gap-x-8 sm:grid-cols-2">
-        {latest.panels.map((p, i) => {
-          const copy = PANEL_COPY[p.kind] ?? { line: "", href: "/overview" };
-          return (
-            <li key={`${latest.id}-${i}`}>
-              <Link href={copy.href} className="os-focus group flex min-h-[60px] items-center gap-3 os-hairline-top py-2">
-                <span className="text-os-accent">
-                  <PanelIcon kind={p.kind} />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[0.9375rem] text-os-ink group-hover:text-white">{panelTitle(p)}</span>
-                  {copy.line ? <span className="block truncate text-[0.8125rem] text-os-muted">{copy.line}</span> : null}
-                </span>
-              </Link>
-            </li>
-          );
+    <OpenSkySection label="From your assistant" trailing={<time dateTime={latest.created_at} className="text-[0.8125rem] text-os-faint">{when}</time>}>
+      {latest.text ? <div className="os-assistant-prose max-w-[72ch]"><MarkdownRenderer content={latest.text} /></div> : null}
+      <div className="mt-4 flex flex-wrap gap-2">
+        {[...new Set(latest.panels.map((panel) => panel.kind))].map((kind) => {
+          const link = PANEL_LINKS[kind];
+          return link ? <Link key={kind} href={link.href} className="os-btn os-focus !px-3.5 !text-sm !font-normal">
+            {link.label}<span aria-hidden="true">{link.href.startsWith("#") ? "↓" : "→"}</span>
+          </Link> : null;
         })}
-      </ul>
-      {earlier.length > 0 ? (
-        <details className="mt-3">
-          <summary className="os-focus min-h-[44px] cursor-pointer list-none py-2 text-[0.9375rem] text-os-accent">
-            Earlier cards ({earlier.length})
-          </summary>
-          <ul>
-            {earlier.map((c) => (
-              <li key={c.id} className="flex min-h-[48px] items-center justify-between gap-4 os-hairline-top">
-                <span className="min-w-0 truncate text-[0.9375rem] text-os-ink">{c.panels.map(panelTitle).join(" · ")}</span>
-                <span className="shrink-0 text-[0.8125rem] text-os-muted">{when(c.created_at)}</span>
-              </li>
-            ))}
-          </ul>
-        </details>
-      ) : null}
+      </div>
+      <Link href="/journal" className="os-focus mt-3 inline-flex min-h-[44px] items-center text-[0.8125rem] text-os-faint hover:text-os-accent">
+        Older notes from your assistant are in your Journal, day by day.
+      </Link>
     </OpenSkySection>
   );
 }
@@ -210,6 +144,7 @@ export default function OverviewPage() {
 
       <div className="grid gap-x-12 gap-y-10 md:grid-cols-2">
         <OpenSkySection
+          id="sleep"
           label="Sleep"
           trailing={
             <Link href="/log" className="os-focus text-[0.875rem] text-os-accent">
@@ -230,6 +165,7 @@ export default function OverviewPage() {
         </OpenSkySection>
 
         <OpenSkySection
+          id="weight"
           label="Weight · 30 days"
           trailing={
             <Link href="/log" className="os-focus text-[0.875rem] text-os-accent">
@@ -258,6 +194,8 @@ export default function OverviewPage() {
         <ThisWeekCard enabled={enabled} />
 
         <OpenSkySection
+          id="training"
+          className="md:col-span-2"
           label={`Training · ${doneCount} of ${workouts.length} done`}
           trailing={
             <Link href="/fuel" className="os-focus text-[0.875rem] text-os-accent">

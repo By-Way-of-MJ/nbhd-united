@@ -10,6 +10,7 @@
  * `?fixture=legacy` for a tenant without the web redesign (old shell).
  * `?fixture=journal-conflict` rejects the first block write with the 409 contract;
  * `?fixture=task-failure` rejects the first complete/reopen to check rollback.
+ * `?fixture=logged-out` renders public pages without fixture authentication.
  * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
  * Journal/task writes are in-memory only and reset on a full reload.
  */
@@ -156,7 +157,7 @@ const feed = [
   {
     id: "cron:morning-1",
     role: "assistant",
-    text: "Good morning. Short night, 6h 24m. Push day is on for 6:30pm, and the fabricator cutoff is Friday.",
+    text: "Good morning. Short night, **6h 24m**. Push day is on for 6:30pm, and the fabricator cutoff is Friday.\n\nYour calendar is light until the afternoon call. There’s room to make a little progress on the kitchen plan before you head out.\n\nKeep the workout steady today. An easy evening and an earlier night will help you find your rhythm again.",
     created_at: isoAt(0, 7, 40),
     source: "cron",
     thread_id: "main",
@@ -285,6 +286,8 @@ let fixtureTasks: JournalTask[] = [
   { id: "t1", title: "Book the counter template visit", due_date: isoDay(-1), parent_goal_id: null, status: "open" },
   { id: "t2", title: "Make room for an easy long run", due_date: isoDay(2), parent_goal_id: "g1", status: "open" },
   { id: "t3", title: "Try the route with a friend", due_date: null, parent_goal_id: "g1", status: "open" },
+  ...["Confirm the sink cutout", "Send 2–3 Osaka outreach DMs", "Finish The Core Insight section", "Book the physio check-in", "Buy new running shoes", "Draft the launch post", "Renew the car insurance", "Send the kitchen invoice", "Pick up the passport forms", "Plan the weekend route"].map((title, index) => ({ id: `due-${index}`, title, due_date: isoDay(Math.min(index, 7)), parent_goal_id: index % 3 === 0 ? "g1" : null, status: "open" })),
+  ...["Study on Burp Academy", "Talk about an AI workflow", "Research the laptop write-off", "Review the Academy Watch report", "Research 10 more Osaka teams", "Gather citizenship documents", "Start the passport forms", "Follow up with the team", "Review the weekly plan", "Check the shared document", "Reply to the launch feedback", "Remove the old class reminder", "Accept the team invite", "Sort the garage shelves"].map((title, index) => ({ id: `any-${index}`, title, due_date: null, parent_goal_id: null, status: "open" })),
   { id: "t4", title: "Choose a local 10k", due_date: null, parent_goal_id: "g1", status: "done" },
   { id: "t5", title: "Send the revised kitchen measurements", due_date: null, parent_goal_id: null, status: "done" },
 ].map((task) => ({ description: "", pillar: "", related_ref: "", created_at: isoAt(-7, 9), updated_at: isoAt(0, 9), ...task, status: task.status as JournalTask["status"], completed_at: task.status === "done" ? localMonday() : null }));
@@ -413,6 +416,13 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
       { kind: "goal", label: "Goals", items: isEmpty ? [] : [{ slug: "run-a-10k", title: "Run a 10k", updated_at: isoAt(-2, 8) }] },
       { kind: "ideas", label: "Ideas", items: [] },
     ]);
+  }
+  if (p === "/api/v1/journal/documents/") {
+    const projects = [
+      { id: "project-home", kind: "project", slug: "home-renovation", title: "Home Renovation", updated_at: isoAt(-1, 12) },
+      { id: "project-academy", kind: "project", slug: "academy-watch-japan", title: "Academy Watch Japan", updated_at: isoAt(-4, 9) },
+    ];
+    return json(isEmpty ? [] : projects.filter((doc) => !url.searchParams.get("kind") || doc.kind === url.searchParams.get("kind")));
   }
   const doc = p.match(/^\/api\/v1\/journal\/documents\/([^/]+)\/([^/]+)\/(append\/|blocks\/replace\/)?$/);
   if (doc) {
