@@ -293,11 +293,82 @@ let fixtureTasks: JournalTask[] = [
 ].map((task) => ({ description: "", pillar: "", related_ref: "", created_at: isoAt(-7, 9), updated_at: isoAt(0, 9), ...task, status: task.status as JournalTask["status"], completed_at: task.status === "done" ? localMonday() : null }));
 let pendingSuggestions = [{ id: "suggestion-1", kind: "task", text: "Find a quiet café for a writing morning", confidence: "0.85", source_date: isoDay(-1), created_at: isoAt(-1, 20) }];
 
+// Chart your galaxy (/constellation/play): ~250 lessons over 8 clusters with real
+// edges, so the flight can be screenshotted at scale. Texts are built from a few
+// patterns per cluster; ids and stages are deterministic.
+const GALAXY_CLUSTERS: [string, string[], string[]][] = [
+  ["Health", ["sleep", "a walk", "the gym", "stretching", "water", "breakfast"], ["Protect {s} before the day gets loud.", "When {s} slips, shrink it instead of skipping it.", "Plan {s} the night before and it happens.", "After ten days without {s}, restart lighter than you think.", "Move {s}, don't drop it.", "{S} is the first workout."]],
+  ["Work", ["the first hour", "the rough draft", "a hard email", "the weekly review", "deep work", "a small ship"], ["Start {s} before you feel ready.", "Guard {s} from meetings.", "Finish {s} first, polish later.", "Say no to the good to keep {s}.", "Put {s} on the calendar or it won't exist.", "Ship {s} small, ship it often."]],
+  ["Growth", ["feedback", "a hard question", "boredom", "the slow week", "a mistake", "a new habit"], ["Ask for {s} you fear.", "Notice what {s} is telling you.", "Reflect on {s} weekly, not daily.", "Sit with {s} before fixing it.", "Treat {s} as data, not a verdict.", "Give {s} a month before judging."]],
+  ["Family", ["dinner", "the weekend", "a sick day", "the school run", "bedtime", "a long call"], ["Division of labor beats doing everything together on {s}.", "Keep {s} phone-free.", "Say the plan for {s} out loud.", "Protect {s} from work creep.", "Let {s} be simple.", "Ask about {s} before offering fixes."]],
+  ["Craft", ["the first paragraph", "the outline", "the ugly version", "the second pass", "a constraint", "the ending"], ["Cut {s}.", "Make {s} work, then make it good.", "Steal {s} like an artist.", "Write {s} before you feel ready.", "Give {s} a deadline.", "Rest before {s}, not after."]],
+  ["Money", ["the subscription", "a big purchase", "the tax folder", "the emergency fund", "the invoice", "a raise"], ["Sleep on {s}.", "Automate {s} so you never decide twice.", "Review {s} on the first of the month.", "Ask for {s} with numbers, not feelings.", "Send {s} the day the work is done.", "Name {s} and it stops being scary."]],
+  ["Friends", ["a reply", "the group chat", "an invitation", "a quiet friend", "the reunion", "a favor"], ["Send {s} today, not perfectly.", "Leave {s} on read less often.", "Say yes to {s} before you're sure.", "Check on {s} first.", "Plan {s} two months out.", "Ask for {s}; people like being needed."]],
+  ["Place", ["the morning light", "the river path", "a new café", "the neighborhood", "the balcony", "the commute"], ["Walk {s} without headphones.", "Learn {s} one street at a time.", "Let {s} set the pace.", "Sit in {s} for ten minutes.", "Photograph {s} once a season.", "Say hello in {s}."]],
+];
+const GALAXY_STAGES = ["proto", "proto", "proto", "ignited", "proto", "radiant", "ignited", "proto", "supernova", "proto", "ignited", "proto"];
+const galaxyStars = GALAXY_CLUSTERS.flatMap(([label, subjects, patterns], ci) =>
+  patterns.flatMap((pattern, pi) =>
+    subjects.map((subject, si) => {
+      const n = ci * 36 + pi * 6 + si;
+      if (n % 8 === 7 && ci % 2 === 1) return null; // thin a few so clusters differ in size
+      const text = pattern.replace("{s}", subject).replace("{S}", subject.charAt(0).toUpperCase() + subject.slice(1));
+      const stage = GALAXY_STAGES[(n * 7) % GALAXY_STAGES.length];
+      return {
+        id: 1000 + n,
+        text,
+        tags: [label.toLowerCase(), subject.split(" ").pop() ?? subject],
+        cluster_id: ci + 1,
+        cluster_label: label,
+        star_stage: stage,
+        x: 60 + si * 70 + ((n * 37) % 23),
+        y: 40 + pi * 55 + ((n * 53) % 19),
+        journal_count: stage === "proto" ? 0 : 1 + (n % 3),
+        connection_count: 2,
+        last_tutored_at: null,
+        last_visited_at: null,
+        galaxy_note: "",
+        source_type: n % 5 === 0 ? "fuel" : "journal",
+        context: n % 3 === 0 ? `You wrote this after ${subject} went sideways twice in a row. Naming it got you back the same week.` : "",
+        created_at: isoAt(-((n * 11) % 90) - 1, 9),
+      };
+    }).filter((s): s is NonNullable<typeof s> => s !== null),
+  ),
+);
+const galaxyEdges = galaxyStars.flatMap((s, i) => {
+  const out: { source: number; target: number; similarity: number; connection_type: string }[] = [];
+  const next = galaxyStars[(i + 6) % galaxyStars.length];
+  if (next.cluster_id === s.cluster_id) out.push({ source: s.id, target: next.id, similarity: 0.6 + ((i * 13) % 30) / 100, connection_type: "similar" });
+  if (i % 9 === 0) out.push({ source: s.id, target: galaxyStars[(i + 41) % galaxyStars.length].id, similarity: 0.52, connection_type: "builds_on" });
+  return out;
+});
+const starNotes = new Map<number, { id: string; star: number; text: string; entry_type: string; tags: string[]; created_at: string }[]>([
+  [1002, [{ id: "n-1", star: 1002, text: "Tuesday mornings are the ones that slip.", entry_type: "revisit", tags: [], created_at: isoAt(-4, 21) }]],
+]);
+
 export function fixtureResponse(path: string, init?: RequestInit): Json | undefined {
   const method = (init?.method ?? "GET").toUpperCase();
   const url = new URL(path, "http://fixture.local");
   const p = url.pathname;
   const isEmpty = empty();
+  if (p === "/api/v1/lessons/galaxy/") {
+    return json({
+      stars: isEmpty ? [] : galaxyStars,
+      edges: isEmpty ? [] : galaxyEdges,
+      clusters: isEmpty ? [] : GALAXY_CLUSTERS.map(([label], ci) => ({ id: ci + 1, label, count: galaxyStars.filter((s) => s.cluster_id === ci + 1).length, tags: [label.toLowerCase()] })),
+    });
+  }
+  const starJournal = p.match(/^\/api\/v1\/lessons\/(\d+)\/journal\/(create\/)?$/);
+  if (starJournal) {
+    const starId = Number(starJournal[1]);
+    const list = starNotes.get(starId) ?? [];
+    if (starJournal[2] && method === "POST") {
+      const note = { id: `n-${starId}-${list.length + 1}`, star: starId, text: String(bodyOf(init).text ?? ""), entry_type: "revisit", tags: [], created_at: new Date().toISOString() };
+      starNotes.set(starId, [note, ...list]);
+      return json(note);
+    }
+    return json(list);
+  }
 
   if (p === "/api/v1/auth/me/") {
     // `?fixture=legacy` = a tenant without the web redesign (old shell).
