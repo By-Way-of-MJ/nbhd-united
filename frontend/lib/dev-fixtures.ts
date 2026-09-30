@@ -357,6 +357,46 @@ const starNotes = new Map<number, { id: string; star: number; text: string; entr
   [1002, [{ id: "n-1", star: 1002, text: "Tuesday mornings are the ones that slip.", entry_type: "revisit", tags: [], created_at: isoAt(-4, 21) }]],
 ]);
 
+// Constellation night sky (/constellation, Open Sky): ~120 lessons over 10
+// clusters whose newest lessons span a year (so depth reads), plus two loose
+// lessons and three awaiting review. Deterministic texts and dates.
+const SKY_CLUSTERS: [string, number, string[]][] = [
+  ["Workout Planning", 2, ["When a scheduled mobility session gets skipped, move it, don't drop it.", "Planning the gym visit the night before makes it happen.", "When a gym gap exceeds ten days, restart lighter than you think.", "Shrink the plan when life gets loud, don't skip it.", "Sleep is the first workout.", "Two short sessions beat one heroic one you never start.", "Warm up longer on cold mornings; the knee remembers.", "Log the set while it's fresh, not after the shower.", "A walk counts when the week is too full for the gym.", "Book the class; paying for it is half the motivation.", "Stretch before bed on heavy leg days.", "Rest days are part of the plan, not a break from it.", "Tired legs on Monday mean Sunday was too long."]],
+  ["Nutrition Tracking", 9, ["Logging body weight the morning after a heavy meal shows commitment to data over ego — the trend is the story.", "Protein first at breakfast makes the afternoon slump smaller.", "Weigh in before coffee, not after, or the week reads noisy.", "Prep lunch on Sunday or Wednesday becomes takeaway.", "Water before the second coffee.", "A snack in the bag stops the four o'clock raid.", "Eat the vegetables first when you're hungriest.", "Track the weekend too; that's where the drift hides.", "Dinner after nine costs the next morning's energy.", "One treat planned beats three unplanned.", "Shopping hungry fills the cart with regret."]],
+  ["Juggling Projects And Life", 20, ["Deep work doesn't need an empty calendar, just a protected first hour.", "Errands and focus can share a day if the order is right.", "Kids' pickup is a fixed star; plan around it, not against it.", "Write tomorrow's first task before closing the laptop.", "Say the week's one big thing out loud on Monday.", "A tired afternoon is for admin, not for decisions.", "Batch the small replies into one sitting.", "When two deadlines collide, ask which one can move.", "Leave a gap after every meeting.", "The calendar is a promise to yourself, too.", "Finish one thing before opening the next tab.", "Friday afternoon is for tidying, not starting."]],
+  ["Sleep And Recovery", 38, ["Screens off at ten makes the whole next day easier.", "A short nap before three beats a third coffee.", "When you're tired, lower the bar instead of skipping the habit.", "Same wake time on weekends keeps Monday gentle.", "A cool room sleeps better than a warm one.", "Late workouts cost an hour of sleep.", "Write the worry down so it stops circling at night.", "Recovery weeks are planned, not earned.", "Alcohol steals the second half of the night.", "Energy follows light; get outside before nine.", "Exhausted is a signal, not a character flaw."]],
+  ["App Store Identity Setup", 70, ["Accept the team invite before building, or the build signs with the wrong identity.", "Screenshot every certificate step; you'll need it again in a year.", "Keep the bundle IDs in one note, not three.", "Renew the certificate a month early.", "Test the release build on a real phone before submitting.", "Read the rejection twice before replying.", "Write the review notes like the reviewer has five minutes.", "Keep a clean test account ready for App Review."]],
+  ["Bill Payment Discipline", 105, ["Pay the card the day the statement lands, not the day it's due.", "A money check-in on Sunday beats a panic on Thursday.", "Automate the rent so it never needs a decision.", "Cancel the trial the day you start it.", "One folder for every receipt that might matter at tax time.", "Round up the savings transfer; you won't miss it.", "Look at the subscriptions every quarter.", "Call the provider before the price rise lands.", "Name the emergency fund and it stays untouched.", "Invoice the day the work is done."]],
+  ["Writing Practice", 150, ["Write the ugly first draft before breakfast.", "Cut the first paragraph; the piece usually starts at the second.", "Read it out loud and the clumsy sentences confess.", "Stop mid-sentence so tomorrow starts easy.", "A constraint makes the page less scary.", "Rest before the second pass, not after.", "Steal the structure, not the sentences.", "Three hundred words a day adds up to a book.", "Show the draft to one kind reader first.", "Delete the adverbs you notice on the third read.", "Give the ending a deadline.", "Tired writing is still writing; edit it tomorrow."]],
+  ["Family Logistics", 200, ["Say the weekend plan out loud on Thursday.", "A shared list beats remembering for each other.", "Pack the school bags the night before.", "Split the jobs instead of doing everything together.", "Keep dinner phone-free, even when it's rushed.", "Book the dentist for everyone in one go.", "A spare key at the neighbor's saves an evening.", "Ask about their day before offering fixes.", "Let bedtime be simple on long days.", "Put the birthdays in the calendar in January.", "The sick day plan works best when it's made on a healthy day."]],
+  ["Crisis Response", 280, ["When a partner gets sick while travelling, split the jobs instead of doing everything together.", "In a crisis, write the next three steps, not the whole plan.", "Ask for a quiet friend; people like being needed.", "Keep the insurance number in your phone, not the drawer.", "Eat something even when you're not hungry; the day is long.", "Tell work early and plainly.", "One person talks to the doctors, one to the family.", "Sleep in shifts when it goes on for days.", "Afterwards, write down what helped while you still remember."]],
+  ["Deep Work Habits", 350, ["Guard the first hour from meetings.", "Phone in another room is worth an hour of willpower.", "Start before you feel ready.", "One tab, one task, one timer.", "A walk unsticks what staring can't.", "Decide the next step before stopping.", "Turn off notifications for the whole morning.", "Protect the slow week; it's where the good ideas come from.", "Say no to the good to keep the great.", "When tired, switch to the easy part instead of quitting.", "Ship small, ship often."]],
+];
+const SKY_SOURCES = ["journal", "conversation", "reflection", "journal", "experience", "article"];
+const skyLessons = [
+  ...SKY_CLUSTERS.flatMap(([label, newest, texts], ci) =>
+    texts.map((text, i) => {
+      const id = 2000 + ci * 40 + i;
+      // Newest lesson on `newest` days ago; earlier ones stretch back a few weeks.
+      const age = newest + (texts.length - 1 - i) * (3 + (ci % 3)) + ((id * 7) % 3);
+      return { id, text, context: "", tags: [label.toLowerCase()], cluster_id: ci + 1, cluster_label: label, source_type: SKY_SOURCES[(id * 5) % SKY_SOURCES.length], source_ref: "", x: null, y: null, created_at: isoAt(-(i === texts.length - 1 ? newest : age), 9) };
+    }),
+  ),
+  { id: 2900, text: "Notice which days you hum.", context: "", tags: ["joy"], cluster_id: null, cluster_label: "", source_type: "reflection", source_ref: "", x: null, y: null, created_at: isoAt(-5, 20) },
+  { id: 2901, text: "A slow morning once a week pays for itself.", context: "", tags: ["rest"], cluster_id: null, cluster_label: "", source_type: "journal", source_ref: "", x: null, y: null, created_at: isoAt(-12, 8) },
+];
+const SKY_MEANING: Record<string, string[]> = {
+  tired: ["sleep", "slump", "tired", "exhausted", "a nap", "energy"],
+  money: ["card", "pay", "money", "invoice", "savings", "subscriptions"],
+  family: ["partner", "kids", "family", "bedtime", "dinner"],
+  focus: ["deep work", "focus", "first hour", "one task"],
+};
+const skyPending = [
+  { id: 2950, text: "Morning pages go easier with the window open.", context: "", tags: [], cluster_id: null, cluster_label: "", source_type: "journal", source_ref: "", status: "pending", suggested_at: isoAt(-1, 21), approved_at: null, created_at: isoAt(-1, 21) },
+  { id: 2951, text: "Ask the question you think is obvious.", context: "", tags: [], cluster_id: null, cluster_label: "", source_type: "conversation", source_ref: "", status: "pending", suggested_at: isoAt(-2, 18), approved_at: null, created_at: isoAt(-2, 18) },
+  { id: 2952, text: "Leave the bike by the door and you'll ride it.", context: "", tags: [], cluster_id: null, cluster_label: "", source_type: "journal", source_ref: "", status: "pending", suggested_at: isoAt(-2, 9), approved_at: null, created_at: isoAt(-2, 9) },
+];
+
 export function fixtureResponse(path: string, init?: RequestInit): Json | undefined {
   const method = (init?.method ?? "GET").toUpperCase();
   const url = new URL(path, "http://fixture.local");
@@ -608,29 +648,26 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     });
   }
   if (p === "/api/v1/lessons/constellation/") {
-    const lessons = [
-      ["Start before you feel ready.", 1, "Work", 120, 90],
-      ["Protect the first hour.", 1, "Work", 180, 150],
-      ["Say no to the good to keep the great.", 1, "Work", 90, 170],
-      ["Ship small, ship often.", 1, "Work", 160, 60],
-      ["Sleep is the first workout.", 2, "Health", 420, 110],
-      ["Easy days make hard days possible.", 2, "Health", 470, 190],
-      ["Walk after dinner.", 2, "Health", 520, 120],
-      ["Reflect weekly, not daily.", 3, "Growth", 300, 300],
-      ["Ask for the feedback you fear.", 3, "Growth", 350, 260],
-      ["Notice what drains you.", 3, "Growth", 330, 340],
-      ["Finish the rough draft first.", 4, "Craft", 150, 360],
-      ["Cut the first paragraph.", 4, "Craft", 200, 330],
-      ["Steal like an artist.", 4, "Craft", 110, 400],
-      ["Make it work, then make it good.", 4, "Craft", 190, 420],
-      ["Rest before you are tired.", 4, "Craft", 230, 390],
-    ] as const;
     return json({
-      nodes: isEmpty ? [] : lessons.map(([text, cid, label, x, y], i) => ({ id: i + 1, text, context: "", tags: [label.toLowerCase()], cluster_id: cid, cluster_label: label, x, y, created_at: isoAt(-30 + i, 9) })),
-      edges: isEmpty ? [] : [{ source: 1, target: 2, similarity: 0.7, connection_type: "similar" }, { source: 3, target: 4, similarity: 0.66, connection_type: "similar" }],
+      nodes: isEmpty ? [] : skyLessons,
+      edges: [],
       affinity_edges: [],
-      clusters: isEmpty ? [] : [{ id: 1, label: "Work", count: 4, tags: ["work"] }, { id: 2, label: "Health", count: 3, tags: ["health"] }, { id: 3, label: "Growth", count: 3, tags: ["growth"] }, { id: 4, label: "Craft", count: 5, tags: ["craft"] }],
+      clusters: isEmpty ? [] : SKY_CLUSTERS.map(([label], ci) => ({ id: ci + 1, label, count: skyLessons.filter((l) => l.cluster_id === ci + 1).length, tags: [label.toLowerCase()] })),
     });
+  }
+  if (p === "/api/v1/lessons/search/") {
+    // Stand-in for meaning search (the real one ranks by embeddings): lessons
+    // sharing a word with the query's "meaning" score high, the rest low, so
+    // the page's similarity floor is exercised too.
+    const q = (url.searchParams.get("q") ?? "").trim().toLowerCase();
+    const limit = Number(url.searchParams.get("limit") ?? 10);
+    const words = [q, ...(SKY_MEANING[q] ?? q.split(/\s+/))].filter((w) => w.length > 2);
+    const scored = skyLessons.map((l) => {
+      const text = l.text.toLowerCase();
+      const hits = words.filter((w) => text.includes(w)).length;
+      return { ...l, status: "approved", suggested_at: l.created_at, approved_at: l.created_at, similarity: hits ? Math.min(0.52, 0.36 + hits * 0.04 - (l.id % 5) * 0.01) : 0.1 + ((l.id * 37) % 13) / 100 };
+    });
+    return json(scored.sort((a, b) => b.similarity - a.similarity).slice(0, limit));
   }
   if (p === "/api/v1/datebook/agenda/") {
     // `?agenda=stale` = last complete sync too old to cover the week; `?agenda=disabled` = not connected.
@@ -732,7 +769,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
   if (p === "/api/v1/friends/mission-actions/") return json([]);
   if (p === "/api/v1/lessons/" && url.searchParams.get("status") === "approved") return json([]);
   if (p === "/api/v1/friends/profile/") return json({ handle: "yuki", display_name: "Yuki", bio: "", avatar_hue: 260, discoverable: true });
-  if (p === "/api/v1/lessons/pending/") return json([]);
+  if (p === "/api/v1/lessons/pending/") return json(isEmpty ? [] : skyPending);
   if (p === "/api/v1/core/sessions/") {
     return json(isEmpty ? [] : [{
       id: "med-1", date: isoDay(0), status: "ready", completed_at: null,

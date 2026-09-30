@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { isLoggedIn } from "@/lib/auth";
 import { getLiveQueryClient } from "@/lib/query-persist";
@@ -175,6 +175,7 @@ import {
   fetchConstellation,
   fetchGalaxy,
   fetchPendingLessons,
+  searchLessons,
   approveLesson,
   dismissLesson,
   deleteLesson,
@@ -2017,6 +2018,19 @@ export function useConstellationQuery() {
     queryFn: fetchConstellation,
     staleTime: 5 * 60_000,
     enabled: isLoggedIn(),
+  });
+}
+
+/** Search lessons by meaning. Pass an already-debounced query; empty = idle. */
+export function useLessonSearchQuery(q: string) {
+  const query = q.trim();
+  return useQuery({
+    queryKey: ["lesson-search", query],
+    queryFn: () => searchLessons(query),
+    enabled: isLoggedIn() && query.length > 0,
+    staleTime: 5 * 60_000,
+    retry: 1,
+    placeholderData: keepPreviousData,
   });
 }
 

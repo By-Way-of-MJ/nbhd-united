@@ -71,12 +71,14 @@ export function openSkySections(tenant: Tenant | null | undefined): Section[] {
  */
 const LEGACY_TITLES: { match: (p: string) => boolean; title: string; subtitle?: string }[] = [
   { match: (p) => p === "/journal", title: "Journal" },
-  { match: (p) => p === "/constellation", title: "Constellation", subtitle: "The threads across your life." },
   { match: (p) => p === "/fuel", title: "Fuel", subtitle: "Every session, on the calendar." },
   { match: (p) => p === "/core", title: "Core", subtitle: "A quiet ten minutes, whenever you need it." },
   { match: (p) => p === "/settings" || p.startsWith("/settings/"), title: "Settings", subtitle: "Manage your account, integrations, scheduled tasks, usage, and billing." },
   { match: (p) => p === "/friends", title: "Neighborhood" },
 ];
+
+/** Pages drawn edge to edge on their own sky (no page padding or shell title). */
+const IMMERSIVE_PATHS = new Set(["/constellation"]);
 
 function isActive(pathname: string, href: string) {
   return pathname === href || pathname.startsWith(`${href}/`);
@@ -334,7 +336,10 @@ export function OpenSkyShell({
 }) {
   const pathname = usePathname();
   const sections = openSkySections(tenant);
-  const legacyTitle = LEGACY_TITLES.find((t) => t.match(pathname.replace(/\/$/, "") || "/"));
+  const path = pathname.replace(/\/$/, "") || "/";
+  const legacyTitle = LEGACY_TITLES.find((t) => t.match(path));
+  // Full-bleed pages own the whole content area (their title sits on their own art).
+  const immersive = IMMERSIVE_PATHS.has(path);
 
   return (
     <div className="relative flex h-[100dvh] overflow-hidden text-os-ink" style={{ paddingTop: "env(safe-area-inset-top)" }}>
@@ -349,9 +354,13 @@ export function OpenSkyShell({
         </div>
         <main
           id="main-content"
-          className="min-h-0 flex-1 overflow-y-auto px-4 pb-32 pt-4 sm:px-6 md:px-10 md:pb-12 md:pt-8 lg:px-14"
+          className={
+            immersive
+              ? "relative min-h-0 flex-1 overflow-hidden"
+              : "min-h-0 flex-1 overflow-y-auto px-4 pb-32 pt-4 sm:px-6 md:px-10 md:pb-12 md:pt-8 lg:px-14"
+          }
         >
-          <div className="mx-auto w-full max-w-[1100px]">
+          <div className={immersive ? "h-full w-full" : "mx-auto w-full max-w-[1100px]"}>
             {legacyTitle ? <OpenSkyPageHeader title={legacyTitle.title} subtitle={legacyTitle.subtitle} /> : null}
             <ErrorBoundary
               fallback={
