@@ -123,6 +123,9 @@ SYSTEM_CRONS = [
     # Every 5 min — delete disabled internal at-cron rows once their 24-hour
     # forensic buffer has elapsed. User one-shots remain retained for audit.
     ("cleanup-internal-crons", "*/5 * * * *", "/api/cron/trigger/cleanup_internal_crons/"),
+    # Daily at 05:40 UTC — delete "since you were last here" write events older
+    # than 30 days. Metadata only; the feed never looks further back.
+    ("purge-runtime-write-events", "40 5 * * *", "/api/cron/trigger/purge_runtime_write_events/"),
     # Daily at 01:30 UTC — watchdog for orphaned Fuel/Gravity welcome crons.
     # Re-invokes the self-healing schedulers so a tenant whose welcome was
     # missed (gateway hiccup, agent crash mid-turn) gets retried within 24h.

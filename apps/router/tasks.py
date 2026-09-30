@@ -28,6 +28,28 @@ _EXTRACTION_TURN_TIMEOUT = 120.0
 EXTRACTION_JOB_NAME = "_document_extraction"
 
 
+def purge_runtime_write_events_task(batch_size: int = 5000) -> dict:
+    """Delete ``RuntimeWriteEvent`` rows past the 30-day retention, in batches.
+
+    Called via QStash cron schedule (daily).
+    """
+    from django.utils import timezone
+
+    from apps.router.activity_views import RUNTIME_WRITE_EVENT_RETENTION
+    from apps.router.models import RuntimeWriteEvent
+
+    cutoff = timezone.now() - RUNTIME_WRITE_EVENT_RETENTION
+    deleted = 0
+    while True:
+        batch = list(RuntimeWriteEvent.objects.filter(created_at__lt=cutoff).values_list("id", flat=True)[:batch_size])
+        if not batch:
+            break
+        count, _ = RuntimeWriteEvent.objects.filter(id__in=batch).delete()
+        deleted += count
+    logger.info("purge_runtime_write_events: deleted %s", deleted)
+    return {"deleted": deleted}
+
+
 def cleanup_inbound_media_task() -> None:
     """Delete inbound media files older than 24 hours from all tenant file shares.
 
