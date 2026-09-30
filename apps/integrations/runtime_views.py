@@ -57,7 +57,11 @@ from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fence
 from apps.orchestrator.personas import get_persona
 from apps.orchestrator.tour_guide import places_search_delivery_ready, tour_guide_delivery_ready
 from apps.pii.egress import KnownValueResponseGuardMixin
-from apps.router.document_write_guard import assert_write_allowed_for_document_turn, record_runtime_write_activity
+from apps.router.document_write_guard import (
+    assert_write_allowed_for_document_turn,
+    record_runtime_write_activity,
+    record_runtime_write_event,
+)
 from apps.tenants.models import Tenant
 
 from .apple_maps import search_places
@@ -1061,6 +1065,7 @@ class RuntimeGoalListCreateView(KnownValueResponseGuardMixin, APIView):
             )
 
         goal = serializer.save(pii_receipts=receipts)
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id}, verb="created")
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_201_CREATED,
@@ -1121,6 +1126,7 @@ class RuntimeGoalDetailView(APIView):
         serializer = GoalSerializer(goal, data=authored_data, partial=True, context={"tenant": tenant})
         serializer.is_valid(raise_exception=True)
         serializer.save(pii_receipts=receipts)
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -1152,6 +1158,7 @@ class RuntimeGoalAchieveView(APIView):
 
         _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.achieve")
         goal.mark_achieved()
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -1183,6 +1190,7 @@ class RuntimeGoalAbandonView(APIView):
 
         _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.abandon")
         goal.abandon()
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -2099,6 +2107,10 @@ class RuntimeDailyNoteAppendView(APIView):
 
             bridge_daily_note_mood(tenant=tenant, note_date=d, content=content, writer="runtime")
 
+        record_runtime_write_event(
+            tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if _created else "updated"
+        )
+
         response_payload = {
             "tenant_id": str(tenant.id),
             "date": str(d),
@@ -2985,6 +2997,11 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
                 doc.pii_receipts = {**(doc.pii_receipts or {}), **receipts}
                 doc.save(update_fields=[*update_fields, "pii_receipts", "updated_at"])
 
+        if doc.kind != Document.Kind.MEMORY:
+            record_runtime_write_event(
+                tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if created else "updated"
+            )
+
         return Response(
             {
                 "tenant_id": str(tenant.id),
@@ -3449,6 +3466,11 @@ class RuntimeDocumentAppendView(KnownValueResponseGuardMixin, APIView):
                 stored_text=doc.markdown,
             )
             doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        if doc.kind != Document.Kind.MEMORY:
+            record_runtime_write_event(
+                tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if _created else "updated"
+            )
 
         return Response(
             {

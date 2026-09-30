@@ -640,8 +640,9 @@ export default function ConstellationPage() {
             </div>)}
           </div>
           {/* Mobile Play entry — the toolbar below (with the desktop Play link) is
-              hidden on phones, so surface a tappable Play CTA here on small screens. */}
-          {playEnabled && (
+              hidden on phones, so surface a tappable Play CTA here on small screens.
+              Open Sky already has the "Fly in" ghost button above the sky. */}
+          {playEnabled && !openSky && (
             <Link
               href="/constellation/play"
               title="Fly your galaxy (beta)"
@@ -657,7 +658,7 @@ export default function ConstellationPage() {
             <span className="h-4 w-px bg-white/10 mx-0.5" />
             <button type="button" onClick={() => setPositions(baseLayout)} title="Relayout" className="px-2.5 h-7 rounded-full hover:bg-white/10 text-[#94A3B8] hover:text-white text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.36-2.64L3 16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 21v-5h5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.36 2.64L21 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><path d="M21 3v5h-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>Relayout</button>
-            {playEnabled && (
+            {playEnabled && !openSky && (
               <Link href="/constellation/play" title="Fly your galaxy (beta)" className="px-2.5 h-7 rounded-full text-accent hover:text-accent-hover hover:bg-accent/15 text-[10px] uppercase tracking-wider flex items-center gap-1.5 font-headline">
                 <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 1.4l6.2 3.6L2 8.6z" fill="currentColor" /></svg>Play
               </Link>

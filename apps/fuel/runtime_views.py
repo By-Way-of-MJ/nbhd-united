@@ -23,7 +23,11 @@ from apps.integrations.confirmation_tokens import (
 from apps.integrations.internal_auth import InternalAuthError, validate_internal_runtime_request
 from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
 from apps.pii.egress import KnownValueResponseGuardMixin
-from apps.router.document_write_guard import assert_write_allowed_for_document_turn, record_runtime_write_activity
+from apps.router.document_write_guard import (
+    assert_write_allowed_for_document_turn,
+    record_runtime_write_activity,
+    record_runtime_write_event,
+)
 from apps.tenants.middleware import set_rls_context
 from apps.tenants.models import Tenant
 
@@ -675,6 +679,8 @@ class RuntimeLogWorkoutView(_FuelResponseGuard, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        record_runtime_write_event(tenant, kind="fuel", ref={"workout_id": workout.id}, verb="created")
+
         # PR detection is best-effort — don't let it break workout logging
         try:
             from .services import detect_prs
@@ -960,6 +966,7 @@ class RuntimeWorkoutDetailView(_FuelResponseGuard, APIView):
                     {"error": "update_failed", "detail": str(exc)},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+            record_runtime_write_event(tenant, kind="fuel", ref={"workout_id": workout.id})
 
             # Re-run PR detection if exercise data changed
             if "detail_json" in updated_fields:
@@ -1077,6 +1084,7 @@ class RuntimeWorkoutSkipView(_FuelResponseGuard, APIView):
         workout.skip_reason = authored["skip_reason"]
         workout.pii_receipts = receipts
         workout.save(update_fields=["status", "completed_at", "skip_reason", "pii_receipts", "updated_at"])
+        record_runtime_write_event(tenant_or_resp, kind="fuel", ref={"workout_id": workout.id})
         return Response(
             {
                 "id": str(workout.id),
@@ -1145,6 +1153,7 @@ class RuntimeWorkoutCompleteView(_FuelResponseGuard, APIView):
         # would blind-revert fields a concurrent HealthKit sync just wrote
         # (external_id, merged detail_json).
         workout.save(update_fields=update_fields)
+        record_runtime_write_event(tenant_or_resp, kind="fuel", ref={"workout_id": workout.id})
         try:
             from .services import detect_prs
 
@@ -1202,6 +1211,8 @@ class RuntimeWorkoutSwapView(_FuelResponseGuard, APIView):
             b.save(update_fields=["scheduled_at", "window_start_at", "window_end_at", "date", "updated_at"])
             PersonalRecord.objects.filter(workout_id=a.id).update(date=a.date)
             PersonalRecord.objects.filter(workout_id=b.id).update(date=b.date)
+        record_runtime_write_event(tenant_or_resp, kind="fuel", ref={"workout_id": a.id})
+        record_runtime_write_event(tenant_or_resp, kind="fuel", ref={"workout_id": b.id})
         return Response(
             {
                 "a": {
@@ -3129,6 +3140,7 @@ class RuntimeWorkoutPlanListCreateView(_FuelResponseGuard, APIView):
             )
         _add_catalog_feedback(result, catalog_matches, unmatched_exercises)
         add_prescription_feedback(result, tenant, plan_prescription_days(plan.schedule_json, plan.week_overrides))
+        record_runtime_write_event(tenant, kind="fuel", ref={"plan_id": plan.id}, verb="created")
         return Response(result, status=status.HTTP_201_CREATED)
 
 
@@ -3578,6 +3590,7 @@ class RuntimeWorkoutPlanDetailView(_FuelResponseGuard, APIView):
         _add_catalog_feedback(resp, catalog_matches, unmatched_exercises)
         if "schedule_json" in data or "week_overrides" in data:
             add_prescription_feedback(resp, tenant, plan_prescription_days(plan.schedule_json, plan.week_overrides))
+        record_runtime_write_event(tenant, kind="fuel", ref={"plan_id": plan.id})
         return Response(resp)
 
     def delete(self, request, tenant_id, plan_id):
