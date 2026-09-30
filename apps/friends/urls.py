@@ -5,6 +5,7 @@ from django.urls import path
 from . import project_views
 from .views import (
     AbsorbedListView,
+    AbsorbedPurgeGroupView,
     AbsorbedPurgeView,
     AdoptShareView,
     BlockedListView,
@@ -86,6 +87,7 @@ urlpatterns = [
     path("shares/<uuid:pending_share_id>/reject/", ShareRejectView.as_view(), name="friends-share-reject"),
     path("shares/<uuid:shared_lesson_id>/adopt/", AdoptShareView.as_view(), name="friends-share-adopt"),
     path("absorbed/", AbsorbedListView.as_view(), name="friends-absorbed"),
+    path("absorbed/purge-group/", AbsorbedPurgeGroupView.as_view(), name="friends-absorbed-purge-group"),
     path("absorbed/<uuid:absorbed_item_id>/purge/", AbsorbedPurgeView.as_view(), name="friends-absorbed-purge"),
     # Friend chat (1:1)
     path("threads/", ThreadsView.as_view(), name="friends-threads"),

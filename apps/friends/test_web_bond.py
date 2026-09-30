@@ -42,6 +42,7 @@ ALLOWED_NEIGHBOR_KEYS = {
     "thread_id",
     "bond",
     "friends_since",
+    "reach",  # bucketed friends-of-friends count (test_reach.py), never names
 }
 
 
