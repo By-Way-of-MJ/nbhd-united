@@ -3,24 +3,37 @@
  * WebLessonsDeep mockup). One dome: a procedural Milky Way with dust lanes,
  * thousands of soft background stars in real star colours, a few faint distant
  * galaxies, drifting star dust for depth, the user's lessons as constellations,
- * hills at first light and a dome vignette. Stereographic projection.
+ * and hills at first light. Stereographic projection.
  *
- * Everything that doesn't change while the camera rests (sky, background stars,
- * dust, hills, vignette) is cached offscreen and only repainted when the camera
- * moves or the canvas resizes; lessons, figures and labels draw every frame.
+ * While the camera rests, everything that doesn't change (sky, background
+ * stars, dust, hills) is cached offscreen and only the lessons, figures and
+ * names redraw; in flight, every layer paints straight onto the canvas. The
+ * dome vignette is a CSS overlay (static per size), not part of the canvas.
+ *
+ * Level of detail keeps a big sky calm: only the chosen constellation and its
+ * nearest neighbours in the Next order are drawn fully (every star, the figure,
+ * the name); the rest recede into depth haze as a soft glow with their few
+ * brightest stars, and at most a handful of names are on screen at once.
  */
 
 import { ctx2d, fbm, makeCanvas, seeded, smooth } from "../sky-art/noise";
 import {
   angDiff,
+  brightestStars,
   clusterRadius,
   D2R,
+  detailTarget,
   dirv,
   easeInOut,
   easeSpeed,
+  FAR_STARS,
+  fogFor,
+  type LabelCandidate,
   lerpPose,
   LOOK_BELOW,
+  MAX_LABELS,
   moveDuration,
+  pickLabels,
   type Pose,
   type SkyModel,
   type Vec3,
@@ -29,6 +42,9 @@ import {
 const BOX = 90;
 const SKY_BG = "#030408";
 const RING = "196,187,255";
+/** Top of the hills layer on the 1800-unit design height (the glow above the ridges starts here). */
+const FG_TOP = 1300;
+const STREAK_BANDS = 5;
 
 interface Far { v: Vec3; m: number; t: number }
 interface Dust { x: number; y: number; z: number; m: number; t: number }
@@ -66,6 +82,17 @@ function galaxySprite(rgb: string): HTMLCanvasElement {
   gr.addColorStop(1, `rgba(${rgb},0)`);
   g.fillStyle = gr;
   g.fillRect(0, 0, 96, 96);
+  return c;
+}
+
+/** Soft haze for a distant constellation. */
+function glowSprite(rgb: string): HTMLCanvasElement {
+  const c = makeCanvas(64, 64), g = ctx2d(c), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, `rgba(${rgb},0.55)`);
+  gr.addColorStop(0.35, `rgba(${rgb},0.18)`);
+  gr.addColorStop(1, `rgba(${rgb},0)`);
+  g.fillStyle = gr;
+  g.fillRect(0, 0, 64, 64);
   return c;
 }
 
@@ -115,6 +142,17 @@ export class NightSkyRenderer {
   private selCluster = -1;
   private selLesson = -1;
   private matches: Set<number> | null = null;
+  /** Per constellation: eased level of detail (0 distant glow → 1 full), and "arrived" (0 → 1). */
+  private detail = new Float32Array(0);
+  private arrived = new Float32Array(0);
+  /** Per constellation: its few brightest stars, and which stars are featured before arrival. */
+  private farIdx: number[][] = [];
+  private featured: Uint8Array[] = [];
+  private matchCl = new Uint8Array(0);
+  private lastT = 0;
+  private rot = { ca: 1, sa: 0, ce: 1, se: 0 };
+  private readonly sp: Screen = { x: 0, y: 0, d: 0 };
+  private readonly sp2: Screen = { x: 0, y: 0, d: 0 };
   private cam: Pose = { p: [0, 0, 0], az: 0, alt: 18 };
   private move: Move | null = null;
   private fade: { snap: HTMLCanvasElement; start: number } | null = null;
@@ -124,9 +162,12 @@ export class NightSkyRenderer {
   private far: Far[] = [];
   private dust: Dust[] = [];
   private galaxies: Galaxy[] = [];
-  private sprites: { white: HTMLCanvasElement; blue: HTMLCanvasElement; warm: HTMLCanvasElement; glint: HTMLCanvasElement; gw: HTMLCanvasElement; gc: HTMLCanvasElement; tints: Map<string, HTMLCanvasElement> } | null = null;
+  private sprites: { white: HTMLCanvasElement; blue: HTMLCanvasElement; warm: HTMLCanvasElement; glint: HTMLCanvasElement; gw: HTMLCanvasElement; gc: HTMLCanvasElement; tints: Map<string, HTMLCanvasElement>; glows: Map<string, HTMLCanvasElement> } | null = null;
 
   private mw: HTMLCanvasElement | null = null;
+  /** Optional DOM layer behind the canvas that shows the Milky Way, moved by CSS transform (composited, not repainted). */
+  private dome: HTMLCanvasElement | null = null;
+  private domeTransform = "";
   private mwImg: ImageData | null = null;
   private mwRow = 0;
   private readonly mwW = 720;
@@ -136,7 +177,9 @@ export class NightSkyRenderer {
   private fg: HTMLCanvasElement | null = null;
   private cacheKey = "";
   private font = "Georgia, serif";
+  /** Clickable stars from the last frame: a reused pool, `pickCount` of them live. */
   private picks: { id: number; cluster: number; x: number; y: number }[] = [];
+  private pickCount = 0;
   private canvas: HTMLCanvasElement | null = null;
   private view = { w: 1, h: 1, sc: 1, cx: 0, cy: 0, u: 1 };
 
@@ -161,18 +204,81 @@ export class NightSkyRenderer {
 
   setModel(model: SkyModel): void {
     this.model = model;
+    const n = model.clusters.length;
+    this.farIdx = model.clusters.map((c) => brightestStars(c.lessons.map((l) => l.size), FAR_STARS));
+    this.featured = model.clusters.map((c) => {
+      const f = new Uint8Array(c.lessons.length);
+      for (const i of c.featured) f[i] = 1;
+      return f;
+    });
+    // Start settled at the current selection (no fade on first paint).
+    this.detail = new Float32Array(n);
+    this.arrived = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      this.detail[i] = detailTarget(i, this.selCluster);
+      this.arrived[i] = i === this.selCluster ? 1 : 0;
+    }
+    this.syncMatchClusters();
     this.needsDraw = true;
   }
 
   setSelection(cluster: number, lessonId: number): void {
+    const first = this.selCluster < 0;
     this.selCluster = cluster;
     this.selLesson = lessonId;
+    if (first) {
+      for (let i = 0; i < this.detail.length; i++) {
+        this.detail[i] = detailTarget(i, cluster);
+        this.arrived[i] = i === cluster ? 1 : 0;
+      }
+    }
     this.needsDraw = true;
   }
 
   setMatches(ids: Set<number> | null): void {
     this.matches = ids;
+    this.syncMatchClusters();
     this.needsDraw = true;
+  }
+
+  private syncMatchClusters(): void {
+    const m = this.model;
+    this.matchCl = new Uint8Array(m ? m.clusters.length : 0);
+    const ids = this.matches;
+    if (!m || !ids) return;
+    m.clusters.forEach((c, i) => {
+      if (c.lessons.some((l) => ids.has(l.id))) this.matchCl[i] = 1;
+    });
+  }
+
+  /**
+   * Show the Milky Way on a canvas element that sits behind the sky canvas.
+   * The panorama is drawn into it once and then only moved and scaled with a
+   * CSS transform, so the browser composites it instead of the sky canvas
+   * repainting a full-screen image every frame in flight.
+   */
+  attachDome(el: HTMLCanvasElement | null): void {
+    this.dome = el;
+    this.domeTransform = "";
+    this.cacheKey = "";
+    this.needsDraw = true;
+    if (el && this.mw) this.fillDome();
+  }
+
+  private fillDome(): void {
+    const el = this.dome, mw = this.mw;
+    if (!el || !mw) return;
+    // Three copies side by side so any heading is covered without seams.
+    el.width = mw.width * 3;
+    el.height = mw.height;
+    // One CSS pixel per panorama pixel; the transform does all the scaling.
+    el.style.width = `${el.width}px`;
+    el.style.height = `${el.height}px`;
+    el.style.maxWidth = "none";
+    el.style.transformOrigin = "0 0";
+    el.style.willChange = "transform";
+    const g = ctx2d(el);
+    for (let i = 0; i < 3; i++) g.drawImage(mw, i * mw.width, 0);
   }
 
   /** Jump without animation (first paint). */
@@ -206,7 +312,8 @@ export class NightSkyRenderer {
 
   pick(x: number, y: number, radius: number): PickedStar | null {
     let best: PickedStar | null = null, bd = radius * radius;
-    for (const p of this.picks) {
+    for (let i = 0; i < this.pickCount; i++) {
+      const p = this.picks[i];
       const d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y);
       if (d < bd) {
         bd = d;
@@ -218,22 +325,24 @@ export class NightSkyRenderer {
 
   // ── Projection ───────────────────────────────────────────────────────────
 
-  private dir(n: Vec3): Screen | null {
-    const a = this.cam.az * D2R, e = this.cam.alt * D2R;
-    const x1 = n[0] * Math.cos(a) - n[2] * Math.sin(a), z1 = n[0] * Math.sin(a) + n[2] * Math.cos(a), y1 = n[1];
-    const y2 = y1 * Math.cos(e) - z1 * Math.sin(e), z2 = y1 * Math.sin(e) + z1 * Math.cos(e);
-    if (z2 < -0.35) return null;
+  /** Project a unit direction into `out`; false if it's behind the camera. Uses the per-frame rotation cache. */
+  private projDir(nx: number, ny: number, nz: number, out: Screen): boolean {
+    const { ca, sa, ce, se } = this.rot;
+    const x1 = nx * ca - nz * sa, z1 = nx * sa + nz * ca;
+    const y2 = ny * ce - z1 * se, z2 = ny * se + z1 * ce;
+    if (z2 < -0.35) return false;
     const k = 1 / (1 + z2), { sc, cx, cy } = this.view;
-    return { x: cx + x1 * k * sc, y: cy - y2 * k * sc, d: 0 };
+    out.x = cx + x1 * k * sc;
+    out.y = cy - y2 * k * sc;
+    return true;
   }
 
-  private pt(w: Vec3): Screen | null {
-    const c = this.cam.p, dx = w[0] - c[0], dy = w[1] - c[1], dz = w[2] - c[2];
+  /** Project a world point into `out` (with its distance from the camera); false if behind. */
+  private proj(wx: number, wy: number, wz: number, out: Screen): boolean {
+    const c = this.cam.p, dx = wx - c[0], dy = wy - c[1], dz = wz - c[2];
     const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6;
-    const s = this.dir([dx / d, dy / d, dz / d]);
-    if (!s) return null;
-    s.d = d;
-    return s;
+    out.d = d;
+    return this.projDir(dx / d, dy / d, dz / d, out);
   }
 
   // ── Frame ────────────────────────────────────────────────────────────────
@@ -261,37 +370,56 @@ export class NightSkyRenderer {
       peak = easeSpeed(t);
       if (t >= 1) this.move = null;
     }
+    this.rot = { ca: Math.cos(this.cam.az * D2R), sa: Math.sin(this.cam.az * D2R), ce: Math.cos(this.cam.alt * D2R), se: Math.sin(this.cam.alt * D2R) };
     const mv: Vec3 = [this.cam.p[0] - this.lastPose.p[0], this.cam.p[1] - this.lastPose.p[1], this.cam.p[2] - this.lastPose.p[2]];
     this.lastPose = { p: [...this.cam.p] as Vec3, az: this.cam.az, alt: this.cam.alt };
 
     const W = Math.round(w * dpr), H = Math.round(h * dpr);
+    // The hills only ever reach the bottom ~28% of the view, so their layer is just that band.
+    const fgTop = Math.floor(((FG_TOP * h) / 1800) * dpr);
     const key = `${W}x${H}:${this.cam.p.map((v) => v.toFixed(3)).join(",")}:${this.cam.az.toFixed(3)}:${this.cam.alt.toFixed(3)}:${this.mw ? 1 : 0}:${this.compact ? 1 : 0}`;
     const streaks = !this.reduced && peak > 0.72;
-    if (key !== this.cacheKey || streaks) {
-      if (!this.bg || this.bg.width !== W || this.bg.height !== H) {
-        this.bg = makeCanvas(W, H);
-        this.fg = makeCanvas(W, H);
-      }
-      const b = ctx2d(this.bg);
-      b.setTransform(dpr, 0, 0, dpr, 0, 0);
-      this.paintBackground(b, streaks ? mv : null, streaks ? smooth(0.72, 1, peak) : 0);
-      const f = ctx2d(this.fg!);
-      f.setTransform(1, 0, 0, 1, 0, 0);
-      f.clearRect(0, 0, W, H);
-      f.setTransform(dpr, 0, 0, dpr, 0, 0);
-      this.paintForeground(f);
-      this.cacheKey = streaks ? "" : key;
-    }
-
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = 1;
-    ctx.drawImage(this.bg!, 0, 0);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    this.paintLessons(ctx, now / 1000);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalAlpha = 1;
-    ctx.drawImage(this.fg!, 0, 0);
+    if (this.move || streaks) {
+      // In flight every layer changes each frame, so paint straight onto the
+      // canvas — caching would only add two full-screen copies per frame.
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this.paintBackground(ctx, streaks ? mv : null, streaks ? smooth(0.72, 1, peak) : 0);
+      this.paintLessons(ctx, now / 1000);
+      ctx.globalCompositeOperation = "source-over";
+      this.paintForeground(ctx);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1;
+      this.cacheKey = "";
+    } else {
+      if (key !== this.cacheKey) {
+        if (!this.bg || this.bg.width !== W || this.bg.height !== H) {
+          this.bg = makeCanvas(W, H);
+          this.fg = makeCanvas(W, Math.max(1, H - fgTop));
+        }
+        const b = ctx2d(this.bg);
+        b.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.paintBackground(b, null, 0);
+        const f = ctx2d(this.fg!);
+        f.setTransform(1, 0, 0, 1, 0, 0);
+        f.clearRect(0, 0, W, H - fgTop);
+        f.setTransform(dpr, 0, 0, dpr, 0, -fgTop);
+        this.paintForeground(f);
+        this.cacheKey = key;
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      // "copy" replaces last frame outright (the cached layer may be transparent over the dome).
+      ctx.globalCompositeOperation = "copy";
+      ctx.drawImage(this.bg!, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      this.paintLessons(ctx, now / 1000);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = 1;
+      ctx.drawImage(this.fg!, 0, fgTop);
+    }
 
     if (this.fade) {
       const t = (now - this.fade.start) / 450;
@@ -313,6 +441,7 @@ export class NightSkyRenderer {
       gw: galaxySprite("255,226,196"),
       gc: galaxySprite("206,214,255"),
       tints: new Map(),
+      glows: new Map(),
     };
     if (typeof document !== "undefined") {
       const fam = getComputedStyle(document.documentElement).getPropertyValue("--font-serif").trim();
@@ -326,6 +455,16 @@ export class NightSkyRenderer {
     let s = m.get(rgb);
     if (!s) {
       s = sprite(rgb);
+      m.set(rgb, s);
+    }
+    return s;
+  }
+
+  private glow(rgb: string): HTMLCanvasElement {
+    const m = this.sprites!.glows;
+    let s = m.get(rgb);
+    if (!s) {
+      s = glowSprite(rgb);
       m.set(rgb, s);
     }
     return s;
@@ -352,9 +491,10 @@ export class NightSkyRenderer {
           v = [v[0] * (1 - k) + v2[0] * k, v[1] * (1 - k) + v2[1] * k];
         }
         const I = v[0], warm = v[1] * 0.9, o = (y * W + x) * 4;
-        d[o] = clamp255((150 + 105 * warm) * I * 0.5 + 2);
-        d[o + 1] = clamp255((166 + 70 * warm) * I * 0.5 + 3);
-        d[o + 2] = clamp255((222 - 30 * warm) * I * 0.5 + 6);
+        // Glow on top of the sky colour (SKY_BG = 3,4,8), baked in so the panorama can be copied opaque.
+        d[o] = clamp255((150 + 105 * warm) * I * 0.5 + 2 + 3);
+        d[o + 1] = clamp255((166 + 70 * warm) * I * 0.5 + 3 + 4);
+        d[o + 2] = clamp255((222 - 30 * warm) * I * 0.5 + 6 + 8);
         d[o + 3] = 255;
       }
     }
@@ -364,6 +504,7 @@ export class NightSkyRenderer {
       ctx2d(c).putImageData(this.mwImg, 0, 0);
       this.mw = c;
       this.mwImg = null;
+      this.fillDome();
     }
   }
 
@@ -373,21 +514,39 @@ export class NightSkyRenderer {
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = 1;
     ctx.fillStyle = SKY_BG;
-    ctx.fillRect(0, 0, w, h);
 
-    // Milky Way across the dome (the slice of panorama you're facing).
-    ctx.globalCompositeOperation = "lighter";
-    if (this.mw) {
+    // Milky Way across the dome (the slice of panorama you're facing). The
+    // panorama already carries the sky colour, so it's a plain opaque copy —
+    // no full-screen fill and blend underneath — with the sky filled only
+    // above and below it.
+    if (this.dome && this.mw) {
+      // The Milky Way is its own composited layer behind this canvas.
+      ctx.clearRect(0, 0, w, h);
       const ppd = sc * 0.01333, wAz = ((c.az % 360) + 360) % 360, tileW = 360 * ppd, x0 = cx - (wAz / 360) * tileW;
-      for (let dup = -1; dup <= 1; dup++) ctx.drawImage(this.mw, x0 + dup * tileW, cy - (75 - c.alt) * ppd, tileW, 90 * ppd);
-    }
+      const tf = `translate(${(x0 - tileW).toFixed(2)}px,${(cy - (75 - c.alt) * ppd).toFixed(2)}px) scale(${(tileW / this.mw.width).toFixed(5)},${((90 * ppd) / this.mw.height).toFixed(5)})`;
+      if (tf !== this.domeTransform) {
+        this.dome.style.transform = tf;
+        this.domeTransform = tf;
+      }
+    } else if (this.mw) {
+      const ppd = sc * 0.01333, wAz = ((c.az % 360) + 360) % 360, tileW = 360 * ppd, x0 = cx - (wAz / 360) * tileW;
+      const y0 = cy - (75 - c.alt) * ppd, y1 = y0 + 90 * ppd;
+      for (let dup = -1; dup <= 1; dup++) {
+        const x = x0 + dup * tileW;
+        if (x < w && x + tileW > 0) ctx.drawImage(this.mw, x, y0, tileW, 90 * ppd);
+      }
+      if (y0 > 0) ctx.fillRect(0, 0, w, Math.ceil(y0) + 1);
+      if (y1 < h) ctx.fillRect(0, Math.floor(y1) - 1, w, h - y1 + 2);
+    } else ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = "lighter";
 
     // Background stars: fixed on the dome, far beyond any lesson.
     const glint = this.sprites!.glint;
     const farStep = this.compact ? 2 : 1;
+    const fp = this.sp;
     for (let i = 0; i < this.far.length; i += farStep) {
-      const F = this.far[i], fp = this.dir(F.v);
-      if (!fp || fp.x < -10 || fp.x > w + 10 || fp.y < -10 || fp.y > h + 10) continue;
+      const F = this.far[i];
+      if (!this.projDir(F.v[0], F.v[1], F.v[2], fp) || fp.x < -10 || fp.x > w + 10 || fp.y < -10 || fp.y > h + 10) continue;
       const fs = (1.25 + F.m * 6) * u;
       ctx.globalAlpha = 0.25 + F.m * 0.7;
       ctx.drawImage(this.starColor(F.t), fp.x - fs / 2, fp.y - fs / 2, fs, fs);
@@ -400,8 +559,8 @@ export class NightSkyRenderer {
 
     // A few faint distant galaxies.
     for (const G of this.galaxies) {
-      const gp = this.dir(G.v);
-      if (!gp) continue;
+      const gp = this.sp;
+      if (!this.projDir(G.v[0], G.v[1], G.v[2], gp)) continue;
       ctx.save();
       ctx.translate(gp.x, gp.y);
       ctx.rotate(G.rot);
@@ -414,33 +573,40 @@ export class NightSkyRenderer {
 
     // Star dust around the camera — what makes travel read as travel.
     const dustStep = this.compact ? 2 : 1;
+    // Streaks are batched into a few strokes by nearness (thousands of single strokes stall a frame).
+    const trails = mv && streak > 0 ? Array.from({ length: STREAK_BANDS }, () => new Path2D()) : null;
     for (let j = 0; j < this.dust.length; j += dustStep) {
       const D = this.dust[j];
-      const wp: Vec3 = [wrap(D.x, c.p[0]), wrap(D.y, c.p[1]), wrap(D.z, c.p[2])];
-      const p = this.pt(wp);
-      if (!p || p.x < -30 || p.x > w + 30 || p.y < -30 || p.y > h + 30) continue;
+      const wx = wrap(D.x, c.p[0]), wy = wrap(D.y, c.p[1]), wz = wrap(D.z, c.p[2]);
+      const p = this.sp;
+      if (!this.proj(wx, wy, wz, p) || p.x < -30 || p.x > w + 30 || p.y < -30 || p.y > h + 30) continue;
       const near = Math.min(1, 10 / p.d), sz = (1 + D.m * 3.5 * (0.3 + near * 2)) * u;
-      if (mv && streak > 0) {
+      if (trails && mv) {
         // Faint streaks, only near peak speed.
-        const tail = this.pt([wp[0] - mv[0] * 6, wp[1] - mv[1] * 6, wp[2] - mv[2] * 6]);
-        if (tail) {
-          ctx.globalAlpha = 1;
-          ctx.strokeStyle = `rgba(235,240,255,${(0.12 * near * streak).toFixed(3)})`;
-          ctx.lineWidth = (0.5 + near * 0.6) * u;
-          ctx.beginPath();
-          ctx.moveTo(p.x, p.y);
-          ctx.lineTo(tail.x, tail.y);
-          ctx.stroke();
+        const tail = this.sp2;
+        if (this.proj(wx - mv[0] * 6, wy - mv[1] * 6, wz - mv[2] * 6, tail)) {
+          const band = trails[Math.min(STREAK_BANDS - 1, Math.floor(near * STREAK_BANDS))];
+          band.moveTo(p.x, p.y);
+          band.lineTo(tail.x, tail.y);
         }
       }
       ctx.globalAlpha = Math.min(0.9, (0.08 + D.m * 0.55) * (0.2 + near));
       ctx.drawImage(this.starColor(D.t), p.x - sz / 2, p.y - sz / 2, sz, sz);
     }
+    if (trails) {
+      ctx.strokeStyle = "rgb(235,240,255)";
+      trails.forEach((path, b) => {
+        const near = (b + 0.5) / STREAK_BANDS;
+        ctx.globalAlpha = 0.12 * near * streak;
+        ctx.lineWidth = (0.5 + near * 0.6) * u;
+        ctx.stroke(path);
+      });
+    }
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = 1;
   }
 
-  /** Hills at first light and the dome vignette, over everything else. */
+  /** Hills at first light, over everything else (the dome vignette is a CSS overlay above the canvas). */
   private paintForeground(ctx: CanvasRenderingContext2D): void {
     const { w, h } = this.view;
     const c = this.cam;
@@ -450,7 +616,7 @@ export class NightSkyRenderer {
     glow.addColorStop(0, "rgba(255,190,140,0)");
     glow.addColorStop(1, "rgba(255,170,120,0.10)");
     ctx.fillStyle = glow;
-    ctx.fillRect(0, Y(1300), w, h - Y(1300));
+    ctx.fillRect(0, Y(FG_TOP), w, h - Y(FG_TOP));
     const ridge = (base: number, bow: number, amp: number, freq: number, row: number, seed: number, drift: number, fill: string) => {
       ctx.fillStyle = fill;
       ctx.beginPath();
@@ -466,110 +632,192 @@ export class NightSkyRenderer {
     };
     ridge(1600, 150, 40, 260, 0.5, 9, 30, "#05070C");
     ridge(1680, 120, 28, 180, 1.5, 19, 22, "#030408");
-    const diag = Math.hypot(w, h);
-    const vg = ctx.createRadialGradient(w / 2, h * 0.53, diag * 0.3, w / 2, h * 0.53, diag * 0.565);
-    vg.addColorStop(0, "rgba(3,4,8,0)");
-    vg.addColorStop(1, "rgba(3,4,8,.9)");
-    ctx.fillStyle = vg;
-    ctx.fillRect(0, 0, w, h);
+  }
+
+  private addPick(id: number, cluster: number, x: number, y: number): void {
+    const p = this.picks[this.pickCount];
+    if (p) {
+      p.id = id;
+      p.cluster = cluster;
+      p.x = x;
+      p.y = y;
+    } else this.picks.push({ id, cluster, x, y });
+    this.pickCount++;
   }
 
   private paintLessons(ctx: CanvasRenderingContext2D, t: number): void {
-    this.picks = [];
+    this.pickCount = 0;
     const model = this.model;
     if (!model) return;
-    const { w, h, u } = this.view;
+    const { w, h, u, sc } = this.view;
     const matches = this.matches;
-    const lit = (id: number) => !matches || matches.has(id);
-    const tw = (n: number) => (this.reduced ? 1 : 0.86 + 0.14 * Math.sin(t * 1.1 + n * 2.3));
+    const selC = this.selCluster;
+    const S = this.sp, S2 = this.sp2;
+    const cam = this.cam.p;
+    const glint = this.sprites!.glint;
+    const reduced = this.reduced;
 
-    // Constellation figures.
-    ctx.globalCompositeOperation = "source-over";
+    // Ease each constellation's level of detail toward its target (~0.7 s).
+    const dt = this.lastT ? Math.min(0.1, Math.max(0, t - this.lastT)) : 1;
+    this.lastT = t;
+    const k = reduced ? 1 : 1 - Math.exp(-dt * 4);
+    let still = true;
+
     ctx.lineCap = "round";
-    model.clusters.forEach((cl, ci) => {
-      for (const [ia, ib] of cl.links) {
-        const A = cl.lessons[ia], B = cl.lessons[ib];
-        const a = this.pt(A.pos), b = this.pt(B.pos);
-        if (!a || !b) continue;
-        const hz = Math.max(0.06, Math.min(1, 16 / a.d));
-        let base = ci === this.selCluster ? 0.5 : 0.18;
-        if (matches) base = lit(A.id) && lit(B.id) ? 0.45 : 0.04;
-        ctx.globalAlpha = 1;
-        ctx.strokeStyle = `rgba(236,240,255,${(base * hz).toFixed(3)})`;
-        ctx.lineWidth = (0.4 + 0.35 * hz) * u;
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
-        ctx.stroke();
-      }
-    });
-
-    // Lesson stars.
-    ctx.globalCompositeOperation = "lighter";
+    ctx.strokeStyle = "rgb(236,240,255)";
+    const labels: LabelCandidate[] = [];
+    let selX = 0, selY = 0, hasSel = false;
     let n = 0;
-    let sel: Screen | null = null;
-    model.clusters.forEach((cl, ci) => {
-      const spr = this.tint(cl.tint);
-      for (const L of cl.lessons) {
-        n++;
-        const ps = this.pt(L.pos);
-        if (!ps || ps.x < -80 || ps.x > w + 80 || ps.y < -80 || ps.y > h + 80) continue;
-        const near = Math.max(0.1, Math.min(1, 16 / ps.d));
-        const ss = Math.min(70, (L.size * 700) / ps.d + 3) * u;
-        const al = (matches && !lit(L.id) ? 0.08 : 1) * (0.3 + 0.7 * near) * tw(n);
-        ctx.globalAlpha = al;
-        ctx.drawImage(spr, ps.x - ss / 2, ps.y - ss / 2, ss, ss);
-        const isSel = ci === this.selCluster && L.id === this.selLesson;
-        if (isSel) sel = ps;
-        if (near > 0.5 && (isSel || (matches && lit(L.id)))) {
-          const Lg = ss * 0.55;
-          ctx.drawImage(this.sprites!.glint, ps.x - Lg, ps.y - Lg, Lg * 2, Lg * 2);
+
+    for (let ci = 0; ci < model.clusters.length; ci++) {
+      const cl = model.clusters[ci];
+      const det = (this.detail[ci] += (detailTarget(ci, selC) - this.detail[ci]) * k);
+      const arr = (this.arrived[ci] += ((ci === selC ? 1 : 0) - this.arrived[ci]) * k);
+      if (Math.abs(det - detailTarget(ci, selC)) > 0.004 || Math.abs(arr - (ci === selC ? 1 : 0)) > 0.004) still = false;
+      n += cl.lessons.length;
+
+      // Cull the whole constellation early when it's behind the camera or well off screen.
+      const R = clusterRadius(cl.lessons.length);
+      const onDome = this.proj(cl.pos[0], cl.pos[1], cl.pos[2], S);
+      const camDist = S.d;
+      if (ci !== selC) {
+        if (!onDome) {
+          if (camDist > R * 1.6) continue;
+        } else {
+          const pr = (R / Math.max(1, camDist)) * sc * 0.7 + 60;
+          if (S.x < -pr || S.x > w + pr || S.y < -pr || S.y > h + pr) continue;
         }
-        this.picks.push({ id: L.id, cluster: ci, x: ps.x, y: ps.y });
       }
-    });
+      const cx = S.x, cy = S.y;
+      const fog = fogFor(camDist);
+      const hasMatch = !!matches && this.matchCl[ci] === 1;
+      const far = 1 - det;
+      const spr = this.tint(cl.tint);
+
+      // Distant: a soft haze and its few brightest stars.
+      if (far > 0.01 && onDome) {
+        const gs = Math.min(150, Math.max(10, (R * 1.3 * sc) / camDist)) * u;
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = 0.13 * fog * far * (matches && !hasMatch ? 0.4 : 1);
+        ctx.drawImage(this.glow(cl.tint), cx - gs / 2, cy - gs / 2, gs, gs);
+        for (const li of this.farIdx[ci]) {
+          const L = cl.lessons[li];
+          if (!this.proj(L.pos[0], L.pos[1], L.pos[2], S2)) continue;
+          const ss = Math.min(14, (L.size * 520) / S2.d + 2.2) * u;
+          const lit = !matches || matches.has(L.id);
+          ctx.globalAlpha = far * (0.3 + 0.55 * fog) * (lit ? 1 : 0.25) * (reduced ? 1 : 0.86 + 0.14 * Math.sin(t * 1.1 + (n + li) * 2.3));
+          ctx.drawImage(spr, S2.x - ss / 2, S2.y - ss / 2, ss, ss);
+          if (det < 0.5) this.addPick(L.id, ci, S2.x, S2.y);
+        }
+        // Search matches shine through the haze.
+        if (hasMatch && matches) {
+          for (const L of cl.lessons) {
+            if (!matches.has(L.id) || !this.proj(L.pos[0], L.pos[1], L.pos[2], S2)) continue;
+            const ss = Math.min(16, (L.size * 600) / S2.d + 3) * u;
+            ctx.globalAlpha = far * (0.55 + 0.45 * fog);
+            ctx.drawImage(spr, S2.x - ss / 2, S2.y - ss / 2, ss, ss);
+            ctx.globalAlpha = far * 0.7;
+            ctx.drawImage(glint, S2.x - ss * 0.6, S2.y - ss * 0.6, ss * 1.2, ss * 1.2);
+            if (det < 0.5) this.addPick(L.id, ci, S2.x, S2.y);
+          }
+        }
+      }
+
+      // Near: every figure line and star. Big constellations show their
+      // brightest stars fully and the rest as faint points until you arrive.
+      if (det > 0.01) {
+        const isSelC = ci === selC;
+        const links = arr > 0.5 ? cl.links : cl.featuredLinks;
+        const feat = this.featured[ci];
+        if (links.length) {
+          ctx.globalCompositeOperation = "source-over";
+          const hz = Math.max(0.06, Math.min(1, 16 / camDist));
+          const base = (isSelC ? 0.5 : 0.2) * det * hz;
+          ctx.lineWidth = (0.4 + 0.35 * hz) * u;
+          // Lit (or no search) lines in one stroke, dimmed ones in another.
+          for (let pass = 0; pass < (matches ? 2 : 1); pass++) {
+            ctx.beginPath();
+            let any = false;
+            for (const [ia, ib] of links) {
+              const A = cl.lessons[ia], B = cl.lessons[ib];
+              if (matches && (matches.has(A.id) && matches.has(B.id)) !== (pass === 0)) continue;
+              if (!this.proj(A.pos[0], A.pos[1], A.pos[2], S) || !this.proj(B.pos[0], B.pos[1], B.pos[2], S2)) continue;
+              ctx.moveTo(S.x, S.y);
+              ctx.lineTo(S2.x, S2.y);
+              any = true;
+            }
+            if (!any) continue;
+            ctx.globalAlpha = matches ? (pass === 0 ? 0.45 * det * hz : 0.04 * det) : base;
+            ctx.stroke();
+          }
+        }
+        ctx.globalCompositeOperation = "lighter";
+        for (let li = 0; li < cl.lessons.length; li++) {
+          const L = cl.lessons[li];
+          if (!this.proj(L.pos[0], L.pos[1], L.pos[2], S) || S.x < -80 || S.x > w + 80 || S.y < -80 || S.y > h + 80) continue;
+          const lit = !matches || matches.has(L.id);
+          const isSel = isSelC && L.id === this.selLesson;
+          const shown = feat[li] || isSel || (matches && lit) ? 1 : arr;
+          const near = Math.max(0.1, Math.min(1, 16 / S.d));
+          const full = Math.min(70, (L.size * 700) / S.d + 3) * u;
+          const ss = shown >= 1 ? full : 2.6 * u + (full - 2.6 * u) * shown;
+          const tw = reduced ? 1 : 0.86 + 0.14 * Math.sin(t * 1.1 + (n + li) * 2.3);
+          ctx.globalAlpha = det * (lit ? 1 : 0.08) * (0.3 + 0.7 * near) * (0.3 + 0.7 * shown) * tw;
+          ctx.drawImage(spr, S.x - ss / 2, S.y - ss / 2, ss, ss);
+          if (isSel) {
+            hasSel = true;
+            selX = S.x;
+            selY = S.y;
+          }
+          if (near > 0.5 && (isSel || (matches && lit))) {
+            const Lg = ss * 0.55;
+            ctx.drawImage(glint, S.x - Lg, S.y - Lg, Lg * 2, Lg * 2);
+          }
+          if (det >= 0.5) this.addPick(L.id, ci, S.x, S.y);
+        }
+      }
+      if (det > 0.3 || hasMatch || ci === selC) labels.push({ index: ci, camDist, match: hasMatch });
+    }
+    if (!still) this.needsDraw = true;
     ctx.globalCompositeOperation = "source-over";
 
     // Selection ring — the one violet accent.
-    if (sel) {
-      const s = sel as Screen;
-      const r = (14 + (this.reduced ? 0 : 1.5 * Math.sin(t * 1.6))) * u;
+    if (hasSel) {
+      const r = (14 + (reduced ? 0 : 1.5 * Math.sin(t * 1.6))) * u;
       ctx.globalAlpha = 0.75;
       ctx.strokeStyle = `rgba(${RING},0.85)`;
       ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+      ctx.arc(selX, selY, r, 0, Math.PI * 2);
       ctx.stroke();
     }
 
-    // Constellation names: nearest first, never piled on each other.
-    const labels: { x: number; y: number; size: number; alpha: number; name: string; on: boolean }[] = [];
-    model.clusters.forEach((cl, ci) => {
-      const drop = clusterRadius(cl.lessons.length) * 0.75 + 2.5;
-      const lp = this.pt([cl.pos[0], cl.pos[1] - drop, cl.pos[2]]);
-      if (!lp || lp.x < -200 || lp.x > w + 200 || lp.y < 0 || lp.y > h) return;
-      const on = ci === this.selCluster;
-      const hz = Math.max(0.12, Math.min(1, 20 / lp.d));
-      const fade = Number.isFinite(this.labelFloor) ? 1 - smooth(this.labelFloor - 70, this.labelFloor - 16, lp.y) : 1;
-      let alpha = (on ? 0.92 : 0.5) * hz * fade;
-      if (matches && !on && !cl.lessons.some((l) => matches.has(l.id))) alpha *= 0.35;
-      if (alpha < 0.07) return;
-      labels.push({ x: lp.x, y: lp.y, size: Math.max(12, Math.min(30, 430 / lp.d)) * u, alpha, name: cl.name, on });
-    });
-    labels.sort((a, b) => Number(b.on) - Number(a.on) || b.size - a.size);
+    // Constellation names: the chosen one, then search matches, then the
+    // nearest — at most a handful, never piled on each other.
     const placed: { x0: number; x1: number; y0: number; y1: number }[] = [];
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    for (const L of labels) {
-      ctx.font = `italic 400 ${Math.round(L.size)}px ${this.font}`;
-      const tw2 = ctx.measureText(L.name).width / 2;
-      const box = { x0: L.x - tw2 - 6, x1: L.x + tw2 + 6, y0: L.y - L.size, y1: L.y + L.size * 0.3 };
-      if (!L.on && (box.x0 < 4 || box.x1 > w - 4)) continue;
+    for (const ci of pickLabels(labels, selC, labels.length)) {
+      if (placed.length >= MAX_LABELS) break;
+      const cl = model.clusters[ci];
+      const drop = clusterRadius(cl.lessons.length) * 0.75 + 2.5;
+      if (!this.proj(cl.pos[0], cl.pos[1] - drop, cl.pos[2], S) || S.x < -200 || S.x > w + 200 || S.y < 0 || S.y > h) continue;
+      const on = ci === selC;
+      const hz = Math.max(0.12, Math.min(1, 20 / S.d));
+      const fade = Number.isFinite(this.labelFloor) ? 1 - smooth(this.labelFloor - 70, this.labelFloor - 16, S.y) : 1;
+      let alpha = (on ? 0.92 : 0.5 * Math.max(this.detail[ci], 0.6)) * hz * fade;
+      if (matches && !on && this.matchCl[ci] !== 1) alpha *= 0.35;
+      if (alpha < 0.07) continue;
+      const size = Math.max(12, Math.min(30, 430 / S.d)) * u;
+      ctx.font = `italic 400 ${Math.round(size)}px ${this.font}`;
+      const tw2 = ctx.measureText(cl.name).width / 2;
+      const box = { x0: S.x - tw2 - 6, x1: S.x + tw2 + 6, y0: S.y - size, y1: S.y + size * 0.3 };
+      if (!on && (box.x0 < 4 || box.x1 > w - 4)) continue;
       if (placed.some((p) => p.x0 < box.x1 && box.x0 < p.x1 && p.y0 < box.y1 && box.y0 < p.y1)) continue;
       placed.push(box);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = `rgba(236,240,255,${L.alpha.toFixed(3)})`;
-      ctx.fillText(L.name, L.x, L.y);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "rgb(236,240,255)";
+      ctx.fillText(cl.name, S.x, S.y);
     }
     ctx.globalAlpha = 1;
   }

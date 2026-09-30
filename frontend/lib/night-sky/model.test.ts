@@ -5,9 +5,25 @@ import assert from "node:assert/strict";
 
 import {
   ageToDistance,
+  ALT_MAX,
+  ALT_MIN,
   angDiff,
+  angularGap,
   assignDirections,
+  brightestStars,
   buildSky,
+  coilSeparation,
+  detailTarget,
+  FEATURED_STARS,
+  fogFor,
+  FULL_NEIGHBORS,
+  MAX_LABELS,
+  MIN_DEPTH_GAP,
+  NEAR_DEPTH,
+  orderMatches,
+  pairStep,
+  pickLabels,
+  rankDepths,
   easeInOut,
   easeSpeed,
   filterSearchHits,
@@ -19,7 +35,6 @@ import {
   LOOSE_KEY,
   matchLine,
   MAX_TURN_DEG_PER_S,
-  minSeparation,
   MIN_MOVE_S,
   moveDuration,
   navHint,
@@ -80,23 +95,43 @@ test("when labels read like a person would say them", () => {
   assert.equal(whenLabel("2025-12-03T09:00:00Z", NOW), "December 2025");
 });
 
-test("cluster directions are deterministic and independent of input order", () => {
-  const a = assignDirections([3, 1, 2, 9, 40]);
-  const b = assignDirections([40, 9, 2, 1, 3]);
-  for (const k of [1, 2, 3, 9, 40]) assert.deepEqual(a.get(k), b.get(k));
+test("rank depths: nearest first, evenly spaced, never closer than the minimum gap", () => {
+  const recent = Array.from({ length: 53 }, (_, i) => Math.floor(i / 4)); // many from the same few weeks
+  const d = rankDepths(recent);
+  assert.equal(d[0], NEAR_DEPTH);
+  for (let i = 1; i < d.length; i++) assert.ok(d[i] - d[i - 1] >= MIN_DEPTH_GAP - 1e-9, `gap ${i}: ${(d[i] - d[i - 1]).toFixed(2)}`);
+  assert.ok(d[d.length - 1] >= NEAR_DEPTH * 10, "a big sky reaches ~10× deeper than the nearest");
+  // A sparse sky spreads over the whole depth range, and a year-old one still sits far out.
+  const six = rankDepths([1, 30, 60, 120, 200, 365]);
+  assert.ok(six[5] >= NEAR_DEPTH * 6 && six[5] >= ageToDistance(365));
+  for (let i = 1; i < six.length; i++) assert.ok(six[i] > six[i - 1]);
+  // Big constellations are never so close they fill the sky.
+  assert.ok(rankDepths([0], [10])[0] >= 16);
 });
 
-test("cluster directions are spread apart", () => {
-  const keys = Array.from({ length: 12 }, (_, i) => i * 7 + 1);
-  const dirs = assignDirections(keys);
-  const sep = minSeparation(keys.length);
-  const pts = [...dirs.values()];
-  for (let i = 0; i < pts.length; i++)
-    for (let j = i + 1; j < pts.length; j++) {
-      const cosAlt = Math.cos((((pts[i].alt + pts[j].alt) / 2) * Math.PI) / 180);
-      const d = Math.hypot(angDiff(pts[i].az, pts[j].az) * cosAlt, pts[j].alt - pts[i].alt);
-      assert.ok(d > sep * 0.8, `clusters ${i},${j} overlap (${d.toFixed(1)}° < ${sep.toFixed(1)}°)`);
-    }
+for (const n of [6, 53, 150]) {
+  test(`directions for ${n} constellations: inside the dome band, no overlaps, gentle turns`, () => {
+    const keys = Array.from({ length: n }, (_, i) => i * 7 + 1);
+    const dirs = assignDirections(keys);
+    const sep = coilSeparation(n);
+    assert.ok(sep >= (n <= 6 ? 28 : n <= 60 ? 12 : 6), `spacing ${sep.toFixed(1)}° for ${n}`);
+    for (const d of dirs) assert.ok(d.alt >= ALT_MIN && d.alt <= ALT_MAX);
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++) {
+        const g = angularGap(dirs[i], dirs[j]);
+        assert.ok(g > sep * 0.5, `constellations ${i},${j} overlap (${g.toFixed(1)}° < half of ${sep.toFixed(1)}°)`);
+      }
+    // Next is a small turn, never a swing across the sky.
+    for (let i = 1; i < n; i++) assert.ok(angularGap(dirs[i - 1], dirs[i]) < 45);
+    assert.deepEqual(assignDirections(keys), dirs, "deterministic");
+  });
+}
+
+test("big neighbours turn far enough apart not to overlap", () => {
+  assert.ok(pairStep(10, 8, 16, 22) > 45);
+  assert.ok(pairStep(3, 3, 200, 206) < 5);
+  const dirs = assignDirections([1, 2, 3], [60, 0, 0]);
+  assert.ok(angularGap(dirs[0], dirs[1]) > 50);
 });
 
 test("buildSky: deterministic placement, older clusters deeper, loose lessons grouped", () => {
@@ -115,11 +150,12 @@ test("buildSky: deterministic placement, older clusters deeper, loose lessons gr
   }
 });
 
-test("navigation order: nearer depth bands first, then by direction; wraps", () => {
+test("navigation order: newest first, every Next is deeper; wraps", () => {
   const sky = buildSky(fixture(), NOW);
   for (let i = 1; i < sky.clusters.length; i++) {
     const a = sky.clusters[i - 1], b = sky.clusters[i];
-    assert.ok(Math.floor((a.lightYears - 1) / 4) <= Math.floor((b.lightYears - 1) / 4));
+    assert.ok(a.ageDays <= b.ageDays);
+    assert.ok(b.dist - a.dist >= MIN_DEPTH_GAP - 1e-9);
   }
   assert.equal(stepIndex(0, -1, 5), 4);
   assert.equal(stepIndex(4, 1, 5), 0);
@@ -203,4 +239,75 @@ test("match line copy", () => {
 test("source line", () => {
   assert.equal(sourceLine("journal", "2026-09-12T10:00:00"), "From your journal · 12 Sep 2026");
   assert.equal(sourceLine("", "2026-09-12T10:00:00"), "12 Sep 2026");
+});
+
+function bigFixture(): SkyInput {
+  const nodes = [];
+  let id = 1;
+  const sizes = [30, 24, 19, 16, 15, ...Array.from({ length: 48 }, (_, i) => [2, 3, 2, 4, 3, 6, 2, 3, 5, 2, 4, 3][i % 12])];
+  for (let c = 0; c < sizes.length; c++) {
+    const newest = c % 10 < 7 ? (c * 13) % 90 : 90 + ((c * 37) % 275);
+    for (let i = 0; i < sizes[c]; i++) nodes.push({ id: id++, text: `L${id}`, cluster_id: c + 1, created_at: daysAgo(newest + i * 2) });
+  }
+  return { nodes, clusters: sizes.map((_, c) => ({ id: c + 1, label: `C${c}` })) };
+}
+
+test("a real-sized sky (~260 lessons, 53 constellations) spreads out in depth and direction", () => {
+  const sky = buildSky(bigFixture(), NOW);
+  assert.equal(sky.clusters.length, 53);
+  assert.equal(sky.lessonCount, 260);
+  const d = sky.clusters.map((c) => c.dist);
+  assert.ok(d[d.length - 1] / d[0] >= 10);
+  for (const c of sky.clusters) {
+    assert.ok(c.featured.length === Math.min(FEATURED_STARS, c.lessons.length));
+    assert.equal(c.featuredLinks.length, Math.max(0, c.featured.length - 1));
+    for (const [a, b] of c.featuredLinks) assert.ok(c.featured.includes(a) && c.featured.includes(b));
+  }
+});
+
+test("brightest stars: capped, brightest first, stable ties", () => {
+  assert.deepEqual(brightestStars([1, 3, 2, 3, 0.5], 2), [1, 3]);
+  assert.deepEqual(brightestStars([1, 2], 12), [0, 1]);
+  assert.equal(brightestStars(Array.from({ length: 30 }, (_, i) => i % 7), FEATURED_STARS).length, FEATURED_STARS);
+});
+
+test("level of detail: the chosen constellation and its nearest neighbours in the Next order are full", () => {
+  const full = Array.from({ length: 53 }, (_, i) => detailTarget(i, 10)).filter((v) => v === 1).length;
+  assert.equal(full, 2 * FULL_NEIGHBORS + 1);
+  assert.equal(detailTarget(10, 10), 1);
+  assert.equal(detailTarget(10 + FULL_NEIGHBORS + 1, 10), 0);
+  assert.equal(detailTarget(0, -1), 0);
+  assert.equal(Array.from({ length: 53 }, (_, i) => detailTarget(i, 0)).filter((v) => v === 1).length, FULL_NEIGHBORS + 1);
+});
+
+test("depth haze: clear up close, fading with distance, never gone", () => {
+  assert.equal(fogFor(10), 1);
+  let prev = 2;
+  for (const d of [20, 40, 80, 160, 320]) {
+    const f = fogFor(d);
+    assert.ok(f < prev && f >= 0.12);
+    prev = f;
+  }
+});
+
+test("labels: capped, chosen first, then matches, then nearest", () => {
+  const cands = Array.from({ length: 20 }, (_, i) => ({ index: i, camDist: 100 - i, match: i === 3 }));
+  const picked = pickLabels(cands, 7);
+  assert.equal(picked.length, MAX_LABELS);
+  assert.deepEqual(picked, [7, 3, 19, 18, 17]);
+  assert.deepEqual(pickLabels([], 0), []);
+});
+
+test("search matches step along the path: best, its constellation, deeper ones, then back nearer", () => {
+  const where = new Map([
+    [1, { rank: 5, lesson: 2 }],
+    [2, { rank: 5, lesson: 0 }],
+    [3, { rank: 9, lesson: 1 }],
+    [4, { rank: 2, lesson: 0 }],
+    [5, { rank: 7, lesson: 0 }],
+    [6, { rank: 4, lesson: 0 }],
+  ]);
+  assert.deepEqual(orderMatches([1, 3, 4, 5, 6, 2, 99], where), [1, 2, 5, 3, 6, 4]);
+  assert.deepEqual(orderMatches([4], where), [4]);
+  assert.deepEqual(orderMatches([], where), []);
 });
