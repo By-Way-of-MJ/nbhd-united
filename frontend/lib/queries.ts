@@ -1,6 +1,6 @@
 "use client";
 
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { isLoggedIn } from "@/lib/auth";
 import { getLiveQueryClient } from "@/lib/query-persist";
@@ -2570,6 +2570,27 @@ export function useMissionDetailQuery(id: string | null) {
   });
 }
 
+/** Several missions' crew projections at once (same cache as useMissionDetailQuery). */
+export function useMissionDetailsQueries(ids: string[]) {
+  const { data: tenant } = useTenantQuery();
+  const on = isLoggedIn() && !!tenant?.neighborhood_enabled;
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["mission", id],
+      queryFn: () => fetchMissionDetail(id),
+      staleTime: 15_000,
+      enabled: on,
+    })),
+    combine: dataOnly,
+  });
+}
+
+// Module-level so useQueries keeps the combined array referentially stable
+// while the underlying data is unchanged.
+function dataOnly<T>(results: { data?: T }[]): (T | undefined)[] {
+  return results.map((r) => r.data);
+}
+
 export function useGoalActionsQuery() {
   const { data: tenant } = useTenantQuery();
   return useQuery({
@@ -2781,6 +2802,21 @@ export function useCircleDetailQuery(id: string | null) {
     queryFn: () => fetchCircleDetail(id as string),
     staleTime: 15_000,
     enabled: isLoggedIn() && !!tenant?.neighborhood_enabled && !!id,
+  });
+}
+
+/** Several circles' details at once (same cache entries as useCircleDetailQuery). */
+export function useCircleDetailsQueries(ids: string[]) {
+  const { data: tenant } = useTenantQuery();
+  const on = isLoggedIn() && !!tenant?.neighborhood_enabled;
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["circle", id],
+      queryFn: () => fetchCircleDetail(id),
+      staleTime: 15_000,
+      enabled: on,
+    })),
+    combine: dataOnly,
   });
 }
 
