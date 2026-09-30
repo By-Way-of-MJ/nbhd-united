@@ -152,6 +152,11 @@ AZURE_STORAGE_KEY_CACHE_TTL_SECONDS = env("AZURE_STORAGE_KEY_CACHE_TTL_SECONDS",
 # USER.md skip-unchanged canary gate. Container App env var name MUST match.
 USER_MD_SKIP_UNCHANGED_TENANT_IDS = env("USER_MD_SKIP_UNCHANGED_TENANT_IDS", default="")
 
+# Morning Briefing programmatic-weather canary gate (nbhd_weather_briefing
+# tool). Container App env var name MUST match. EMPTY MEANS NOBODY; open a
+# tenant only once its running OpenClaw image ships the tool.
+BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
+
 # OpenClaw image auto-roll allowlist. Container App env var name MUST match.
 # EMPTY MEANS NOBODY: a deploy bumps OPENCLAW_IMAGE_TAG but apply_pending_configs
 # + wake refresh only move a tenant onto it if listed here (comma-separated

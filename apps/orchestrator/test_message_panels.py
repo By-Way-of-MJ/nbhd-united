@@ -37,7 +37,7 @@ class MorningPanelPromptTests(SimpleTestCase):
         for message, digest in (
             (
                 _build_morning_briefing_prompt(self.tenant),
-                "7480d546f2388875e22e226023e17702459298f4403d13b04cd4f43d17a6c3ad",
+                "955a339e3d18858ed3ad550f9b8758ade2470cbe5f3bd73ad4d6a3bef57db630",
             ),
             (self.typed()["message"], "beb27e0cd02da4431fc5c0122bd60d1def48b50d28fea13bda78d6839fc51a0c"),
         ):

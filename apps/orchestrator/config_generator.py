@@ -453,19 +453,112 @@ def _prepare_cron_prompt(prompt: str, tenant: Tenant) -> str:
     )
 
 
-# Weather is programmatic (apps/orchestrator/briefing_weather.py): the
-# `nbhd_weather_briefing` tool resolves the location, calls Open-Meteo, writes
-# the note's weather section itself and returns a `message_line` the model
-# relays verbatim. The model never searches for, composes, or guesses weather —
-# that is the whole point (invented "heavy, wet and windy" briefings when
-# web_search failed). One step for every tenant; nothing to branch on.
+# ── Morning Briefing weather: two lanes, gated per tenant ──────────────
+#
+# Programmatic lane (BRIEFING_WEATHER_TOOL_TENANT_IDS, apps/orchestrator/
+# briefing_weather.py): the `nbhd_weather_briefing` tool resolves the location,
+# calls Open-Meteo, writes the note's weather section itself and returns a
+# `message_line` the model relays verbatim. The model never searches for,
+# composes, or guesses weather — that is the whole point (invented "heavy, wet
+# and windy" briefings when web_search failed).
+#
+# Search lane (everyone else): the web_search step exactly as before, because
+# the tool only exists on images that ship the plugin and the prompt refresh is
+# fleet-wide while images roll per tenant. Its only change is the step-11
+# honesty sentence: never describe weather you didn't get.
 _MORNING_BRIEFING_WEATHER_STEP = (
+    "1. Weather city: check `## Right now` in USER.md — if it shows a fresh Current location, "
+    "get today's weather with `web_search` for that city. The value below is a SNAPSHOT of "
+    "the home base taken when this job was created and may be stale; use it only if "
+    "`## Right now` shows nothing fresher. SNAPSHOT home base: {location}. Get the weather "
+    'with `web_search` for "<city> weather forecast today" (a follow-up search for tomorrow '
+    "is fine). Do NOT use web_fetch, curl, or exec — none of those "
+    "are available; web_search is the only weather tool you have.\n"
+)
+
+_MORNING_BRIEFING_LEGACY_WEATHER_STEP = (
+    '1. Get today\'s weather with `web_search` for "{location} weather forecast today" '
+    '(a follow-up search — e.g. "{location} weather tomorrow" — is fine if the first '
+    "result doesn't cover tomorrow). Do NOT use web_fetch, curl, or exec — none of those "
+    "are available; web_search is the only weather tool you have.\n"
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_GUIDANCE = (
+    "   Search results vary in structure: some include an hour-by-hour breakdown (time, "
+    "condition, temperature, precipitation chance, wind), others only a daily summary. "
+    "Use whatever level of detail the results actually contain — do not invent hourly "
+    "numbers that aren't there.\n"
+    "   IMPORTANT — distinguish past from future using the current time (from the date/time "
+    "line above). Only flag conditions for hours AHEAD of now. If precipitation or storms "
+    "occurred in hours before now, describe them as past — 'rained earlier this morning', "
+    "'cleared up overnight' — never say 'rainy day' for rain that already ended.\n"
+    "   If the results include an hourly/intraday breakdown, mention timing ONLY when "
+    "something notable is coming later today: a rain or storm window, a temperature swing "
+    "of 10°F+ (≈ 5.5°C), or wind picking up sharply after being calm. Flag the approximate "
+    "window and peak (e.g. 'rain ~13:00-16:00, heaviest around 14:00').\n"
+    "   If the results are daily-only, or nothing notable stands out, write a single "
+    "summary line and omit the Intraday block. Do NOT enumerate every hour. 'Sunny all "
+    "day' does not become '9am sun, 10am sun, 11am sun'.\n"
+    '   If the search returns nothing weather-related, or fails, write "Weather '
+    'unavailable" for the weather section in step 10 and continue — do not let this '
+    "block the rest of the briefing.\n"
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_SECTION = (
+    "**weather section:**\n"
+    "**Today:** temp range, conditions, what to wear\n"
+    "**Intraday:** (include ONLY if step 1 found a notable intraday window) one or two bullet lines "
+    "flagging the window — e.g. `- Rain window ~13:00–16:00 (70% at 14:00, tapering after)`, "
+    "`- Temp drops from 68°F at noon to 48°F by 18:00 — jacket if out late`. Omit this line "
+    "entirely on stable days.\n"
+    "**Tomorrow:** brief forecast; flag any thunderstorm or heavy-rain window by hour\n\n"
+    "Examples of good output (follow the same shape):\n"
+    "  Stable day (journal):\n"
+    "    **Today:** 68–74°F, partly cloudy. Light layers.\n"
+    "    **Tomorrow:** Similar, slightly warmer.\n"
+    "  Stable day (user message): `Partly cloudy, 68–74°F — light layers.`\n"
+    "  Rain window (journal):\n"
+    "    **Today:** 62–70°F, rain developing midday.\n"
+    "    **Intraday:** - Rain ~13:00–16:00 (peak 70% at 14:00). Dry after 17:00.\n"
+    "    **Tomorrow:** Clearing, 64–72°F.\n"
+    "  Rain window (user message): `Rain in Osaka ~1pm, clearing by 4pm — grab an umbrella.`\n"
+    "  Variable day (journal):\n"
+    "    **Today:** 55–78°F, thunderstorm risk late afternoon.\n"
+    "    **Intraday:** - Warm through noon, front arrives ~16:00 with thunderstorms. "
+    "Temp drops ~15°F by evening.\n"
+    "    **Tomorrow:** Cooler, 52–61°F, showers easing.\n"
+    "  Variable day (user message): `Storms around 4pm, then 15°F drop — jacket for anything after dinner.`\n\n"
+)
+
+_MORNING_BRIEFING_WEATHER_HONESTY_SENTENCE = (
+    "If you could not get weather in step 1, write `Weather couldn't be fetched this "
+    "morning.` — never describe weather you didn't get."
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_MESSAGE_LINE = (
+    "- Weather + what to wear (1 line). If step 1 flagged a notable intraday window, add one "
+    "short clause naming it — e.g. 'Rain in Osaka ~1pm, clearing by 4pm — umbrella'. "
+    "Otherwise keep it one line. " + _MORNING_BRIEFING_WEATHER_HONESTY_SENTENCE + "\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_STEP = (
     "1. Weather: call `nbhd_weather_briefing` ONCE (no arguments). It reads the user's "
     "location itself (fresh Current location, else the profile), fetches the forecast, "
     "and already writes the daily note's weather section. Keep its `message_line` for "
     "step 11. If the tool is not available in this session, treat the weather as "
     "unavailable. NEVER use web_search, web_fetch, curl, or exec for weather, and never "
     "describe weather from memory or from any other source.\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_SECTION = (
+    "**weather section:** already written by `nbhd_weather_briefing` in step 1 — do NOT write or overwrite it.\n\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE = (
+    "- Weather (1 line): the `message_line` returned by `nbhd_weather_briefing`, VERBATIM. "
+    "If the tool wasn't available or returned nothing, write exactly "
+    "`Weather couldn't be fetched this morning.` Never describe weather from memory, "
+    "from web_search, or from any other source.\n"
 )
 
 _PROACTIVE_SUGGESTIONS_BLOCK = (
@@ -515,6 +608,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "Stale news presented as current is worse than no news.\n\n"
     "Steps:\n"
     "{weather_step}"
+    "{weather_guidance}"
     "2. Check their calendar for today's events and upcoming 48hrs\n"
     'Calendar entries are plans, even after their end time; never write "done", "banked", '
     '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
@@ -550,8 +644,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "- List today's events with times\n\n"
     "### Reminders & Follow-ups\n"
     "- Anything carried over from yesterday, upcoming deadlines, things to remember\n\n"
-    "**weather section:** already written by `nbhd_weather_briefing` in step 1 — do NOT "
-    "write or overwrite it.\n\n"
+    "{weather_section}"
     "**news section:**\n"
     "### Headlines\n"
     "- 2-3 relevant headlines (tech, world, topics they care about)\n\n"
@@ -574,10 +667,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "- Past lessons from the constellation that apply to today's plans\n"
     "- Skip this section if no lessons are relevant\n\n"
     "11. Send the user exactly ONE message via `nbhd_send_to_user`. Keep it concise:\n"
-    "- Weather (1 line): the `message_line` returned by `nbhd_weather_briefing`, VERBATIM. "
-    "If the tool wasn't available or returned nothing, write exactly "
-    "`Weather couldn't be fetched this morning.` Never describe weather from memory, "
-    "from web_search, or from any other source.\n"
+    "{weather_message_line}"
     "- Top priority for the day (1 line)\n"
     "- Anything time-sensitive (1-2 lines)\n"
     "- Full details are in the journal\n\n"
@@ -614,6 +704,27 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
 )
 
 
+def _render_morning_briefing_template(*, weather_step: str, tool_weather: bool) -> str:
+    """Fill the morning briefing template for one weather lane.
+
+    ``tool_weather=False`` reproduces the pre-gate prompt byte-for-byte apart
+    from the step-11 honesty sentence; ``True`` swaps in the programmatic lane.
+    """
+    if tool_weather:
+        return _MORNING_BRIEFING_PROMPT_TEMPLATE.format(
+            weather_step=weather_step,
+            weather_guidance="",
+            weather_section=_MORNING_BRIEFING_TOOL_WEATHER_SECTION,
+            weather_message_line=_MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE,
+        )
+    return _MORNING_BRIEFING_PROMPT_TEMPLATE.format(
+        weather_step=weather_step,
+        weather_guidance=_MORNING_BRIEFING_SEARCH_WEATHER_GUIDANCE,
+        weather_section=_MORNING_BRIEFING_SEARCH_WEATHER_SECTION,
+        weather_message_line=_MORNING_BRIEFING_SEARCH_WEATHER_MESSAGE_LINE,
+    )
+
+
 _MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK = (
     "If `## Right now` shows a fresh Current location away from home base, include "
     "`Things to do nearby` among the quick-replies labels on the final marker line."
@@ -641,17 +752,43 @@ def _with_morning_briefing_away_tour_pill(prompt: str, tenant) -> str:
 def _build_morning_briefing_prompt(tenant) -> str:
     """Build the morning briefing prompt.
 
-    Weather history, newest first: (3) programmatic — the prompt only tells the
-    model to call ``nbhd_weather_briefing`` and relay its ``message_line``
-    verbatim (``apps.orchestrator.briefing_weather``); (2) ``web_search`` for a
-    location label, which the model narrated and, when the search failed,
-    invented; (1) a pre-built Open-Meteo URL for ``web_fetch``, denied
-    fleet-wide since (``tool_policy.py`` P0-0/P0-0b). No location or lat/lon
-    is baked into the prompt any more — Django resolves the location at fire
-    time from the fresh situation or the profile, so a stale snapshot cannot
-    drive the forecast.
+    Weather lanes, gated per tenant by ``BRIEFING_WEATHER_TOOL_TENANT_IDS``
+    (``apps.router.chat_gates.briefing_weather_tool_enabled``):
+
+    - Programmatic (gated): the prompt only tells the model to call
+      ``nbhd_weather_briefing`` and relay its ``message_line`` verbatim
+      (``apps.orchestrator.briefing_weather``). No location is baked in —
+      Django resolves it at fire time from the fresh situation or the profile.
+    - Search (everyone else): ``web_search`` for a location label, as before.
+      ``web_fetch`` of a pre-built Open-Meteo URL is denied fleet-wide
+      (``tool_policy.py`` P0-0/P0-0b), so that tool takes a place name: the
+      user's own ``location_city`` when set, else a label derived from the
+      IANA timezone. Never lat/lon. Only the step-11 honesty sentence differs
+      from the pre-gate prompt.
     """
-    prompt = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=_MORNING_BRIEFING_WEATHER_STEP)
+    from apps.router.chat_gates import briefing_weather_tool_enabled
+
+    if briefing_weather_tool_enabled(tenant):
+        prompt = _render_morning_briefing_template(
+            weather_step=_MORNING_BRIEFING_TOOL_WEATHER_STEP,
+            tool_weather=True,
+        )
+    else:
+        from apps.orchestrator.weather import resolve_weather_search_location
+
+        user = tenant.user
+        user_tz = str(getattr(user, "timezone", "") or "UTC")
+        location_city = str(getattr(user, "location_city", "") or "")
+        location = resolve_weather_search_location(location_city, user_tz)
+
+        if tenant.situational_context_enabled:
+            weather_step_template = _MORNING_BRIEFING_WEATHER_STEP
+        else:
+            weather_step_template = _MORNING_BRIEFING_LEGACY_WEATHER_STEP
+        prompt = _render_morning_briefing_template(
+            weather_step=weather_step_template.format(location=location),
+            tool_weather=False,
+        )
     prompt = _with_morning_briefing_away_tour_pill(prompt, tenant)
     from apps.router.chat_gates import chat_panels_tool_enabled
     from apps.router.panels import MORNING_PANEL_INSTRUCTION

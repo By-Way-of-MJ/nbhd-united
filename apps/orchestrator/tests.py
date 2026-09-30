@@ -642,12 +642,68 @@ class ConfigGeneratorTest(TestCase):
         morning = next(j for j in jobs if j["name"] == "Morning Briefing")
         return morning["payload"]["message"]
 
-    def test_morning_briefing_prompt_uses_weather_tool_not_search(self):
+    def test_morning_briefing_prompt_uses_web_search_not_web_fetch(self):
+        """web_fetch is denied fleet-wide (tool_policy.py P0-0/P0-0b — see
+        docs/upload-security-threat-model.md). The weather step must route
+        through web_search, tell the agent NOT to use web_fetch (a denied
+        tool call would just error), and must not reference the old
+        Open-Meteo API URL at all."""
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("web_search` for", prompt)
+        self.assertIn("Do NOT use web_fetch", prompt)
+        self.assertNotIn("Use the web_fetch tool", prompt)
+        self.assertNotIn("api.open-meteo.com", prompt)
+
+    def test_morning_briefing_prompt_has_right_now_and_home_base_fallback(self):
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("## Right now", prompt)
+        self.assertIn("SNAPSHOT home base:", prompt)
+        self.assertIn('"<city> weather forecast today"', prompt)
+
+    def test_morning_briefing_prompt_uses_profile_city_for_home_base_snapshot(self):
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        self.tenant.user.location_city = "Osaka"
+        self.tenant.user.save()
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("SNAPSHOT home base: Osaka", prompt)
+
+    def test_morning_briefing_prompt_flag_off_uses_legacy_weather_step(self):
+        from .config_generator import _build_morning_briefing_prompt
+
+        self.tenant.situational_context_enabled = False
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        self.tenant.user.location_city = "Osaka"
+        self.tenant.user.save()
+
+        prompt = self._morning_briefing_prompt()
+        self.assertIn('"Osaka weather forecast today"', prompt)
+        self.assertNotIn("## Right now", prompt)
+        self.assertNotIn("SNAPSHOT", _build_morning_briefing_prompt(self.tenant))
+
+    def test_morning_briefing_prompt_degrades_gracefully_on_search_failure(self):
+        prompt = self._morning_briefing_prompt()
+        self.assertIn("Weather unavailable", prompt)
+        # Search lane honesty sentence: the model must never narrate weather it didn't get.
+        self.assertIn(
+            "If you could not get weather in step 1, write `Weather couldn't be fetched this morning.`", prompt
+        )
+        self.assertIn("never describe weather you didn't get", prompt)
+
+    # ── Programmatic weather lane (BRIEFING_WEATHER_TOOL_TENANT_IDS) ──
+
+    def _gated_morning_briefing_prompt(self) -> str:
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=str(self.tenant.id)):
+            return self._morning_briefing_prompt()
+
+    def test_gated_morning_briefing_uses_weather_tool_not_search(self):
         """Weather is programmatic (apps/orchestrator/briefing_weather.py): the
         prompt tells the model to call `nbhd_weather_briefing` once and relay
         its `message_line` verbatim. It must not tell the model to search for
         weather, fetch a URL, or compose weather itself."""
-        prompt = self._morning_briefing_prompt()
+        prompt = self._gated_morning_briefing_prompt()
         self.assertIn("call `nbhd_weather_briefing` ONCE", prompt)
         self.assertIn("VERBATIM", prompt)
         self.assertIn("NEVER use web_search, web_fetch, curl, or exec for weather", prompt)
@@ -655,30 +711,47 @@ class ConfigGeneratorTest(TestCase):
         self.assertNotIn("web_search is the only weather tool", prompt)
         self.assertNotIn("api.open-meteo.com", prompt)
         self.assertNotIn("SNAPSHOT home base", prompt)
+        # web_search stays for news.
+        self.assertIn("web_search", prompt)
 
-    def test_morning_briefing_prompt_weather_step_is_identical_in_both_lanes(self):
-        prompts = []
-        for enabled in (False, True):
-            self.tenant.situational_context_enabled = enabled
-            self.tenant.save(update_fields=["situational_context_enabled"])
-            self.tenant.user.location_city = "Osaka"
-            self.tenant.user.save()
-            prompts.append(self._morning_briefing_prompt())
-        self.assertEqual(prompts[0], prompts[1])
-        # No location is baked into the prompt any more — Django resolves it at fire time.
-        self.assertNotIn("Osaka", prompts[0])
-
-    def test_morning_briefing_prompt_degrades_gracefully_when_tool_missing(self):
-        prompt = self._morning_briefing_prompt()
+    def test_gated_morning_briefing_degrades_gracefully_when_tool_missing(self):
+        prompt = self._gated_morning_briefing_prompt()
         self.assertIn("If the tool is not available in this session, treat the weather as unavailable", prompt)
         self.assertIn("`Weather couldn't be fetched this morning.`", prompt)
 
-    def test_morning_briefing_prompt_does_not_ask_model_to_write_weather_section(self):
-        prompt = self._morning_briefing_prompt()
+    def test_gated_morning_briefing_does_not_ask_model_to_write_weather_section(self):
+        prompt = self._gated_morning_briefing_prompt()
         self.assertIn("**weather section:** already written by `nbhd_weather_briefing`", prompt)
         self.assertNotIn("**Today:** temp range", prompt)
+        self.assertNotIn("**Intraday:**", prompt)
         self.assertNotIn("temperature swing", prompt)
         self.assertNotIn("Sunny all day", prompt)
+
+    def test_briefing_weather_gate_parser(self):
+        from apps.router.chat_gates import briefing_weather_tool_enabled
+
+        for raw, expected in (
+            ("", False),
+            (None, False),
+            ("*", True),
+            (str(self.tenant.id), True),
+            (f" , {str(self.tenant.id).upper()} , ", True),
+            ("00000000-0000-0000-0000-000000000000", False),
+            ("not-a-uuid,*x", False),
+        ):
+            with self.subTest(raw=raw), override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=raw):
+                self.assertIs(briefing_weather_tool_enabled(self.tenant), expected)
+
+    def test_morning_briefing_prompt_has_intraday_threshold_rule(self):
+        prompt = self._morning_briefing_prompt()
+        # Agent is told which intraday patterns warrant mention — no longer
+        # tied to Open-Meteo's structured hourly JSON fields (web_search
+        # doesn't return those); the rule is now best-effort over whatever
+        # structure the search results actually contain.
+        self.assertIn("temperature swing", prompt)
+        self.assertIn("thunderstorm", prompt.lower())
+        # And told NOT to enumerate stable days
+        self.assertIn("Sunny all day", prompt)
 
     def test_calendar_prompts_require_completion_evidence(self):
         jobs = build_cron_seed_jobs(self.tenant) + [_build_heartbeat_cron(self.tenant)]
@@ -703,14 +776,12 @@ class ConfigGeneratorTest(TestCase):
                 self.assertNotIn("Was it marked done or addressed anywhere in the note?", prompt)
         self.assertEqual(checked, expected)
 
-    def test_morning_briefing_prompt_has_no_weather_section_template(self):
-        # The section shape (**Today:** / **Intraday:** / **Tomorrow:**) is now
-        # rendered by apps/orchestrator/briefing_weather.py, not described to
-        # the model — nothing in the prompt should invite it to write weather.
+    def test_morning_briefing_prompt_has_intraday_section_template(self):
         prompt = self._morning_briefing_prompt()
-        self.assertNotIn("**Intraday:**", prompt)
-        self.assertNotIn("**Today:**", prompt)
-        self.assertNotIn("**Tomorrow:**", prompt)
+        self.assertIn("**Intraday:**", prompt)
+        # Stable-day example preserved
+        self.assertIn("**Today:**", prompt)
+        self.assertIn("**Tomorrow:**", prompt)
 
     def test_week_ahead_prompt_uses_right_now_for_travel_evidence(self):
         self.tenant.situational_context_enabled = True
