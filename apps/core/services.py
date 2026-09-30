@@ -94,9 +94,6 @@ def gather_meditation_signals(tenant: Tenant) -> dict:
       a cooldown covering the last three playable sits.
     * recent consented user chat and explicitly owner-authored quick logs.
 
-    The journal/constellation sources egress to OpenRouter, which is configured for
-    zero-data-retention — the basis for lifting the earlier PII-egress deferral on
-    these signals.
     """
     signals: dict = {"tenant_id": str(tenant.id)}
     try:
