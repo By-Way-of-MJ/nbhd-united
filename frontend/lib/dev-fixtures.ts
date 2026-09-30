@@ -204,7 +204,7 @@ let people = [
   ["f-5", "Sora", "sora", 40, false, "light", "2025-08-30"],
   ["f-6", "Hana", "hana", 280, false, "strong", "2024-09-12"],
   ["f-7", "Kenji", "kenji", 90, false, "light", "2025-02-01"],
-].map(([id, name, handle, hue, sky, bond, since]) => ({
+].map(([id, name, handle, hue, sky, bond, since], i) => ({
   friendship_id: id as string,
   display_name: name as string,
   handle: handle as string,
@@ -216,6 +216,7 @@ let people = [
   friends_since: since as string,
   has_unread_thread: false,
   thread_id: null as string | null,
+  reach: (["10+", "5+", null, "25+", "3+", "10+", null] as (string | null)[])[i],
 }));
 // `?fixture=crowded` (12 sky + 80 others) and `?fixture=medium` (6 sky + 25
 // others) exercise the map at scale. Names are deterministic, some long.
@@ -239,14 +240,129 @@ function crowd(sky: number, others: number) {
       friends_since: `${2019 + (i % 8)}-${String(1 + (i % 12)).padStart(2, "0")}-10`,
       has_unread_thread: false,
       thread_id: null as string | null,
+      reach: ([null, "3+", "5+", "10+", "25+", "10+", "50+", "5+", "100+"] as (string | null)[])[(i * 7) % 9],
     };
   });
 }
+// `?fixture=two` is the approved two-friend Neighborhood (Kiho close, Dudley
+// further out); `?fixture=many` is ~150 friends with friends-of-friends.
+function two() {
+  return [
+    { friendship_id: "k-1", display_name: "Kiho", handle: "kiho", avatar_hue: 345, bio: "", spark_count: 3, in_my_sky: true, bond: "strong", friends_since: "2025-04-12", has_unread_thread: false, thread_id: null as string | null, reach: "10+" as string | null },
+    { friendship_id: "k-2", display_name: "Dudley", handle: "dudley", avatar_hue: 210, bio: "", spark_count: 0, in_my_sky: false, bond: "light", friends_since: "2026-02-03", has_unread_thread: false, thread_id: null as string | null, reach: "3+" as string | null },
+  ];
+}
 let crowdState: { mode: string; list: ReturnType<typeof crowd> } | null = null;
 function crowdFor(mode: string | null) {
-  if (mode !== "crowded" && mode !== "medium") return null;
-  if (!crowdState || crowdState.mode !== mode) crowdState = { mode, list: mode === "crowded" ? crowd(12, 80) : crowd(6, 25) };
+  if (mode !== "crowded" && mode !== "medium" && mode !== "many" && mode !== "two") return null;
+  if (!crowdState || crowdState.mode !== mode) {
+    crowdState = { mode, list: mode === "crowded" ? crowd(12, 80) : mode === "many" ? crowd(12, 138) : mode === "two" ? two() : crowd(6, 25) };
+  }
   return crowdState;
+}
+function neighborsNow() {
+  return crowdFor(fixtureMode())?.list ?? people;
+}
+
+// Clusters (Circles) with members drawn from whichever neighborhood is showing,
+// plus a few members who aren't your friends (they're never placed on the map).
+const STRANGERS = ["Emi", "Nora", "Taro", "Wen", "Leo", "Jun", "Sora", "Hina", "Rio", "Yui", "Kaito"];
+function clusterList() {
+  const mode = fixtureMode();
+  const list = neighborsNow();
+  const pick = (from: number, n: number) => list.slice(from, from + n).map((x) => x.handle);
+  const defs =
+    mode === "two"
+      ? [
+          { circle_id: "c-kita", name: "Kita-ku parents", hue: 340, my_role: "member", description: "Saturday market rota and the school run.", friends: ["kiho"], strangers: 5, admin: "kiho" },
+          { circle_id: "c-b3", name: "Building 3", hue: 212, my_role: "admin", description: "Borrowing tools, parcels and the bike room.", friends: ["dudley"], strangers: 9, admin: "" },
+        ]
+      : mode === "many" || mode === "crowded"
+        ? [
+            { circle_id: "c-run", name: "Sunday run club", hue: 150, my_role: "member", description: "", friends: pick(3, 16), strangers: 4, admin: list[3]?.handle ?? "" },
+            { circle_id: "c-b3", name: "Building 3", hue: 212, my_role: "admin", description: "Borrowing tools, parcels and the bike room.", friends: pick(30, 22), strangers: 6, admin: "" },
+            { circle_id: "c-kita", name: "Kita-ku parents", hue: 340, my_role: "member", description: "", friends: pick(60, 9), strangers: 3, admin: list[60]?.handle ?? "" },
+          ]
+        : [
+            { circle_id: "c-1", name: "Sunday run club", hue: 150, my_role: "member", description: "", friends: ["aiko", "ren", "hana"], strangers: 3, admin: "aiko" },
+            { circle_id: "c-2", name: "Book swap", hue: 30, my_role: "admin", description: "One in, one out, every other Thursday.", friends: ["mika", "dan"], strangers: 1, admin: "" },
+          ];
+  return defs.map((d) => ({
+    ...d,
+    invite_code: d.my_role === "admin" ? `NBHD-${d.circle_id.slice(2).toUpperCase()}7` : null,
+    member_count: d.friends.length + d.strangers + 1,
+  }));
+}
+function clusterDetail(id: string) {
+  const c = clusterList().find((x) => x.circle_id === id);
+  if (!c) return undefined;
+  const byHandle = new Map(neighborsNow().map((n) => [n.handle, n]));
+  const members = [
+    { handle: "yuki", display_name: "Yuki", avatar_hue: 260, role: c.my_role, is_me: true },
+    ...c.friends.map((h) => ({ handle: h, display_name: byHandle.get(h)?.display_name ?? h, avatar_hue: byHandle.get(h)?.avatar_hue ?? 200, role: h === c.admin ? "admin" : "member", is_me: false })),
+    ...STRANGERS.slice(0, c.strangers).map((n, i) => ({ handle: `${n.toLowerCase()}${i}`, display_name: n, avatar_hue: (i * 53) % 360, role: "member", is_me: false })),
+  ];
+  return { circle_id: c.circle_id, name: c.name, description: c.description, hue: c.hue, members, my_role: c.my_role, thread_id: `t-${c.circle_id}`, invite_code: c.invite_code };
+}
+
+function missionDetail(id: string) {
+  const m = missionAsks.find((x) => x.mission_id === id);
+  if (!m) return undefined;
+  const list = neighborsNow();
+  const other = list[0];
+  const days = m.target && (m.target as { cadence?: string }).cadence === "weekly" ? 28 : 7;
+  const invited = m.my_status === "invited";
+  return {
+    mission_id: m.mission_id,
+    title: m.title,
+    status: m.status,
+    cadence: days === 28 ? "weekly" : "daily",
+    window_days: days,
+    target: m.target,
+    overall_pct: 21,
+    description: m.mission_id === "m-pm" ? "Consistency towards working on a project together." : "",
+    version: m.version,
+    my_commitment: m.my_commitment,
+    my_role: m.my_role,
+    my_status: m.my_status,
+    members: invited ? [] : [
+      { handle: "yuki", showed_up: m.mission_id === "m-pm" ? 0 : 3, window_days: days, streak: m.mission_id === "m-pm" ? 0 : 2, last_activity: null, next_step: m.mission_id === "m-pm" ? null : "Try the river loop", commitment: m.my_commitment, is_creator: m.my_role === "owner" },
+      ...(other ? [{ handle: other.handle, showed_up: m.mission_id === "m-pm" ? 1 : 5, window_days: days, streak: 1, last_activity: null, next_step: m.mission_id === "m-pm" ? "Talk about an AI workflow" : null, commitment: "", is_creator: m.my_role !== "owner" }] : []),
+    ],
+    updates: invited ? [] : m.mission_id === "m-pm" ? [] : [
+      { id: "u1", kind: "progress", text: "Did the long loop this morning, felt easy.", created_at: isoAt(-1, 7, 40), author_name: other?.display_name ?? "Neighbor" },
+      { id: "u2", kind: "note", text: "Rain tomorrow — shall we go at 7 instead?", created_at: isoAt(-3, 20, 10), author_name: "Yuki" },
+    ],
+  };
+}
+
+function threadList() {
+  const list = neighborsNow();
+  const at = (d: number, h: number) => isoAt(d, h);
+  const t = (n: (typeof list)[number] | undefined, last: string, when: string | null, unread = 0) =>
+    n ? { thread_id: `t-${n.friendship_id}`, friendship_id: n.friendship_id, display_name: n.display_name, handle: n.handle, avatar_hue: n.avatar_hue, unread, last_message: last, last_message_at: when, muted: false, agent_absorb_enabled: false } : null;
+  return [
+    t(list[0], "See you at the park on Sunday.", at(-2, 18), 1),
+    t(list[3], "Thanks for the book! Nearly done.", at(-5, 21)),
+    t(list[5], "Shall we do the market again?", at(-12, 9)),
+  ].filter((x): x is NonNullable<typeof x> => !!x);
+}
+
+function absorbedList() {
+  const list = neighborsNow();
+  const a = list[0]?.handle ?? "aiko", b = list[1]?.handle ?? "ren";
+  const kept = (id: string, from: string | null, label: string, day: number, extra: Record<string, string> = {}) => ({ id, source_kind: "spark", source_id: id, from_handle: from, label, absorbed_at: isoAt(day, 9), ...extra });
+  return [
+    kept("ab1", a, `Chat summary with ${list[0]?.display_name ?? "Aiko"}`, -19, { group_key: `chat:${a}`, kind_label: "Chat summary" }),
+    kept("ab2", a, `Chat summary with ${list[0]?.display_name ?? "Aiko"}`, -14, { group_key: `chat:${a}`, kind_label: "Chat summary" }),
+    kept("ab3", a, `Chat summary with ${list[0]?.display_name ?? "Aiko"}`, -8, { group_key: `chat:${a}`, kind_label: "Chat summary" }),
+    kept("ab4", a, `Chat summary with ${list[0]?.display_name ?? "Aiko"}`, -3, { group_key: `chat:${a}`, kind_label: "Chat summary" }),
+    kept("ab5", a, "Wants to channel climate awareness into their art practice.", -11),
+    kept("ab6", a, "Prefers mornings for anything that needs thinking.", -22),
+    kept("ab7", a, "Prefers mornings for anything that needs thinking.", -20),
+    kept("ab8", b, "Keeps a spare bike pump in the hall cupboard.", -6),
+    kept("ab9", "yuki", "Security work and family errands can share the same day — deep work just needs discipline, not an empty calendar.", -7),
+  ];
 }
 /** Same shape apiFetch throws for a non-2xx response: body text in .message, plus .status. */
 function httpError(status: number, body: Json): Error {
@@ -266,6 +382,7 @@ const missionAsks = [
   { mission_id: "m-1", title: "Help Aiko move on Saturday", status: "active", target: {}, target_date: null as string | null, version: 1, my_commitment: "", my_status: "invited", my_role: "member" },
   { mission_id: "m-2", title: "Ren's 10k training buddy", status: "active", target: { cadence: "weekly" }, target_date: null as string | null, version: 1, my_commitment: "", my_status: "invited", my_role: "member" },
   { mission_id: "m-3", title: "Morning walks", status: "active", target: { cadence: "daily" }, target_date: null as string | null, version: 1, my_commitment: "Walk 20 min", my_status: "active", my_role: "owner" },
+  { mission_id: "m-pm", title: "nbhd project management", status: "active", target: { cadence: "daily" }, target_date: null as string | null, version: 1, my_commitment: "", my_status: "active", my_role: "owner" },
 ];
 
 function json(body: Json): Json {
@@ -753,7 +870,8 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     wavesIn = wavesIn.map((w) => ({ ...w, created_at: w.created_at || isoAt(-1, 18) }));
     return json({
       profile: { handle: "yuki", display_name: "Yuki", avatar_hue: 260 },
-      neighbors: isEmpty ? [] : (crowdFor(fixtureMode())?.list ?? people),
+      neighbors: isEmpty ? [] : neighborsNow(),
+      reach_total: isEmpty ? null : fixtureMode() === "two" ? "10+" : fixtureMode() === "many" ? "100+" : "25+",
       pending_in: isEmpty ? [] : wavesIn,
       pending_out: isEmpty ? [] : [{ friendship_id: "w-2", direction: "outgoing", display_name: "Mei", handle: "mei", avatar_hue: 330, note: "", created_at: isoAt(-3, 9) }],
       moments: [],
@@ -782,12 +900,12 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     const w = wavesIn.find((x) => x.friendship_id === waveAct[1]);
     wavesIn = wavesIn.filter((x) => x.friendship_id !== waveAct[1]);
     if (w && waveAct[2] === "accept") {
-      people = [...people, { friendship_id: w.friendship_id, display_name: w.display_name, handle: w.handle, avatar_hue: w.avatar_hue, bio: "", spark_count: 0, in_my_sky: false, bond: "light", friends_since: isoDay(0), has_unread_thread: false, thread_id: null }];
+      people = [...people, { friendship_id: w.friendship_id, display_name: w.display_name, handle: w.handle, avatar_hue: w.avatar_hue, bio: "", spark_count: 0, in_my_sky: false, bond: "light", friends_since: isoDay(0), has_unread_thread: false, thread_id: null, reach: null }];
     }
     return json({ friendship_id: waveAct[1], status: waveAct[2] === "accept" ? "accepted" : "declined" });
   }
   if (p === "/api/v1/friends/missions/" && method === "GET") {
-    const rows = isEmpty ? [] : missionAsks;
+    const rows = isEmpty ? [] : fixtureMode() === "two" ? missionAsks.filter((m) => m.mission_id === "m-pm") : missionAsks;
     return json(url.searchParams.get("include_invited") ? rows : rows.filter((m) => m.my_status === "active"));
   }
   const joinM = p.match(/^\/api\/v1\/friends\/missions\/([^/]+)\/join\/$/);
@@ -797,20 +915,59 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     return json({ mission_id: joinM[1], status: "active" });
   }
   if (p === "/api/v1/friends/circles/" && method === "GET") {
-    return json(isEmpty ? [] : [
-      { circle_id: "c-1", name: "Sunday run club", hue: 150, member_count: 6, my_role: "member", invite_code: null },
-      { circle_id: "c-2", name: "Book swap", hue: 30, member_count: 4, my_role: "admin", invite_code: "BOOKS1" },
-    ]);
+    return json(isEmpty ? [] : clusterList().map(({ circle_id, name, hue, member_count, my_role, invite_code }) => ({ circle_id, name, hue, member_count, my_role, invite_code })));
+  }
+  if (p === "/api/v1/friends/circles/join/" && method === "POST") {
+    const code = String(bodyOf(init).invite_code ?? "");
+    if (!code.startsWith("NBHD-")) throw httpError(404, { detail: "That code doesn't match a cluster." });
+    return json({ circle_id: "c-b3", status: "active" });
+  }
+  if (p === "/api/v1/friends/circles/" && method === "POST") return json({ circle_id: "c-b3" });
+  const circleM = p.match(/^\/api\/v1\/friends\/circles\/([^/]+)\/$/);
+  if (circleM && method === "GET") {
+    const d = clusterDetail(circleM[1]);
+    if (!d) throw httpError(404, { detail: "Not found." });
+    return json(d);
+  }
+  const missionM = p.match(/^\/api\/v1\/friends\/missions\/([^/]+)\/$/);
+  if (missionM && method === "GET") {
+    const d = missionDetail(missionM[1]);
+    if (!d) throw httpError(404, { detail: "Not found." });
+    return json(d);
+  }
+  if (p === "/api/v1/friends/invites/" && method === "POST") {
+    return json({ token: "fx-invite-7Qk2", url: `${typeof window !== "undefined" ? window.location.origin : "https://hoodunited.org"}/friends/invite/fx-invite-7Qk2`, expires_at: isoAt(14, 12), max_uses: 5, uses: 0 });
   }
   if (p === "/api/v1/friends/threads/") {
     if (method === "POST") return json({ thread_id: `t-${String(bodyOf(init).friendship_id ?? "x")}`, friendship_id: bodyOf(init).friendship_id });
-    return json([]);
+    return json(isEmpty ? [] : threadList());
   }
-  if (/^\/api\/v1\/friends\/threads\/[^/]+\/messages\/$/.test(p)) return json({ messages: [], next_cursor: null });
+  if (/^\/api\/v1\/friends\/threads\/[^/]+\/messages\/$/.test(p)) {
+    if (method === "POST") return json({ public_id: `m-${Date.now()}`, seq: 9, text: String(bodyOf(init).text ?? ""), mine: true, created_at: new Date().toISOString() });
+    const first = neighborsNow()[0];
+    return json({
+      messages: p.includes(first ? `t-${first.friendship_id}` : "none")
+        ? [
+            { public_id: "c1", seq: 1, text: "Are you going to the park on Sunday?", mine: true, created_at: isoAt(-3, 17) },
+            { public_id: "c2", seq: 2, text: "Yes! Bringing the kids around 10.", mine: false, created_at: isoAt(-2, 17) },
+            { public_id: "c3", seq: 3, text: "See you at the park on Sunday.", mine: false, created_at: isoAt(-2, 18) },
+          ]
+        : [],
+      next_cursor: null,
+    });
+  }
   if (/^\/api\/v1\/friends\/threads\/[^/]+\/read\/$/.test(p)) return json({ ok: true });
-  if (p === "/api/v1/friends/shares/pending/") return json([]);
-  if (p === "/api/v1/friends/absorbed/") return json([]);
-  if (p === "/api/v1/friends/mission-actions/") return json([]);
+  if (p === "/api/v1/friends/shares/pending/") {
+    const first = neighborsNow()[0];
+    return json(isEmpty || !first ? [] : [
+      { id: "ps-1", lesson_id: 11, lesson_preview: "When fasting, plan for the hunger window in advance — going in without prep leads to snacking.", proposed_by: "agent", friendship_id: first.friendship_id, audience: first.display_name, created_at: isoAt(-1, 8) },
+      { id: "ps-2", lesson_id: 12, lesson_preview: "Even on a full family day, carving out an hour for project work keeps momentum alive.", proposed_by: "agent", friendship_id: first.friendship_id, audience: first.display_name, created_at: isoAt(-2, 8) },
+    ]);
+  }
+  if (p === "/api/v1/friends/absorbed/") return json(isEmpty ? [] : absorbedList());
+  if (p === "/api/v1/friends/mission-actions/") {
+    return json(isEmpty ? [] : [{ id: "ga-1", mission_id: "m-3", mission_title: "Morning walks", suggested: { title: "Look up the river loop distance", description: "", due_date: null }, created_at: isoAt(-1, 12) }]);
+  }
   if (p === "/api/v1/lessons/" && url.searchParams.get("status") === "approved") return json([]);
   if (p === "/api/v1/friends/profile/") return json({ handle: "yuki", display_name: "Yuki", bio: "", avatar_hue: 260, discoverable: true });
   if (p === "/api/v1/lessons/pending/") return json(isEmpty ? [] : skyPending);

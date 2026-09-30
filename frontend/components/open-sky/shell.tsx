@@ -74,7 +74,6 @@ const LEGACY_TITLES: { match: (p: string) => boolean; title: string; subtitle?: 
   { match: (p) => p === "/fuel", title: "Fuel", subtitle: "Every session, on the calendar." },
   { match: (p) => p === "/core", title: "Core", subtitle: "A quiet ten minutes, whenever you need it." },
   { match: (p) => p === "/settings" || p.startsWith("/settings/"), title: "Settings", subtitle: "Manage your account, integrations, scheduled tasks, usage, and billing." },
-  { match: (p) => p === "/friends", title: "Neighborhood" },
 ];
 
 /** Pages drawn edge to edge on their own sky (no page padding or shell title). */

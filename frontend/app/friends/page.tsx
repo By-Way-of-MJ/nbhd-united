@@ -7,7 +7,7 @@ import { ConfirmDialog } from "@/components/journal/confirm-dialog";
 import { IconMore } from "@/components/icons/constellation";
 import { SectionCard } from "@/components/section-card";
 import { Skeleton, SectionCardSkeleton } from "@/components/skeleton";
-import { NeighborhoodOpenSky } from "@/components/open-sky/neighborhood";
+import { NeighborhoodPage } from "@/components/neighborhood/neighborhood-page";
 import { StatusPill } from "@/components/status-pill";
 import { emitToast } from "@/components/toast";
 import { fetchCircleSharePreview, fetchSharePreview } from "@/lib/api";
@@ -87,6 +87,12 @@ function avatarStyle(hue: number): CSSProperties {
 }
 
 export default function FriendsPage() {
+  const { data: tenant } = useTenantQuery();
+  return tenant?.web_redesign ? <NeighborhoodPage /> : <LegacyFriendsPage />;
+}
+
+// The pre-redesign Neighborhood, unchanged for tenants without web_redesign.
+function LegacyFriendsPage() {
   const { data, isLoading } = useNeighborhoodQuery();
   const { data: pendingShares = [] } = usePendingSharesQuery();
   const { data: threads = [], isLoading: threadsLoading } = useThreadsQuery();
@@ -163,22 +169,6 @@ export default function FriendsPage() {
           Nothing here is public &mdash; only people you&rsquo;ve both agreed to know each other.
         </p>
       </header>
-
-      {openSky ? (
-        <NeighborhoodOpenSky
-          onMessage={(n) =>
-            void handleMessageNeighbor({
-              friendship_id: n.friendship_id,
-              display_name: n.display_name,
-              handle: n.handle,
-              avatar_hue: n.avatar_hue,
-              status: "accepted",
-              since: n.friends_since,
-            })
-          }
-          onOpenCircle={setOpenCircleId}
-        />
-      ) : null}
 
       <div data-os-neighborhood className="space-y-6">
         {isLoading ? (

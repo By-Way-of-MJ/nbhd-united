@@ -1100,6 +1100,9 @@ export interface HomeNeighbor {
   friends_since: string; // YYYY-MM-DD
   has_unread_thread: boolean;
   thread_id: string | null;
+  // Bucketed count of this friend's friends you don't know — never exact.
+  // Optional: older servers omit it (then no glimmers, no copy).
+  reach?: null | "3+" | "5+" | "10+" | "25+" | "50+" | "100+";
 }
 
 export interface HomeWave {
@@ -1117,6 +1120,8 @@ export interface NeighborhoodHome {
   neighbors: HomeNeighbor[];
   pending_in: HomeWave[];
   pending_out: HomeWave[];
+  // Same buckets as HomeNeighbor.reach, across everyone. Optional.
+  reach_total?: null | "3+" | "5+" | "10+" | "25+" | "50+" | "100+";
 }
 
 // Response shape shared by the accept/decline/block and unfriend endpoints.
@@ -1234,6 +1239,10 @@ export interface AbsorbedItem {
   from_handle: string | null;
   label: string;
   absorbed_at: string;
+  // Optional grouping hints: items sharing a group_key are one thing kept
+  // several times; kind_label is a human word for what it is.
+  group_key?: string | null;
+  kind_label?: string | null;
 }
 
 // ── Friend chat (PR5) ──────────────────────────────────────────────────────
@@ -1326,6 +1335,17 @@ export interface MissionDetail {
   version: number;
   my_commitment: string;
   my_role: "owner" | "member";
+  my_status?: "active" | "invited";
+  // Newest first, attributed (members only; empty for an invited preview).
+  updates?: MissionUpdate[];
+}
+
+export interface MissionUpdate {
+  id: string;
+  kind: string;
+  text: string;
+  created_at: string;
+  author_name: string;
 }
 
 // An agent-proposed Mission task for the tenant's OWN human (design §2.10) —

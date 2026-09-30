@@ -39,6 +39,8 @@ export type { AppleAuthenticationResult } from "@/lib/apple-auth";
 
 interface SharedAppleButtonProps {
   className?: string;
+  /** Replaces the button's own classes (the Open Sky sign-in uses Apple's large white style). */
+  buttonClassName?: string;
   disabled?: boolean;
   label?: string;
   legalCopy?: ReactNode;
@@ -120,6 +122,11 @@ function subscribeToEligibility(onStoreChange: () => void): () => void {
     window.removeEventListener("storage", handleStorage);
     if (expiryTimer !== null) window.clearTimeout(expiryTimer);
   };
+}
+
+/** Whether the Apple button will render here (same check the button makes). */
+export function useAppleSignInEligible(): boolean {
+  return useSyncExternalStore(subscribeToEligibility, getEligibilitySnapshot, () => false);
 }
 
 export function AppleSignInButton(props: AppleSignInButtonProps) {
@@ -386,7 +393,10 @@ export function AppleSignInButton(props: AppleSignInButtonProps) {
         type="button"
         onClick={handleClick}
         disabled={disabled}
-        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg border border-black bg-white px-4 py-3 text-sm font-semibold text-black transition hover:bg-white/90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+        className={
+          props.buttonClassName ??
+          "flex min-h-[44px] w-full items-center justify-center gap-2 rounded-lg border border-black bg-white px-4 py-3 text-sm font-semibold text-black transition hover:bg-white/90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+        }
       >
         <svg
           viewBox="0 0 24 24"
