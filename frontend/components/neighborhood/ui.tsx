@@ -104,7 +104,7 @@ export function SidePanel({ label, onClose, children, wide = false, bare = false
         aria-label={label}
         tabIndex={-1}
         className={clsx(
-          "os-panel-in os-panel-sky absolute right-0 top-0 flex h-full w-full flex-col border-l border-os-hairline outline-none",
+          "os-panel-in os-panel-sky absolute right-0 top-0 flex h-full w-full flex-col border-l border-os-hairline outline-none focus-visible:shadow-none",
           bare ? "overflow-hidden pt-[env(safe-area-inset-top)]" : "overflow-y-auto px-5 pb-[calc(env(safe-area-inset-bottom)+2rem)] pt-[calc(env(safe-area-inset-top)+1.25rem)] sm:px-11 sm:pt-10",
           wide ? "sm:w-[600px]" : "sm:w-[520px]",
         )}

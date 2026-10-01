@@ -1,25 +1,29 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useMemo, useState } from "react";
 
-import { ClusterPanel, ClustersSection, CreateClusterPanel } from "@/components/neighborhood/clusters";
+import { ClustersSection, CreateClusterPanel } from "@/components/neighborhood/clusters";
 import { InvitePanel } from "@/components/neighborhood/invite";
 import { MessagesSection, ThreadPanel } from "@/components/neighborhood/messages";
 import { NeedsYou } from "@/components/neighborhood/needs-you";
 import { PeopleSky } from "@/components/neighborhood/people-sky";
+import { CreateProjectV2Panel, DraftReviewPanel } from "@/components/neighborhood/project/create";
 import { CreateProjectPanel, ProjectPanel, ProjectsSection } from "@/components/neighborhood/projects";
 import { ShareLessonPanel, ShareReviewPanel } from "@/components/neighborhood/share";
 import { ghostBtnCls } from "@/components/neighborhood/ui";
 import { emitToast } from "@/components/toast";
 import { getErrorMessage } from "@/lib/errors";
 import { buildNeeds, countsLine, groupKeeps, keepsSummary, messageRows, type MessageRow, type Need } from "@/lib/neighborhood";
+import { parsePlan, type ProjectPlan } from "@/lib/project-plan";
 import {
   useAbsorbedQuery,
   useAcceptWaveMutation,
   useApproveGoalActionMutation,
   useCircleDetailsQueries,
   useCirclesQuery,
+  useDeclineMissionMutation,
   useDeclineWaveMutation,
   useGoalActionsQuery,
   useJoinMissionMutation,
@@ -28,6 +32,9 @@ import {
   useNeighborhoodHomeQuery,
   useOpenThreadMutation,
   usePendingSharesQuery,
+  useProjectDraftsQuery,
+  useProjectPlansQueries,
+  useProjectsV2Enabled,
   useRejectGoalActionMutation,
   useSkyMembershipMutation,
   useThreadsQuery,
@@ -37,7 +44,7 @@ import type { ChatThread, CircleDetail, HomeNeighbor, MissionDetail, PendingShar
 type Panel =
   | { kind: "project"; id: string }
   | { kind: "new-project" }
-  | { kind: "cluster"; id: string; invite: boolean }
+  | { kind: "draft"; id: string }
   | { kind: "new-cluster" }
   | { kind: "thread"; thread: ChatThread }
   | { kind: "review"; share: PendingShare }
@@ -72,6 +79,9 @@ function skyErrorMessage(err: unknown): string {
  * links. Everything else lives one step away, in its own panel or page.
  */
 export function NeighborhoodPage() {
+  const router = useRouter();
+  // Projects v2: a project opens on its own page (plan · timeline · people).
+  const v2 = useProjectsV2Enabled();
   const home = useNeighborhoodHomeQuery();
   const circlesQ = useCirclesQuery();
   const asksQ = useMissionAsksQuery();
@@ -79,10 +89,12 @@ export function NeighborhoodPage() {
   const actionsQ = useGoalActionsQuery();
   const threadsQ = useThreadsQuery();
   const absorbedQ = useAbsorbedQuery();
+  const draftsQ = useProjectDraftsQuery();
 
   const accept = useAcceptWaveMutation();
   const decline = useDeclineWaveMutation();
   const join = useJoinMissionMutation();
+  const declineAsk = useDeclineMissionMutation();
   const approveAction = useApproveGoalActionMutation();
   const rejectAction = useRejectGoalActionMutation();
   const sky = useSkyMembershipMutation();
@@ -107,12 +119,21 @@ export function NeighborhoodPage() {
   const asks = useMemo(() => asksQ.data ?? [], [asksQ.data]);
   const projects = useMemo(() => asks.filter((m) => m.my_status === "active"), [asks]);
   const projectIds = useMemo(() => projects.slice(0, DETAIL_CAP).map((m) => m.mission_id), [projects]);
-  const missionData = useMissionDetailsQueries(projectIds);
+  const missionData = useMissionDetailsQueries(v2 ? [] : projectIds);
+  const planData = useProjectPlansQueries(v2 ? projectIds : []);
+  const plans = useMemo(() => {
+    const m = new Map<string, ProjectPlan>();
+    planData.forEach((d, i) => {
+      const plan = parsePlan(d);
+      if (plan) m.set(projectIds[i], plan);
+    });
+    return m;
+  }, [projectIds, planData]);
   const missionDetails = useMemo(() => {
     const m = new Map<string, MissionDetail>();
-    missionData.forEach((d, i) => d && m.set(projectIds[i], d));
+    if (!v2) missionData.forEach((d, i) => d && m.set(projectIds[i], d));
     return m;
-  }, [projectIds, missionData]);
+  }, [projectIds, missionData, v2]);
 
   const needs = useMemo(
     () => buildNeeds({ shares: sharesQ.data, waves: home.data?.pending_in, asks, actions: actionsQ.data }),
@@ -125,6 +146,7 @@ export function NeighborhoodPage() {
     accept.isPending ? `wave:${accept.variables}` :
     decline.isPending ? `wave:${decline.variables}` :
     join.isPending ? `ask:${join.variables?.id}` :
+    declineAsk.isPending ? `ask:${declineAsk.variables}` :
     approveAction.isPending ? `action:${approveAction.variables}` :
     rejectAction.isPending ? `action:${rejectAction.variables}` : null;
 
@@ -138,8 +160,12 @@ export function NeighborhoodPage() {
   };
   const dismiss = (n: Need) => {
     if (n.kind === "wave") decline.mutate(n.id);
+    else if (n.kind === "ask") declineAsk.mutate(n.id, { onSuccess: () => emitToast("No problem. Maybe next time.", "success") });
     else if (n.kind === "action") rejectAction.mutate(n.id);
   };
+  const openProject = (id: string) => (v2 ? router.push(`/friends/project?id=${encodeURIComponent(id)}`) : setPanel({ kind: "project", id }));
+  // A cluster opens on its own page: its conversation, its people, its invitation.
+  const openCluster = (id: string, invite = false) => router.push(`/friends/cluster?id=${encodeURIComponent(id)}${invite ? "&invite=1" : ""}`);
 
   const messageNeighbor = async (n: HomeNeighbor) => {
     const existing = (threadsQ.data ?? []).find((t) => t.friendship_id === n.friendship_id);
@@ -193,8 +219,8 @@ export function NeighborhoodPage() {
           onMessage={(n) => void messageNeighbor(n)}
           onToggleSky={toggleSky}
           onShareLesson={(n) => setPanel({ kind: "share", friendshipId: n.friendship_id })}
-          onOpenCluster={(id) => setPanel({ kind: "cluster", id, invite: false })}
-          onInviteCluster={(id) => setPanel({ kind: "cluster", id, invite: true })}
+          onOpenCluster={(id) => openCluster(id)}
+          onInviteCluster={(id) => openCluster(id, true)}
           onInvite={() => setPanel({ kind: "invite" })}
         />
       </div>
@@ -209,16 +235,19 @@ export function NeighborhoodPage() {
           details={circleDetails}
           loading={circlesQ.isLoading}
           joinCode={joinCode}
-          onOpen={(id) => setPanel({ kind: "cluster", id, invite: false })}
+          onOpen={(id) => openCluster(id)}
           onCreate={() => setPanel({ kind: "new-cluster" })}
         />
         <ProjectsSection
           missions={projects}
           details={missionDetails}
+          plans={v2 ? plans : undefined}
+          drafts={v2 ? (draftsQ.data ?? []) : []}
           loading={asksQ.isLoading}
           myHandle={myHandle}
           names={names}
-          onOpen={(id) => setPanel({ kind: "project", id })}
+          onOpen={openProject}
+          onOpenDraft={(id) => setPanel({ kind: "draft", id })}
           onCreate={() => setPanel({ kind: "new-project" })}
         />
       </div>
@@ -243,9 +272,10 @@ export function NeighborhoodPage() {
       </nav>
 
       {panel?.kind === "project" ? <ProjectPanel missionId={panel.id} myHandle={myHandle} names={names} onClose={close} /> : null}
-      {panel?.kind === "new-project" ? <CreateProjectPanel neighbors={neighbors} onClose={close} onCreated={(id) => setPanel({ kind: "project", id })} /> : null}
-      {panel?.kind === "cluster" ? <ClusterPanel circleId={panel.id} focusInvite={panel.invite} onClose={close} onOpenChat={(thread) => setPanel({ kind: "thread", thread })} /> : null}
-      {panel?.kind === "new-cluster" ? <CreateClusterPanel onClose={close} onCreated={(id) => setPanel({ kind: "cluster", id, invite: true })} /> : null}
+      {panel?.kind === "new-project" && v2 ? <CreateProjectV2Panel neighbors={neighbors} onClose={close} onCreated={openProject} /> : null}
+      {panel?.kind === "new-project" && !v2 ? <CreateProjectPanel neighbors={neighbors} onClose={close} onCreated={(id) => setPanel({ kind: "project", id })} /> : null}
+      {panel?.kind === "draft" ? <DraftReviewPanel key={panel.id} draftId={panel.id} onClose={close} onStarted={openProject} /> : null}
+      {panel?.kind === "new-cluster" ? <CreateClusterPanel onClose={close} onCreated={(id) => openCluster(id, true)} /> : null}
       {panel?.kind === "thread" ? <ThreadPanel key={panel.thread.thread_id} thread={panel.thread} onClose={close} /> : null}
       {panel?.kind === "review" ? <ShareReviewPanel key={panel.share.id} share={panel.share} onClose={close} /> : null}
       {panel?.kind === "share" ? <ShareLessonPanel neighbors={neighbors} circles={circles} initial={panel} onClose={close} /> : null}

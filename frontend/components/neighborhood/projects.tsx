@@ -17,7 +17,9 @@ import {
 } from "@/components/neighborhood/ui";
 import { emitToast } from "@/components/toast";
 import { getErrorMessage } from "@/lib/errors";
+import { AID_INTENTS, aidIntent } from "@/lib/cluster";
 import { crewLabel, memberName, messageTime, projectLine, windowLabel } from "@/lib/neighborhood";
+import { crewLine, healthWords, type ProjectPlan, projectRowLine } from "@/lib/project-plan";
 import {
   useAddMissionTaskMutation,
   useAddMissionUpdateMutation,
@@ -27,7 +29,7 @@ import {
   useMissionDetailQuery,
   usePatchMissionMutation,
 } from "@/lib/queries";
-import type { HomeNeighbor, MissionAsk, MissionDetail } from "@/lib/types";
+import type { HomeNeighbor, MissionAsk, MissionDetail, ProjectDraftSummary } from "@/lib/types";
 
 function Bar({ pct }: { pct: number }) {
   const w = Math.min(100, Math.max(0, pct));
@@ -39,26 +41,36 @@ function Bar({ pct }: { pct: number }) {
 }
 
 /**
- * Projects (Missions in the API): something you're doing together, with a
- * goal and a weekly rhythm. Each row: crew, this week, the next step.
+ * Projects (Missions in the API): something you're doing together. With a plan
+ * (Projects v2) each row is how far along it is, your next step and whether
+ * it's on track; without one it's the crew, this week and the next step.
  */
 export function ProjectsSection({
   missions,
   details,
+  plans,
+  drafts = [],
   loading,
   myHandle,
   names,
   onOpen,
+  onOpenDraft,
   onCreate,
 }: {
   missions: MissionAsk[];
   details: Map<string, MissionDetail>;
+  /** Plans by mission id, for accounts with Projects v2. */
+  plans?: Map<string, ProjectPlan>;
+  /** Private starter plans your assistant drafted. */
+  drafts?: ProjectDraftSummary[];
   loading: boolean;
   myHandle: string | null;
   names: Map<string, string>;
   onOpen: (id: string) => void;
+  onOpenDraft?: (id: string) => void;
   onCreate: () => void;
 }) {
+  const planned = !!plans;
   return (
     <section aria-labelledby="projects-heading" className="min-w-0 flex-1">
       <SectionHead
@@ -70,14 +82,48 @@ export function ProjectsSection({
           </button>
         }
       />
-      <p className="mb-1 mt-1 text-[0.8125rem] leading-relaxed text-os-faint">Something you&rsquo;re doing together, with a goal and a weekly rhythm.</p>
+      <p className="mb-1 mt-1 text-[0.8125rem] leading-relaxed text-os-faint">
+        {planned ? "Something you’re doing together — who does what, and when." : "Something you’re doing together, with a goal and a weekly rhythm."}
+      </p>
       {loading ? (
         <p className="os-hairline-top py-4 text-[0.9375rem] text-os-muted">Loading&hellip;</p>
-      ) : missions.length === 0 ? (
+      ) : missions.length === 0 && drafts.length === 0 ? (
         <p className="os-hairline-top py-4 text-[0.9375rem] text-os-muted">No projects yet. Start one with a neighbor &mdash; a walk every morning, a shared garden, a move.</p>
       ) : (
         <ul>
+          {drafts.map((draft) => (
+            <li key={draft.draft_id}>
+              <button type="button" onClick={() => onOpenDraft?.(draft.draft_id)} className="os-focus os-hairline-top group flex w-full flex-col gap-1.5 py-3.5 text-left">
+                <span className="flex w-full items-baseline justify-between gap-4">
+                  <span className="os-serif min-w-0 truncate text-[1.5rem] leading-tight text-white transition group-hover:text-os-accent sm:text-[1.625rem]">{draft.title}</span>
+                  <span className="shrink-0 text-[0.75rem] text-os-accent">Review</span>
+                </span>
+                <span className="text-[0.875rem] text-os-muted">
+                  Draft from your assistant &middot; {draft.step_count} {draft.step_count === 1 ? "step" : "steps"} &middot; only you can see it
+                </span>
+              </button>
+            </li>
+          ))}
           {missions.map((m) => {
+            const plan = plans?.get(m.mission_id);
+            if (plan) {
+              const health = healthWords(plan.health);
+              return (
+                <li key={m.mission_id}>
+                  <button type="button" onClick={() => onOpen(m.mission_id)} className="os-focus os-hairline-top group flex w-full flex-col gap-2 py-3.5 text-left">
+                    <span className="flex w-full items-baseline justify-between gap-4">
+                      <span className="os-serif min-w-0 truncate text-[1.5rem] leading-tight text-white transition group-hover:text-os-accent sm:text-[1.625rem]">{plan.title}</span>
+                      <span className="shrink-0 text-[0.75rem] text-os-faint">{crewLine(plan)}</span>
+                    </span>
+                    <Bar pct={plan.total ? (100 * plan.doneCount) / plan.total : 0} />
+                    <span className="text-[0.875rem] text-os-muted">
+                      {projectRowLine({ ...plan, health: "on_track" })}
+                      {plan.health !== "on_track" ? <span className="text-os-attn"> &middot; {health.short}</span> : null}
+                    </span>
+                  </button>
+                </li>
+              );
+            }
             const d = details.get(m.mission_id);
             const me = d?.members.find((x) => x.handle && x.handle === myHandle);
             const pct = me && me.window_days ? (100 * me.showed_up) / me.window_days : d?.overall_pct ?? 0;
@@ -89,7 +135,10 @@ export function ProjectsSection({
                     <span className="shrink-0 text-[0.75rem] text-os-faint">{crewLabel(d, myHandle, names)}</span>
                   </span>
                   {d ? <Bar pct={pct} /> : <span className="block h-[2px] w-full bg-os-hairline" aria-hidden="true" />}
-                  <span className="text-[0.875rem] text-os-muted">{d ? projectLine(d, myHandle) || m.my_commitment || " " : m.my_commitment || " "}</span>
+                  <span className="text-[0.875rem] text-os-muted">
+                    {aidIntent(m.target?.aid_kind) ? <span className="text-os-faint">{aidIntent(m.target?.aid_kind)?.title} &middot; </span> : null}
+                    {d ? projectLine(d, myHandle) || m.my_commitment || " " : m.my_commitment || " "}
+                  </span>
                 </button>
               </li>
             );
@@ -329,13 +378,15 @@ export function CreateProjectPanel({ neighbors, onClose, onCreated }: { neighbor
   const [value, setValue] = useState("");
   const [cadence, setCadence] = useState<"daily" | "weekly">("daily");
   const [targetDate, setTargetDate] = useState("");
+  const [intent, setIntent] = useState("");
   const [error, setError] = useState("");
   const sorted = [...neighbors].sort((a, b) => Number(b.in_my_sky) - Number(a.in_my_sky) || a.display_name.localeCompare(b.display_name));
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!friendshipId || !title.trim()) return;
     setError("");
-    const target: { metric?: string; cadence?: "daily" | "weekly"; value?: number } = { cadence };
+    const target: { metric?: string; cadence?: "daily" | "weekly"; value?: number; aid_kind?: string } = { cadence };
+    if (intent) target.aid_kind = intent;
     if (metric.trim()) target.metric = metric.trim();
     if (value.trim() && !Number.isNaN(Number(value))) target.value = Number(value);
     try {
@@ -361,6 +412,17 @@ export function CreateProjectPanel({ neighbors, onClose, onCreated }: { neighbor
                 {sorted.map((n) => (
                   <option key={n.friendship_id} value={n.friendship_id}>
                     {n.display_name} (@{n.handle})
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className={labelCls}>Start with (optional)</span>
+              <select value={intent} onChange={(e) => setIntent(e.target.value)} className={`${fieldCls} bg-os-sky`}>
+                <option value="">Just a shared project</option>
+                {AID_INTENTS.map((i) => (
+                  <option key={i.kind} value={i.kind}>
+                    {i.title} — {i.subtitle}
                   </option>
                 ))}
               </select>

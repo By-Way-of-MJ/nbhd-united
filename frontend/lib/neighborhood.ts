@@ -101,6 +101,7 @@ export function buildNeeds(input: {
       tag: "Ask",
       text: `You’re asked to help with “${a.title}”${a.target_date ? `, by ${dayLabel(a.target_date)}` : ""}.`,
       action: "I can help",
+      dismiss: "Not this time",
       at: a.target_date ? ms(`${a.target_date}T12:00:00`) : 0,
       id: a.mission_id,
     });

@@ -2,35 +2,13 @@
 
 import { type FormEvent, useState } from "react";
 
-import {
-  CopyLink,
-  ErrorLine,
-  fieldCls,
-  ghostBtnCls,
-  Initial,
-  labelCls,
-  PanelBlock,
-  PanelHeader,
-  QrCode,
-  quietBtnCls,
-  SectionHead,
-  SidePanel,
-  textBtnCls,
-  dangerBtnCls,
-} from "@/components/neighborhood/ui";
+import { ErrorLine, fieldCls, ghostBtnCls, labelCls, PanelHeader, quietBtnCls, SectionHead, SidePanel, textBtnCls } from "@/components/neighborhood/ui";
 import { emitToast } from "@/components/toast";
 import { getErrorMessage } from "@/lib/errors";
-import { clusterInviteUrl, plural } from "@/lib/neighborhood";
+import { plural } from "@/lib/neighborhood";
 import { clusterCss } from "@/lib/people-sky/renderer";
-import {
-  useCircleDetailQuery,
-  useCreateCircleMutation,
-  useJoinCircleMutation,
-  useLeaveCircleMutation,
-  useRegenerateInviteCodeMutation,
-  useRemoveCircleMemberMutation,
-} from "@/lib/queries";
-import type { ChatThread, CircleDetail, CircleSummary } from "@/lib/types";
+import { useCreateCircleMutation, useJoinCircleMutation } from "@/lib/queries";
+import type { CircleDetail, CircleSummary } from "@/lib/types";
 
 function membersPreview(detail: CircleDetail | undefined): string {
   if (!detail) return "";
@@ -116,9 +94,23 @@ export function ClustersSection({
   );
 }
 
+/** Whether your assistant may learn from the cluster's conversation — off unless you say so. */
+function AssistantLearning({ checked, onChange }: { checked: boolean; onChange: (next: boolean) => void }) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="mt-1 h-4 w-4 shrink-0 accent-[var(--os-accent)]" />
+      <span className="flex flex-col gap-0.5">
+        <span className="text-[0.875rem] text-os-ink">Let my assistant learn from the cluster conversation</span>
+        <span className="text-[0.75rem] leading-relaxed text-os-faint">Optional, and separate from sharing with people. You can change it later on the cluster&rsquo;s page.</span>
+      </span>
+    </label>
+  );
+}
+
 function JoinClusterForm({ initialCode, onDone }: { initialCode: string; onDone: () => void }) {
   const join = useJoinCircleMutation();
   const [code, setCode] = useState(initialCode);
+  const [learning, setLearning] = useState(false);
   const [error, setError] = useState("");
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -126,7 +118,7 @@ function JoinClusterForm({ initialCode, onDone }: { initialCode: string; onDone:
     if (!trimmed) return;
     setError("");
     try {
-      await join.mutateAsync(trimmed);
+      await join.mutateAsync({ code: trimmed, assistantLearning: learning });
       emitToast("You’re in.", "success");
       setCode("");
       onDone();
@@ -156,174 +148,10 @@ function JoinClusterForm({ initialCode, onDone }: { initialCode: string; onDone:
           Cancel
         </button>
       </div>
+      <p className="text-[0.75rem] leading-relaxed text-os-faint">You can join a cluster started by someone you&rsquo;re already connected with. Its members can see your name and what you share there.</p>
+      <AssistantLearning checked={learning} onChange={setLearning} />
       {error ? <ErrorLine>{error}</ErrorLine> : null}
     </form>
-  );
-}
-
-/** A cluster, opened: chat, invite (link + QR + code), members, leave. */
-export function ClusterPanel({
-  circleId,
-  focusInvite,
-  onClose,
-  onOpenChat,
-}: {
-  circleId: string;
-  focusInvite: boolean;
-  onClose: () => void;
-  onOpenChat: (thread: ChatThread) => void;
-}) {
-  const { data: circle, isLoading, isError } = useCircleDetailQuery(circleId);
-  const remove = useRemoveCircleMemberMutation();
-  const regenerate = useRegenerateInviteCodeMutation();
-  const leave = useLeaveCircleMutation();
-  const [removing, setRemoving] = useState<string | null>(null);
-  const [confirmLeave, setConfirmLeave] = useState(false);
-  const isAdmin = circle?.my_role === "admin";
-  const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const host = circle?.members.find((m) => m.role === "admin" && !m.is_me);
-
-  const openChat = () => {
-    if (!circle?.thread_id) return;
-    onOpenChat({
-      thread_id: circle.thread_id,
-      friendship_id: null,
-      display_name: circle.name,
-      handle: null,
-      avatar_hue: circle.hue,
-      unread: 0,
-      last_message: "",
-      last_message_at: null,
-      muted: false,
-      agent_absorb_enabled: false,
-    });
-  };
-
-  const doLeave = (keep: boolean) =>
-    leave.mutate(
-      { id: circleId, keep },
-      {
-        onSuccess: (result) => {
-          emitToast(result.purged ? "Left the cluster — what your assistant learned there was deleted." : "Left the cluster.", "success");
-          onClose();
-        },
-        onError: () => setConfirmLeave(false),
-      },
-    );
-
-  const invite =
-    circle && isAdmin && circle.invite_code ? (
-      <PanelBlock
-        label="Invite"
-        trailing={
-          <button type="button" className={quietBtnCls} disabled={regenerate.isPending} onClick={() => regenerate.mutate(circleId)}>
-            {regenerate.isPending ? "Making a new code…" : "New code"}
-          </button>
-        }
-      >
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
-          <QrCode value={clusterInviteUrl(origin, circle.invite_code)} size={148} label={`QR code to join ${circle.name}`} />
-          <div className="flex min-w-0 flex-1 flex-col gap-2">
-            <p className="text-[0.875rem] leading-relaxed text-os-muted">Anyone with this link or code can join. Make a new code to stop the old one working.</p>
-            <CopyLink url={clusterInviteUrl(origin, circle.invite_code)} label="Cluster invite link" />
-            <p className="text-[0.8125rem] text-os-faint">
-              Code <span className="font-mono text-os-ink">{circle.invite_code}</span>
-            </p>
-          </div>
-        </div>
-      </PanelBlock>
-    ) : circle ? (
-      <PanelBlock label="Invite">
-        <p className="text-[0.875rem] text-os-muted">
-          {host ? `${host.display_name.split(/\s+/)[0]} hosts this cluster — ask them for the invite link.` : "Only the host can share this cluster’s invite link."}
-        </p>
-      </PanelBlock>
-    ) : null;
-
-  return (
-    <SidePanel label={circle?.name ?? "Cluster"} onClose={onClose}>
-      <div className="flex flex-1 flex-col gap-6">
-        <PanelHeader
-          onClose={onClose}
-          eyebrow={circle ? `Cluster · ${plural(circle.members.length, "person", "people")}${isAdmin ? " · you host" : ""}` : "Cluster"}
-          eyebrowColor={circle ? clusterCss(circle.hue) : undefined}
-          title={circle?.name ?? (isLoading ? "…" : "Cluster")}
-        />
-        {isLoading && !circle ? (
-          <p className="text-[0.9375rem] text-os-muted">Loading&hellip;</p>
-        ) : isError || !circle ? (
-          <p className="text-[0.9375rem] text-os-muted">This cluster isn&rsquo;t available right now.</p>
-        ) : (
-          <>
-            {circle.description ? <p className="text-[1rem] leading-relaxed text-os-muted">{circle.description}</p> : null}
-            <div className="flex flex-wrap gap-3">
-              <button type="button" className={ghostBtnCls} onClick={openChat} disabled={!circle.thread_id} data-autofocus={focusInvite ? undefined : true}>
-                Open the cluster chat
-              </button>
-            </div>
-            {focusInvite ? <div data-autofocus tabIndex={-1} className="outline-none">{invite}</div> : invite}
-            <PanelBlock label="Members">
-              <ul>
-                {circle.members.map((m, i) => {
-                  const canRemove = isAdmin && !m.is_me && !!m.handle;
-                  return (
-                    <li key={m.handle ?? `m-${i}`} className="flex min-h-[48px] items-center gap-3">
-                      <Initial name={m.is_me ? "You" : m.display_name} hue={m.avatar_hue} size={32} />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[0.9375rem] text-os-ink">{m.is_me ? "You" : m.display_name}</span>
-                        <span className="block truncate text-[0.75rem] text-os-faint">
-                          {m.handle ? `@${m.handle}` : "no handle yet"}
-                          {m.role === "admin" ? " · host" : ""}
-                        </span>
-                      </span>
-                      {canRemove ? (
-                        <button
-                          type="button"
-                          className={quietBtnCls}
-                          disabled={removing === m.handle}
-                          onClick={() => {
-                            setRemoving(m.handle);
-                            remove.mutate(
-                              { id: circleId, handle: m.handle as string },
-                              { onSuccess: () => emitToast(`Removed @${m.handle}.`, "success"), onSettled: () => setRemoving(null) },
-                            );
-                          }}
-                        >
-                          {removing === m.handle ? "Removing…" : "Remove"}
-                        </button>
-                      ) : null}
-                    </li>
-                  );
-                })}
-              </ul>
-            </PanelBlock>
-            <div className="mt-auto flex flex-col gap-2 pt-4">
-              {confirmLeave ? (
-                <div className="os-hairline-top flex flex-col gap-2 pt-4">
-                  <p className="text-[0.9375rem] text-os-ink">Leave {circle.name}?</p>
-                  <p className="text-[0.875rem] leading-relaxed text-os-muted">You&rsquo;ll lose its chat and shares. What should happen to anything your assistant already learned here?</p>
-                  <div className="flex flex-wrap gap-x-5 gap-y-1 pt-1">
-                    <button type="button" className={dangerBtnCls} disabled={leave.isPending} onClick={() => doLeave(false)}>
-                      {leave.isPending ? "Leaving…" : "Leave and delete what it learned"}
-                    </button>
-                    <button type="button" className={quietBtnCls} disabled={leave.isPending} onClick={() => doLeave(true)}>
-                      Leave, but keep it
-                    </button>
-                    <button type="button" className={quietBtnCls} disabled={leave.isPending} onClick={() => setConfirmLeave(false)}>
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button type="button" className={`${dangerBtnCls} self-start`} onClick={() => setConfirmLeave(true)}>
-                  Leave cluster
-                </button>
-              )}
-            </div>
-          </>
-        )}
-      </div>
-    </SidePanel>
   );
 }
 
@@ -333,13 +161,14 @@ export function CreateClusterPanel({ onClose, onCreated }: { onClose: () => void
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [hue, setHue] = useState(() => Math.floor(Math.random() * 360));
+  const [learning, setLearning] = useState(false);
   const [error, setError] = useState("");
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
     setError("");
     try {
-      const res = await create.mutateAsync({ name: name.trim(), description: description.trim() || undefined, hue });
+      const res = await create.mutateAsync({ name: name.trim(), description: description.trim() || undefined, hue, agent_absorb_enabled: learning });
       emitToast("Cluster started.", "success");
       onCreated(res.circle_id);
     } catch (err) {
@@ -350,13 +179,13 @@ export function CreateClusterPanel({ onClose, onCreated }: { onClose: () => void
     <SidePanel label="Start a cluster" onClose={onClose}>
       <form onSubmit={submit} className="flex flex-1 flex-col gap-6">
         <PanelHeader onClose={onClose} eyebrow="New cluster" title="Start a cluster" />
-        <p className="text-[0.9375rem] leading-relaxed text-os-muted">A group of neighbors who look out for each other. You&rsquo;ll get a link and a QR code to invite people.</p>
+        <p className="text-[0.9375rem] leading-relaxed text-os-muted">A group of neighbors who look out for each other. You&rsquo;ll get a link and a QR code to share yourself; people choose whether to join, and members can see one another and the conversation.</p>
         <label className="flex flex-col gap-1">
           <span className={labelCls}>Name</span>
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Building 3" maxLength={120} className={fieldCls} data-autofocus />
         </label>
         <label className="flex flex-col gap-1">
-          <span className={labelCls}>What it&rsquo;s for (optional)</span>
+          <span className={labelCls}>What brings you together (optional)</span>
           <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} maxLength={400} placeholder="Saturday market rota, borrowing tools, the school run…" className={`${fieldCls} resize-none py-2.5`} />
         </label>
         <div className="flex items-center gap-4">
@@ -366,6 +195,7 @@ export function CreateClusterPanel({ onClose, onCreated }: { onClose: () => void
             <input type="range" min={0} max={359} value={hue} onChange={(e) => setHue(Number(e.target.value))} className="w-full accent-[var(--os-accent)]" aria-label="Cluster colour" />
           </label>
         </div>
+        <AssistantLearning checked={learning} onChange={setLearning} />
         {error ? <ErrorLine>{error}</ErrorLine> : null}
         <div className="mt-auto flex items-center gap-4 pt-4">
           <button type="submit" className={ghostBtnCls} disabled={!name.trim() || create.isPending}>
