@@ -13,9 +13,14 @@
  * `?fixture=logged-out` renders public pages without fixture authentication.
  * `?fixture=big` gives /constellation a real-account-sized sky (263 lessons, 53 clusters).
  * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
+ * `?fixture=v1` is a tenant without Projects v2 (the older project panel).
+ * Projects (plans, steps, milestones) live in `dev-fixtures-projects.ts`; cluster
+ * conversations in `dev-fixtures-clusters.ts`. Their writes are in-memory too.
  * Journal/task writes are in-memory only and reset on a full reload.
  */
 
+import { clusterFixture, clusterInviteCode, clusterLeft, clusterRemoved, clusterThreadRows } from "./dev-fixtures-clusters";
+import { hasProjectFixture, projectFixture, projectFixtureTitle } from "./dev-fixtures-projects";
 import { splitJournalBlocks } from "./journal-blocks";
 import { localMonday } from "./horizons-tasks";
 import type { JournalTask } from "./types";
@@ -82,6 +87,7 @@ const tenant = {
   byo_models_enabled: false,
   neighborhood_enabled: true,
   friends_enabled: true,
+  projects_v2_enabled: true,
 };
 
 const me = {
@@ -287,11 +293,13 @@ function clusterList() {
             { circle_id: "c-1", name: "Sunday run club", hue: 150, my_role: "member", description: "", friends: ["aiko", "ren", "hana"], strangers: 3, admin: "aiko" },
             { circle_id: "c-2", name: "Book swap", hue: 30, my_role: "admin", description: "One in, one out, every other Thursday.", friends: ["mika", "dan"], strangers: 1, admin: "" },
           ];
-  return defs.map((d) => ({
-    ...d,
-    invite_code: d.my_role === "admin" ? `NBHD-${d.circle_id.slice(2).toUpperCase()}7` : null,
-    member_count: d.friends.length + d.strangers + 1,
-  }));
+  return defs
+    .filter((d) => !clusterLeft(d.circle_id))
+    .map((d) => ({
+      ...d,
+      invite_code: clusterInviteCode(d.circle_id, d.my_role === "admin" ? `NBHD-${d.circle_id.slice(2).toUpperCase()}7` : null),
+      member_count: d.friends.length + d.strangers + 1 - clusterRemoved(d.circle_id).size,
+    }));
 }
 function clusterDetail(id: string) {
   const c = clusterList().find((x) => x.circle_id === id);
@@ -301,9 +309,11 @@ function clusterDetail(id: string) {
     { handle: "yuki", display_name: "Yuki", avatar_hue: 260, role: c.my_role, is_me: true },
     ...c.friends.map((h) => ({ handle: h, display_name: byHandle.get(h)?.display_name ?? h, avatar_hue: byHandle.get(h)?.avatar_hue ?? 200, role: h === c.admin ? "admin" : "member", is_me: false })),
     ...STRANGERS.slice(0, c.strangers).map((n, i) => ({ handle: `${n.toLowerCase()}${i}`, display_name: n, avatar_hue: (i * 53) % 360, role: "member", is_me: false })),
-  ];
-  return { circle_id: c.circle_id, name: c.name, description: c.description, hue: c.hue, members, my_role: c.my_role, thread_id: `t-${c.circle_id}`, invite_code: c.invite_code };
+  ].filter((m) => !clusterRemoved(c.circle_id).has(m.handle));
+  return { circle_id: c.circle_id, name: c.name, description: c.description, hue: c.hue, members, my_role: c.my_role, thread_id: `t-${c.circle_id}`, invite_code: clusterInviteCode(c.circle_id, c.invite_code) };
 }
+
+const postedUpdates = new Map<string, { id: string; kind: string; text: string; created_at: string; author_name: string }[]>();
 
 function missionDetail(id: string) {
   const m = missionAsks.find((x) => x.mission_id === id);
@@ -329,9 +339,23 @@ function missionDetail(id: string) {
       { handle: "yuki", showed_up: m.mission_id === "m-pm" ? 0 : 3, window_days: days, streak: m.mission_id === "m-pm" ? 0 : 2, last_activity: null, next_step: m.mission_id === "m-pm" ? null : "Try the river loop", commitment: m.my_commitment, is_creator: m.my_role === "owner" },
       ...(other ? [{ handle: other.handle, showed_up: m.mission_id === "m-pm" ? 1 : 5, window_days: days, streak: 1, last_activity: null, next_step: m.mission_id === "m-pm" ? "Talk about an AI workflow" : null, commitment: "", is_creator: m.my_role !== "owner" }] : []),
     ],
-    updates: invited ? [] : m.mission_id === "m-pm" ? [] : [
-      { id: "u1", kind: "progress", text: "Did the long loop this morning, felt easy.", created_at: isoAt(-1, 7, 40), author_name: other?.display_name ?? "Neighbor" },
-      { id: "u2", kind: "note", text: "Rain tomorrow — shall we go at 7 instead?", created_at: isoAt(-3, 20, 10), author_name: "Yuki" },
+    updates: invited ? [] : [
+      ...(postedUpdates.get(m.mission_id) ?? []),
+      ...(m.mission_id === "m-pm"
+        ? [
+            { id: "u1", kind: "note", text: `${other?.display_name ?? "Kiho"} said yes to “Write down the workflow”`, created_at: isoAt(0, 8, 5), author_name: other?.display_name ?? "Kiho" },
+            { id: "u2", kind: "note", text: "Talk about an AI workflow", created_at: isoAt(-3, 10, 30), author_name: "Yuki" },
+            { id: "u3", kind: "note", text: "Created the project", created_at: isoAt(-3, 10, 12), author_name: "Yuki" },
+          ]
+        : m.mission_id === "m-garden"
+          ? [
+              { id: "u1", kind: "progress", text: "Timber is ordered — the yard delivers Thursday.", created_at: isoAt(-1, 17, 20), author_name: "Sam" },
+              { id: "u2", kind: "milestone", text: "Plan agreed. Four beds, two rows.", created_at: isoAt(-4, 9, 0), author_name: "Yuki" },
+            ]
+          : [
+              { id: "u1", kind: "progress", text: "Did the long loop this morning, felt easy.", created_at: isoAt(-1, 7, 40), author_name: other?.display_name ?? "Neighbor" },
+              { id: "u2", kind: "note", text: "Rain tomorrow — shall we go at 7 instead?", created_at: isoAt(-3, 20, 10), author_name: "Yuki" },
+            ]),
     ],
   };
 }
@@ -383,6 +407,7 @@ const missionAsks = [
   { mission_id: "m-2", title: "Ren's 10k training buddy", status: "active", target: { cadence: "weekly" }, target_date: null as string | null, version: 1, my_commitment: "", my_status: "invited", my_role: "member" },
   { mission_id: "m-3", title: "Morning walks", status: "active", target: { cadence: "daily" }, target_date: null as string | null, version: 1, my_commitment: "Walk 20 min", my_status: "active", my_role: "owner" },
   { mission_id: "m-pm", title: "nbhd project management", status: "active", target: { cadence: "daily" }, target_date: null as string | null, version: 1, my_commitment: "", my_status: "active", my_role: "owner" },
+  { mission_id: "m-garden", title: "Fix up the shared garden", status: "active", target: {}, target_date: null as string | null, version: 0, my_commitment: "", my_status: "active", my_role: "owner" },
 ];
 
 function json(body: Json): Json {
@@ -562,6 +587,23 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
   const url = new URL(path, "http://fixture.local");
   const p = url.pathname;
   const isEmpty = empty();
+  if (p.startsWith("/api/v1/friends/")) {
+    const body = bodyOf(init);
+    if (fixtureMode() !== "v1") {
+      const project = projectFixture(p, method, url, body);
+      if (project !== undefined) {
+        // A project made here shows up in the Neighborhood list too.
+        const made = (project as { mission_id?: string }).mission_id;
+        if (p === "/api/v1/friends/missions/" && made) missionAsks.push({ mission_id: made, title: String(body.title ?? "New project"), status: "active", target: {}, target_date: null, version: 0, my_commitment: "", my_status: "active", my_role: "owner" });
+        if (/\/project-drafts\/[^/]+\/publish\/$/.test(p) && made) missionAsks.push({ mission_id: made, title: projectFixtureTitle(made) ?? "New project", status: "active", target: {}, target_date: null, version: 0, my_commitment: "", my_status: "active", my_role: "owner" });
+        return json(project);
+      }
+    }
+    const cluster = clusterFixture(p, method, body, (threadId) =>
+      clusterDetail(threadId.slice(2))?.members.filter((m) => !m.is_me).map((m) => ({ handle: m.handle, display_name: m.display_name, avatar_hue: m.avatar_hue })),
+    );
+    if (cluster !== undefined) return json(cluster);
+  }
   if (p === "/api/v1/lessons/galaxy/") {
     return json({
       stars: isEmpty ? [] : galaxyStars,
@@ -584,6 +626,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
   if (p === "/api/v1/auth/me/") {
     // `?fixture=legacy` = a tenant without the web redesign (old shell).
     const legacy = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("fixture") === "legacy";
+    if (fixtureMode() === "v1") return json({ ...me, tenant: { ...tenant, projects_v2_enabled: false } });
     return json(legacy ? { ...me, tenant: { ...tenant, web_redesign: false } } : me);
   }
   if (p === "/api/v1/chat/messages/") {
@@ -905,7 +948,13 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     return json({ friendship_id: waveAct[1], status: waveAct[2] === "accept" ? "accepted" : "declined" });
   }
   if (p === "/api/v1/friends/missions/" && method === "GET") {
-    const rows = isEmpty ? [] : fixtureMode() === "two" ? missionAsks.filter((m) => m.mission_id === "m-pm") : missionAsks;
+    const v1 = fixtureMode() === "v1";
+    const planned = (id: string) => ["m-pm", "m-garden", "m-3"].includes(id) || /^m-(fx|cleanup)/.test(id);
+    const live = missionAsks
+      // The garden only exists as a plan; a planned project you left or deleted is gone.
+      .filter((m) => (v1 ? m.mission_id !== "m-garden" : !planned(m.mission_id) || hasProjectFixture(m.mission_id)))
+      .map((m) => (v1 ? m : { ...m, title: projectFixtureTitle(m.mission_id) ?? m.title }));
+    const rows = isEmpty ? [] : fixtureMode() === "two" ? live.filter((m) => m.mission_id === "m-pm" || /^m-(fx|cleanup)/.test(m.mission_id)) : live;
     return json(url.searchParams.get("include_invited") ? rows : rows.filter((m) => m.my_status === "active"));
   }
   const joinM = p.match(/^\/api\/v1\/friends\/missions\/([^/]+)\/join\/$/);
@@ -913,6 +962,26 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     const m = missionAsks.find((x) => x.mission_id === joinM[1]);
     if (m) m.my_status = "active";
     return json({ mission_id: joinM[1], status: "active" });
+  }
+  const missionWrite = p.match(/^\/api\/v1\/friends\/missions\/([^/]+)\/(updates|tasks|decline|leave)\/$/);
+  if (missionWrite && method === "POST") {
+    const [, id, action] = missionWrite;
+    const b = bodyOf(init);
+    if (action === "updates") {
+      const row = { id: `u-new-${Date.now()}`, kind: String(b.kind ?? "note"), text: String(b.text ?? ""), created_at: new Date().toISOString(), author_name: "Yuki" };
+      postedUpdates.set(id, [row, ...(postedUpdates.get(id) ?? [])]);
+      return json({ id: row.id, kind: row.kind });
+    }
+    if (action === "tasks") return json({ task_id: `task-${Date.now()}`, title: String(b.title ?? "") });
+    const at = missionAsks.findIndex((m) => m.mission_id === id);
+    if (at >= 0) missionAsks.splice(at, 1);
+    return json({ mission_id: id, status: action === "decline" ? "declined" : "left" });
+  }
+  if (p === "/api/v1/friends/missions/" && method === "POST") {
+    const b = bodyOf(init);
+    const id = `m-new-${missionAsks.length + 1}`;
+    missionAsks.push({ mission_id: id, title: String(b.title ?? "New project"), status: "active", target: (b.target as Record<string, string>) ?? {}, target_date: null, version: 1, my_commitment: "", my_status: "active", my_role: "owner" });
+    return json({ mission_id: id });
   }
   if (p === "/api/v1/friends/circles/" && method === "GET") {
     return json(isEmpty ? [] : clusterList().map(({ circle_id, name, hue, member_count, my_role, invite_code }) => ({ circle_id, name, hue, member_count, my_role, invite_code })));
@@ -940,7 +1009,7 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
   }
   if (p === "/api/v1/friends/threads/") {
     if (method === "POST") return json({ thread_id: `t-${String(bodyOf(init).friendship_id ?? "x")}`, friendship_id: bodyOf(init).friendship_id });
-    return json(isEmpty ? [] : threadList());
+    return json(isEmpty ? [] : [...threadList(), ...clusterThreadRows(clusterList())]);
   }
   if (/^\/api\/v1\/friends\/threads\/[^/]+\/messages\/$/.test(p)) {
     if (method === "POST") return json({ public_id: `m-${Date.now()}`, seq: 9, text: String(bodyOf(init).text ?? ""), mine: true, created_at: new Date().toISOString() });

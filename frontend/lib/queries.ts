@@ -229,6 +229,13 @@ import {
   leaveCircle,
   removeCircleMember,
   regenerateInviteCode,
+  declineMission,
+  fetchProjectPlan,
+  fetchProjectProposals,
+  fetchProjectDrafts,
+  fetchProjectDraft,
+  fetchActiveGoals,
+  reportFriendMessage,
 } from "@/lib/api";
 import { selectGreeting } from "@/lib/welcome-message";
 
@@ -2657,6 +2664,18 @@ export function useJoinMissionMutation() {
   });
 }
 
+/** Turn a project invitation down ("Not this time"). */
+export function useDeclineMissionMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => declineMission(id),
+    onSettled: (_data, _err, id) => {
+      void qc.invalidateQueries({ queryKey: ["missions"] });
+      void qc.invalidateQueries({ queryKey: ["mission", id] });
+    },
+  });
+}
+
 // Optimistically drops the mission from the list (mirrors useUnfriendMutation)
 // — leaving is immediate and the summary endpoint only ever returns active
 // memberships, so the row would disappear on the next fetch regardless.
@@ -2836,7 +2855,10 @@ export function useCreateCircleMutation() {
 export function useJoinCircleMutation() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (inviteCode: string) => joinCircle(inviteCode),
+    // A bare code keeps the server's default; the form passes the person's
+    // explicit choice about their assistant learning from the conversation.
+    mutationFn: (input: string | { code: string; assistantLearning: boolean }) =>
+      typeof input === "string" ? joinCircle(input) : joinCircle(input.code, input.assistantLearning),
     meta: { skipErrorToast: true },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["circles"] });
@@ -2937,4 +2959,76 @@ export function useReplaceDocumentBlockMutation() {
 
 export function useTaskGoalsQuery() {
   return useQuery({ queryKey: ["task-goals"], queryFn: fetchTaskGoals, enabled: isLoggedIn(), staleTime: 60_000 });
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// The shared plan behind the project page. Gated on the tenant's
+// `projects_v2_enabled` (the endpoints 404 otherwise). Not persisted to
+// localStorage: a plan is other people's live work, never replayed stale.
+
+export function useProjectsV2Enabled(): boolean {
+  const { data: tenant } = useTenantQuery();
+  return !!tenant?.neighborhood_enabled && !!tenant?.projects_v2_enabled;
+}
+
+export function useProjectPlanQuery(id: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({
+    queryKey: ["project-plan", id],
+    queryFn: () => fetchProjectPlan(id as string),
+    staleTime: 15_000,
+    retry: false,
+    enabled: isLoggedIn() && on && !!id,
+  });
+}
+
+/** Several plans at once, for the Neighborhood's project rows (same cache as the page). */
+export function useProjectPlansQueries(ids: string[]) {
+  const on = useProjectsV2Enabled();
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["project-plan", id],
+      queryFn: () => fetchProjectPlan(id),
+      staleTime: 15_000,
+      retry: false,
+      enabled: isLoggedIn() && on,
+    })),
+    combine: dataOnly,
+  });
+}
+
+/** My assistant's pending suggestions for one project. */
+export function useProjectProposalsQuery(missionId: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({
+    queryKey: ["project-proposals", missionId],
+    queryFn: () => fetchProjectProposals(missionId as string),
+    staleTime: 15_000,
+    retry: false,
+    enabled: isLoggedIn() && on && !!missionId,
+  });
+}
+
+/** Private starter plans my assistant drafted. */
+export function useProjectDraftsQuery() {
+  const on = useProjectsV2Enabled();
+  return useQuery({ queryKey: ["project-drafts"], queryFn: fetchProjectDrafts, staleTime: 30_000, retry: false, enabled: isLoggedIn() && on });
+}
+
+export function useProjectDraftQuery(draftId: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({ queryKey: ["project-draft", draftId], queryFn: () => fetchProjectDraft(draftId as string), retry: false, enabled: isLoggedIn() && on && !!draftId });
+}
+
+/** My active Horizons goals — loaded only while the "Part of my goal" picker is open. */
+export function useActiveGoalsQuery(enabled: boolean) {
+  return useQuery({ queryKey: ["active-goals"], queryFn: fetchActiveGoals, staleTime: 60_000, enabled: enabled && isLoggedIn() });
+}
+
+/** Report a message in a cluster conversation; the form shows a failure inline. */
+export function useReportMessageMutation() {
+  return useMutation({
+    mutationFn: ({ publicId, reason, detail }: { publicId: string; reason: string; detail: string }) => reportFriendMessage(publicId, reason, detail),
+    meta: { skipErrorToast: true },
+  });
 }

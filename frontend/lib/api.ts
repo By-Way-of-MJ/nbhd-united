@@ -2563,7 +2563,10 @@ export function fetchMissionAsks(): Promise<import("@/lib/types").MissionAsk[]> 
 
 /** POST /api/v1/friends/missions/ — create a 1:1 mission on an accepted friendship. */
 export function createMission(data: {
-  friendship_id: string;
+  // The legacy single neighbor, or (Projects v2) `member_friendship_ids` —
+  // any number of neighbors, an empty list for a solo project.
+  friendship_id?: string;
+  member_friendship_ids?: string[];
   title: string;
   description?: string;
   target?: import("@/lib/types").MissionTarget;
@@ -2631,6 +2634,13 @@ export function joinMission(
   });
 }
 
+/** POST /api/v1/friends/missions/<id>/decline/ — turn an invitation down. */
+export function declineMission(id: string): Promise<{ mission_id: string; status: string }> {
+  return apiFetch<{ mission_id: string; status: string }>(`/api/v1/friends/missions/${id}/decline/`, {
+    method: "POST",
+  });
+}
+
 export function leaveMission(id: string): Promise<{ mission_id: string; status: string }> {
   return apiFetch<{ mission_id: string; status: string }>(`/api/v1/friends/missions/${id}/leave/`, {
     method: "POST",
@@ -2693,6 +2703,9 @@ export function createCircle(data: {
   name: string;
   description?: string;
   hue?: number;
+  // Whether my assistant may learn from the conversation. The server's default
+  // is on, so the form always sends the person's explicit choice.
+  agent_absorb_enabled?: boolean;
 }): Promise<{ circle_id: string }> {
   return apiFetch<{ circle_id: string }>("/api/v1/friends/circles/", {
     method: "POST",
@@ -2702,10 +2715,10 @@ export function createCircle(data: {
 
 /** POST /api/v1/friends/circles/join/ {invite_code} — join via a code shared
  * by a neighbor already in the circle. */
-export function joinCircle(inviteCode: string): Promise<import("@/lib/types").CircleJoinResult> {
+export function joinCircle(inviteCode: string, agentAbsorbEnabled?: boolean): Promise<import("@/lib/types").CircleJoinResult> {
   return apiFetch<import("@/lib/types").CircleJoinResult>("/api/v1/friends/circles/join/", {
     method: "POST",
-    body: JSON.stringify({ invite_code: inviteCode }),
+    body: JSON.stringify(agentAbsorbEnabled === undefined ? { invite_code: inviteCode } : { invite_code: inviteCode, agent_absorb_enabled: agentAbsorbEnabled }),
   });
 }
 
@@ -2804,4 +2817,153 @@ export async function replaceDocumentBlock(kind: string, slug: string, data: Blo
 /** Goal labels for tasks, including goals outside the active Horizons list. */
 export function fetchTaskGoals(): Promise<Array<{ id: string; title: string }>> {
   return apiFetch("/api/v1/journal/goals/");
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// The shared plan and every write the project page makes to it. Every path is
+// under /api/v1/friends/ and 404s when the tenant isn't on the v2 allowlist.
+// The server is authoritative: each write is followed by a fresh plan read.
+
+const missionBase = (id: string) => `/api/v1/friends/missions/${id}/`;
+
+/** GET missions/<id>/plan/ — milestones, steps, who has what, what waits on what. */
+export function fetchProjectPlan(id: string): Promise<import("@/lib/types").ProjectPlanData> {
+  return apiFetch<import("@/lib/types").ProjectPlanData>(`${missionBase(id)}plan/`);
+}
+
+export interface StepBody {
+  title?: string;
+  description?: string;
+  start_date?: string | null;
+  due_date?: string | null;
+  milestone_id?: string | null;
+  order?: number;
+}
+
+export function createProjectStep(id: string, body: StepBody): Promise<{ step_id: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/`, { method: "POST", body: JSON.stringify(body) });
+}
+
+/** PATCH needs the step's current `version`; a stale one is a 409. */
+export function patchProjectStep(id: string, stepId: string, body: StepBody & { version: number }): Promise<{ step_id: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function deleteProjectStep(id: string, stepId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/`, { method: "DELETE" });
+}
+
+/** Ask members to take a step. Nothing reaches their journal until they say yes. */
+export function askProjectStep(id: string, stepId: string, membershipIds: string[]): Promise<{ step_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/ask/`, { method: "POST", body: JSON.stringify({ membership_ids: membershipIds }) });
+}
+
+export type StepAnswer =
+  | { answer: "yes" }
+  | { answer: "no" }
+  | { answer: "dates"; start?: string; due?: string }
+  | { answer: "smaller"; note: string };
+
+export function respondProjectStep(id: string, stepId: string, answer: StepAnswer): Promise<{ assignment_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/respond/`, { method: "POST", body: JSON.stringify(answer) });
+}
+
+export function setProjectStepDone(id: string, stepId: string, done: boolean): Promise<{ step_id: string; status: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/${done ? "complete" : "reopen"}/`, { method: "POST", body: "{}" });
+}
+
+export interface MilestoneBody {
+  title: string;
+  target_date: string | null;
+  order?: number;
+}
+
+export function createProjectMilestone(id: string, body: MilestoneBody): Promise<{ milestone_id: string }> {
+  return apiFetch(`${missionBase(id)}milestones/`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function patchProjectMilestone(id: string, milestoneId: string, body: MilestoneBody): Promise<{ milestone_id: string }> {
+  return apiFetch(`${missionBase(id)}milestones/${milestoneId}/`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+/** Its steps stay in the project, under "Other steps". */
+export function deleteProjectMilestone(id: string, milestoneId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}milestones/${milestoneId}/`, { method: "DELETE" });
+}
+
+export function createProjectDependency(id: string, blockerId: string, blockedId: string): Promise<{ dependency_id: string }> {
+  return apiFetch(`${missionBase(id)}dependencies/`, { method: "POST", body: JSON.stringify({ blocker_id: blockerId, blocked_id: blockedId }) });
+}
+
+export function deleteProjectDependency(id: string, dependencyId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}dependencies/${dependencyId}/`, { method: "DELETE" });
+}
+
+/** PATCH missions/<id>/ {title, version} — rename (owners; 409 if someone got there first). */
+export function renameProject(id: string, title: string, version: number): Promise<{ mission_id: string; version: number; title: string }> {
+  return apiFetch(missionBase(id), { method: "PATCH", body: JSON.stringify({ title, version }) });
+}
+
+/** Invite more of my neighbors into a project I started; each still decides. */
+export function addProjectMembers(id: string, friendshipIds: string[]): Promise<{ invited: number }> {
+  return apiFetch(`${missionBase(id)}members/`, { method: "POST", body: JSON.stringify({ member_friendship_ids: friendshipIds }) });
+}
+
+/** An owner deletes the project for everyone. */
+export function deleteProject(id: string): Promise<{ mission_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}delete/`, { method: "POST", body: "{}" });
+}
+
+/** Link this project to one of my own Horizons goals (null clears). Only I ever see it. */
+export function setProjectLinkedGoal(id: string, goalId: string | null): Promise<{ linked_goal_id: string | null }> {
+  return apiFetch(`${missionBase(id)}membership/`, { method: "PATCH", body: JSON.stringify({ linked_goal_id: goalId }) });
+}
+
+/** My active Horizons goals, for "Part of my goal". */
+export async function fetchActiveGoals(): Promise<{ id: string; title: string }[]> {
+  const body = await apiFetch<unknown>("/api/v1/journal/goals/?status=active");
+  const rows = Array.isArray(body) ? body : ((body as { results?: unknown[] } | null)?.results ?? []);
+  return rows
+    .map((r) => r as { id?: unknown; title?: unknown })
+    .filter((r) => r.id !== undefined && r.id !== null)
+    .map((r) => ({ id: String(r.id), title: typeof r.title === "string" && r.title ? r.title : "Goal" }));
+}
+
+/** My assistant's pending suggestions (optionally for one project). */
+export function fetchProjectProposals(missionId?: string): Promise<import("@/lib/types").ProjectProposal[]> {
+  const qs = missionId ? `?mission_id=${encodeURIComponent(missionId)}` : "";
+  return apiFetch<import("@/lib/types").ProjectProposal[]>(`/api/v1/friends/project-proposals/${qs}`);
+}
+
+/** The human decides. Approving applies what the normal rules allow and reports the rest. */
+export function decideProjectProposal(proposalId: string, approve: boolean): Promise<{ status?: string; changes?: { outcome?: string }[] }> {
+  return apiFetch(`/api/v1/friends/project-proposals/${proposalId}/${approve ? "approve" : "reject"}/`, { method: "POST", body: "{}" });
+}
+
+export function fetchProjectDrafts(): Promise<import("@/lib/types").ProjectDraftSummary[]> {
+  return apiFetch<import("@/lib/types").ProjectDraftSummary[]>("/api/v1/friends/project-drafts/");
+}
+
+export function fetchProjectDraft(draftId: string): Promise<import("@/lib/types").ProjectDraftDetail> {
+  return apiFetch<import("@/lib/types").ProjectDraftDetail>(`/api/v1/friends/project-drafts/${draftId}/`);
+}
+
+/** Start the drafted project: the people it suggests are then asked, and they decide. */
+export function publishProjectDraft(draftId: string): Promise<{ mission_id?: string }> {
+  return apiFetch(`/api/v1/friends/project-drafts/${draftId}/publish/`, { method: "POST", body: "{}" });
+}
+
+export function discardProjectDraft(draftId: string): Promise<void> {
+  return apiFetch(`/api/v1/friends/project-drafts/${draftId}/`, { method: "DELETE" });
+}
+
+/**
+ * POST /api/v1/friends/report/ — report a cluster message. The server hides it
+ * for the reporter straight away and records it for review.
+ */
+export function reportFriendMessage(publicId: string, reason: string, detail: string): Promise<{ report_id: string; hidden: boolean }> {
+  return apiFetch("/api/v1/friends/report/", {
+    method: "POST",
+    body: JSON.stringify({ target_kind: "friend_message", target_id: publicId, reason, detail }),
+  });
 }

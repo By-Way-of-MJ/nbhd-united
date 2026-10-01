@@ -81,6 +81,8 @@ export interface Tenant {
   byo_models_enabled: boolean;
   neighborhood_enabled: boolean;
   friends_enabled: boolean;
+  /** Projects v2 (plan · timeline · people) — per-tenant gate PROJECTS_V2_TENANT_IDS. Missing = off. */
+  projects_v2_enabled?: boolean;
 }
 
 // Core (mindfulness) pillar — generated guided meditations.
@@ -1267,6 +1269,9 @@ export interface ChatMessage {
   text: string;
   mine: boolean;
   created_at: string;
+  // Who wrote it — what a cluster conversation shows above each message.
+  // Optional: optimistic rows and older servers omit it.
+  author?: { handle: string | null; display_name: string; avatar_hue: number; photo_url?: string | null };
 }
 
 export interface ChatPage {
@@ -1288,6 +1293,8 @@ export interface MissionTarget {
   unit?: string;
   cadence?: "daily" | "weekly" | string;
   value?: number;
+  // How the project began (iPhone "Grow together"): asking, offering or learning.
+  aid_kind?: "ask" | "offer" | "learn" | string;
 }
 
 export interface MissionSummary {
@@ -1411,6 +1418,132 @@ export interface CircleLeaveResult {
   circle_id: string;
   status: string;
   purged: boolean;
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// GET /api/v1/friends/missions/<id>/plan/ — the shared plan as the server sends
+// it. Dates are calendar days (YYYY-MM-DD) or null. `lib/project-plan.ts` turns
+// this into the model the project page draws.
+export type PlanHealth = "on_track" | "at_risk" | "late";
+export type PlanStepStatus = "open" | "in_progress" | "done" | "skipped";
+export type PlanAssignmentStatus = "asked" | "accepted" | "declined" | "countered";
+
+export interface PlanMemberData {
+  id: string;
+  handle: string | null;
+  display_name: string;
+  hue: number;
+  role: "owner" | "member" | string;
+  status: "invited" | "active" | "left" | "declined" | string;
+  photo_url?: string | null;
+  // Only on the viewer's own membership.
+  muted?: boolean;
+  linked_goal_id?: string | null;
+  linked_goal_title?: string | null;
+}
+
+export interface PlanAssignmentData {
+  id: string;
+  step_id?: string;
+  membership_id: string;
+  status: PlanAssignmentStatus;
+  counter_start?: string | null;
+  counter_due?: string | null;
+  note?: string;
+}
+
+export interface PlanMilestoneData {
+  id: string;
+  title: string;
+  target_date: string | null;
+  order: number;
+  reached_at?: string | null;
+  done_count?: number;
+  total?: number;
+  projected_date?: string | null;
+}
+
+export interface PlanStepData {
+  id: string;
+  milestone_id: string | null;
+  title: string;
+  description?: string;
+  start_date: string | null;
+  due_date: string | null;
+  status: PlanStepStatus;
+  order: number;
+  version: number;
+  assignments?: PlanAssignmentData[];
+  owners?: { id: string }[];
+  blocked_by_open?: string[];
+  ready?: boolean;
+  slack_days?: number | null;
+  on_critical_path?: boolean;
+  moves_if_late?: string[];
+  projected_date?: string | null;
+}
+
+export interface PlanEdgeData {
+  id: string;
+  blocker_id: string;
+  blocked_id: string;
+}
+
+export interface ProjectPlanData {
+  mission_id: string;
+  title: string;
+  description?: string;
+  status?: string;
+  version?: number;
+  target_date?: string | null;
+  members: PlanMemberData[];
+  milestones: PlanMilestoneData[];
+  steps: PlanStepData[];
+  edges: PlanEdgeData[];
+  health?: PlanHealth;
+  done_count?: number;
+  total?: number;
+  my_membership_id: string;
+  my_role?: string;
+  can_invite?: boolean;
+}
+
+/** A suggestion the viewer's assistant made for a project. Nothing changes until they approve it. */
+export interface ProjectProposal {
+  proposal_id: string;
+  mission_id: string;
+  project_title: string;
+  summary: string;
+  changes: string[];
+  touches_others: boolean;
+  from_project_text: boolean;
+  created_at?: string;
+}
+
+/** A private starter plan the viewer's assistant drafted. */
+export interface ProjectDraftSummary {
+  draft_id: string;
+  title: string;
+  goal: string;
+  step_count: number;
+}
+
+export interface ProjectDraftDetail {
+  draft_id: string;
+  payload: {
+    title?: string;
+    goal?: string;
+    milestones?: { key: string; title?: string; target_date?: string | null }[];
+    steps?: {
+      key: string;
+      title?: string;
+      start_date?: string | null;
+      due_date?: string | null;
+      milestone_key?: string | null;
+      owner?: string | null;
+      depends_on?: string[];
+    }[];
+  };
 }
 
 // GET /api/v1/datebook/agenda/?days=N — owner read-only projection of the
