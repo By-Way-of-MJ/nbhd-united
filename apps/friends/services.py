@@ -1846,18 +1846,35 @@ def join_mission(tenant, user, mission_id, commitment="") -> dict:
 
 @transaction.atomic
 def leave_mission(tenant, mission_id) -> dict:
+    from . import project_notifications, project_services
+
     mission, membership = access.lock_project(tenant, mission_id)
     others = access.mission_memberships().filter(shared_goal=mission, status="active").exclude(id=membership.id)
+    heir = None
     if membership.role == "owner" and not others.filter(role="owner").exists():
         # The last owner leaving hands the project to whoever joined first.
         heir = others.order_by("joined_at", "id").first()
         if heir is not None:
             heir.role = "owner"
             heir.save(update_fields=["role"])
+    # Their open steps go back to "anyone" out loud instead of silently orphaning.
+    released = project_services._release(mission, membership)
+    for step in released:
+        _append_update(
+            mission,
+            tenant,
+            None,
+            "step_released",
+            payload={"step_id": str(step.id), "membership_id": str(membership.id)},
+        )
     membership.status = "left"
     membership.left_at = timezone.now()
     membership.save(update_fields=["status", "left_at"])
-    return {"mission_id": str(mission.id), "status": "left"}
+    _append_update(mission, tenant, None, "member_left", payload={"membership_id": str(membership.id)})
+    project_notifications.notify_member_left(
+        mission, tenant, released_count=len(released), heir_membership_id=heir.id if heir else None
+    )
+    return {"mission_id": str(mission.id), "status": "left", "released": len(released)}
 
 
 def add_mission_update(tenant, user, mission_id, kind, text) -> dict:

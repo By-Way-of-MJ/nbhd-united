@@ -13,9 +13,15 @@ uses the existing comma-list helper (empty denies all; exact `*` enables all).
 | POST | `missions/<id>/steps/` | Active member |
 | PATCH, DELETE | `missions/<id>/steps/<step_id>/` | Authorized step editor (below); PATCH requires integer `version` |
 | POST | `missions/<id>/steps/<step_id>/ask/` | Active member; `membership_ids` must identify active members or valid invitees of this project |
-| POST | `missions/<id>/steps/<step_id>/respond/` | Asked member; `answer`: yes, dates, smaller, no |
+| POST | `missions/<id>/steps/<step_id>/respond/` | Asked member; `answer`: yes, dates, smaller, no, other (`suggest_membership_id` optional) |
 | POST | `missions/<id>/steps/<step_id>/complete/` | Active, accepted step owner |
 | POST | `missions/<id>/steps/<step_id>/reopen/` | Active, accepted step owner |
+| POST | `missions/<id>/steps/<step_id>/second-look/` | Active member; `{"on": bool}` (rules below) |
+| POST | `missions/<id>/steps/<step_id>/confirm/` | Active member who did not do the step |
+| POST | `missions/<id>/steps/<step_id>/question/` | Active member; optional `note` (200) |
+| POST | `missions/<id>/steps/<step_id>/keep/` | Active, accepted step owner |
+| POST | `missions/<id>/step-back/` | Active member; `{"all": true}` or `{"steps": [{"step_id", "note"?}]}` |
+| POST | `missions/<id>/owners/` | Project owner; `membership_id`, `role`: owner or member |
 | POST | `missions/<id>/milestones/` | Active member |
 | PATCH, DELETE | `missions/<id>/milestones/<milestone_id>/` | Active milestone creator or project owner |
 | POST | `missions/<id>/dependencies/` | Active member; `blocker_id`, `blocked_id` from this project |
@@ -132,3 +138,49 @@ context supports the receiver. `check_friends_rls` includes them. All eight frie
 backstop tables are exempt from the boot-time `disable_rls` sweep through
 `RLS_KEEP_ENABLED`; the regression test checks the complete `FRIENDS_TABLES` set
 and verifies enforcement remains enabled after the sweep.
+
+## People come and go (2026-10)
+
+**Stepping back and leaving.** `step-back/` sets the caller's `asked`/`accepted`/
+`countered` assignments on open steps to `released` (stamping `released_at`; `note`
+becomes the optional hand-off line, 500 chars). `leave/` does the same for every
+open step before the membership turns `left`. Done and in-review steps are not
+touched, and the private journal Task is never changed. The plan lists each
+step's `released` entries (`membership_id`, `note`, `released_at`), newest first; a
+fresh ask to that member clears theirs. One push goes to the other active members
+("stepped back from …" / "left … — N steps are open again"); it never carries a
+note or a reason. When the last owner leaves, the earliest-joined active member
+still becomes owner and is told so. `owners/` lets an owner make another active
+member an owner, or step down themselves once another owner exists; nobody can
+demote someone else.
+
+**Not me — maybe them.** `respond` answer `other` declines and may carry
+`suggest_membership_id` (an active or invited member, not the caller). It is stored
+on the assignment and shown in the plan; nobody is asked by it.
+
+**Showing the work.** `complete/` accepts an optional `note` (500) and `link`
+(http/https, 500), returned on the step as `done_note` / `done_link` and cleared
+on reopen. They are members' text: they are not sent to assistants and never
+appear in a push.
+
+**The second look.** Any active member may switch `needs_review` on for a step
+that is still open or in progress (the project needs two active members). Only
+whoever switched it on, or a project owner, may switch it off. Completing such a
+step — from the app or by ticking the linked private Task — parks it in status
+`in_review`: not closed, so milestones and dependent steps wait. `confirm/` by an
+active member who neither completed the step nor holds an accepted assignment on
+it makes it `done` (`reviewed_at`, `reviewed_by_membership_id`) and only then
+emits the `step_done` update, unblock pushes and milestone checks. The owner may
+`reopen/` while it waits. It never confirms itself. Clients that predate
+`in_review` render the step as open.
+
+**Asking about a step.** `question/` on a done or in-review step records a
+`step_questioned` update and pushes the step's owners that someone asked (never
+the note). One per member, per step, per day. It never reopens the step.
+
+**Needs someone.** Each plan step carries `attention`: `needs_look` (in review),
+`open_again` (no owner, someone released it), `unowned_due` (no owner, due within
+two days or past), `overdue` (owned, three or more days past due, and no owner
+said "still mine" in the last seven days via `keep/`), or null. These are
+schedule facts. The hourly nudge task also sends each owner one "still yours?"
+push per due date once a step is three days past due, at 09:00 their time.

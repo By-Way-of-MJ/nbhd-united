@@ -22,6 +22,35 @@ from datetime import date, datetime, timedelta
 from uuid import UUID
 
 CLOSED = {"done", "skipped"}
+# "Needs someone": how long an owned step may sit past its date, how long an
+# owner's "still mine" quiets that, and how soon an ownerless step counts as due.
+QUIET_AFTER_DAYS = 3
+KEPT_QUIET_DAYS = 7
+UNOWNED_DUE_SOON_DAYS = 2
+
+
+def _attention(step, owners, assignments, today):
+    """Why the group should look at this step, or None. Schedule facts only —
+    never a judgement about a person."""
+    if step["status"] == "in_review":
+        return "needs_look"
+    if step["status"] in CLOSED:
+        return None
+    due = step.get("due_date")
+    if not owners:
+        if any(a["status"] == "released" for a in assignments):
+            return "open_again"
+        return "unowned_due" if due and (due - today).days <= UNOWNED_DUE_SOON_DAYS else None
+    if due and (today - due).days >= QUIET_AFTER_DAYS:
+        owner_ids = {o["id"] for o in owners}
+        kept = [
+            a["kept_at"].date()
+            for a in assignments
+            if a.get("kept_at") and a["status"] == "accepted" and a["membership_id"] in owner_ids
+        ]
+        if not any((today - day).days < KEPT_QUIET_DAYS for day in kept):
+            return "overdue"
+    return None
 
 
 def _json(value):
@@ -124,6 +153,17 @@ def build_plan(goal, *, today):
             and str(a["membership_id"]) in members
             and members[str(a["membership_id"])]["status"] == "active"
         ]
+        # Who let go of it (stepped back or left), newest first, with their hand-off line.
+        s["released"] = sorted(
+            (
+                {"membership_id": a["membership_id"], "note": a.get("note") or "", "released_at": a.get("released_at")}
+                for a in assignments
+                if a["status"] == "released" and str(a["membership_id"]) in members
+            ),
+            key=lambda r: str(r["released_at"] or ""),
+            reverse=True,
+        )
+        s["attention"] = _attention(s, s["owners"], assignments, today)
         s["blocked_by_open"] = sorted(p for p in parents[sid] if steps[p]["status"] not in CLOSED)
         s["ready"] = s["status"] not in CLOSED and not s["blocked_by_open"]
         s["slack_days"] = (

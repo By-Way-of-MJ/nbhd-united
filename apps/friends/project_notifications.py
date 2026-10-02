@@ -139,6 +139,7 @@ _ANSWER_TEXT = {
     "dates": "suggested other dates for “{title}”",
     "smaller": "offered to take part of “{title}”",
     "no": "can’t take “{title}” this time",
+    "other": "can’t take “{title}” — maybe someone else can",
 }
 
 
@@ -210,6 +211,132 @@ def notify_milestone_reached(goal, milestone_title: str, actor_tenant) -> None:
     _dispatch(fn)
 
 
+def _others(goal, actor_tenant):
+    return [m for m in _members(goal) if m.tenant_id != actor_tenant.id]
+
+
+def notify_stepped_back(goal, steps, actor_tenant) -> None:
+    """Everyone else learns steps are open again. Never why."""
+    titles = [s.title for s in steps]
+    step_id = steps[0].id if len(steps) == 1 else None
+
+    def fn():
+        who = _name(actor_tenant.id)
+        if len(titles) == 1:
+            body = f"{who} stepped back from “{_short(titles[0])}” — it’s open again"
+        else:
+            body = f"{who} stepped back from {len(titles)} steps in “{_short(goal.title, 40)}”"
+        _deliver(
+            _others(goal, actor_tenant),
+            ptype="step_released",
+            body=body,
+            mission_id=goal.id,
+            step_id=step_id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
+def notify_member_left(goal, actor_tenant, *, released_count: int, heir_membership_id=None) -> None:
+    """One gentle line to the people still in it; the new owner hears that too."""
+
+    def fn():
+        who, title = _name(actor_tenant.id), _short(goal.title, 40)
+        if released_count == 1:
+            tail = " — 1 step is open again"
+        elif released_count:
+            tail = f" — {released_count} steps are open again"
+        else:
+            tail = ""
+        for membership in _others(goal, actor_tenant):
+            extra = " You’re looking after it now." if membership.id == heir_membership_id else ""
+            _deliver(
+                [membership],
+                ptype="project_owner" if extra else "member_left",
+                body=f"{who} left “{title}”{tail}.{extra}",
+                mission_id=goal.id,
+                actor_tenant_id=actor_tenant.id,
+            )
+
+    _dispatch(fn)
+
+
+def notify_now_owner(goal, membership_id, actor_tenant) -> None:
+    def fn():
+        body = f"{_name(actor_tenant.id)} asked you to help look after “{_short(goal.title)}”"
+        _deliver(
+            _members(goal, ids=[membership_id]),
+            ptype="project_owner",
+            body=body,
+            mission_id=goal.id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
+def _step_owners(goal, step):
+    from . import access
+
+    ids = access.project_assignments(goal).filter(step=step, status="accepted").values_list("membership_id", flat=True)
+    return _members(goal, ids=list(ids))
+
+
+def notify_step_needs_look(goal, step, actor_tenant) -> None:
+    """A step that needs a second look was ticked off: ask the others to look."""
+    title = step.title
+
+    def fn():
+        owner_ids = {m.id for m in _step_owners(goal, step)}
+        body = f"{_name(actor_tenant.id)} finished “{_short(title)}” — can someone take a look?"
+        _deliver(
+            [m for m in _others(goal, actor_tenant) if m.id not in owner_ids],
+            ptype="step_needs_look",
+            body=body,
+            mission_id=goal.id,
+            step_id=step.id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
+def notify_step_confirmed(goal, step, actor_tenant) -> None:
+    title = step.title
+
+    def fn():
+        body = f"{_name(actor_tenant.id)} took a look — “{_short(title)}” is done"
+        _deliver(
+            _step_owners(goal, step),
+            ptype="step_confirmed",
+            body=body,
+            mission_id=goal.id,
+            step_id=step.id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
+def notify_step_question(goal, step, actor_tenant) -> None:
+    """Only that someone asked — never their note."""
+    title = step.title
+
+    def fn():
+        body = f"{_name(actor_tenant.id)} asked about “{_short(title)}”"
+        _deliver(
+            _step_owners(goal, step),
+            ptype="step_question",
+            body=body,
+            mission_id=goal.id,
+            step_id=step.id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
 # ── "Due tomorrow" (hourly cron) ─────────────────────────────────────────────
 
 NUDGE_LOCAL_HOUR = 9
@@ -245,5 +372,52 @@ def run_due_nudges(now=None) -> dict:
             body = f"“{_short(row.step.title)}” is due tomorrow"
             sent += _deliver(
                 [row.membership], ptype="step_due", body=body, mission_id=row.step.shared_goal_id, step_id=row.step_id
+            )
+    return {"claimed": claimed, "sent": sent}
+
+
+# ── "Still yours?" (same hourly cron) ────────────────────────────────────────
+
+QUIET_AFTER_DAYS = 3
+KEPT_QUIET_DAYS = 7
+
+
+def run_still_yours_nudges(now=None) -> dict:
+    """One soft "still yours?" per (owner, step, due date) once a step is three days
+    past due, at 09:00 in the owner's own time zone. The owner answers in the app:
+    keep it, move the date, or let it go. Never sent again for the same due date,
+    and never to anyone but the owner."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.common.tenant_tz import tenant_tz
+
+    from . import access
+    from .project_flags import projects_v2_enabled
+
+    now = now or timezone.now()
+    sent = claimed = 0
+    with access.backstop_service_context():
+        for row in access.due_nudge_candidates():
+            tenant = row.membership.tenant
+            if not projects_v2_enabled(tenant):
+                continue
+            local = now.astimezone(tenant_tz(tenant))
+            due = row.step.due_date
+            if local.hour != NUDGE_LOCAL_HOUR or (local.date() - due).days < QUIET_AFTER_DAYS:
+                continue
+            if row.kept_at and row.kept_at > now - timedelta(days=KEPT_QUIET_DAYS):
+                continue
+            if row.still_yours_nudged_for == due or not access.claim_still_yours_nudge(row.id, due):
+                continue
+            claimed += 1
+            body = f"Still yours? “{_short(row.step.title)}” — keep it, move the date, or let it go"
+            sent += _deliver(
+                [row.membership],
+                ptype="step_still_yours",
+                body=body,
+                mission_id=row.step.shared_goal_id,
+                step_id=row.step_id,
             )
     return {"claimed": claimed, "sent": sent}

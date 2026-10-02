@@ -64,6 +64,22 @@ class ProjectDeleteView(ProjectView):
         return Response({"mission_id": str(mission_id), "status": "abandoned"})
 
 
+class StepBackView(ProjectView):
+    """POST: let go of some or all of my open steps, staying in the project."""
+
+    def post(self, request, mission_id):
+        released = projects.step_back(self.get_tenant(request), request.user, mission_id, self.data(request))
+        return Response({"released": len(released)})
+
+
+class OwnersView(ProjectView):
+    """POST: an owner makes another member an owner too, or steps down."""
+
+    def post(self, request, mission_id):
+        target = projects.set_owner_role(self.get_tenant(request), request.user, mission_id, self.data(request))
+        return Response({"membership_id": str(target.id), "role": target.role})
+
+
 class LinkedProjectsView(ProjectView):
     """GET my projects linked to my own Horizons goals."""
 
@@ -81,7 +97,16 @@ class StepActionView(ProjectView):
         if action == "respond":
             assignment = projects.respond(tenant, request.user, mission_id, step_id, data)
             return Response({"assignment_id": str(assignment.id), "status": assignment.status})
-        step = projects.complete(tenant, request.user, mission_id, step_id, reopen=action == "reopen")
+        if action == "second-look":
+            step = projects.set_second_look(tenant, mission_id, step_id, data.get("on"))
+        elif action == "confirm":
+            step = projects.confirm(tenant, request.user, mission_id, step_id)
+        elif action == "question":
+            step = projects.question(tenant, request.user, mission_id, step_id, data)
+        elif action == "keep":
+            step = projects.keep_step(tenant, mission_id, step_id)
+        else:
+            step = projects.complete(tenant, request.user, mission_id, step_id, reopen=action == "reopen", data=data)
         return Response({"step_id": str(step.id), "status": step.status, "version": step.version})
 
 

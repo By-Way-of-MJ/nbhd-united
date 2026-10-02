@@ -1410,6 +1410,17 @@ def claim_due_nudge(assignment_id, due) -> bool:
     )
 
 
+def claim_still_yours_nudge(assignment_id, due) -> bool:
+    """Compare-and-set: True only for the one run that records this overdue date."""
+    from .models import SharedGoalStepAssignment
+
+    return bool(
+        SharedGoalStepAssignment.objects.filter(id=assignment_id)
+        .exclude(still_yours_nudged_for=due)
+        .update(still_yours_nudged_for=due)
+    )
+
+
 def my_linked_step_tasks(membership):
     """This member's own accepted step assignments that carry a private journal Task."""
     from .models import SharedGoalStepAssignment
@@ -1430,6 +1441,9 @@ def _own_goal_title(viewer, goal_id):
     from apps.journal.models import Goal
 
     return Goal.objects.filter(id=goal_id, tenant_id=_tenant_id(viewer)).values_list("title", flat=True).first()
+
+
+_STEP_TENANT_FIELDS = {"completed_by_id", "reviewed_by_id", "review_set_by_id"}
 
 
 def project_snapshot(goal, *, viewer):
@@ -1470,8 +1484,10 @@ def project_snapshot(goal, *, viewer):
         # membership id in this project.
         "steps": [
             {
-                **{k: v for k, v in row.items() if k != "completed_by_id"},
+                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS},
                 "completed_by_membership_id": membership_by_tenant.get(row["completed_by_id"]),
+                "reviewed_by_membership_id": membership_by_tenant.get(row["reviewed_by_id"]),
+                "review_set_by_membership_id": membership_by_tenant.get(row["review_set_by_id"]),
             }
             for row in project_steps(goal).values(
                 "id",
@@ -1483,13 +1499,29 @@ def project_snapshot(goal, *, viewer):
                 "status",
                 "completed_at",
                 "completed_by_id",
+                "done_note",
+                "done_link",
+                "needs_review",
+                "review_set_by_id",
+                "reviewed_at",
+                "reviewed_by_id",
                 "order",
                 "version",
             )
         ],
         "assignments": list(
             project_assignments(goal).values(
-                "id", "step_id", "membership_id", "status", "counter_start", "counter_due", "note", "responded_at"
+                "id",
+                "step_id",
+                "membership_id",
+                "status",
+                "counter_start",
+                "counter_due",
+                "note",
+                "responded_at",
+                "released_at",
+                "kept_at",
+                "suggested_membership_id",
             )
         ),
         "edges": list(project_dependencies(goal).order_by("id").values("id", "blocker_id", "blocked_id")),
