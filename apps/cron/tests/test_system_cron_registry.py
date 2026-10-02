@@ -316,7 +316,7 @@ class SystemCronsWellFormednessTests(TestCase):
         """
         by_name = {name: (cron_expr, path, retries) for name, cron_expr, path, retries in reg_cmd.iter_system_crons()}
         expected = {
-            "eval-journey-chat": ("*/30 * * * *", "/api/cron/trigger/eval_journey_chat/", 0),
+            "eval-journey-chat": ("30 4 * * *", "/api/cron/trigger/eval_journey_chat/", 0),
             "eval-journey-journal": ("5 5 * * *", "/api/cron/trigger/eval_journey_journal/", 0),
             "eval-journey-wake": ("12 5 * * *", "/api/cron/trigger/eval_journey_wake/", 0),
             "eval-journey-cron": ("20 5 * * *", "/api/cron/trigger/eval_journey_cron/", 0),
@@ -378,9 +378,9 @@ class SystemCronsWellFormednessTests(TestCase):
         for name, cron_expr, _path, _retries in reg_cmd.iter_system_crons():
             if not name.startswith(("eval-journey-", "reap-stuck-eval")):
                 continue
+            if name == "eval-journey-chat":
+                continue  # the chat probe itself
             minute_field = cron_expr.split()[0]
-            if minute_field.startswith("*"):
-                continue  # the chat probe itself (*/30)
             self.assertNotIn(
                 int(minute_field),
                 chat_minutes,

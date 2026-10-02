@@ -83,7 +83,7 @@ def eval_journey_chat_task() -> dict:
     from apps.evals.models import EvalRun
     from apps.evals.suites.journey_chat import run_chat_roundtrip_suite
 
-    # Fired by the eval-journey-chat QStash cron (PR-B6, */30) — a scheduled run.
+    # Fired by the eval-journey-chat QStash cron (daily 04:30 UTC) — a scheduled run.
     run = run_chat_roundtrip_suite(trigger=EvalRun.Trigger.SCHEDULED)
 
     # Shared contract: non-pass → alert owner + raise into the DLQ; pass → continue.
