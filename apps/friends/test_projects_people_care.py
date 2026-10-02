@@ -475,6 +475,34 @@ class ShowingTheWorkTests(_Base):
 
 
 @override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
+class MutingTests(_Base):
+    prefix = "mu"
+
+    def test_i_can_mute_a_project_and_then_get_no_pushes_from_it(self):
+        step = self.step()
+        self.give(step, self.b)
+        response = self.client_for(self.a).patch(self.url("membership/"), {"muted": True}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["muted"], True)
+        with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
+            projects.step_back(self.b, self.b.user, self.goal.id, {"all": True})
+        self.assertEqual(cap.to(self.a), [])
+        self.assertEqual(len(cap.to(self.c)), 1)
+        # Only I see my own switch.
+        mine_id = str(self.member(self.a).id)
+        mine = next(m for m in projects.get_plan(self.a, self.goal.id)["members"] if m["id"] == mine_id)
+        theirs = next(m for m in projects.get_plan(self.b, self.goal.id)["members"] if m["id"] == mine_id)
+        self.assertEqual(mine["muted"], True)
+        self.assertNotIn("muted", theirs)
+        # Unmuting brings them back.
+        self.client_for(self.a).patch(self.url("membership/"), {"muted": False}, format="json")
+        self.give(step, self.c)
+        with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
+            projects.step_back(self.c, self.c.user, self.goal.id, {"all": True})
+        self.assertEqual(len(cap.to(self.a)), 1)
+
+
+@override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
 class QuietStepTests(_Base):
     prefix = "qs"
 

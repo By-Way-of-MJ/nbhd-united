@@ -832,6 +832,16 @@ def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
 
 
 @transaction.atomic
+def set_muted(tenant, mission_id, muted):
+    """My own switch: no pushes from this project for me. Nobody else sees it."""
+    _goal, member = access.lock_project(tenant, mission_id)
+    if member.muted != muted:
+        member.muted = muted
+        member.save(update_fields=["muted"])
+    return member
+
+
+@transaction.atomic
 def set_linked_goal(tenant, mission_id, goal_id):
     """Link this project to ONE of my own Horizons goals (or clear it with None).
 

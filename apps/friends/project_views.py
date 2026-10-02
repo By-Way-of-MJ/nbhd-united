@@ -149,14 +149,24 @@ class DependencyView(ProjectView):
 
 
 class MembershipView(ProjectView):
-    """PATCH my own membership: ``linked_goal_id`` (my Horizons goal, or null)."""
+    """PATCH my own membership: ``linked_goal_id`` (my Horizons goal, or null) and/or
+    ``muted`` (no pushes from this project for me; nobody else sees it)."""
 
     def patch(self, request, mission_id):
         data = self.data(request)
-        if set(data) - {"linked_goal_id"} or "linked_goal_id" not in data:
-            raise ValidationError("Only linked_goal_id can be changed here.")
-        member = projects.set_linked_goal(self.get_tenant(request), mission_id, data.get("linked_goal_id"))
-        return Response({"linked_goal_id": str(member.linked_goal_id) if member.linked_goal_id else None})
+        if set(data) - {"linked_goal_id", "muted"} or not data:
+            raise ValidationError("Only linked_goal_id and muted can be changed here.")
+        tenant = self.get_tenant(request)
+        if "muted" in data and type(data["muted"]) is not bool:
+            raise ValidationError("muted must be true or false.")
+        member = None
+        if "linked_goal_id" in data:
+            member = projects.set_linked_goal(tenant, mission_id, data.get("linked_goal_id"))
+        if "muted" in data:
+            member = projects.set_muted(tenant, mission_id, data["muted"])
+        return Response(
+            {"linked_goal_id": str(member.linked_goal_id) if member.linked_goal_id else None, "muted": member.muted}
+        )
 
 
 # ── Assistant drafts + proposals: the HUMAN side (app JWT only) ────────────────

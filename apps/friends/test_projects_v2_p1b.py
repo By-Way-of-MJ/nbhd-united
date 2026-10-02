@@ -251,7 +251,10 @@ class MomentsGoalLinkAndPrivacyTests(TestCase):
             f"/api/v1/friends/missions/{self.goal.id}/membership/", {"linked_goal_id": str(theirs.id)}, format="json"
         )
         self.assertEqual(res.status_code, 404)
-        res = client.patch(f"/api/v1/friends/missions/{self.goal.id}/membership/", {"muted": True}, format="json")
+        # Only linked_goal_id and muted (a real boolean) can be changed here.
+        res = client.patch(f"/api/v1/friends/missions/{self.goal.id}/membership/", {"muted": "yes"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = client.patch(f"/api/v1/friends/missions/{self.goal.id}/membership/", {"role": "owner"}, format="json")
         self.assertEqual(res.status_code, 400)
 
     def test_plan_payload_never_carries_tenant_ids(self):
