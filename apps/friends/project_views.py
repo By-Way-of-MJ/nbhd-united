@@ -24,6 +24,14 @@ class ProjectView(FriendsView):
             raise ValidationError("An object is required.")
         return request.data
 
+    def handle_exception(self, exc):
+        """Project refusals are sentences written for the person ("You already asked
+        about this step today."). DRF renders a bare-string ValidationError as a JSON
+        list, which the apps don't show; send it as ``non_field_errors`` so they do."""
+        if isinstance(exc, ValidationError) and isinstance(exc.detail, list):
+            exc = ValidationError({"non_field_errors": exc.detail})
+        return super().handle_exception(exc)
+
 
 class PlanView(ProjectView):
     def get(self, request, mission_id):

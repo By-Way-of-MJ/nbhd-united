@@ -240,6 +240,13 @@ class ShowingTheWorkTests(_Base):
         seen = self.plan_step(self.a, step)
         self.assertEqual((seen["status"], seen["done_note"], seen["done_link"]), ("open", "", ""))
 
+    def test_a_refusal_reaches_the_app_as_a_sentence_it_will_show(self):
+        step = self.step()
+        self.give(step, self.b)
+        response = self.client_for(self.c).post(self.url(f"steps/{step.id}/question/"), {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"non_field_errors": ["You can ask about a step once it's ticked off."]})
+
     def test_a_link_must_be_a_web_link(self):
         step = self.step()
         self.give(step, self.b)
