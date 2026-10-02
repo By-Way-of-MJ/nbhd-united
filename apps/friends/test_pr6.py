@@ -401,7 +401,10 @@ class EnvelopeMissionsTest(TestCase):
         SharedGoalMembership.objects.filter(shared_goal=mission, tenant=a).update(commitment="10k steps")
 
         out = envelope.render_missions(a)
-        self.assertIn("July Steps", out)
+        # Never the title (any member can rename a mission; USER.md is trusted) —
+        # only my own commitment and the count.
+        self.assertNotIn("July Steps", out)
+        self.assertIn("a mission you started", out)
         self.assertIn("10k steps", out)
 
         services.leave_mission(a, str(mission.id))

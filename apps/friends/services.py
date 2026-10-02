@@ -44,7 +44,7 @@ from .models import (
     SharedLesson,
     compute_pair_key,
 )
-from .project_hygiene import clean_payload, clean_text
+from .project_hygiene import UNTRUSTED_RULE, clean_payload, clean_text, fence
 from .scrub import _content_hash
 
 # Handles people can never claim (impersonation / support-desk confusion).
@@ -1333,18 +1333,23 @@ def neighborhood_context(tenant, since=None) -> dict:
             title,
             circle_id=grant.circle_id,  # tag circle-sourced sparks (cross-leak guard + scoped purge)
         )
+        # A neighbor wrote this. The scrub took names out, not instructions: hand it
+        # to the assistant as fenced data (the stored AbsorbedItem label stays plain —
+        # it is shown to the human, never to the model).
+        author = _handle_for(shared_lesson.owner_tenant_id)
         sparks.append(
             {
                 "shared_lesson_id": str(shared_lesson.id),
-                "from_handle": _handle_for(shared_lesson.owner_tenant_id),
-                "title": title,
-                "text": shared_lesson.redacted_text,
+                "from_handle": author,
+                "title": fence(title, author),
+                "text": fence(shared_lesson.redacted_text, author),
             }
         )
         if latest is None or grant.created_at > latest:
             latest = grant.created_at
 
     return {
+        "rule": UNTRUSTED_RULE,
         "neighbors": _accepted_neighbor_handles(tenant),
         "sparks": sparks,
         "chat": _absorb_chat(tenant),
@@ -1358,14 +1363,19 @@ def _absorb_chat(tenant) -> list[dict]:
     the per-thread cursor advanced (idempotent), and a NEUTRAL AbsorbedItem
     logged per message (label = "Chat with @handle" — a pointer, never the
     message text). Skipped for threads where agent_absorb_enabled is off."""
-    from apps.pii.redactor import redact_user_message
+    from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message
 
     highlights: list[dict] = []
     for entry in access.absorb_pending_chat(tenant):
         circle_id = entry.get("circle_id")
         texts = []
         for message in entry["messages"]:
-            texts.append(redact_user_message(message.text, tenant))  # fresh redaction, ephemeral
+            # Fresh redaction that SAVES NOTHING: a neighbor's words must not add
+            # entries to MY hidden-names list (names I already hid keep their tag;
+            # anything else the detector flags becomes [REDACTED]). Then fenced:
+            # it is another person's text — data, never instructions.
+            redacted = redact_user_message(message.text, tenant, mint=MINT_REDACT_ONLY)
+            texts.append(fence(redacted, _handle_for(message.sender_tenant_id)))
             # from_tenant = the actual sender (works for 1:1 AND circle group chat);
             # label is a NEUTRAL pointer + circle tag, never message text.
             sender_handle = _handle_for(message.sender_tenant_id)
@@ -2028,5 +2038,25 @@ def runtime_missions(tenant) -> list[dict]:
         membership = access.mission_memberships().filter(shared_goal=mission, tenant=tenant, status="active").first()
         status = projection.build_mission_status(mission)
         status["my_commitment"] = membership.commitment if membership else ""
-        out.append(status)
+        out.append(_fence_mission_status(status, _handle_for(tenant.id), _handle_for(mission.created_by_id)))
     return out
+
+
+def _fence_mission_status(status: dict, my_handle, creator_handle) -> dict:
+    """Everything in a mission another member wrote — or can edit — reaches the
+    assistant as fenced data. Any member can rename a mission, so the title is
+    fenced even for its creator; only my own member row stays plain."""
+    status["title"] = fence(status.get("title", ""), creator_handle)
+    target = status.get("target")
+    if isinstance(target, dict):
+        status["target"] = {
+            key: fence(value, creator_handle) if isinstance(value, str) else value for key, value in target.items()
+        }
+    for member in status.get("members", []):
+        if my_handle and member.get("handle") == my_handle:
+            continue
+        for key in ("next_step", "commitment"):
+            if member.get(key):
+                member[key] = fence(member[key], member.get("handle"))
+    status["rule"] = UNTRUSTED_RULE
+    return status
