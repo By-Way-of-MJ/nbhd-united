@@ -84,7 +84,7 @@ def _validate_step(goal, fields, step=None):
     due = fields.get("due_date", getattr(step, "due_date", None))
     if start and due and start > due:
         raise ValidationError("Start must be on or before due date.")
-    if step and step.status in {"done", "skipped"} and "status" in fields:
+    if step and step.status in {"done", "skipped", "in_review"} and "status" in fields:
         raise ValidationError("Use reopen to change completion.")
 
 
@@ -323,6 +323,7 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
         assignment.asked_by = tenant
         assignment.asked_at = timezone.now()
         assignment.counter_start = assignment.counter_due = assignment.responded_at = None
+        assignment.released_at = assignment.suggested_membership = None
         assignment.note = ""
         assignment.save()
         newly_asked.append(member.id)
@@ -338,8 +339,8 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
 def respond(tenant, user, mission_id, step_id, data):
     goal, member = services._assert_mission_member(tenant, mission_id)
     answer = data.get("answer")
-    if answer not in {"yes", "dates", "smaller", "no"}:
-        raise ValidationError("answer must be yes, dates, smaller, or no.")
+    if answer not in {"yes", "dates", "smaller", "no", "other"}:
+        raise ValidationError("answer must be yes, dates, smaller, no, or other.")
     note = clean_text(data.get("note"), limit=200 if answer == "smaller" else 500)
     start, due = _date(data.get("start")), _date(data.get("due"))
     if start and due and start > due:
@@ -371,10 +372,28 @@ def respond(tenant, user, mission_id, step_id, data):
             if answer == "yes":
                 return assignment
             raise ValidationError("This step is already accepted.")
-        assignment.status = {"yes": "accepted", "no": "declined", "dates": "countered", "smaller": "countered"}[answer]
+        assignment.status = {
+            "yes": "accepted",
+            "no": "declined",
+            "other": "declined",
+            "dates": "countered",
+            "smaller": "countered",
+        }[answer]
         assignment.counter_start, assignment.counter_due = (start, due) if answer == "dates" else (None, None)
         assignment.note = note
         assignment.responded_at = timezone.now()
+        # "Not me — maybe them?" only points; the asker decides whether to ask them.
+        assignment.suggested_membership = None
+        if answer == "other" and data.get("suggest_membership_id"):
+            suggested = (
+                access.mission_memberships()
+                .filter(shared_goal=goal, status__in=["active", "invited"], id=_uuid(data["suggest_membership_id"]))
+                .exclude(id=member.id)
+                .first()
+            )
+            if suggested is None:
+                raise NotFound("No such project member.")
+            assignment.suggested_membership = suggested
         if answer == "yes" and not assignment.task_id:
             if prepared is None:
                 raise Conflict()
@@ -432,35 +451,107 @@ def _refresh_milestones(goal, tenant, user):
             milestone.save(update_fields=["reached_at"])
 
 
-def _finish(goal, step, tenant, user, *, reopen=False):
-    status = "open" if reopen else "done"
-    if step.status == status:
-        return
-    step.status = status
-    step.completed_at = None if reopen else timezone.now()
-    step.completed_by = None if reopen else tenant
-    step.version += 1
-    step.save(update_fields=["status", "completed_at", "completed_by", "version"])
-    if not reopen:
-        services._append_update(goal, tenant, user, "step_done", text=step.title, payload={"step_id": str(step.id)})
-        for edge in access.project_dependencies(goal).filter(blocker=step):
-            if (
-                not access.project_dependencies(goal)
-                .filter(blocked_id=edge.blocked_id)
-                .exclude(blocker__status__in=["done", "skipped"])
-                .exists()
-            ):
-                services._append_update(goal, tenant, user, "step_unblocked", payload={"step_id": str(edge.blocked_id)})
-                from .project_notifications import notify_step_unblocked
+_FINISH_FIELDS = [
+    "status",
+    "completed_at",
+    "completed_by",
+    "done_note",
+    "done_link",
+    "reviewed_at",
+    "reviewed_by",
+    "version",
+]
 
-                notify_step_unblocked(goal, edge.blocked_id, step.title, tenant)
+
+def _finish(goal, step, tenant, user, *, reopen=False, note="", link=""):
+    """Tick a step off (or reopen it). A step that needs a second look parks in
+    ``in_review`` — not done for milestones or the steps waiting on it — until a
+    member who doesn't own it confirms (:func:`confirm`)."""
+    if reopen:
+        if step.status == "open":
+            return
+        step.status, step.completed_at, step.completed_by = "open", None, None
+        step.done_note = step.done_link = ""
+        step.reviewed_at = step.reviewed_by = None
+        step.version += 1
+        step.save(update_fields=_FINISH_FIELDS)
+        _refresh_milestones(goal, tenant, user)
+        return
+    if step.status in {"done", "in_review"}:
+        return
+    step.completed_at, step.completed_by = timezone.now(), tenant
+    step.done_note, step.done_link = note, link
+    # Park only if someone is able to give the look; otherwise it would wait forever.
+    step.status = "in_review" if step.needs_review and _can_anyone_look(goal, step, tenant) else "done"
+    step.version += 1
+    step.save(update_fields=_FINISH_FIELDS)
+    if step.status == "in_review":
+        services._append_update(goal, tenant, user, "step_submitted", payload={"step_id": str(step.id)})
+        from .project_notifications import notify_step_needs_look
+
+        notify_step_needs_look(goal, step, tenant)
+        return
+    _announce_done(goal, step, tenant, user)
+
+
+def _can_anyone_look(goal, step, completer):
+    """An active member who neither ticked the step nor holds it can confirm —
+    and whose app can show it (someone outside the rollout can't look)."""
+    from .project_flags import projects_v2_enabled
+
+    holders = (
+        access.project_assignments(goal).filter(step=step, status="accepted").values_list("membership_id", flat=True)
+    )
+    others = (
+        access.mission_memberships()
+        .filter(shared_goal=goal, status="active")
+        .exclude(tenant=completer)
+        .exclude(id__in=list(holders))
+        .select_related("tenant")
+    )
+    return any(projects_v2_enabled(m.tenant) for m in others)
+
+
+def _announce_done(goal, step, tenant, user, *, credit=None):
+    """``credit``: who did the step when someone else (the confirmer) is the actor.
+    Only the ``step_done`` row is theirs; the actor stays the one skipped by pushes."""
+    services._append_update(
+        goal,
+        credit or tenant,
+        None if credit else user,
+        "step_done",
+        text=step.title,
+        payload={"step_id": str(step.id)},
+    )
+    for edge in access.project_dependencies(goal).filter(blocker=step):
+        if (
+            not access.project_dependencies(goal)
+            .filter(blocked_id=edge.blocked_id)
+            .exclude(blocker__status__in=["done", "skipped"])
+            .exists()
+        ):
+            services._append_update(goal, tenant, user, "step_unblocked", payload={"step_id": str(edge.blocked_id)})
+            from .project_notifications import notify_step_unblocked
+
+            notify_step_unblocked(goal, edge.blocked_id, step.title, tenant)
     _refresh_milestones(goal, tenant, user)
 
 
+def _done_proof(data):
+    """The optional note and link an owner adds when ticking a step off."""
+    data = data or {}
+    note = clean_text(data.get("note"), limit=500)
+    link = clean_text(data.get("link"), limit=500)
+    if link and not link.lower().startswith(("https://", "http://")):
+        raise ValidationError("A link must start with https:// or http://.")
+    return note, link
+
+
 @transaction.atomic
-def complete(tenant, user, mission_id, step_id, *, reopen=False):
+def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
     from apps.journal.models import Task
 
+    note, link = ("", "") if reopen else _done_proof(data)
     # Match journal writes' lock order: private Task first, project second.
     # Otherwise Task.save's synchronous receiver (Task -> project) can deadlock
     # against a project completion holding the project while waiting on Task.
@@ -468,6 +559,8 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False):
     step = _row(access.project_steps(goal), step_id)
     assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
     if assignment is None:
+        if reopen and member.role == "owner":
+            return _unpark(tenant, user, mission_id, step_id)
         raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
     linked_task_id = assignment.task_id
     task = Task.objects.select_for_update().filter(id=linked_task_id, tenant=tenant).first() if linked_task_id else None
@@ -478,7 +571,7 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False):
         raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
     if assignment.task_id != linked_task_id:
         raise Conflict()
-    _finish(goal, step, tenant, user, reopen=reopen)
+    _finish(goal, step, tenant, user, reopen=reopen, note=note, link=link)
     # Owner-only private mirror; never fetch another owner's task.
     if task and reopen and task.status == "done":
         task.status, task.completed_at = "open", None
@@ -486,6 +579,231 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False):
     elif task and not reopen and task.status != "done":
         task.complete()
     return step
+
+
+def _unpark(tenant, user, mission_id, step_id):
+    """A project owner reopens a step stuck waiting for a look after everyone who held
+    it has left. While an active member still holds it, reopening is theirs. Only
+    ``in_review`` — never finished work — and no private Task is touched."""
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    held = access.project_assignments(goal).filter(step=step, status="accepted")
+    if member.role != "owner" or step.status != "in_review" or held.filter(membership__status="active").exists():
+        raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
+    # The people who held it are gone: their rows become "had this", so the step
+    # shows as open again and its creator can edit it.
+    held.update(status="released", released_at=timezone.now(), note="")
+    _finish(goal, step, tenant, user, reopen=True)
+    return step
+
+
+# ── Showing the work: the second look ────────────────────────────────────────
+
+
+@transaction.atomic
+def set_second_look(tenant, mission_id, step_id, on):
+    """Any member can ask for a second look on a step that isn't ticked off yet.
+    Switching it off takes whoever switched it on, or a project owner — never the
+    doer alone (unless they asked for it themselves)."""
+    if type(on) is not bool:
+        raise ValidationError("on must be true or false.")
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if step.status not in {"open", "in_progress"}:
+        raise ValidationError("Change this before the step is ticked off.")
+    if step.needs_review == on:
+        return step
+    if on:
+        if access.mission_memberships().filter(shared_goal=goal, status="active").count() < 2:
+            raise ValidationError("A second look needs a second person in the project.")
+        step.needs_review, step.review_set_by = True, tenant
+    else:
+        holds = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").exists()
+        if step.review_set_by_id != tenant.id and (holds or member.role != "owner"):
+            raise PermissionDenied("Whoever asked for the second look, or a project owner, can switch it off.")
+        step.needs_review, step.review_set_by = False, None
+    step.version += 1
+    step.save(update_fields=["needs_review", "review_set_by", "version"])
+    return step
+
+
+@transaction.atomic
+def confirm(tenant, user, mission_id, step_id):
+    """The second look: a member who doesn't own the step says it's really done."""
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if step.status != "in_review":
+        raise ValidationError("This step isn't waiting for a look.")
+    if (
+        step.completed_by_id == tenant.id
+        or access.project_assignments(goal).filter(step=step, membership=member, status="accepted").exists()
+    ):
+        raise PermissionDenied("Someone who didn't do the step takes the second look.")
+    step.status, step.reviewed_at, step.reviewed_by = "done", timezone.now(), tenant
+    step.version += 1
+    step.save(update_fields=["status", "reviewed_at", "reviewed_by", "version"])
+    _announce_done(goal, step, tenant, user, credit=step.completed_by)
+    from .project_notifications import notify_step_confirmed
+
+    notify_step_confirmed(goal, step, tenant)
+    return step
+
+
+@transaction.atomic
+def question(tenant, user, mission_id, step_id, data):
+    """ "Is this really done?" — a nudge to the step's owners. It never reopens the
+    step; the owner decides. One per member, per step, per day."""
+    from datetime import timedelta
+
+    goal, _member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if step.status not in {"done", "in_review"}:
+        raise ValidationError("You can ask about a step once it's ticked off.")
+    note = clean_text((data or {}).get("note"), limit=200)
+    if (
+        access.mission_updates()
+        .filter(
+            shared_goal=goal,
+            tenant=tenant,
+            kind="step_questioned",
+            payload__step_id=str(step.id),
+            created_at__gte=timezone.now() - timedelta(days=1),
+        )
+        .exists()
+    ):
+        raise ValidationError("You already asked about this step today.")
+    services._append_update(goal, tenant, user, "step_questioned", text=note, payload={"step_id": str(step.id)})
+    from .project_notifications import notify_step_question
+
+    notify_step_question(goal, step, tenant)
+    return step
+
+
+# ── Stepping back, leaving, looking after the project ────────────────────────
+
+
+def _release(goal, member, *, picks=None):
+    """Let go of ``member``'s steps that are still open. ``picks`` maps step id →
+    hand-off note; None means every open step. A step they had ACCEPTED becomes
+    ``released``. An ask they never answered is closed as declined — they never held
+    it, so nothing "opens again". The private journal Task is left alone.
+    Returns ``(released_steps, declined_rows)``."""
+    rows = (
+        access.project_assignments(goal)
+        .filter(
+            membership=member,
+            status__in=["asked", "accepted", "countered"],
+            step__status__in=["open", "in_progress"],
+        )
+        .select_related("step")
+    )
+    if picks is not None:
+        rows = rows.filter(step_id__in=list(picks))
+    released, declined = [], []
+    for row in rows:
+        held = row.status == "accepted"
+        row.status = "released" if held else "declined"
+        row.released_at = timezone.now() if held else None
+        row.note = (picks or {}).get(row.step_id, "") if held else ""
+        row.counter_start = row.counter_due = row.suggested_membership = row.kept_at = None
+        if not held:
+            row.responded_at = timezone.now()
+        row.save()
+        if held:
+            released.append(row.step)
+        else:
+            declined.append(row)
+    return released, declined
+
+
+@transaction.atomic
+def step_back(tenant, user, mission_id, data):
+    """I stay in the project but let go of steps: ``{"all": true}`` or
+    ``{"steps": [{"step_id", "note"?}]}``. Each goes back to "anyone", with my
+    optional hand-off line. Nobody is told why."""
+    goal, member = access.lock_project(tenant, mission_id)
+    data = data or {}
+    picks = None
+    if data.get("all") is not True:
+        items = data.get("steps")
+        if not isinstance(items, list) or not items or len(items) > 60:
+            raise ValidationError("Choose the steps to let go of.")
+        picks = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValidationError("Choose the steps to let go of.")
+            picks[_uuid(item.get("step_id"))] = clean_text(item.get("note"), limit=500)
+    released, declined = _release(goal, member, picks=picks)
+    for step in released:
+        services._append_update(
+            goal, tenant, user, "step_released", payload={"step_id": str(step.id), "membership_id": str(member.id)}
+        )
+    from .project_notifications import notify_step_answer, notify_stepped_back
+
+    if released:
+        notify_stepped_back(goal, released, tenant)
+    # Letting go of a step I was only asked about is a plain "no" to whoever asked.
+    for row in declined:
+        services._append_update(
+            goal, tenant, user, "step_answered", payload={"step_id": str(row.step_id), "answer": "no"}
+        )
+        if row.asked_by_id and row.asked_by_id != tenant.id:
+            notify_step_answer(goal, row.step, "no", tenant, row.asked_by_id)
+    return released
+
+
+@transaction.atomic
+def keep_step(tenant, mission_id, step_id):
+    """ "Still yours?" → yes. Quiets the overdue flag for a week."""
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
+    if assignment is None:
+        raise PermissionDenied("Only the step's owner can say that.")
+    assignment.kept_at = timezone.now()
+    assignment.save(update_fields=["kept_at"])
+    return step
+
+
+@transaction.atomic
+def set_owner_role(tenant, user, mission_id, data):
+    """A project owner shares or passes on looking after the project: make another
+    active member an owner, or step down themselves once someone else is one."""
+    goal, member = access.lock_project(tenant, mission_id)
+    if member.role != "owner":
+        raise PermissionDenied("Only a project owner can change who looks after it.")
+    role = (data or {}).get("role")
+    if role not in {"owner", "member"}:
+        raise ValidationError("role must be owner or member.")
+    target = (
+        access.mission_memberships()
+        .filter(shared_goal=goal, status="active", id=_uuid((data or {}).get("membership_id")))
+        .first()
+    )
+    if target is None:
+        raise NotFound("No such project member.")
+    if target.role == role:
+        return target
+    if role == "member":
+        if target.id != member.id:
+            raise PermissionDenied("You can only step down yourself.")
+        if not (
+            access.mission_memberships()
+            .filter(shared_goal=goal, status="active", role="owner")
+            .exclude(id=member.id)
+            .exists()
+        ):
+            raise ValidationError("Make someone else an owner first.")
+    target.role = role
+    target.save(update_fields=["role"])
+    services._append_update(
+        goal, tenant, user, "owner_changed", payload={"membership_id": str(target.id), "role": role}
+    )
+    if role == "owner":
+        from .project_notifications import notify_now_owner
+
+        notify_now_owner(goal, target.id, tenant)
+    return target
 
 
 @transaction.atomic

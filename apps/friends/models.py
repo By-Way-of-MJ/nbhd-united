@@ -590,6 +590,11 @@ class SharedGoalUpdate(models.Model):
         STEP_ANSWERED = "step_answered", "Step answered"
         STEP_DONE = "step_done", "Step done"
         STEP_UNBLOCKED = "step_unblocked", "Step unblocked"
+        STEP_RELEASED = "step_released", "Step released"
+        STEP_SUBMITTED = "step_submitted", "Step waiting for a look"
+        STEP_QUESTIONED = "step_questioned", "Step questioned"
+        MEMBER_LEFT = "member_left", "Member left"
+        OWNER_CHANGED = "owner_changed", "Owner changed"
         MILESTONE_REACHED = "milestone_reached", "Milestone reached"
         TASK_ADDED = "task_added", "Task added"
         TASK_COMPLETED = "task_completed", "Task completed"
@@ -755,6 +760,8 @@ class SharedGoalStep(models.Model):
     class Status(models.TextChoices):
         OPEN = "open", "Open"
         IN_PROGRESS = "in_progress", "In progress"
+        # The owner says it's done; someone else still has to take a look.
+        IN_REVIEW = "in_review", "Waiting for a look"
         DONE = "done", "Done"
         SKIPPED = "skipped", "Skipped"
 
@@ -770,6 +777,17 @@ class SharedGoalStep(models.Model):
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN)
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    # Showing the work: what the owner wrote when ticking it off (cleared on reopen).
+    # db_default: migrations run when the new container boots while the old one still
+    # serves and inserts steps without knowing these columns.
+    done_note = models.CharField(max_length=500, blank=True, db_default="")
+    done_link = models.CharField(max_length=500, blank=True, db_default="")
+    # "Needs a second look": any member can switch it on before the step is done. Then
+    # ticking parks the step in ``in_review`` until a member who doesn't own it confirms.
+    needs_review = models.BooleanField(default=False, db_default=False)
+    review_set_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     order = models.IntegerField(default=0)
     version = models.PositiveIntegerField(default=0)
     created_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
@@ -785,6 +803,9 @@ class SharedGoalStepAssignment(models.Model):
         ACCEPTED = "accepted", "Accepted"
         DECLINED = "declined", "Declined"
         COUNTERED = "countered", "Countered"
+        # The member had (or was asked to take) this step and let it go — stepping
+        # back or leaving. ``note`` then holds their optional hand-off line.
+        RELEASED = "released", "Released"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     step = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="assignments")
@@ -801,6 +822,16 @@ class SharedGoalStepAssignment(models.Model):
     due_nudged_for = models.DateField(null=True, blank=True)
     # When this member was last asked (orders the Neighborhood decision moments).
     asked_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    # "Not me — maybe them?": a declining member may point at another member. Nobody
+    # is asked by this; the asker decides whether to ask them.
+    suggested_membership = models.ForeignKey(
+        SharedGoalMembership, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # "Still yours?" on an overdue step: the owner said yes (quiets the flag for a
+    # while), and the overdue date they were last asked about (one push per due date).
+    kept_at = models.DateTimeField(null=True, blank=True)
+    still_yours_nudged_for = models.DateField(null=True, blank=True)
 
     class Meta:
         db_table = "shared_goal_step_assignments"

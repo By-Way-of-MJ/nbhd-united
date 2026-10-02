@@ -142,6 +142,8 @@ urlpatterns += [
     path("missions/<uuid:mission_id>/membership/", project_views.MembershipView.as_view()),
     path("missions/<uuid:mission_id>/members/", project_views.MembersView.as_view()),
     path("missions/<uuid:mission_id>/delete/", project_views.ProjectDeleteView.as_view()),
+    path("missions/<uuid:mission_id>/step-back/", project_views.StepBackView.as_view()),
+    path("missions/<uuid:mission_id>/owners/", project_views.OwnersView.as_view()),
     path("projects/linked/", project_views.LinkedProjectsView.as_view()),
     path("missions/<uuid:mission_id>/steps/", project_views.StepsView.as_view()),
     path("missions/<uuid:mission_id>/steps/<uuid:step_id>/", project_views.StepView.as_view()),
@@ -164,7 +166,7 @@ for action in ("approve", "reject"):
             {"action": action},
         )
     )
-for action in ("ask", "respond", "complete", "reopen"):
+for action in ("ask", "respond", "complete", "reopen", "second-look", "confirm", "question", "keep"):
     urlpatterns.append(
         path(
             f"missions/<uuid:mission_id>/steps/<uuid:step_id>/{action}/",
