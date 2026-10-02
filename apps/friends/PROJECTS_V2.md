@@ -195,3 +195,7 @@ push per due date once a step is 3–14 days past due, at 09:00 their time: at m
 one per person per morning, and not within three days of them taking the step.
 New push kinds carry `kind`; their `type` is one every released build routes to
 the project (`step_answer` with a step, else `milestone_reached`).
+
+**Mute.** `PATCH missions/<id>/membership/` also accepts `muted` (boolean): the
+caller gets no pushes from this project. Only the caller's own plan membership
+carries it.
