@@ -1410,6 +1410,22 @@ def claim_due_nudge(assignment_id, due) -> bool:
     )
 
 
+def still_yours_candidates(now):
+    """Owners of open steps 2–16 days past due who haven't been asked "still yours?"
+    for that due date (the sweep narrows to 3–14 days in each owner's local time)."""
+    from datetime import timedelta
+
+    from django.db.models import F
+
+    today = now.date()
+    return (
+        due_nudge_candidates()
+        .filter(step__due_date__lte=today - timedelta(days=2), step__due_date__gte=today - timedelta(days=16))
+        .exclude(still_yours_nudged_for=F("step__due_date"))
+        .order_by("step__due_date", "id")
+    )
+
+
 def claim_still_yours_nudge(assignment_id, due) -> bool:
     """Compare-and-set: True only for the one run that records this overdue date."""
     from .models import SharedGoalStepAssignment

@@ -84,7 +84,7 @@ def _validate_step(goal, fields, step=None):
     due = fields.get("due_date", getattr(step, "due_date", None))
     if start and due and start > due:
         raise ValidationError("Start must be on or before due date.")
-    if step and step.status in {"done", "skipped"} and "status" in fields:
+    if step and step.status in {"done", "skipped", "in_review"} and "status" in fields:
         raise ValidationError("Use reopen to change completion.")
 
 
@@ -481,7 +481,8 @@ def _finish(goal, step, tenant, user, *, reopen=False, note="", link=""):
         return
     step.completed_at, step.completed_by = timezone.now(), tenant
     step.done_note, step.done_link = note, link
-    step.status = "in_review" if step.needs_review else "done"
+    # Park only if someone is able to give the look; otherwise it would wait forever.
+    step.status = "in_review" if step.needs_review and _can_anyone_look(goal, step, tenant) else "done"
     step.version += 1
     step.save(update_fields=_FINISH_FIELDS)
     if step.status == "in_review":
@@ -491,6 +492,20 @@ def _finish(goal, step, tenant, user, *, reopen=False, note="", link=""):
         notify_step_needs_look(goal, step, tenant)
         return
     _announce_done(goal, step, tenant, user)
+
+
+def _can_anyone_look(goal, step, completer):
+    """An active member who neither ticked the step nor holds it can confirm."""
+    holders = (
+        access.project_assignments(goal).filter(step=step, status="accepted").values_list("membership_id", flat=True)
+    )
+    return (
+        access.mission_memberships()
+        .filter(shared_goal=goal, status="active")
+        .exclude(tenant=completer)
+        .exclude(id__in=list(holders))
+        .exists()
+    )
 
 
 def _announce_done(goal, step, tenant, user):
@@ -531,6 +546,8 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
     step = _row(access.project_steps(goal), step_id)
     assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
     if assignment is None:
+        if reopen and member.role == "owner":
+            return _unpark(tenant, user, mission_id, step_id)
         raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
     linked_task_id = assignment.task_id
     task = Task.objects.select_for_update().filter(id=linked_task_id, tenant=tenant).first() if linked_task_id else None
@@ -548,6 +565,18 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
         task.save(update_fields=["status", "completed_at", "updated_at"])
     elif task and not reopen and task.status != "done":
         task.complete()
+    return step
+
+
+def _unpark(tenant, user, mission_id, step_id):
+    """A project owner reopens a step that is stuck waiting for a look (its doer left,
+    or nobody can confirm). Only ``in_review`` — never someone's finished work — and
+    no private Task is touched."""
+    goal, member = access.lock_project(tenant, mission_id)
+    step = _row(access.project_steps(goal), step_id)
+    if member.role != "owner" or step.status != "in_review":
+        raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
+    _finish(goal, step, tenant, user, reopen=True)
     return step
 
 
@@ -572,7 +601,8 @@ def set_second_look(tenant, mission_id, step_id, on):
             raise ValidationError("A second look needs a second person in the project.")
         step.needs_review, step.review_set_by = True, tenant
     else:
-        if step.review_set_by_id != tenant.id and member.role != "owner":
+        holds = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").exists()
+        if step.review_set_by_id != tenant.id and (holds or member.role != "owner"):
             raise PermissionDenied("Whoever asked for the second look, or a project owner, can switch it off.")
         step.needs_review, step.review_set_by = False, None
     step.version += 1
@@ -595,7 +625,8 @@ def confirm(tenant, user, mission_id, step_id):
     step.status, step.reviewed_at, step.reviewed_by = "done", timezone.now(), tenant
     step.version += 1
     step.save(update_fields=["status", "reviewed_at", "reviewed_by", "version"])
-    _announce_done(goal, step, tenant, user)
+    doer = step.completed_by
+    _announce_done(goal, step, doer or tenant, None if doer else user)
     from .project_notifications import notify_step_confirmed
 
     notify_step_confirmed(goal, step, tenant)
@@ -636,9 +667,11 @@ def question(tenant, user, mission_id, step_id, data):
 
 
 def _release(goal, member, *, picks=None):
-    """Let go of ``member``'s asked/accepted/countered assignments on steps that are
-    still open. ``picks`` maps step id → hand-off note; None means every open step.
-    The private journal Task is left alone. Returns the released steps."""
+    """Let go of ``member``'s steps that are still open. ``picks`` maps step id →
+    hand-off note; None means every open step. A step they had ACCEPTED becomes
+    ``released`` (and is returned, to be announced). An ask they never answered is
+    simply closed as declined — they never held it, so nothing "opens again".
+    The private journal Task is left alone."""
     rows = (
         access.project_assignments(goal)
         .filter(
@@ -652,11 +685,14 @@ def _release(goal, member, *, picks=None):
         rows = rows.filter(step_id__in=list(picks))
     released = []
     for row in rows:
-        row.status, row.released_at = "released", timezone.now()
-        row.note = (picks or {}).get(row.step_id, "")
+        held = row.status == "accepted"
+        row.status = "released" if held else "declined"
+        row.released_at = timezone.now() if held else None
+        row.note = (picks or {}).get(row.step_id, "") if held else ""
         row.counter_start = row.counter_due = row.suggested_membership = row.kept_at = None
         row.save()
-        released.append(row.step)
+        if held:
+            released.append(row.step)
     return released
 
 

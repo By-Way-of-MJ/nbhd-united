@@ -97,7 +97,11 @@ def _dispatch(fn) -> None:
 def _members(goal, *, ids=None, statuses=("active",)):
     from . import access
 
-    qs = access.mission_memberships().filter(shared_goal=goal, status__in=list(statuses)).select_related("user")
+    qs = (
+        access.mission_memberships()
+        .filter(shared_goal=goal, status__in=list(statuses))
+        .select_related("user", "tenant")
+    )
     if ids is not None:
         qs = qs.filter(id__in=list(ids))
     return list(qs)
@@ -220,7 +224,11 @@ def notify_milestone_reached(goal, milestone_title: str, actor_tenant) -> None:
 
 
 def _others(goal, actor_tenant):
-    return [m for m in _members(goal) if m.tenant_id != actor_tenant.id]
+    """The other active members whose app can show these newer kinds. A legacy
+    mission's members outside the Projects rollout hear nothing (a tap would dead-end)."""
+    from .project_flags import projects_v2_enabled
+
+    return [m for m in _members(goal) if m.tenant_id != actor_tenant.id and projects_v2_enabled(m.tenant)]
 
 
 def notify_stepped_back(goal, steps, actor_tenant) -> None:
@@ -334,7 +342,7 @@ def notify_step_question(goal, step, actor_tenant) -> None:
     def fn():
         body = f"{_name(actor_tenant.id)} asked about “{_short(title)}”"
         _deliver(
-            _step_owners(goal, step),
+            _step_owners(goal, step) or [m for m in _members(goal) if m.role == "owner"],
             ptype="step_question",
             body=body,
             mission_id=goal.id,
@@ -388,13 +396,16 @@ def run_due_nudges(now=None) -> dict:
 
 QUIET_AFTER_DAYS = 3
 KEPT_QUIET_DAYS = 7
+# Don't dig up ancient steps (or ones backfilled from old missions) on the first run.
+QUIET_UNTIL_DAYS = 14
 
 
 def run_still_yours_nudges(now=None) -> dict:
     """One soft "still yours?" per (owner, step, due date) once a step is three days
     past due, at 09:00 in the owner's own time zone. The owner answers in the app:
     keep it, move the date, or let it go. Never sent again for the same due date,
-    and never to anyone but the owner."""
+    and never to anyone but the owner. At most one per person per morning, only for
+    steps 3–14 days late, and not within three days of them taking the step."""
     from datetime import timedelta
 
     from django.utils import timezone
@@ -406,20 +417,25 @@ def run_still_yours_nudges(now=None) -> dict:
 
     now = now or timezone.now()
     sent = claimed = 0
+    asked_today = set()
     with access.backstop_service_context():
-        for row in access.due_nudge_candidates():
+        for row in access.still_yours_candidates(now):
             tenant = row.membership.tenant
-            if not projects_v2_enabled(tenant):
+            if tenant.id in asked_today or not projects_v2_enabled(tenant):
                 continue
             local = now.astimezone(tenant_tz(tenant))
             due = row.step.due_date
-            if local.hour != NUDGE_LOCAL_HOUR or (local.date() - due).days < QUIET_AFTER_DAYS:
+            late = (local.date() - due).days
+            if local.hour != NUDGE_LOCAL_HOUR or not QUIET_AFTER_DAYS <= late <= QUIET_UNTIL_DAYS:
                 continue
             if row.kept_at and row.kept_at > now - timedelta(days=KEPT_QUIET_DAYS):
+                continue
+            if row.responded_at and row.responded_at > now - timedelta(days=QUIET_AFTER_DAYS):
                 continue
             if row.still_yours_nudged_for == due or not access.claim_still_yours_nudge(row.id, due):
                 continue
             claimed += 1
+            asked_today.add(tenant.id)
             body = f"Still yours? “{_short(row.step.title)}” — keep it, move the date, or let it go"
             sent += _deliver(
                 [row.membership],

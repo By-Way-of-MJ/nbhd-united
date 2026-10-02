@@ -192,7 +192,8 @@ def render_projects(tenant: Tenant) -> str:
                 creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
                 name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
             mine = [s for s in plan["steps"] if any(o["id"] == str(membership.id) for o in s.get("owners", []))]
-            open_mine = [s for s in mine if s["status"] not in ("done", "skipped")]
+            # in_review = I've ticked it off; it only waits for someone else's look.
+            open_mine = [s for s in mine if s["status"] not in ("done", "skipped", "in_review")]
             asks = sum(
                 1
                 for s in plan["steps"]

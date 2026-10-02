@@ -778,11 +778,13 @@ class SharedGoalStep(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     # Showing the work: what the owner wrote when ticking it off (cleared on reopen).
-    done_note = models.CharField(max_length=500, blank=True)
-    done_link = models.CharField(max_length=500, blank=True)
+    # db_default: migrations run when the new container boots while the old one still
+    # serves and inserts steps without knowing these columns.
+    done_note = models.CharField(max_length=500, blank=True, db_default="")
+    done_link = models.CharField(max_length=500, blank=True, db_default="")
     # "Needs a second look": any member can switch it on before the step is done. Then
     # ticking parks the step in ``in_review`` until a member who doesn't own it confirms.
-    needs_review = models.BooleanField(default=False)
+    needs_review = models.BooleanField(default=False, db_default=False)
     review_set_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     reviewed_at = models.DateTimeField(null=True, blank=True)
     reviewed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")

@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -123,6 +124,38 @@ class SteppingBackTests(_Base):
         self.assertEqual(len(self.plan_step(self.a, other)["owners"]), 1)
         self.assertEqual(self.plan_step(self.a, other)["released"], [])
 
+    def test_an_ask_i_never_answered_is_closed_quietly_not_announced_as_stepping_back(self):
+        step = self.step()
+        projects.ask(self.a, self.a.user, self.goal.id, step.id, [str(self.member(self.b).id)])
+        with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
+            released = projects.step_back(self.b, self.b.user, self.goal.id, {"all": True})
+        self.assertEqual(released, [])
+        self.assertEqual(cap.calls, [])
+        seen = self.plan_step(self.a, step)
+        self.assertEqual((seen["released"], seen["attention"]), ([], None))
+        self.assertEqual(
+            SharedGoalStepAssignment.objects.get(step=step, membership=self.member(self.b)).status, "declined"
+        )
+
+    def test_only_people_in_the_project_can_use_the_new_actions(self):
+        step = self.step()
+        self.give(step, self.b)
+        outsider = _tenant("sb_out")
+        _profile(outsider, "olga")
+        services.leave_mission(self.c, self.goal.id)
+        for caller in (outsider, self.c):
+            client = self.client_for(caller)
+            for tail, body in [
+                ("step-back/", {"all": True}),
+                ("owners/", {"membership_id": str(self.member(self.b).id), "role": "owner"}),
+                (f"steps/{step.id}/second-look/", {"on": True}),
+                (f"steps/{step.id}/confirm/", {}),
+                (f"steps/{step.id}/question/", {}),
+                (f"steps/{step.id}/keep/", {}),
+            ]:
+                with self.subTest(caller=caller.id, tail=tail):
+                    self.assertEqual(client.post(self.url(tail), body, format="json").status_code, 404)
+
     def test_step_back_needs_a_choice(self):
         with self.assertRaises(ValidationError):
             projects.step_back(self.b, self.b.user, self.goal.id, {})
@@ -151,13 +184,25 @@ class LeavingTests(_Base):
     def test_the_new_owner_is_told_when_the_last_owner_leaves(self):
         with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
             services.leave_mission(self.a, self.goal.id)
-        self.assertEqual(self.member(self.b).role, "owner")
-        [to_heir] = cap.to(self.b)
+        # Whoever joined first inherits; the test doesn't care which of the two it is.
+        heir, other = (self.b, self.c) if self.member(self.b).role == "owner" else (self.c, self.b)
+        self.assertEqual((self.member(heir).role, self.member(other).role), ("owner", "member"))
+        [to_heir] = cap.to(heir)
         self.assertEqual(to_heir["extra"]["kind"], "project_owner")
         self.assertIn("You’re looking after it now.", to_heir["body"])
-        [to_other] = cap.to(self.c)
+        [to_other] = cap.to(other)
         self.assertEqual(to_other["extra"]["kind"], "member_left")
         self.assertNotIn("looking after", to_other["body"])
+
+    def test_leaving_a_mission_outside_the_rollout_pushes_nobody(self):
+        with (
+            override_settings(PROJECTS_V2_TENANT_IDS=""),
+            _PushCapture(self) as cap,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            services.leave_mission(self.b, self.goal.id)
+        self.assertEqual(self.member(self.b).status, "left")
+        self.assertEqual(cap.calls, [])
 
     def test_an_owner_shares_then_passes_on_looking_after_the_project(self):
         target = str(self.member(self.b).id)
@@ -210,6 +255,16 @@ class NotMeMaybeThemTests(_Base):
     def test_you_cannot_suggest_yourself_or_a_stranger(self):
         step = self.step()
         projects.ask(self.a, self.a.user, self.goal.id, step.id, [str(self.member(self.b).id)])
+        elsewhere = services.create_mission(
+            self.a, self.a.user, member_friendship_ids=[str(self.ac.id)], title="Another project"
+        )
+        stranger = SharedGoalMembership.objects.get(shared_goal=elsewhere, tenant=self.c)
+        response = self.client_for(self.b).post(
+            self.url(f"steps/{step.id}/respond/"),
+            {"answer": "other", "suggest_membership_id": str(stranger.id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
         response = self.client_for(self.b).post(
             self.url(f"steps/{step.id}/respond/"),
             {"answer": "other", "suggest_membership_id": str(self.member(self.b).id)},
@@ -323,6 +378,76 @@ class ShowingTheWorkTests(_Base):
         self.assertEqual(self.fresh(step).status, "open")
         self.assertTrue(self.fresh(step).needs_review)
 
+    def test_the_doer_cannot_wave_the_look_away_even_as_project_owner(self):
+        step = self.step()
+        self.give(step, self.a)  # Aya is the project owner AND holds the step
+        projects.set_second_look(self.c, self.goal.id, step.id, True)
+        with self.assertRaises(PermissionDenied):
+            projects.set_second_look(self.a, self.goal.id, step.id, False)
+        self.assertTrue(self.fresh(step).needs_review)
+
+    def test_a_co_owner_cannot_confirm_and_the_milestone_waits_and_done_is_credited_to_the_doer(self):
+        milestone = projects.milestone_write(self.a, self.goal.id, {"title": "Paid"})
+        step = self.step(milestone_id=str(milestone.id))
+        self.give(step, self.b)
+        self.give(step, self.c)
+        projects.set_second_look(self.a, self.goal.id, step.id, True)
+        projects.complete(self.b, self.b.user, self.goal.id, step.id)
+        with self.assertRaises(PermissionDenied):
+            projects.confirm(self.c, self.c.user, self.goal.id, step.id)  # holds the step too
+        plan = projects.get_plan(self.a, self.goal.id)
+        self.assertIsNone(plan["milestones"][0]["reached_at"])
+        projects.confirm(self.a, self.a.user, self.goal.id, step.id)
+        self.assertIsNotNone(projects.get_plan(self.a, self.goal.id)["milestones"][0]["reached_at"])
+        done = SharedGoalUpdate.objects.get(shared_goal=self.goal, kind="step_done")
+        self.assertEqual(done.tenant_id, self.b.id)
+
+    def test_a_question_about_a_step_nobody_holds_reaches_the_project_owner(self):
+        step = self.step()
+        self.give(step, self.b)
+        projects.complete(self.b, self.b.user, self.goal.id, step.id)
+        services.leave_mission(self.b, self.goal.id)
+        with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
+            projects.question(self.c, self.c.user, self.goal.id, step.id, {})
+        self.assertEqual([c["extra"]["kind"] for c in cap.to(self.a)], ["step_question"])
+
+    def test_a_waiting_step_cannot_be_patched_back_to_in_progress(self):
+        step = self.step()
+        self.give(step, self.b)
+        projects.set_second_look(self.a, self.goal.id, step.id, True)
+        projects.complete(self.b, self.b.user, self.goal.id, step.id)
+        version = self.fresh(step).version
+        with self.assertRaises(ValidationError):
+            projects.patch_step(self.b, self.goal.id, step.id, {"version": version, "status": "in_progress"})
+        self.assertEqual(self.fresh(step).status, "in_review")
+
+    def test_a_step_never_waits_for_a_look_nobody_can_give(self):
+        # Everyone left in the project holds the step: ticking goes straight to done.
+        services.leave_mission(self.c, self.goal.id)
+        step = self.step()
+        self.give(step, self.b)
+        projects.set_second_look(self.b, self.goal.id, step.id, True)
+        projects.ask(self.b, self.b.user, self.goal.id, step.id, [str(self.member(self.a).id)])
+        projects.respond(self.a, self.a.user, self.goal.id, step.id, {"answer": "yes"})
+        projects.complete(self.b, self.b.user, self.goal.id, step.id)
+        self.assertEqual(self.fresh(step).status, "done")
+
+    def test_a_project_owner_can_reopen_a_step_stuck_waiting_but_not_finished_work(self):
+        waiting, finished = self.step("Send the money"), self.step("Order seeds")
+        for step in (waiting, finished):
+            self.give(step, self.b)
+        projects.set_second_look(self.c, self.goal.id, waiting.id, True)
+        projects.complete(self.b, self.b.user, self.goal.id, waiting.id)
+        projects.complete(self.b, self.b.user, self.goal.id, finished.id)
+        services.leave_mission(self.b, self.goal.id)  # the doer is gone; nobody holds the step
+        with self.assertRaises(PermissionDenied):
+            projects.complete(self.c, self.c.user, self.goal.id, waiting.id, reopen=True)  # a plain member
+        with self.assertRaises(PermissionDenied):
+            projects.complete(self.a, self.a.user, self.goal.id, finished.id, reopen=True)  # done work stays done
+        projects.complete(self.a, self.a.user, self.goal.id, waiting.id, reopen=True)
+        fresh = self.fresh(waiting)
+        self.assertEqual((fresh.status, fresh.done_note, fresh.completed_by_id), ("open", "", None))
+
     def test_a_second_look_needs_a_second_person(self):
         services.leave_mission(self.b, self.goal.id)
         services.leave_mission(self.c, self.goal.id)
@@ -380,6 +505,43 @@ class QuietStepTests(_Base):
         # Only the owner can say "still mine".
         with self.assertRaises(PermissionDenied):
             projects.keep_step(self.c, self.goal.id, self.step_.id)
+
+    def test_no_burst_no_ancient_steps_and_not_right_after_taking_one(self):
+        # Three more overdue steps for Ben: one push this morning, the rest on later mornings.
+        for title, due in [("Old A", "2026-10-13"), ("Old B", "2026-10-14"), ("Ancient", "2026-09-01")]:
+            self.give(self.step(title, due_date=due), self.b)
+        SharedGoalStepAssignment.objects.filter(membership=self.member(self.b)).update(
+            responded_at=self.nine - timedelta(days=10)
+        )
+        with _PushCapture(self) as cap:
+            first = run_still_yours_nudges(now=self.nine)
+            second = run_still_yours_nudges(now=self.nine + timedelta(days=1))
+            third = run_still_yours_nudges(now=self.nine + timedelta(days=2))
+            fourth = run_still_yours_nudges(now=self.nine + timedelta(days=3))
+        self.assertEqual([r["sent"] for r in (first, second, third, fourth)], [1, 1, 1, 0])
+        self.assertFalse(any("Ancient" in c["body"] for c in cap.calls))
+        # Someone who took an already-late step yesterday isn't asked this morning.
+        late = self.step("Just taken", due_date="2026-10-10")
+        self.give(late, self.c)
+        took = datetime(2026, 10, 17, 9, 5, tzinfo=ZoneInfo("UTC"))
+        SharedGoalStepAssignment.objects.filter(step=late).update(responded_at=took)
+        with _PushCapture(self) as cap:
+            run_still_yours_nudges(now=datetime(2026, 10, 18, 9, 5, tzinfo=ZoneInfo("UTC")))
+        self.assertEqual(cap.to(self.c), [])
+
+    def test_keep_clears_the_overdue_flag_in_the_real_plan(self):
+        # Real rows, real clock: a step five days past due is flagged until its owner says "still mine".
+        late = self.step("Late one", due_date=(timezone.localdate() - timedelta(days=5)).isoformat())
+        self.give(late, self.b)
+        self.assertEqual(self.plan_step(self.a, late)["attention"], "overdue")
+        projects.keep_step(self.b, self.goal.id, late.id)
+        self.assertIsNone(self.plan_step(self.a, late)["attention"])
+        # And the morning sweep leaves a just-kept step alone.
+        SharedGoalStepAssignment.objects.filter(step=late).update(responded_at=timezone.now() - timedelta(days=9))
+        nine_today = timezone.now().astimezone(ZoneInfo("Asia/Tokyo")).replace(hour=9, minute=5)
+        with _PushCapture(self) as cap:
+            run_still_yours_nudges(now=nine_today)
+        self.assertFalse(any("Late one" in c["body"] for c in cap.calls))
 
     def test_attention_is_a_schedule_fact(self):
         def attention(step, owners, assignments, today):
