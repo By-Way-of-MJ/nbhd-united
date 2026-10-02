@@ -66,7 +66,8 @@ class AssistantSurfaceTests(TestCase):
         self.assertTrue(other["title"].startswith("<<untrusted from @ben>>"))
         self.assertNotIn("https://", other["title"])  # links made inert
         mine = next(s for s in project["my_steps"] if s["id"] == str(self.mine.id))
-        self.assertEqual(mine["title"], "Build frames")  # my own text is plain
+        # In a shared project even my own title is fenced: another member may have edited it.
+        self.assertEqual(mine["title"], "<<untrusted>> Build frames <</untrusted>>")
         self.assertNotIn("hospital", str(ctx))
         self.assertIn("1 note(s)", project["member_notes"])
 

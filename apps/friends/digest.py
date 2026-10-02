@@ -68,7 +68,10 @@ def _deliver_digest(tenant, mission) -> None:
 def _render_digest(status: dict) -> str:
     """Warm, non-shaming (§7 tone): '🌱 July Steps — you + @aya both hit 6/7.
     @kiho's had a quieter week — a wave might help.'"""
-    lines = [f"\U0001f331 {status['title']} — your crew this week:"]
+    # No title: any member can rename a mission, and this text is replayed to the
+    # reader's assistant as its own earlier message. Handles and counts only.
+    starter = next((m["handle"] for m in status["members"] if m.get("is_creator") and m.get("handle")), None)
+    lines = [f"\U0001f331 Your crew with @{starter} this week:" if starter else "\U0001f331 Your crew this week:"]
     for member in status["members"]:
         who = f"@{member['handle']}" if member["handle"] else "a neighbor"
         streak = f", {member['streak']}-day streak" if member["streak"] else ""

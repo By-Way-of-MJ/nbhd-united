@@ -22,6 +22,12 @@ _ENTITY_LEGEND_MAX_ENTRIES = 20
 _ENTITY_LEGEND_MAX_LINE_CHARS = 140
 
 
+# Spans the substitution never touches: existing placeholders, and the fence
+# markers around other people's text (a hidden name equal to "untrusted", or to a
+# neighbor's handle, must not rewrite the marker the assistant's rule refers to).
+_PROTECTED_RE = re.compile(_PLACEHOLDER_RE.pattern + r"|<<untrusted(?: from @[a-z0-9_]{3,30})?>>|<</untrusted>>")
+
+
 @dataclass(frozen=True)
 class _KnownValueMatcher:
     pattern: re.Pattern[str]
@@ -96,7 +102,7 @@ def _redact_known_values(tenant: Tenant | None, text: str) -> str:
 
     parts: list[str] = []
     last = 0
-    for placeholder_match in _PLACEHOLDER_RE.finditer(text):
+    for placeholder_match in _PROTECTED_RE.finditer(text):
         parts.append(matcher.pattern.sub(replace, text[last : placeholder_match.start()]))
         parts.append(placeholder_match.group(0))
         last = placeholder_match.end()

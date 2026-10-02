@@ -30,7 +30,6 @@ from apps.tenants.models import Tenant
 from . import access
 from .models import (
     AbsorbedItem,
-    Circle,
     CircleMembership,
     FriendMessage,
     Friendship,
@@ -58,10 +57,11 @@ _MAX_SPARKS = 5
     order=63,
 )
 def render_neighborhood(tenant: Tenant) -> str:
-    """TIGHT (≤~1KB): accepted neighbor handles + up to 5 newest un-purged
-    absorbed sparks (title + @handle) + a chat POINTER (thread + @handle + count,
-    NEVER message text — USER.md is written to the share file, so raw friend text
-    must stay out; the agent pulls the redacted text at turn time). Never raises."""
+    """TIGHT (≤~1KB): accepted neighbor handles + POINTERS only — how many un-purged
+    sparks each neighbor shared and how many new chat messages wait. NEVER a spark's
+    label, a Circle's name or message text: USER.md is trusted on every turn and
+    never taints one, so nothing another person wrote (or can rename) may sit in it.
+    The agent pulls the fenced text with nbhd_neighborhood_context. Never raises."""
     try:
         edges = Friendship.objects.filter(
             Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.ACCEPTED
@@ -93,23 +93,24 @@ def render_neighborhood(tenant: Tenant) -> str:
                     "tenant_id", "handle"
                 )
             )
-            # Tag circle-sourced sparks with their circle so the agent honors the
-            # no-cross-Circle-leakage rule (design §12 / AGENTS.md gate).
-            circle_ids = [s.circle_id for s in sparks if s.circle_id]
-            circle_name_by_id = (
-                dict(Circle.objects.filter(id__in=circle_ids).values_list("id", "name")) if circle_ids else {}
-            )
             lines.append(
-                "Sparks neighbors shared (hold until useful, then surface naturally; never claim you shared anything):"
+                "Sparks neighbors shared (call nbhd_neighborhood_context to read them; hold until useful, "
+                "then surface naturally; never claim you shared anything):"
             )
+            # Counts per neighbor only. A Circle-sourced spark keeps the
+            # no-cross-Circle-leakage rule (design §12 / AGENTS.md gate) without
+            # printing the Circle's name, which its creator chose.
+            per_neighbor: dict = {}
             for spark in sparks:
-                who = handle_by_id.get(spark.from_tenant_id)
-                title = (spark.label or "a shared spark").strip()[:100]
-                circle_name = circle_name_by_id.get(spark.circle_id)
-                suffix = f" — @{who}" if who else ""
-                if circle_name:
-                    suffix += f" (in {circle_name}; keep it in that Circle)"
-                lines.append(f"- {title}{suffix}")
+                entry = per_neighbor.setdefault(spark.from_tenant_id, {"count": 0, "circle": False})
+                entry["count"] += 1
+                entry["circle"] = entry["circle"] or bool(spark.circle_id)
+            for from_id, entry in per_neighbor.items():
+                who = handle_by_id.get(from_id)
+                line = f"- {entry['count']} from @{who}" if who else f"- {entry['count']} from a neighbor"
+                if entry["circle"]:
+                    line += " (shared in a Circle; keep it in that Circle)"
+                lines.append(line)
         if chat_counts:
             lines.append("New neighborhood messages (call nbhd_neighborhood_context to read them):")
             for entry in chat_counts:
@@ -151,7 +152,13 @@ def render_missions(tenant: Tenant) -> str:
             goal = membership.shared_goal
             pct = projection.build_mission_status(goal)["overall_pct"]
             commit = f"you: {membership.commitment}" if membership.commitment else "you: showing up"
-            lines.append(f"- {goal.title} — {commit}; crew {pct}% this window")
+            # Never the title: any member can rename a mission, and USER.md is trusted.
+            if str(goal.created_by_id) == str(tenant.id):
+                name = "a mission you started"
+            else:
+                creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
+                name = f"a mission with @{creator.handle}" if creator and creator.handle else "a shared mission"
+            lines.append(f"- {name} — {commit}; crew {pct}% this window")
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 — an envelope section must never break a turn
         logger.warning("render_missions failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
@@ -186,8 +193,9 @@ def render_projects(tenant: Tenant) -> str:
         for membership in memberships:
             goal = membership.shared_goal
             plan = project_services.get_plan(tenant, goal.id)
+            # Never the title: any member can rename a project, and USER.md is trusted.
             if str(goal.created_by_id) == str(tenant.id):
-                name = goal.title
+                name = "a project you started"
             else:
                 creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
                 name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
@@ -204,9 +212,8 @@ def render_projects(tenant: Tenant) -> str:
             bits = [f"{plan['done_count']}/{plan['total']} steps done"]
             if open_mine:
                 nxt = sorted(open_mine, key=lambda s: s.get("start_date") or "9999")[0]
-                own_title = access.project_steps(goal).filter(id=nxt["id"], created_by_id=tenant.id).exists()
-                label = f"“{nxt['title']}”" if own_title else "one of your steps"
-                bits.append(f"your next: {label}" + (f" (due {nxt['due_date']})" if nxt.get("due_date") else ""))
+                # Never the step's title: a project owner can edit a step someone else wrote.
+                bits.append("your next step" + (f" is due {nxt['due_date']}" if nxt.get("due_date") else " is open"))
             if waiting:
                 bits.append(f"{waiting} of your steps waiting on others")
             if asks:

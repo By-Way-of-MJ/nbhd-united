@@ -421,7 +421,12 @@ def _recent_proactive_lines(tenant, tz) -> list[str]:
     for r in reversed(rows):  # oldest → newest so the block reads in time order
         hhmm = r.created_at.astimezone(tz).strftime("%H:%M")
         label = (r.job_name or "").strip() or "proactive"
-        body = _one_line(r.message_text, _PROACTIVE_LINE_CHARS)
+        # The weekly mission digest carries the mission's title, which any member can
+        # rename. USER.md is trusted on every turn, so only say that it was sent.
+        if label.startswith("_mission:"):
+            body = "weekly crew digest (titles and handles left out here)"
+        else:
+            body = _one_line(r.message_text, _PROACTIVE_LINE_CHARS)
         lines.append(f"- {hhmm} · {label}: {body}")
     return lines
 
