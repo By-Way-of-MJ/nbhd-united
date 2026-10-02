@@ -329,7 +329,10 @@ class DigestTest(TestCase):
 
     def test_render_is_warm_non_shaming(self):
         text = digest._render_digest(projection.build_mission_status(self.mission))
-        self.assertIn("July Steps", text)
+        # No title (any member can rename a mission and this text is replayed to the
+        # reader's assistant): it names the crew by who started it.
+        self.assertNotIn("July Steps", text)
+        self.assertIn("Your crew with @", text)
         self.assertIn("crew", text.lower())
 
     def test_app_channel_member_digest_writes_proactive_outbound(self):

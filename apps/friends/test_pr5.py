@@ -375,14 +375,26 @@ class AbsorbTest(TestCase):
         # redact_user_message would load the 554MB model — patch it (identity).
         seen = {}
 
+        from apps.pii.redactor import RedactionOutcome
+
         def fake(text, tenant, **kwargs):
             seen.update(kwargs)
-            return f"[red]{text}"
+            return RedactionOutcome(text=f"[red]{text}", confirmed=self.redaction_confirmed, reason="test")
 
-        with mock.patch("apps.pii.redactor.redact_user_message", side_effect=fake):
+        with mock.patch("apps.pii.redactor.redact_user_message_checked", side_effect=fake):
             ctx = services.neighborhood_context(tenant)
         self.redact_kwargs = seen
         return ctx
+
+    redaction_confirmed = True
+
+    def test_unconfirmed_redaction_never_hands_over_the_raw_message(self):
+        self.redaction_confirmed = False
+        ctx = self._context(self.b)
+        [message] = ctx["chat"][0]["messages"]
+        self.assertEqual(
+            message, "<<untrusted from @sender>> [message not shown here — it is in the app] <</untrusted>>"
+        )
 
     def test_absorb_returns_redacted_chat_and_advances_cursor(self):
         ctx = self._context(self.b)

@@ -355,8 +355,12 @@ def respond(tenant, user, mission_id, step_id, data):
         raise PermissionDenied("Only the asked member can respond.")
     if existing.status == "accepted" and answer != "yes":
         raise ValidationError("This step is already accepted.")
+    # A step someone else wrote: my private Task takes its title (I just read it and
+    # said yes) but not its description — up to 500 characters of another person's
+    # text that my assistant would later read as my own to-do. It stays on the step.
+    task_description = before.description if before.created_by_id == tenant.id else ""
     prepared = (
-        services._prepare_member_task(tenant, before.title, before.description)
+        services._prepare_member_task(tenant, before.title, task_description)
         if answer == "yes" and not existing.task_id
         else None
     )
@@ -398,7 +402,7 @@ def respond(tenant, user, mission_id, step_id, data):
             if prepared is None:
                 raise Conflict()
             assignment.task = services._mint_member_task(
-                tenant, goal, step.title, step.description, step.due_date, step=step, prepared=prepared
+                tenant, goal, step.title, task_description, step.due_date, step=step, prepared=prepared
             )
         assignment.save()
         services._append_update(

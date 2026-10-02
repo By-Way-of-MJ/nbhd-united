@@ -82,13 +82,10 @@ def _project_context(tenant, membership) -> dict:
 
     # Who wrote a row is not who last edited it: any member can rename the project,
     # and an owner-role member or an accepted assignee can retitle a step or
-    # milestone. So in a project with anyone else in it, ALL free text is fenced —
-    # including what I wrote. Only a project that has only ever had me is plain.
-    shared = len(plan["members"]) > 1
-
+    # milestone. So ALL free text is fenced, including what I wrote — and even when
+    # I am the only member left (membership rows vanish when an account is deleted,
+    # so "solo" proves nothing about who edited what).
     def text(value, author_tenant_id):
-        if not shared and str(author_tenant_id) == str(tenant.id):
-            return value
         mine = str(author_tenant_id) == str(tenant.id)
         return fence(value, None if mine else handles.get(author_tenant_id))
 

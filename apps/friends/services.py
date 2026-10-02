@@ -1363,7 +1363,7 @@ def _absorb_chat(tenant) -> list[dict]:
     the per-thread cursor advanced (idempotent), and a NEUTRAL AbsorbedItem
     logged per message (label = "Chat with @handle" — a pointer, never the
     message text). Skipped for threads where agent_absorb_enabled is off."""
-    from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message
+    from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message_checked
 
     highlights: list[dict] = []
     for entry in access.absorb_pending_chat(tenant):
@@ -1374,7 +1374,10 @@ def _absorb_chat(tenant) -> list[dict]:
             # entries to MY hidden-names list (names I already hid keep their tag;
             # anything else the detector flags becomes [REDACTED]). Then fenced:
             # it is another person's text — data, never instructions.
-            redacted = redact_user_message(message.text, tenant, mint=MINT_REDACT_ONLY)
+            # Fail closed: if redaction can't be confirmed, the assistant gets a pointer,
+            # not the neighbor's raw words.
+            outcome = redact_user_message_checked(message.text, tenant, mint=MINT_REDACT_ONLY)
+            redacted = outcome.text if outcome.confirmed else "[message not shown here — it is in the app]"
             texts.append(fence(redacted, _handle_for(message.sender_tenant_id)))
             # from_tenant = the actual sender (works for 1:1 AND circle group chat);
             # label is a NEUTRAL pointer + circle tag, never message text.
@@ -1727,7 +1730,7 @@ def create_mission(
         title=title,
         description=clean_text(description),
         pillar=clean_text(pillar, limit=20),
-        target=clean_payload(target or {}),
+        target=clean_payload(target if isinstance(target, dict) else {}),
         target_date=target_date,
     )
     access.mission_memberships().create(shared_goal=mission, tenant=tenant, user=user, role="owner", status="active")
@@ -1910,6 +1913,8 @@ def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dic
     if "title" in fields:
         fields["title"] = clean_text(fields["title"], limit=120, required=True)
     if "target" in fields:
+        if not isinstance(fields["target"], dict):
+            raise ValidationError("target must be an object.")
         fields["target"] = clean_payload(fields["target"])
     updated, result = access.update_mission(
         mission, expected_version=expected_version, editor_owner=f"user:{tenant.id}", fields=fields
@@ -2042,16 +2047,28 @@ def runtime_missions(tenant) -> list[dict]:
     return out
 
 
+_MISSION_TARGET_KEYS = frozenset({"metric", "unit", "cadence", "value", "aid_kind"})
+
+
 def _fence_mission_status(status: dict, my_handle, creator_handle) -> dict:
     """Everything in a mission another member wrote — or can edit — reaches the
     assistant as fenced data. Any member can rename a mission, so the title is
     fenced even for its creator; only my own member row stays plain."""
-    status["title"] = fence(status.get("title", ""), creator_handle)
+    # Any member may have written these; name no author unless it is someone else's.
+    author = None if creator_handle == my_handle else creator_handle
+    status["title"] = fence(status.get("title", ""), None)
     target = status.get("target")
-    if isinstance(target, dict):
-        status["target"] = {
-            key: fence(value, creator_handle) if isinstance(value, str) else value for key, value in target.items()
+    # Only the keys the product defines, numbers kept, every string fenced; anything
+    # else (extra keys, nested objects, lists) is dropped — the key itself is free text.
+    status["target"] = (
+        {
+            key: fence(value, author) if isinstance(value, str) else value
+            for key, value in target.items()
+            if key in _MISSION_TARGET_KEYS and isinstance(value, (str, int, float, bool))
         }
+        if isinstance(target, dict)
+        else {}
+    )
     for member in status.get("members", []):
         if my_handle and member.get("handle") == my_handle:
             continue

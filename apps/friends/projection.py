@@ -53,8 +53,10 @@ def build_mission_status(mission, *, now=None) -> dict:
     ``SharedGoal`` instance (its ``.objects`` access already went through the
     accessor)."""
     now = now or timezone.now()
-    target = mission.target or {}
-    cadence = str(target.get("cadence", "daily")).lower()
+    # ``target`` is member-editable JSON of any shape: never trust its type, and
+    # never echo its free text as a top-level field.
+    target = mission.target if isinstance(mission.target, dict) else {}
+    cadence = "weekly" if str(target.get("cadence", "daily")).lower() == "weekly" else "daily"
     window_days = 28 if cadence == "weekly" else 7
     window_start = now - timedelta(days=window_days)
 
