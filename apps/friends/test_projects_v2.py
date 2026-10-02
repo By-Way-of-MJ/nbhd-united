@@ -204,19 +204,23 @@ class ProjectAPITests(TestCase):
                     self.assertEqual(str(response.data["detail"]), "Ask the step's owner to change it.")
                     self.assertTrue(access.project_dependencies(self.goal).filter(id=edge.id).exists())
 
-    def test_creator_cannot_edit_after_asking_another_member_even_if_they_left(self):
-        # Cleo (a plain member) creates the step and it is asked of Aya; Aya — the only
-        # owner — leaves, so ownership passes to Ben (joined first), not to Cleo.
+    def test_creator_gets_the_step_back_when_the_asked_member_leaves(self):
+        # Cleo (a plain member) creates the step and it is asked of Aya: while that ask
+        # is out, Cleo can't edit. Aya — the only owner — leaves; leaving lets her
+        # steps go (people-come-and-go, 2026-10), so the creator can edit again.
         projects.add_members(self.a, self.goal.id, [str(_edge(self.a, self.c).id)])
         services.join_mission(self.c, self.c.user, self.goal.id)
         step = self._editable_step_fixture(self.c, [(self.member_a, "asked")])
-        services.leave_mission(self.a, self.goal.id)
         self.assertEqual(
             self.jwt(self.c).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 403
         )
-        # The member who inherited ownership can.
+        services.leave_mission(self.a, self.goal.id)
         self.assertEqual(
-            self.jwt(self.b).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 200
+            self.jwt(self.c).patch(self.base + f"steps/{step.id}/", {"version": 0}, format="json").status_code, 200
+        )
+        # Ownership passed to Ben (joined first), who can edit too.
+        self.assertEqual(
+            self.jwt(self.b).patch(self.base + f"steps/{step.id}/", {"version": 1}, format="json").status_code, 200
         )
 
     def test_milestone_patch_delete_creator_or_project_owner(self):

@@ -40,7 +40,8 @@ Step PATCH and DELETE require active membership and at least one of:
 - The caller created the step and **no other member** has an `asked` or `accepted`
   assignment on it. A self-ask does not remove creator rights; other members'
   `countered` and `declined` assignments do not block them. Outstanding asks or
-  acceptances still block creator rights after that member leaves.
+  acceptances on open steps are released when that member leaves (below), which
+  returns the creator's rights.
 - The caller has project membership role `owner`.
 
 Otherwise the API returns 403: "Ask the step's owner to change it."
