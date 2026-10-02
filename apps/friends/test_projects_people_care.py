@@ -85,7 +85,9 @@ class SteppingBackTests(_Base):
         self.assertEqual(self.member(self.b).status, "active")
         self.assertEqual(cap.to(self.b), [])
         [call] = cap.to(self.a)
-        self.assertEqual(call["extra"]["type"], "step_released")
+        self.assertEqual(call["extra"]["kind"], "step_released")
+        # Builds that predate this kind still open the step: the routing type is one they know.
+        self.assertEqual((call["extra"]["type"], call["extra"]["step_id"]), ("step_answer", str(step.id)))
         self.assertIn("stepped back from “Buy timber”", call["body"])
         self.assertNotIn("Thursday", call["body"])
         self.assertEqual(len(cap.to(self.c)), 1)
@@ -141,7 +143,7 @@ class LeavingTests(_Base):
         self.assertEqual(seen["attention"], "open_again")
         self.assertEqual(seen["released"][0]["membership_id"], str(self.member(self.b).id))
         [call] = cap.to(self.a)
-        self.assertEqual(call["extra"]["type"], "member_left")
+        self.assertEqual(call["extra"]["kind"], "member_left")
         self.assertIn("left “Garden” — 1 step is open again.", call["body"])
         self.assertEqual(cap.to(self.b), [])
         self.assertTrue(SharedGoalUpdate.objects.filter(shared_goal=self.goal, kind="member_left").exists())
@@ -151,10 +153,10 @@ class LeavingTests(_Base):
             services.leave_mission(self.a, self.goal.id)
         self.assertEqual(self.member(self.b).role, "owner")
         [to_heir] = cap.to(self.b)
-        self.assertEqual(to_heir["extra"]["type"], "project_owner")
+        self.assertEqual(to_heir["extra"]["kind"], "project_owner")
         self.assertIn("You’re looking after it now.", to_heir["body"])
         [to_other] = cap.to(self.c)
-        self.assertEqual(to_other["extra"]["type"], "member_left")
+        self.assertEqual(to_other["extra"]["kind"], "member_left")
         self.assertNotIn("looking after", to_other["body"])
 
     def test_an_owner_shares_then_passes_on_looking_after_the_project(self):
@@ -173,7 +175,7 @@ class LeavingTests(_Base):
                 self.url("owners/"), {"membership_id": target, "role": "owner"}, format="json"
             )
         self.assertEqual(response.json(), {"membership_id": target, "role": "owner"})
-        self.assertEqual(cap.to(self.b)[0]["extra"]["type"], "project_owner")
+        self.assertEqual(cap.to(self.b)[0]["extra"]["kind"], "project_owner")
         # Nobody demotes someone else; stepping down yourself is fine now.
         with self.assertRaises(PermissionDenied):
             projects.set_owner_role(self.a, self.a.user, self.goal.id, {"membership_id": target, "role": "member"})
@@ -286,7 +288,7 @@ class ShowingTheWorkTests(_Base):
         self.assertEqual(projects.get_plan(self.a, self.goal.id)["done_count"], 0)
         self.assertFalse(SharedGoalUpdate.objects.filter(shared_goal=self.goal, kind="step_done").exists())
         self.assertEqual(cap.to(self.b), [])
-        self.assertEqual(cap.to(self.a)[0]["extra"]["type"], "step_needs_look")
+        self.assertEqual(cap.to(self.a)[0]["extra"]["kind"], "step_needs_look")
         # The doer can't confirm their own work; it can't be switched off mid-look.
         with self.assertRaises(PermissionDenied):
             projects.confirm(self.b, self.b.user, self.goal.id, first.id)
@@ -299,7 +301,7 @@ class ShowingTheWorkTests(_Base):
         self.assertEqual(seen["reviewed_by_membership_id"], str(self.member(self.a).id))
         self.assertIsNone(seen["attention"])
         self.assertEqual(self.plan_step(self.a, second)["blocked_by_open"], [])
-        self.assertEqual(cap.to(self.b)[0]["extra"]["type"], "step_confirmed")
+        self.assertEqual(cap.to(self.b)[0]["extra"]["kind"], "step_confirmed")
         self.assertTrue(SharedGoalUpdate.objects.filter(shared_goal=self.goal, kind="step_done").exists())
 
     def test_ticking_my_private_task_also_waits_for_the_look(self):
@@ -341,7 +343,7 @@ class ShowingTheWorkTests(_Base):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.fresh(step).status, "done")
         [call] = cap.to(self.b)
-        self.assertEqual(call["extra"]["type"], "step_question")
+        self.assertEqual(call["extra"]["kind"], "step_question")
         self.assertNotIn("refund", call["body"])
         with self.assertRaises(ValidationError):
             projects.question(self.c, self.c.user, self.goal.id, step.id, {})
@@ -368,7 +370,7 @@ class QuietStepTests(_Base):
         self.assertEqual(first, {"claimed": 1, "sent": 1})
         self.assertEqual(again["claimed"], 0)
         [call] = cap.to(self.b)
-        self.assertEqual(call["extra"]["type"], "step_still_yours")
+        self.assertEqual(call["extra"]["kind"], "step_still_yours")
         self.assertEqual(cap.to(self.a), [])
         response = self.client_for(self.b).post(self.url(f"steps/{self.step_.id}/keep/"), {}, format="json")
         self.assertEqual(response.status_code, 200)

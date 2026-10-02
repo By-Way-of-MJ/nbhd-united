@@ -21,6 +21,8 @@ from django.db import transaction
 logger = logging.getLogger(__name__)
 
 TITLE_CAP = 60
+# Push types the first Projects v2 app builds (2.2.x) know how to open.
+_ORIGINAL_TYPES = {"project_invite", "step_ask", "step_answer", "step_unblocked", "step_due", "milestone_reached"}
 
 
 def _short(text: str, cap: int = TITLE_CAP) -> str:
@@ -47,7 +49,13 @@ def _deliver(memberships, *, ptype: str, body: str, mission_id, step_id=None, ac
 
     blocked = access.blocked_counterpart_ids(actor_tenant_id) if actor_tenant_id else set()
     sent = 0
-    extra = {"type": ptype, "mission_id": str(mission_id)}
+    # App builds route a tap by ``type`` and send an unknown one to Chat. Kinds added
+    # after the first Projects v2 release ride a type every build already opens the
+    # project (or step) for; ``kind`` carries what actually happened.
+    route_type = ptype if ptype in _ORIGINAL_TYPES else ("step_answer" if step_id else "milestone_reached")
+    extra = {"type": route_type, "mission_id": str(mission_id)}
+    if route_type != ptype:
+        extra["kind"] = ptype
     if step_id:
         extra["step_id"] = str(step_id)
     for membership in memberships:
