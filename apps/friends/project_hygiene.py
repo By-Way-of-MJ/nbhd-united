@@ -63,8 +63,30 @@ _ANGLES = str.maketrans(
         "\u300b": ")",
         "\u2329": "(",
         "\u232a": ")",
+        "\u226a": "(",
+        "\u226b": ")",
+        "\u27ea": "(",
+        "\u27eb": ")",
+        "\u276c": "(",
+        "\u276d": ")",
+        "\u276e": "(",
+        "\u276f": ")",
+        "\u2770": "(",
+        "\u2771": ")",
+        "\u29fc": "(",
+        "\u29fd": ")",
+        "\u02c2": "(",
+        "\u02c3": ")",
+        "\u1438": "(",
+        "\u1433": ")",
+        "\u22d8": "(",
+        "\u22d9": ")",
+        "\u2aa1": "(",
+        "\u2aa2": ")",
     }
 )
+# The marker word itself never appears intact inside the body.
+_MARKER_WORD_RE = re.compile(r"(?i)un(?=trusted)")
 
 
 def fence(text, author: str | None) -> str:
@@ -78,5 +100,6 @@ def fence(text, author: str | None) -> str:
         " " if c.isspace() else c for c in body if c.isspace() or unicodedata.category(c) not in {"Cc", "Cf", "Cs"}
     )
     body = " ".join(_URL_RE.sub("[link]", body).translate(_ANGLES).split())
-    who = f" from @{author}" if isinstance(author, str) and _HANDLE_RE.match(author) else ""
+    body = _MARKER_WORD_RE.sub(lambda m: m.group(0) + "-", body)
+    who = f" from @{author}" if isinstance(author, str) and _HANDLE_RE.fullmatch(author) else ""
     return f"<<untrusted{who}>> {body} <</untrusted>>"
