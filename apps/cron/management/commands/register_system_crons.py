@@ -251,8 +251,12 @@ SYSTEM_CRONS = [
     #     reaper would leave them invisible for ~24h. At :50, a stranded row is
     #     reaped within ~2h worst-case. It only flips runs stuck >30min, so it never
     #     touches a live probe run.
-    # Every 30 min — chat round-trip journey canary.
-    ("eval-journey-chat", "*/30 * * * *", "/api/cron/trigger/eval_journey_chat/", 0),
+    # Daily at 04:30 UTC — chat round-trip journey canary. Was */30 until
+    # 2026-10-02: every fire bumps the synthetic tenant's last_message_at, so it
+    # never idled long enough to hibernate (~$55/mo of always-on container), and
+    # in ~4,000 runs it never saw more than 2 consecutive fails. Daily, ahead of
+    # the 05:xx probe block, keeps the end-to-end check at ~$1-2/mo.
+    ("eval-journey-chat", "30 4 * * *", "/api/cron/trigger/eval_journey_chat/", 0),
     # Daily at 05:05 UTC — journal write→FTS-search journey canary.
     ("eval-journey-journal", "5 5 * * *", "/api/cron/trigger/eval_journey_journal/", 0),
     # Daily at 05:12 UTC — hibernation-wake journey canary (force-hibernates the
