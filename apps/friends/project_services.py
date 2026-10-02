@@ -495,21 +495,34 @@ def _finish(goal, step, tenant, user, *, reopen=False, note="", link=""):
 
 
 def _can_anyone_look(goal, step, completer):
-    """An active member who neither ticked the step nor holds it can confirm."""
+    """An active member who neither ticked the step nor holds it can confirm —
+    and whose app can show it (someone outside the rollout can't look)."""
+    from .project_flags import projects_v2_enabled
+
     holders = (
         access.project_assignments(goal).filter(step=step, status="accepted").values_list("membership_id", flat=True)
     )
-    return (
+    others = (
         access.mission_memberships()
         .filter(shared_goal=goal, status="active")
         .exclude(tenant=completer)
         .exclude(id__in=list(holders))
-        .exists()
+        .select_related("tenant")
     )
+    return any(projects_v2_enabled(m.tenant) for m in others)
 
 
-def _announce_done(goal, step, tenant, user):
-    services._append_update(goal, tenant, user, "step_done", text=step.title, payload={"step_id": str(step.id)})
+def _announce_done(goal, step, tenant, user, *, credit=None):
+    """``credit``: who did the step when someone else (the confirmer) is the actor.
+    Only the ``step_done`` row is theirs; the actor stays the one skipped by pushes."""
+    services._append_update(
+        goal,
+        credit or tenant,
+        None if credit else user,
+        "step_done",
+        text=step.title,
+        payload={"step_id": str(step.id)},
+    )
     for edge in access.project_dependencies(goal).filter(blocker=step):
         if (
             not access.project_dependencies(goal)
@@ -569,13 +582,17 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
 
 
 def _unpark(tenant, user, mission_id, step_id):
-    """A project owner reopens a step that is stuck waiting for a look (its doer left,
-    or nobody can confirm). Only ``in_review`` — never someone's finished work — and
-    no private Task is touched."""
+    """A project owner reopens a step stuck waiting for a look after everyone who held
+    it has left. While an active member still holds it, reopening is theirs. Only
+    ``in_review`` — never finished work — and no private Task is touched."""
     goal, member = access.lock_project(tenant, mission_id)
     step = _row(access.project_steps(goal), step_id)
-    if member.role != "owner" or step.status != "in_review":
+    held = access.project_assignments(goal).filter(step=step, status="accepted")
+    if member.role != "owner" or step.status != "in_review" or held.filter(membership__status="active").exists():
         raise PermissionDenied("Only an accepted owner can complete or reopen this step.")
+    # The people who held it are gone: their rows become "had this", so the step
+    # shows as open again and its creator can edit it.
+    held.update(status="released", released_at=timezone.now(), note="")
     _finish(goal, step, tenant, user, reopen=True)
     return step
 
@@ -625,8 +642,7 @@ def confirm(tenant, user, mission_id, step_id):
     step.status, step.reviewed_at, step.reviewed_by = "done", timezone.now(), tenant
     step.version += 1
     step.save(update_fields=["status", "reviewed_at", "reviewed_by", "version"])
-    doer = step.completed_by
-    _announce_done(goal, step, doer or tenant, None if doer else user)
+    _announce_done(goal, step, tenant, user, credit=step.completed_by)
     from .project_notifications import notify_step_confirmed
 
     notify_step_confirmed(goal, step, tenant)
@@ -669,9 +685,9 @@ def question(tenant, user, mission_id, step_id, data):
 def _release(goal, member, *, picks=None):
     """Let go of ``member``'s steps that are still open. ``picks`` maps step id →
     hand-off note; None means every open step. A step they had ACCEPTED becomes
-    ``released`` (and is returned, to be announced). An ask they never answered is
-    simply closed as declined — they never held it, so nothing "opens again".
-    The private journal Task is left alone."""
+    ``released``. An ask they never answered is closed as declined — they never held
+    it, so nothing "opens again". The private journal Task is left alone.
+    Returns ``(released_steps, declined_rows)``."""
     rows = (
         access.project_assignments(goal)
         .filter(
@@ -683,17 +699,21 @@ def _release(goal, member, *, picks=None):
     )
     if picks is not None:
         rows = rows.filter(step_id__in=list(picks))
-    released = []
+    released, declined = [], []
     for row in rows:
         held = row.status == "accepted"
         row.status = "released" if held else "declined"
         row.released_at = timezone.now() if held else None
         row.note = (picks or {}).get(row.step_id, "") if held else ""
         row.counter_start = row.counter_due = row.suggested_membership = row.kept_at = None
+        if not held:
+            row.responded_at = timezone.now()
         row.save()
         if held:
             released.append(row.step)
-    return released
+        else:
+            declined.append(row)
+    return released, declined
 
 
 @transaction.atomic
@@ -713,15 +733,22 @@ def step_back(tenant, user, mission_id, data):
             if not isinstance(item, dict):
                 raise ValidationError("Choose the steps to let go of.")
             picks[_uuid(item.get("step_id"))] = clean_text(item.get("note"), limit=500)
-    released = _release(goal, member, picks=picks)
+    released, declined = _release(goal, member, picks=picks)
     for step in released:
         services._append_update(
             goal, tenant, user, "step_released", payload={"step_id": str(step.id), "membership_id": str(member.id)}
         )
-    if released:
-        from .project_notifications import notify_stepped_back
+    from .project_notifications import notify_step_answer, notify_stepped_back
 
+    if released:
         notify_stepped_back(goal, released, tenant)
+    # Letting go of a step I was only asked about is a plain "no" to whoever asked.
+    for row in declined:
+        services._append_update(
+            goal, tenant, user, "step_answered", payload={"step_id": str(row.step_id), "answer": "no"}
+        )
+        if row.asked_by_id and row.asked_by_id != tenant.id:
+            notify_step_answer(goal, row.step, "no", tenant, row.asked_by_id)
     return released
 
 

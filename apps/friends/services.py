@@ -1858,7 +1858,7 @@ def leave_mission(tenant, mission_id) -> dict:
             heir.role = "owner"
             heir.save(update_fields=["role"])
     # Their open steps go back to "anyone" out loud instead of silently orphaning.
-    released = project_services._release(mission, membership)
+    released, _declined = project_services._release(mission, membership)
     for step in released:
         _append_update(
             mission,

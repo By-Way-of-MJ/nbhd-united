@@ -145,7 +145,8 @@ and verifies enforcement remains enabled after the sweep.
 **Stepping back and leaving.** `step-back/` sets the caller's `accepted`
 assignments on open steps to `released` (stamping `released_at`; `note` becomes the
 optional hand-off line, 500 chars). An ask they never answered (`asked`/`countered`)
-is closed as `declined` without any announcement — they never held the step. `leave/` does the same for every
+is closed as `declined` — they never held the step. On `step-back/` whoever asked
+gets the ordinary "can't take it" answer push; on `leave/` nothing extra is sent. `leave/` does the same for every
 open step before the membership turns `left`. Done and in-review steps are not
 touched, and the private journal Task is never changed. The plan lists each
 step's `released` entries (`membership_id`, `note`, `released_at`), newest first; a
@@ -174,8 +175,8 @@ step — from the app or by ticking the linked private Task — parks it in stat
 active member who neither completed the step nor holds an accepted assignment on
 it makes it `done` (`reviewed_at`, `reviewed_by_membership_id`) and only then
 emits the `step_done` update, unblock pushes and milestone checks. The owner may
-`reopen/` while it waits, and so may a project owner (only for `in_review`, e.g.
-when the doer has left). If no active member could give the look — everyone left
+`reopen/` while it waits, and so may a project owner once no active member
+holds the step (its holders left; their rows become `released`). If no active member could give the look — everyone left
 holds the step — ticking goes straight to `done`. The `step_done` update is
 credited to whoever did the step. A PATCH cannot change the status of a step that
 is `in_review`. It never confirms itself. Clients that predate

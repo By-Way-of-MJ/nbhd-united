@@ -130,7 +130,11 @@ class SteppingBackTests(_Base):
         with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
             released = projects.step_back(self.b, self.b.user, self.goal.id, {"all": True})
         self.assertEqual(released, [])
-        self.assertEqual(cap.calls, [])
+        # Whoever asked hears a plain "can't take it" — never "stepped back" / "open again".
+        self.assertEqual(cap.to(self.c), [])
+        [call] = cap.to(self.a)
+        self.assertEqual(call["extra"]["type"], "step_answer")
+        self.assertIn("can’t take “Buy timber” this time", call["body"])
         seen = self.plan_step(self.a, step)
         self.assertEqual((seen["released"], seen["attention"]), ([], None))
         self.assertEqual(
@@ -397,10 +401,18 @@ class ShowingTheWorkTests(_Base):
             projects.confirm(self.c, self.c.user, self.goal.id, step.id)  # holds the step too
         plan = projects.get_plan(self.a, self.goal.id)
         self.assertIsNone(plan["milestones"][0]["reached_at"])
-        projects.confirm(self.a, self.a.user, self.goal.id, step.id)
+        nxt = self.step("Order seeds")
+        projects.dependency_write(self.a, self.goal.id, {"blocker_id": str(step.id), "blocked_id": str(nxt.id)})
+        self.give(nxt, self.b)
+        with _PushCapture(self) as cap, self.captureOnCommitCallbacks(execute=True):
+            projects.confirm(self.a, self.a.user, self.goal.id, step.id)
         self.assertIsNotNone(projects.get_plan(self.a, self.goal.id)["milestones"][0]["reached_at"])
         done = SharedGoalUpdate.objects.get(shared_goal=self.goal, kind="step_done")
         self.assertEqual(done.tenant_id, self.b.id)
+        # The doer hears everything that follows from it; the one who tapped confirm doesn't.
+        kinds = sorted(c["extra"].get("kind", c["extra"]["type"]) for c in cap.to(self.b))
+        self.assertEqual(kinds, ["milestone_reached", "step_confirmed", "step_unblocked"])
+        self.assertEqual(cap.to(self.a), [])
 
     def test_a_question_about_a_step_nobody_holds_reaches_the_project_owner(self):
         step = self.step()
@@ -439,6 +451,9 @@ class ShowingTheWorkTests(_Base):
         projects.set_second_look(self.c, self.goal.id, waiting.id, True)
         projects.complete(self.b, self.b.user, self.goal.id, waiting.id)
         projects.complete(self.b, self.b.user, self.goal.id, finished.id)
+        # While the doer is still here, reopening is theirs — not the project owner's.
+        with self.assertRaises(PermissionDenied):
+            projects.complete(self.a, self.a.user, self.goal.id, waiting.id, reopen=True)
         services.leave_mission(self.b, self.goal.id)  # the doer is gone; nobody holds the step
         with self.assertRaises(PermissionDenied):
             projects.complete(self.c, self.c.user, self.goal.id, waiting.id, reopen=True)  # a plain member
@@ -447,6 +462,18 @@ class ShowingTheWorkTests(_Base):
         projects.complete(self.a, self.a.user, self.goal.id, waiting.id, reopen=True)
         fresh = self.fresh(waiting)
         self.assertEqual((fresh.status, fresh.done_note, fresh.completed_by_id), ("open", "", None))
+        # It reads as open again ("Ben had this"), not as an ownerless mystery.
+        seen = self.plan_step(self.a, waiting)
+        self.assertEqual(seen["attention"], "open_again")
+        self.assertEqual(seen["released"][0]["membership_id"], str(self.member(self.b).id))
+
+    def test_someone_outside_the_rollout_cannot_be_the_one_to_look(self):
+        step = self.step()
+        self.give(step, self.a)
+        projects.set_second_look(self.a, self.goal.id, step.id, True)
+        with override_settings(PROJECTS_V2_TENANT_IDS=str(self.a.id)):
+            projects.complete(self.a, self.a.user, self.goal.id, step.id)
+        self.assertEqual(self.fresh(step).status, "done")
 
     def test_a_second_look_needs_a_second_person(self):
         services.leave_mission(self.b, self.goal.id)
