@@ -548,9 +548,26 @@ jobs:
           # ARG OPENCLAW_VERSION). Deliberately NO :latest — a moving tag can pull
           # an unvalidated build into a tenant on the next restart/wake. Each build
           # is frozen; tenants are bumped onto a specific, canary-validated tag.
+          #
+          # The suffix is a hash of the image's INPUTS (every path Dockerfile.openclaw
+          # COPYs, plus the Dockerfile and its ignore file), not the commit SHA. A
+          # Django-only merge therefore reuses the existing image instead of pushing
+          # another ~1.5 GB copy (2026-10: ~10 identical rebuilds/day had grown the
+          # registry to 147 GB) and doesn't move OPENCLAW_IMAGE_TAG, so tenants are
+          # not rolled onto a byte-identical "new" image. The ISO week is mixed in
+          # so the floating node base image is still refreshed at least weekly.
           OC_VERSION=$(grep -oP 'ARG OPENCLAW_VERSION=\K[0-9.]+' Dockerfile.openclaw)
-          OC_TAG="${OC_VERSION}-${GITHUB_SHA::7}"
+          OC_INPUTS=$( {
+            git ls-files -s -- Dockerfile.openclaw Dockerfile.openclaw.dockerignore .dockerignore \
+              runtime/openclaw skills agent-skills templates/openclaw
+            date -u +%G-W%V
+          } | sha256sum | cut -c1-7)
+          OC_TAG="${OC_VERSION}-${OC_INPUTS}"
           echo "OC_IMAGE_TAG=${OC_TAG}" >> "$GITHUB_ENV"
+          if docker manifest inspect ${{ env.ACR_NAME }}.azurecr.io/nbhd-openclaw:${OC_TAG} > /dev/null 2>&1; then
+            echo "nbhd-openclaw:${OC_TAG} already exists (OpenClaw inputs unchanged) — reusing it, no rebuild."
+            exit 0
+          fi
           echo "Building nbhd-openclaw:${OC_TAG}"
           docker build --platform linux/amd64 \
             -f Dockerfile.openclaw \
