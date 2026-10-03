@@ -1027,7 +1027,30 @@ def check_cron_wake_idle_task(tenant_id: str) -> dict:
             )
             return {"status": "deferred_for_upcoming_cron"}
 
-    # No user activity, no upcoming cron — re-hibernate (this also
+    # A cron still mid-run (``runningAtMs`` set) must not be cut off: a long
+    # briefing can outlast the idle window, and hibernating now SIGTERMs it
+    # before the reply reaches the user (prod 2026-09-12, ~12 tenants/day at a
+    # 10-min window). Re-check shortly instead of waiting a full idle window.
+    defer_reason = _cron_active_or_imminent(tenant)
+    if defer_reason:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task("check_cron_wake_idle", str(tenant.id), delay_seconds=_CRON_DEFER_WINDOW_SECONDS)
+        except Exception:
+            logger.exception(
+                "check_cron_wake_idle: failed to schedule recheck for %s — idle sweep is the fallback",
+                tenant_id[:8],
+            )
+        logger.info(
+            "check_cron_wake_idle: tenant %s — %s, deferring re-hibernation %ds",
+            tenant_id[:8],
+            defer_reason,
+            _CRON_DEFER_WINDOW_SECONDS,
+        )
+        return {"status": f"deferred_{defer_reason}"}
+
+    # No user activity, no upcoming or running cron — re-hibernate (this also
     # schedules the next cron wake).
     logger.info(
         "check_cron_wake_idle: tenant %s idle after cron wake, re-hibernating",
