@@ -1,0 +1,101 @@
+name: OpenClaw image GC
+
+# Weekly safety net for the nbhd-openclaw repository in ACR. Deletes ONLY tags
+# that are (a) not referenced by any tenant container or by Django's
+# OPENCLAW_IMAGE_TAG, (b) older than MIN_AGE_DAYS, and (c) outside the newest
+# KEEP_NEWEST. The in-use set is read fresh from Azure on every run, so a
+# hibernated tenant parked on an old tag never loses its image (a plain
+# `acr purge --keep N --ago D` would, and that tenant could not wake).
+# Deletion runs inside an ACR task (`az acr run`) with an exact-name filter,
+# which the CI identity's "Container Registry Tasks Contributor" role allows.
+# Manual runs default to a dry run.
+
+on:
+  schedule:
+    - cron: "30 9 * * 0" # Sundays 09:30 UTC, clear of the 03:00/08:00 Django purges
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted without deleting"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: openclaw-image-gc
+  cancel-in-progress: false
+
+env:
+  ACR_NAME: nbhdunited
+  AZURE_RG: rg-nbhd-prod
+  REPO: nbhd-openclaw
+  KEEP_NEWEST: "10"
+  MIN_AGE_DAYS: "14"
+  # Abort if Azure reports fewer tenant containers than this — an empty or
+  # truncated in-use list must never be treated as "nothing is in use".
+  MIN_TENANT_APPS: "10"
+
+jobs:
+  gc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete unused, old OpenClaw tags
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+
+          # 1. Tags in use: every oc-* container's current image + the fleet tag.
+          apps=$(az containerapp list -g "$AZURE_RG" \
+            --query "[?starts_with(name,'oc-')].properties.template.containers[0].image" -o tsv)
+          n_apps=$(printf '%s\n' "$apps" | grep -c . || true)
+          if [ "$n_apps" -lt "$MIN_TENANT_APPS" ]; then
+            echo "::error::Only $n_apps tenant containers listed (< $MIN_TENANT_APPS) — refusing to GC on a possibly truncated in-use list."
+            exit 1
+          fi
+          fleet_tag=$(az containerapp show -g "$AZURE_RG" -n nbhd-django-westus2 \
+            --query "properties.template.containers[0].env[?name=='OPENCLAW_IMAGE_TAG'].value | [0]" -o tsv)
+          if [ -z "$fleet_tag" ]; then
+            echo "::error::Could not read Django's OPENCLAW_IMAGE_TAG — refusing to GC."
+            exit 1
+          fi
+          in_use=$( { printf '%s\n' "$apps" | grep "/$REPO:" | sed "s#.*/$REPO:##; s#@.*##"; echo "$fleet_tag"; } | sort -u)
+          echo "In use ($(printf '%s\n' "$in_use" | grep -c .) tags across $n_apps containers):"
+          printf '  %s\n' $in_use
+
+          # 2. All tags, newest first, with last-update time.
+          cutoff=$(date -u -d "-${MIN_AGE_DAYS} days" +%s)
+          candidates=""
+          i=0
+          while IFS=$'\t' read -r tag updated; do
+            i=$((i + 1))
+            [ "$i" -le "$KEEP_NEWEST" ] && continue
+            printf '%s\n' "$in_use" | grep -qxF "$tag" && continue
+            [ "$(date -u -d "$updated" +%s)" -ge "$cutoff" ] && continue
+            candidates="$candidates $tag"
+          done < <(az acr repository show-tags -n "$ACR_NAME" --repository "$REPO" \
+                     --detail --orderby time_desc --query "[].[name,lastUpdateTime]" -o tsv)
+
+          if [ -z "${candidates// /}" ]; then
+            echo "Nothing to delete."
+            exit 0
+          fi
+          echo "Will delete:"
+          printf '  %s\n' $candidates
+
+          # 3. Exact-name purge inside an ACR task (locked tags are skipped by purge).
+          regex=$(printf '%s\n' $candidates | sed 's/\./\\./g' | paste -sd'|' -)
+          flags="--ago 0d --untagged"
+          [ "$DRY_RUN" = "true" ] && flags="$flags --dry-run"
+          az acr run -r "$ACR_NAME" \
+            --cmd "acr purge --filter '$REPO:^($regex)\$' $flags" /dev/null
