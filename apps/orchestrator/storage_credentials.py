@@ -87,7 +87,24 @@ def _fetch(account_name):
 
     storage_client = get_storage_client()
     keys = storage_client.storage_accounts.list_keys(settings.AZURE_RESOURCE_GROUP, account_name)
-    return keys.keys[0].value
+    return select_account_key(keys)
+
+
+def storage_key_index() -> int:
+    """Which storage account key nbhd uses: 0 = key1, 1 = key2 (default).
+
+    Every nbhd reader of the account key goes through ``select_account_key`` so a
+    rotation is one setting plus re-registering the env storages, never a code hunt.
+    """
+    raw = str(getattr(settings, "AZURE_STORAGE_KEY_INDEX", "1") or "1").strip()
+    if raw not in {"0", "1"}:
+        raise ValueError("AZURE_STORAGE_KEY_INDEX must be 0 (key1) or 1 (key2)")
+    return int(raw)
+
+
+def select_account_key(keys) -> str:
+    """Pick the configured key from a ``list_keys`` result."""
+    return keys.keys[storage_key_index()].value
 
 
 def acquire_account_key(tenant_id) -> KeyLease:

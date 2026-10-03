@@ -178,12 +178,14 @@ class Command(BaseCommand):
         try:
             from azure.storage.fileshare import ShareFileClient
 
+            from apps.orchestrator.storage_credentials import select_account_key
+
             storage_client = get_storage_client()
             keys = storage_client.storage_accounts.list_keys(
                 settings.AZURE_RESOURCE_GROUP,
                 account_name,
             )
-            account_key = keys.keys[0].value
+            account_key = select_account_key(keys)
 
             file_client = ShareFileClient(
                 account_url=f"https://{account_name}.file.core.windows.net",

@@ -112,8 +112,10 @@ def _check_azure_storage_keys() -> None:
         retry_total=0,
     )
     # This exact access is used by file-share read/write paths throughout the app.
-    if not keys.keys[0].value:
-        raise RuntimeError("Azure Storage returned an empty primary key")
+    from apps.orchestrator.storage_credentials import select_account_key
+
+    if not select_account_key(keys):
+        raise RuntimeError("Azure Storage returned an empty account key")
 
 
 def _check_azure_file_share_rw() -> None:
@@ -156,9 +158,11 @@ def _check_azure_file_share_rw() -> None:
         read_timeout=10,
         retry_total=0,
     )
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import select_account_key
+
+    account_key = select_account_key(keys)
     if not account_key:
-        raise RuntimeError("Azure Storage returned an empty primary key")
+        raise RuntimeError("Azure Storage returned an empty account key")
 
     account_url = f"https://{account}.file.core.windows.net"
     for directory_path in ("workspace", "workspace/smoke"):

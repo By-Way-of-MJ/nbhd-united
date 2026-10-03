@@ -37,7 +37,7 @@ class InboundMediaGCTest(TestCase):
         self.enterContext(patch("apps.orchestrator.azure_client._is_mock", return_value=False))
         storage = self.enterContext(patch("apps.orchestrator.azure_client.get_storage_client"))
         keys = MagicMock()
-        keys.keys = [MagicMock(value="dummy-key")]
+        keys.keys = [MagicMock(value="key1-unused"), MagicMock(value="dummy-key")]
         storage.return_value.storage_accounts.list_keys.return_value = keys
         return self.enterContext(patch("azure.storage.fileshare.ShareDirectoryClient"))
 
@@ -129,7 +129,7 @@ class InboundMediaGCTest(TestCase):
     def test_pdf_and_image_both_aged_out(self, _mock_is_mock, mock_get_storage, mock_dir_cls):
         # Storage account key lookup.
         keys = MagicMock()
-        keys.keys = [MagicMock(value="fake-key")]
+        keys.keys = [MagicMock(value="key1-unused"), MagicMock(value="fake-key")]
         mock_get_storage.return_value.storage_accounts.list_keys.return_value = keys
 
         old = datetime.now(UTC) - timedelta(hours=48)  # past the 24h cutoff

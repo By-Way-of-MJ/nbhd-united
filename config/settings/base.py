@@ -278,6 +278,8 @@ TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 # empty keeps the existing per-operation listKeys behavior.
 AZURE_STORAGE_KEY_CACHE_TENANT_IDS = env("AZURE_STORAGE_KEY_CACHE_TENANT_IDS", default="")
 AZURE_STORAGE_KEY_CACHE_TTL_SECONDS = env("AZURE_STORAGE_KEY_CACHE_TTL_SECONDS", default="300")
+# Which storage account key nbhd uses: "0" = key1, "1" = key2 (rotation 2026-10).
+AZURE_STORAGE_KEY_INDEX = env("AZURE_STORAGE_KEY_INDEX", default="1")
 
 # USER.md skip-unchanged canary gate; empty preserves all existing writes.
 USER_MD_SKIP_UNCHANGED_TENANT_IDS = env("USER_MD_SKIP_UNCHANGED_TENANT_IDS", default="")

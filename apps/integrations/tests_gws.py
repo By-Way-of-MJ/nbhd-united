@@ -147,7 +147,10 @@ class GWSCredentialWriteTest(TestCase):
         tokens = {"access_token": "ya29.test", "refresh_token": "1//test-refresh"}
 
         fake_storage_client = MagicMock()
-        fake_storage_client.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage_client.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
 
         with (
             patch.dict(os.environ, {"AZURE_MOCK": "false"}),

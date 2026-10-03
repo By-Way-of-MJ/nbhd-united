@@ -52,7 +52,7 @@ class SanitizeShareTextTest(SimpleTestCase):
         _directory_client_cls,
     ):
         keys = MagicMock()
-        keys.keys = [MagicMock(value="secret")]
+        keys.keys = [MagicMock(value="key1-unused"), MagicMock(value="secret")]
         get_storage_client.return_value.storage_accounts.list_keys.return_value = keys
         file_client = file_client_cls.return_value
         payload = b"\x00\x01\x02binary"

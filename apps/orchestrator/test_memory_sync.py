@@ -33,7 +33,7 @@ class UploadMemoryFilesTest(SimpleTestCase):
         self.enterContext(patch("apps.orchestrator.azure_client._is_mock", return_value=False))
         storage = self.enterContext(patch("apps.orchestrator.azure_client.get_storage_client"))
         keys = MagicMock()
-        keys.keys = [MagicMock(value="dummy-key")]
+        keys.keys = [MagicMock(value="key1-unused"), MagicMock(value="dummy-key")]
         storage.return_value.storage_accounts.list_keys.return_value = keys
         self.enterContext(patch("azure.storage.fileshare.ShareClient"))
         self.dir_cls = self.enterContext(patch("azure.storage.fileshare.ShareDirectoryClient"))
@@ -315,7 +315,7 @@ class RenderMemoryFilesTest(TestCase):
         from azure.core.exceptions import ResourceNotFoundError
 
         keys = MagicMock()
-        keys.keys = [MagicMock(value="secret")]
+        keys.keys = [MagicMock(value="key1-unused"), MagicMock(value="secret")]
         get_storage_client.return_value.storage_accounts.list_keys.return_value = keys
         file_client = file_client_cls.return_value
         file_client.get_file_properties.side_effect = ResourceNotFoundError("missing")
