@@ -171,6 +171,7 @@ class CheckCronWakeIdleLookAheadTests(_Base):
     def test_no_cron_in_window_rehibernates(self):
         with (
             patch.object(hibernation, "_next_cron_within_window", return_value=None),
+            patch.object(hibernation, "_cron_active_or_imminent", return_value=None),
             patch.object(hibernation, "hibernate_idle_tenant", return_value=True) as mock_hibernate,
             patch("apps.cron.publish.publish_task") as mock_publish,
         ):
@@ -246,4 +247,75 @@ class CheckCronWakeIdleLookAheadTests(_Base):
 
         self.assertEqual(result["status"], "user_active")
         mock_lookahead.assert_not_called()
+        mock_hibernate.assert_not_called()
+
+
+class CheckCronWakeIdleRunningCronTests(_Base):
+    """A cron still mid-run must not be cut off by the cron-wake idle check.
+
+    Prod 2026-09-12: at a 10-min idle window the check hibernated ~12
+    tenants/day mid-briefing (SIGTERM before the reply was delivered).
+    """
+
+    def _running_job(self) -> dict:
+        now_ms = int(timezone.now().timestamp() * 1000)
+        job = self._job(name="Morning Briefing", next_run_ms=now_ms + 24 * 3600 * 1000)
+        job["state"]["runningAtMs"] = now_ms - 9 * 60 * 1000
+        return job
+
+    def test_running_cron_defers_and_rechecks_in_five_minutes(self):
+        with (
+            patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": [self._running_job()]}),
+            patch.object(hibernation, "hibernate_idle_tenant") as mock_hibernate,
+            patch("apps.cron.publish.publish_task") as mock_publish,
+        ):
+            result = check_cron_wake_idle_task(str(self.tenant.id))
+
+        self.assertEqual(result["status"], "deferred_cron_in_flight")
+        mock_hibernate.assert_not_called()
+        mock_publish.assert_called_once_with(
+            "check_cron_wake_idle", str(self.tenant.id), delay_seconds=hibernation._CRON_DEFER_WINDOW_SECONDS
+        )
+        self.tenant.refresh_from_db()
+        self.assertIsNone(self.tenant.hibernated_at)
+
+    def test_running_cron_defers_even_if_recheck_publish_fails(self):
+        with (
+            patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": [self._running_job()]}),
+            patch.object(hibernation, "hibernate_idle_tenant") as mock_hibernate,
+            patch("apps.cron.publish.publish_task", side_effect=RuntimeError("queue unavailable")),
+            self.assertLogs("apps.orchestrator.hibernation", level="ERROR"),
+        ):
+            result = check_cron_wake_idle_task(str(self.tenant.id))
+
+        self.assertEqual(result["status"], "deferred_cron_in_flight")
+        mock_hibernate.assert_not_called()
+
+    def test_finished_cron_rehibernates(self):
+        now_ms = int(timezone.now().timestamp() * 1000)
+        done = self._job(name="Morning Briefing", next_run_ms=now_ms + 24 * 3600 * 1000)
+        done["state"]["lastRunAtMs"] = now_ms - 5 * 60 * 1000
+        with (
+            patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": [done]}),
+            patch.object(hibernation, "hibernate_idle_tenant", return_value=True) as mock_hibernate,
+            patch("apps.cron.publish.publish_task"),
+        ):
+            result = check_cron_wake_idle_task(str(self.tenant.id))
+
+        self.assertEqual(result["status"], "re_hibernated")
+        mock_hibernate.assert_called_once()
+
+    def test_unreadable_cron_state_at_final_check_stays_awake(self):
+        with (
+            patch.object(hibernation, "_next_cron_within_window", return_value=None),
+            patch(
+                "apps.cron.gateway_client.invoke_gateway_tool",
+                side_effect=GatewayError("bad_gateway", status_code=502),
+            ),
+            patch.object(hibernation, "hibernate_idle_tenant") as mock_hibernate,
+            patch("apps.cron.publish.publish_task"),
+        ):
+            result = check_cron_wake_idle_task(str(self.tenant.id))
+
+        self.assertEqual(result["status"], "deferred_cron_state_unknown")
         mock_hibernate.assert_not_called()
