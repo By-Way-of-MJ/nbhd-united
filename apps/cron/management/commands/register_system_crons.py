@@ -186,6 +186,7 @@ SYSTEM_CRONS = [
     # the creation-before-enqueue crash window. Turns with any matching pending
     # queue row remain owned by the normal drain/reaper and are excluded.
     ("reap-stale-app-chat-messages", "*/5 * * * *", "/api/cron/trigger/reap_stale_app_chat_messages/"),
+    ("reap-meditations", "*/10 * * * *", "/api/cron/trigger/reap_meditations/"),
     # Daily at 03:15 UTC — poll LINE Messaging API for monthly Push usage,
     # update the fleet-wide quota state, and dispatch the user-facing
     # fan-out (90% pre-warn, exhaustion emails + channel flips, recovery
