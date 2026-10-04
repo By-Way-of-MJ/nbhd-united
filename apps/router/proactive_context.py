@@ -368,6 +368,10 @@ def _format_block(rows: Iterable[ProactiveOutbound]) -> str:
             any_structured = True
             anchors = "\n".join(f"  [{i + 1}] {item}" for i, item in enumerate(row.parsed_items))
             body = f"{row.message_text}\n\n(numbered items you asked about:\n{anchors}\n)"
+        elif (row.job_name or "").startswith("_mission:"):
+            # The weekly mission digest names missions any member can rename: the
+            # person sees it; the assistant only learns that it was sent.
+            body = "(weekly mission digest sent to the user; its text is left out here)"
         else:
             body = row.message_text
         if row.journal_link:

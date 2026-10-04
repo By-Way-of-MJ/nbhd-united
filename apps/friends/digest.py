@@ -32,51 +32,68 @@ def digest_dedup_id(mission_id, tenant_id, window: str) -> str:
 
 
 def run_weekly_mission_digest(now=None) -> dict:
+    """One message per person per week covering all their (legacy) missions,
+    written to them ("You: …"). People on Projects v2 get none: their projects
+    have their own pushes, and "showed up N days" means nothing for a project."""
+    from .project_flags import projects_v2_enabled
+
     now = now or timezone.now()
     window = iso_week(now)
-    sent = 0
+    sent = skipped = 0
     memberships = (
         access.mission_memberships()
         .filter(status="active", shared_goal__status="active")
         .select_related("shared_goal", "tenant", "tenant__user")
+        .order_by("tenant_id", "joined_at", "id")
     )
+    by_tenant: dict = {}
     for membership in memberships:
-        # Compare-and-set: claim this (member, window) exactly once (rowcount 1).
-        claimed = (
-            access.mission_memberships()
-            .filter(id=membership.id)
+        by_tenant.setdefault(membership.tenant_id, []).append(membership)
+    for rows in by_tenant.values():
+        tenant = rows[0].tenant
+        # Compare-and-set: claim each (member, window) exactly once (rowcount 1).
+        missions = [
+            m.shared_goal
+            for m in rows
+            if access.mission_memberships()
+            .filter(id=m.id)
             .exclude(last_digest_window=window)
             .update(last_digest_window=window)
-        )
-        if not claimed:
+        ]
+        if not missions:
+            continue
+        if projects_v2_enabled(tenant):
+            skipped += 1
             continue
         try:
-            _deliver_digest(membership.tenant, membership.shared_goal)
+            _deliver_digest(tenant, missions)
             sent += 1
         except Exception:  # noqa: BLE001 — one member's failure must not stop the fan-out
-            logger.warning("mission digest delivery failed for member %s", str(membership.tenant_id)[:8], exc_info=True)
-    return {"window": window, "sent": sent}
+            logger.warning("mission digest delivery failed for member %s", str(tenant.id)[:8], exc_info=True)
+    return {"window": window, "sent": sent, "skipped_projects_v2": skipped}
 
 
-def _deliver_digest(tenant, mission) -> None:
+def _deliver_digest(tenant, missions) -> None:
     from . import projection
+    from .services import _handle_for
 
-    text = _render_digest(projection.build_mission_status(mission))
+    me = _handle_for(tenant.id)
+    text = "\n\n".join(_render_digest(projection.build_mission_status(m), me) for m in missions)
     _deliver_text(tenant, text)
 
 
-def _render_digest(status: dict) -> str:
-    """Warm, non-shaming (§7 tone): '🌱 July Steps — you + @aya both hit 6/7.
-    @kiho's had a quieter week — a wave might help.'"""
-    # No title: any member can rename a mission, and this text is replayed to the
-    # reader's assistant as its own earlier message. Handles and counts only.
-    starter = next((m["handle"] for m in status["members"] if m.get("is_creator") and m.get("handle")), None)
-    lines = [f"\U0001f331 Your crew with @{starter} this week:" if starter else "\U0001f331 Your crew this week:"]
+def _render_digest(status: dict, me: str | None = None) -> str:
+    """Warm, non-shaming (§7 tone), written TO the reader: '🌱 July Steps this
+    week: • You: showed up 6/7 days • @aya: 4/7 days. @kiho had a quieter week —
+    a wave might help.' The title is for the person; the assistant never sees it
+    (proactive_context and conversation_capture replay this job without its text)."""
+    lines = [f"\U0001f331 {status['title']} this week:"]
     for member in status["members"]:
-        who = f"@{member['handle']}" if member["handle"] else "a neighbor"
+        mine = bool(me) and member["handle"] == me
+        who = "You" if mine else (f"@{member['handle']}" if member["handle"] else "A neighbor")
         streak = f", {member['streak']}-day streak" if member["streak"] else ""
         lines.append(f"• {who}: showed up {member['showed_up']}/{member['window_days']} days{streak}")
-    quiet = [f"@{m['handle']}" for m in status["members"] if m["showed_up"] == 0 and m["handle"]]
+    quiet = [f"@{m['handle']}" for m in status["members"] if m["showed_up"] == 0 and m["handle"] and m["handle"] != me]
     if quiet:
         lines.append(f"{', '.join(quiet)} had a quieter week — a wave might help. \U0001f49b")
     return "\n".join(lines)
