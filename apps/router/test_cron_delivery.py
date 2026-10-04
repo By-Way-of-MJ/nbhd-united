@@ -315,6 +315,47 @@ class CronDeliveryViewTest(TestCase):
         self.assertNotIn("insight", ProactiveOutbound.objects.get(tenant=self.tenant).message_text)
 
     @patch("apps.router.proactive_context._dispatch_ios_push")
+    def test_app_block_marker_stripped_before_persist(self, _push):
+        """The typed-cron ``[block: ...]`` render marker never reaches the app feed."""
+        from apps.router.models import DeviceToken
+
+        DeviceToken.objects.create(tenant=self.tenant, user=self.user, token="b" * 64)
+
+        resp = self.client.post(
+            self.url,
+            {"message": "[block: task_hygiene]\n**Weekly task hygiene** — nothing looked clearly done."},
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        stored = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(stored.message_text, "**Weekly task hygiene** — nothing looked clearly done.")
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_telegram_inline_block_marker_stripped_before_send(self, mock_client_cls):
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_http.post.return_value = mock_resp
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        resp = self.client.post(
+            self.url,
+            {"message": "[block: daily_briefing] Good morning!\nTwo events today."},
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        sent_text = mock_http.post.call_args.kwargs["json"]["text"]
+        self.assertEqual(sent_text, "Good morning!\nTwo events today.")
+        self.assertNotIn("[block", ProactiveOutbound.objects.get(tenant=self.tenant).message_text)
+
+    @patch("apps.router.proactive_context._dispatch_ios_push")
     def test_app_quick_reply_marker_stripped_before_send_and_persisted(self, _push):
         from apps.router.models import DeviceToken
 
