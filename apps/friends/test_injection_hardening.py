@@ -212,14 +212,20 @@ class MissionInjectionTests(TestCase):
         self.assertEqual(status["target"], {})
         self.assertIn("crew", envelope.render_missions(self.a))
 
-    def test_the_weekly_digest_never_carries_the_title(self):
+    def test_the_weekly_digest_title_reaches_the_person_but_never_the_assistant(self):
+        from apps.router.models import ProactiveOutbound
+        from apps.router.proactive_context import _format_block
+
         from . import projection
         from .digest import _render_digest
 
         SharedGoal.objects.filter(id=self.mission.id).update(title=ATTACK)
-        text = _render_digest(projection.build_mission_status(SharedGoal.objects.get(id=self.mission.id)))
-        self.assertNotIn("Ignore", text)
-        self.assertIn("Your crew with @aya this week", text)
+        text = _render_digest(projection.build_mission_status(SharedGoal.objects.get(id=self.mission.id)), "aya")
+        self.assertIn("Ignore", text)  # the person sees what the mission is called
+        row = ProactiveOutbound(
+            tenant=self.a, channel="app", channel_user_id="1", message_text=text, job_name="_mission:digest"
+        )
+        self.assertNotIn("Ignore", _format_block([row]))  # replayed to the assistant without it
 
     def test_a_renamed_mission_never_reaches_my_standing_notes(self):
         SharedGoal.objects.filter(id=self.mission.id).update(title=ATTACK)
