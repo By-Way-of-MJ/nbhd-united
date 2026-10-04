@@ -81,11 +81,22 @@ Live control-plane DB is Supabase **us-west-1** `dljqtpunnobyztampxus` (see debu
 # Dead-tool detection — per-tool calls + error rate; flags 100%-error tools. Report-only.
 python manage.py report_tool_health --days 7 --min-calls 5 [--namespace runtime] [--tenant <uuid>]
 
-# Retention purge — default 90 days, batched.
-python manage.py purge_tool_events --older-than-days 90 [--batch-size 5000] [--dry-run]
+# Retention purge — default 90 days, batched; manual runs are unlimited by default.
+python manage.py purge_tool_events --older-than-days 90 [--batch-size 5000] [--max-batches 20] [--max-seconds 30] [--dry-run]
 ```
 
-Scheduling is QStash, as always — trigger the purge the way the other sweeps are triggered. Do not build new scheduling infra for it.
+QStash schedules `purge-tool-events` daily at **05:50 UTC**, through
+`/api/cron/trigger/purge_tool_events/` and `apps.platform_logs.tasks.purge_tool_events_task`.
+The task retains 90 days and deletes at most twenty 5,000-row batches (100,000
+rows per firing). It stops starting batches after 30 seconds; PostgreSQL
+statements, including lock waits and counts, are capped at five seconds (or the
+remaining budget if shorter). Each batch commits independently, so the final
+in-flight batch can slightly exceed the 30-second budget, well below Gunicorn's
+300-second timeout. Database errors propagate for QStash retry; a reported
+remaining backlog waits for the next daily run or an operator's manual run.
+Only `ToolContractEvent` rows strictly older than the cutoff are deleted;
+conversation content and `PlatformIssueLog` rows are untouched. System-cron
+registration after deploy and the daily reconcile keep this schedule in sync.
 
 ## Phase map
 

@@ -126,6 +126,9 @@ SYSTEM_CRONS = [
     # Daily at 05:40 UTC — delete "since you were last here" write events older
     # than 30 days. Metadata only; the feed never looks further back.
     ("purge-runtime-write-events", "40 5 * * *", "/api/cron/trigger/purge_runtime_write_events/"),
+    # Daily at 05:50 UTC — purge diagnostic tool events older than 90 days.
+    # Offset from the 05:40 runtime-write purge and all other daily entries.
+    ("purge-tool-events", "50 5 * * *", "/api/cron/trigger/purge_tool_events/"),
     # Daily at 01:30 UTC — watchdog for orphaned Fuel/Gravity welcome crons.
     # Re-invokes the self-healing schedulers so a tenant whose welcome was
     # missed (gateway hiccup, agent crash mid-turn) gets retried within 24h.

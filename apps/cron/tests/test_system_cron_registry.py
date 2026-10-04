@@ -284,6 +284,24 @@ class SystemCronsWellFormednessTests(TestCase):
         self.assertEqual(match.kwargs, {"task_name": "reap_meditations"})
         self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), reap_meditations)
 
+    def test_tool_event_purge_is_registered_daily_at_0550_utc(self):
+        from django.urls import resolve
+        from django.utils.module_loading import import_string
+
+        from apps.cron.views import TASK_MAP, trigger_task
+        from apps.platform_logs.tasks import purge_tool_events_task
+
+        entries = [e for e in reg_cmd.SYSTEM_CRONS if e[0] == "purge-tool-events"]
+        self.assertEqual(
+            entries,
+            [("purge-tool-events", "50 5 * * *", "/api/cron/trigger/purge_tool_events/")],
+        )
+        match = resolve(entries[0][2])
+        self.assertIs(match.func, trigger_task)
+        self.assertEqual(match.kwargs, {"task_name": "purge_tool_events"})
+        self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), purge_tool_events_task)
+        self.assertEqual([e[0] for e in reg_cmd.SYSTEM_CRONS if e[1] == "50 5 * * *"], ["purge-tool-events"])
+
     def test_sautai_generation_recovery_is_registered_every_minute(self):
         from apps.cron.views import TASK_MAP
 

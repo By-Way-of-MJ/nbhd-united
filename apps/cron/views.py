@@ -345,6 +345,8 @@ TASK_MAP = {
     "render_meditation": "apps.core.tasks.render_meditation_task",
     "compose_meditation": "apps.core.tasks.compose_meditation_task",
     "reap_meditations": "apps.core.tasks.reap_meditations",
+    # Daily bounded retention sweep for content-free diagnostic telemetry.
+    "purge_tool_events": "apps.platform_logs.tasks.purge_tool_events_task",
     # Fuel session-scheduling cutover — derived from Workout.scheduled_at
     "regenerate_fuel_crons": "apps.orchestrator.tasks.regenerate_fuel_crons_task",
     "reconcile_fuel_crons": "apps.orchestrator.tasks.reconcile_fuel_crons_task",
