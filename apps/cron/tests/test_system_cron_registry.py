@@ -267,6 +267,23 @@ class SystemCronsWellFormednessTests(TestCase):
             "apps.router.pending_queue.reap_stale_app_chat_messages_task",
         )
 
+    def test_meditation_reaper_is_registered_every_ten_minutes(self):
+        from django.urls import resolve
+        from django.utils.module_loading import import_string
+
+        from apps.core.tasks import reap_meditations
+        from apps.cron.views import TASK_MAP, trigger_task
+
+        entries = [e for e in reg_cmd.SYSTEM_CRONS if e[0] == "reap-meditations"]
+        self.assertEqual(
+            entries,
+            [("reap-meditations", "*/10 * * * *", "/api/cron/trigger/reap_meditations/")],
+        )
+        match = resolve(entries[0][2])
+        self.assertIs(match.func, trigger_task)
+        self.assertEqual(match.kwargs, {"task_name": "reap_meditations"})
+        self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), reap_meditations)
+
     def test_sautai_generation_recovery_is_registered_every_minute(self):
         from apps.cron.views import TASK_MAP
 
