@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -298,6 +299,11 @@ def _record_send(tenant_id: str) -> None:
     _rate_counts.setdefault(tenant_id, []).append(time.time())
 
 
+# ``[block: daily_briefing]`` / ``[block: task_hygiene]`` / ``[block: <render_block>]``
+# — see apps/cron/patterns. Takes the rest of a marker-only line with it.
+_BLOCK_MARKER_RE = re.compile(r"\[block:\s*[a-z][a-z0-9_]*\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
+
+
 def _is_morning_briefing_send(*, tenant, job_name: str) -> bool:
     try:
         normalized_job_name = str(job_name or "").strip()
@@ -577,6 +583,10 @@ class CronDeliveryView(APIView):
 
         insight_source_text = placeholder_message_text
         placeholder_message_text = INSIGHT_MARKER_RE.sub(lambda m: (m.group(2) or "").strip(), placeholder_message_text)
+        # ``[block: <pattern>]`` is the typed-cron render marker. The prompt asks
+        # for it and the runtime gate checks it BEFORE this send arrives; nothing
+        # downstream reads it, so it is spent by the time we get here.
+        placeholder_message_text = _BLOCK_MARKER_RE.sub("", placeholder_message_text).lstrip()
         if journal_link is None:
             try:
                 if _is_morning_briefing_send(
