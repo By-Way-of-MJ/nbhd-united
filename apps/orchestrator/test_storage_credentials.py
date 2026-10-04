@@ -41,7 +41,8 @@ def storage_error(status=403, code="AuthenticationFailed"):
 
 
 def keys(value):
-    return SimpleNamespace(keys=[SimpleNamespace(value=value)])
+    # list_keys returns key1 then key2; nbhd uses key2 by default (2026-10 rotation).
+    return SimpleNamespace(keys=[SimpleNamespace(value="key1-unused"), SimpleNamespace(value=value)])
 
 
 class GateTests(SimpleTestCase):
@@ -602,3 +603,20 @@ class TelemetryTests(CacheTestCase):
             self.assertNotIn("dummy-secret", record.getMessage())
             self.assertNotIn("dummy-key", record.getMessage())
             self.assertIsNone(record.exc_info)
+
+
+class KeyIndexTests(SimpleTestCase):
+    def test_default_is_key2(self):
+        result = SimpleNamespace(keys=[SimpleNamespace(value="one"), SimpleNamespace(value="two")])
+        self.assertEqual(credentials.select_account_key(result), "two")
+
+    def test_index_zero_selects_key1(self):
+        result = SimpleNamespace(keys=[SimpleNamespace(value="one"), SimpleNamespace(value="two")])
+        with override_settings(AZURE_STORAGE_KEY_INDEX="0"):
+            self.assertEqual(credentials.select_account_key(result), "one")
+
+    def test_invalid_index_fails_loudly(self):
+        result = SimpleNamespace(keys=[SimpleNamespace(value="one"), SimpleNamespace(value="two")])
+        for bad in ("2", "key2", "-1"):
+            with self.subTest(bad=bad), override_settings(AZURE_STORAGE_KEY_INDEX=bad), self.assertRaises(ValueError):
+                credentials.select_account_key(result)

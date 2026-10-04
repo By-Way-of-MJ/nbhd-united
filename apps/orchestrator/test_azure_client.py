@@ -341,7 +341,7 @@ class RegisterEnvironmentStorageTest(SimpleTestCase):
         mock_storage_client = MagicMock()
         mock_get_storage_client.return_value = mock_storage_client
         mock_storage_client.storage_accounts.list_keys.return_value = SimpleNamespace(
-            keys=[SimpleNamespace(value="fake-key-123")],
+            keys=[SimpleNamespace(value="key1-unused"), SimpleNamespace(value="fake-key-123")],
         )
 
         mock_container_client = MagicMock()
@@ -815,7 +815,10 @@ class DeleteWorkspaceFileTest(SimpleTestCase):
     @patch("azure.storage.fileshare.ShareFileClient")
     def test_existing_workspace_file_is_deleted(self, mock_share_cls, mock_get_storage, _mock_is_mock):
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
 
         delete_workspace_file("148ccf1c-ef13-47f8-ada1-a98fa90e14a0", "workspace/rules/subagents.md")
@@ -832,7 +835,10 @@ class DeleteWorkspaceFileTest(SimpleTestCase):
         from azure.core.exceptions import ResourceNotFoundError
 
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
         file_client = mock_share_cls.return_value
         file_client.get_file_properties.side_effect = ResourceNotFoundError("missing")
@@ -868,7 +874,10 @@ class UploadConfigToFileShareTest(SimpleTestCase):
     @patch("azure.storage.fileshare.ShareFileClient")
     def test_upload_config_uses_direct_upload_file_with_length(self, mock_share_cls, mock_get_storage, _mock_is_mock):
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
 
         upload_config_to_file_share(
