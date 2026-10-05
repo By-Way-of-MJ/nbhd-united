@@ -317,7 +317,8 @@ def _apply_to_tenant(sub: AppStoreSubscription) -> None:
             tenant.save(update_fields=["pending_deletion", "deletion_scheduled_at", "updated_at"])
             logger.warning("apple_iap: cleared scheduled deletion for %s (now pays through the App Store)", tenant.id)
         running = tenant.status == Tenant.Status.ACTIVE and bool(tenant.container_id)
-        if not running and tenant.status != Tenant.Status.PROVISIONING:
+        # A running trial user who buys still needs is_trial cleared (activate's no-op path).
+        if (not running or tenant.is_trial) and tenant.status != Tenant.Status.PROVISIONING:
             try:
                 outcome = services.activate_paid_tenant(tenant)
             except services.ActivationDeferred as exc:
@@ -345,6 +346,13 @@ def _stripe():
 _STRIPE_ENDED = {"canceled", "incomplete_expired"}
 
 
+def stripe_field(obj, name: str, default=None):
+    """Read a field from a Stripe object (attribute on stripe-py 15+) or a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 def _resolve_double_billing(tenant) -> None:
     """Apple has charged; if a Stripe subscription is still live, end it at period
     end and tell MJ. A Stripe id that is already dead is just cleared. Never
@@ -356,12 +364,8 @@ def _resolve_double_billing(tenant) -> None:
     stripe = _stripe()
     try:
         current = stripe.Subscription.retrieve(tenant.stripe_subscription_id)
-        state = current.get("status") if hasattr(current, "get") else getattr(current, "status", "")
-        already_ending = bool(
-            current.get("cancel_at_period_end")
-            if hasattr(current, "get")
-            else getattr(current, "cancel_at_period_end", False)
-        )
+        state = stripe_field(current, "status", "")
+        already_ending = bool(stripe_field(current, "cancel_at_period_end", False))
     except Exception as exc:  # noqa: BLE001
         from apps.billing.views import _is_missing_subscription_error
 

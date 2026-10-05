@@ -5,6 +5,7 @@ verification) and `_client` (App Store Server API). A "signed" payload in these 
 is JSON describing what Apple's real JWS would decode to.
 """
 
+import io
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -20,6 +21,8 @@ from apps.billing.entitlement import billing_source, is_paying, paying_q
 from apps.billing.models import AppStoreNotification, AppStoreSubscription
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
+
+DELETE_URL = "/api/v1/tenants/delete-account/"
 
 CONFIGURED = {
     "APPLE_IAP_ISSUER_ID": "issuer",
@@ -500,3 +503,64 @@ class AppleIAPTests(TestCase):
         parsed = _get_cattrs_converter(StatusResponse).structure(raw, StatusResponse)
         item = parsed.data[0].lastTransactions[0]
         self.assertEqual((item.rawStatus, item.originalTransactionId, item.signedTransactionInfo), (4, "x1", "a"))
+
+    # ── review round 2 ────────────────────────────────────────────────────
+
+    def test_a_running_trial_user_who_buys_stops_being_a_trial(self):
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.is_trial = True
+        self.tenant.trial_ends_at = timezone.now() + timedelta(days=10)
+        self.tenant.save()
+        self._active("7000")
+        self.assertFalse(self.fresh().is_trial)
+        self.assertEqual(self.fresh().status, Tenant.Status.ACTIVE)
+
+    def test_clean_up_reads_real_stripe_objects(self):
+        import stripe
+        from django.core.management import call_command
+
+        self.tenant.stripe_subscription_id = "sub_gone"
+        self.tenant.save()
+        real = stripe.Subscription.construct_from({"id": "sub_gone", "status": "canceled"}, "sk_test")
+        with patch("stripe.Subscription.retrieve", return_value=real):
+            call_command("clear_ended_stripe_subscriptions", "--apply", stdout=io.StringIO())
+        self.assertEqual(self.fresh().stripe_subscription_id, "")
+
+    def test_double_billing_reads_real_stripe_objects(self):
+        import stripe
+
+        self.tenant.stripe_subscription_id = "sub_live"
+        self.tenant.save()
+        real = stripe.Subscription.construct_from(
+            {"id": "sub_live", "status": "active", "cancel_at_period_end": False}, "sk_test"
+        )
+        with patch("stripe.Subscription.retrieve", return_value=real), patch("stripe.Subscription.modify") as modify:
+            self._active("7100")
+        modify.assert_called_once_with("sub_live", cancel_at_period_end=True)
+
+    def test_deleting_an_account_that_pays_apple_and_stripe_is_immediate(self):
+        self._active("7200")
+        self.tenant.refresh_from_db()
+        Tenant.objects.filter(id=self.tenant.id).update(stripe_subscription_id="sub_both")
+        client = self.client_for(self.tenant)
+        with (
+            patch("stripe.Subscription.cancel") as cancel,
+            patch("stripe.Subscription.modify") as modify,
+            patch("apps.tenants.views._do_hard_delete") as hard_delete,  # needs no outer transaction
+        ):
+            response = client.post(DELETE_URL, {"confirm": "DELETE"}, format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(response.json()["scheduled"])
+        self.assertTrue(response.json()["apple_subscription_active"])
+        cancel.assert_called_once_with("sub_both")
+        modify.assert_not_called()
+        hard_delete.assert_called_once()
+        self.assertFalse(self.fresh().pending_deletion)
+
+    def test_a_skipped_scheduled_deletion_tells_mj(self):
+        self._active("7300")
+        Tenant.objects.filter(id=self.tenant.id).update(pending_deletion=True, stripe_subscription_id="sub_x")
+        services.handle_subscription_deleted(
+            {"id": "sub_x", "customer": "", "metadata": {"user_id": str(self.tenant.user_id)}}
+        )
+        self.assertTrue(any("skipped scheduled deletion" in c.args[0] for c in self.alert.call_args_list))

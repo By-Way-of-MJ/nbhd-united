@@ -9,7 +9,7 @@ other channels, and the app would hide Subscribe). Asks Stripe about each one.
 
 from django.core.management.base import BaseCommand
 
-from apps.billing.apple_iap import _STRIPE_ENDED, _stripe
+from apps.billing.apple_iap import _STRIPE_ENDED, _stripe, stripe_field
 from apps.billing.services import _end_stripe_subscription
 from apps.tenants.models import Tenant
 
@@ -32,7 +32,7 @@ class Command(BaseCommand):
         ended = live = unknown = 0
         for tenant in candidates:
             try:
-                state = stripe.Subscription.retrieve(tenant.stripe_subscription_id).get("status")
+                state = stripe_field(stripe.Subscription.retrieve(tenant.stripe_subscription_id), "status", "")
             except Exception as exc:  # noqa: BLE001
                 if _is_missing_subscription_error(exc):
                     state = "missing"

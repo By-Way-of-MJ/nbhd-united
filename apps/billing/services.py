@@ -557,7 +557,12 @@ def handle_subscription_deleted(subscription_data: dict) -> None:
             # They scheduled deletion and then subscribed on the iPhone: Apple is
             # billing them, so never hard-delete. Stripe is over either way.
             _end_stripe_subscription(tenant)
-            logger.warning("Skipped scheduled deletion for tenant %s — pays through the App Store", tenant.id)
+            from .apple_iap import _alert
+
+            _alert(
+                f"NBHD: skipped scheduled deletion for tenant {str(tenant.id)[:8]} — it pays through the "
+                "App Store. Check whether they still want the account deleted."
+            )
             return
         # User requested account deletion — paid period is now over, finalize it.
         # Explicit user intent overrides exempt-tenant protection.
