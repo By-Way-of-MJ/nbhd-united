@@ -1862,6 +1862,7 @@ def drain_pending_messages_for_tenant_task(
         # whose follow-up health probe also says down, so a genuine turn
         # timeout against a live container still flows through the normal
         # bounded retry path.
+        wake_failed = False
         if tenant.hibernated_at is not None and container_down:
             from apps.billing.services import check_budget
 
@@ -1881,7 +1882,15 @@ def drain_pending_messages_for_tenant_task(
                 # On a failed wake we fall through to the bounded failure path
                 # below, which advances the attempt counter and eventually
                 # drops + apologizes. (canary 148ccf1c, 2026-06-25)
-                woke = wake_hibernated_tenant(tenant)
+                # Publish the rich-client phase before the blocking Azure wake.
+                _mark_ios_waking(channel, batch)
+                woke = False
+                try:
+                    woke = wake_hibernated_tenant(tenant)
+                finally:
+                    wake_failed = not woke
+                    if wake_failed:
+                        _clear_ios_waking(channel, batch)
                 if woke:
                     for row in batch:
                         row.delivery_in_flight_until = None
@@ -1892,7 +1901,6 @@ def drain_pending_messages_for_tenant_task(
                         _WAKE_DEFER_SECONDS,
                     )
                     _notify_waking(tenant, channel, channel_user_id or "")
-                    _mark_ios_waking(channel, batch)
                     _reschedule_drain(
                         tenant,
                         channel,
@@ -1932,7 +1940,8 @@ def drain_pending_messages_for_tenant_task(
                 boot_state,
                 _WAKE_DEFER_SECONDS,
             )
-            _mark_ios_waking(channel, batch)
+            if not wake_failed:
+                _mark_ios_waking(channel, batch)
             _reschedule_drain(
                 tenant,
                 channel,
@@ -2078,7 +2087,7 @@ def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
     ``GET /chat/messages/<id>/`` can render "your assistant is waking up"
     instead of indefinite typing dots. Telegram gets the same signal via
     ``_notify_waking``'s push ack; rich clients have no push transport.
-    Idempotent — re-stamping on each boot-grace retry is harmless."""
+    Preserve the first stamp across provisioning and boot-grace retries."""
     if channel != PendingMessage.Channel.IOS or not batch:
         return
     client_ids = _ios_client_msg_ids(batch)
@@ -2091,9 +2100,29 @@ def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
             tenant_id=batch[0].tenant_id,
             client_msg_id__in=client_ids,
             status=AppChatMessage.Status.PENDING,
+            waking_at__isnull=True,
         ).update(waking_at=timezone.now())
     except Exception:
         logger.exception("drain_pending: failed to stamp waking_at for ios batch")
+
+
+def _clear_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
+    """A failed wake must not leave pending app turns advertising progress."""
+    if channel != PendingMessage.Channel.IOS or not batch:
+        return
+    client_ids = _ios_client_msg_ids(batch)
+    if not client_ids:
+        return
+    try:
+        from apps.router.models import AppChatMessage
+
+        AppChatMessage.objects.filter(
+            tenant_id=batch[0].tenant_id,
+            client_msg_id__in=client_ids,
+            status=AppChatMessage.Status.PENDING,
+        ).update(waking_at=None)
+    except Exception:
+        logger.exception("drain_pending: failed to clear waking_at for ios batch")
 
 
 def _is_tenant_container_live(tenant: Tenant) -> bool:
