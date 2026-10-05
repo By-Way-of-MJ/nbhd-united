@@ -11,6 +11,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from apps.billing.entitlement import is_paying
 from apps.billing.services import (
     check_budget,
     record_usage,
@@ -447,7 +448,7 @@ def telegram_webhook(request):
         )
 
     frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-    if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+    if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
         lang = tenant.user.language or "en"
         return JsonResponse(
             {

@@ -82,7 +82,9 @@ def user_has_active_subscription(user) -> bool:
         tenant = user.tenant
     except Tenant.DoesNotExist:
         return False
-    return bool(tenant.status == Tenant.Status.ACTIVE and tenant.stripe_subscription_id and not tenant.is_trial)
+    from apps.billing.entitlement import is_paying
+
+    return bool(tenant.status == Tenant.Status.ACTIVE and is_paying(tenant) and not tenant.is_trial)
 
 
 def _stripe_api_key() -> str:

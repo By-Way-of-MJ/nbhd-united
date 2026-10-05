@@ -20,10 +20,14 @@ anyio==4.12.1
     #   google-genai
     #   httpx
     #   openai
+app-store-server-library==3.1.2
+    # via -r requirements.in
 asgiref==3.11.1
     # via
     #   django
     #   django-cors-headers
+asn1==3.2.0
+    # via app-store-server-library
 attrs==26.1.0
     # via
     #   aiohttp
@@ -86,6 +90,8 @@ catalogue==2.0.10
     #   spacy
     #   srsly
     #   thinc
+cattrs==26.2.1
+    # via app-store-server-library
 certifi==2026.2.25
     # via
     #   httpcore
@@ -170,6 +176,8 @@ djangorestframework==3.18.0
     #   djangorestframework-simplejwt
 djangorestframework-simplejwt==5.5.1
     # via -r requirements.in
+enum-compat==0.0.3
+    # via asn1
 fastuuid==0.14.0
     # via litellm
 filelock==3.25.2
@@ -414,6 +422,8 @@ pyjwt[crypto]==2.13.0
     #   djangorestframework-simplejwt
     #   msal
     #   qstash
+pyopenssl==26.2.0
+    # via app-store-server-library
 pyparsing==3.3.2
     # via matplotlib
 pypdf==6.17.0

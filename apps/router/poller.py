@@ -17,6 +17,7 @@ from django.conf import settings
 from django.db import InterfaceError, OperationalError, close_old_connections
 from django.utils import timezone
 
+from apps.billing.entitlement import is_paying
 from apps.billing.services import (
     check_budget,
     record_usage,
@@ -1014,11 +1015,7 @@ class TelegramPoller:
                     self._execute_telegram_response(response_data)
                     return
                 frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-                if (
-                    tenant.status == Tenant.Status.SUSPENDED
-                    and not tenant.is_trial
-                    and not bool(tenant.stripe_subscription_id)
-                ):
+                if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
                     lang = getattr(tenant.user, "language", None) or "en"
                     self._send_message(
                         chat_id,
@@ -1060,7 +1057,7 @@ class TelegramPoller:
 
         # Paused tenant — trial ended or payment lapsed
         frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
             lang = getattr(tenant.user, "language", None) or "en"
             self._send_message(
                 chat_id,
