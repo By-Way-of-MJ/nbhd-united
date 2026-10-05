@@ -34,8 +34,14 @@ def is_paying(tenant) -> bool:
 
 def paying_q(prefix: str = "") -> Q:
     """``is_paying`` as a queryset filter on Tenant (``prefix`` for related lookups,
-    e.g. ``"tenant__"``)."""
-    return Q(**{f"{prefix}stripe_subscription_id__gt": ""}) | Q(**{f"{prefix}app_store_subscriptions__entitles": True})
+    e.g. ``"tenant__"``). ``Exists`` rather than a join, so a tenant with several App
+    Store rows is never returned more than once."""
+    from django.db.models import Exists, OuterRef
+
+    from .models import AppStoreSubscription
+
+    apple = Exists(AppStoreSubscription.objects.filter(tenant_id=OuterRef(f"{prefix}pk"), entitles=True))
+    return Q(**{f"{prefix}stripe_subscription_id__gt": ""}) | Q(apple)
 
 
 def billing_source(tenant) -> str:

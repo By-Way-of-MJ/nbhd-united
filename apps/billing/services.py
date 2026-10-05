@@ -7,6 +7,7 @@ from datetime import date
 from decimal import Decimal
 
 from django.db.models import F
+from django.utils import timezone
 
 from apps.tenants.models import Tenant
 
@@ -512,6 +513,17 @@ def handle_checkout_completed(session_data: dict) -> None:
         logger.info("Tenant %s already provisioning for current subscription", tenant.id)
         return
 
+    from .entitlement import has_apple_subscription
+
+    if has_apple_subscription(tenant):
+        # A web checkout by someone already paying in the App Store: Stripe can be
+        # refunded by us, Apple can't — tell MJ.
+        from .apple_iap import _alert
+
+        _alert(
+            f"NBHD double billing: tenant {str(tenant.id)[:8]} checked out on the web while paying in the App Store."
+        )
+
     if should_wake:
         restore_tenant_runtime(tenant)
 
@@ -539,6 +551,14 @@ def handle_subscription_deleted(subscription_data: dict) -> None:
         return
 
     if tenant.pending_deletion:
+        from .entitlement import has_apple_subscription
+
+        if has_apple_subscription(tenant):
+            # They scheduled deletion and then subscribed on the iPhone: Apple is
+            # billing them, so never hard-delete. Stripe is over either way.
+            _end_stripe_subscription(tenant)
+            logger.warning("Skipped scheduled deletion for tenant %s — pays through the App Store", tenant.id)
+            return
         # User requested account deletion — paid period is now over, finalize it.
         # Explicit user intent overrides exempt-tenant protection.
         logger.info(
@@ -771,6 +791,10 @@ def pause_tenant_for_billing(tenant: Tenant) -> bool:
     return True
 
 
+class ActivationDeferred(Exception):
+    """The account is mid-teardown; activate once deprovisioning has finished."""
+
+
 def activate_paid_tenant(tenant: Tenant) -> str:
     """A payment started or resumed outside Stripe Checkout (the App Store): make the
     assistant run. Mirrors the checkout branch — wake a paused container, or build a
@@ -788,15 +812,30 @@ def activate_paid_tenant(tenant: Tenant) -> str:
     if tenant.status == Tenant.Status.PROVISIONING:
         tenant.save(update_fields=fields)
         return "noop"
+    if tenant.status == Tenant.Status.DEPROVISIONING:
+        # deprovision_tenant is still tearing the old assistant down; building a new
+        # one now would race it (it saves DELETED from a stale object). Retry later.
+        raise ActivationDeferred(f"tenant {tenant.id} is deprovisioning")
     if tenant.status == Tenant.Status.SUSPENDED and tenant.container_id:
         tenant.status = Tenant.Status.ACTIVE
         tenant.hibernated_at = None
         tenant.save(update_fields=[*fields, "status", "hibernated_at"])
-        restore_tenant_runtime(tenant)
+        if not restore_tenant_runtime(tenant):
+            # Same fallback as invoice.paid: mark idle-hibernated so the next message
+            # wakes the container instead of hitting a scaled-to-zero app.
+            tenant.hibernated_at = timezone.now()
+            tenant.save(update_fields=["hibernated_at", "updated_at"])
         return "woken"
+    previous = tenant.status
     tenant.status = Tenant.Status.PROVISIONING
     tenant.save(update_fields=[*fields, "status"])
-    publish_task("provision_tenant", str(tenant.id), idempotency_key=f"provision-{tenant.id}")
+    try:
+        publish_task("provision_tenant", str(tenant.id), idempotency_key=f"provision-{tenant.id}")
+    except Exception:
+        # Put the status back so the next refresh tries again (state-based activation).
+        tenant.status = previous
+        tenant.save(update_fields=["status", "updated_at"])
+        raise
     logger.info("Triggered provisioning for App Store payer %s", tenant.id)
     return "provisioning"
 

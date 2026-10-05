@@ -41,8 +41,9 @@ class FakeApple:
     def __init__(self):
         self.status = {}  # original id -> (code, txn fields, renewal fields)
         self.tokens_set = []
+        self.api_error = None  # an exception get_all_subscription_statuses raises
 
-    def set(self, original_id, code, *, env="Production", token="", expires_in_days=30, auto_renew=1):
+    def set(self, original_id, code, *, env="Production", token="", expires_in_days=30, auto_renew=1, signed_at=None):
         txn = {
             "kind": "transaction",
             "env": env,
@@ -50,7 +51,7 @@ class FakeApple:
             "productId": PRODUCT,
             "expiresDate": int((timezone.now() + timedelta(days=expires_in_days)).timestamp() * 1000),
             "appAccountToken": token,
-            "signedDate": int(timezone.now().timestamp() * 1000),
+            "signedDate": int((signed_at or timezone.now()).timestamp() * 1000),
         }
         renewal = {"kind": "renewal", "env": env, "rawAutoRenewStatus": auto_renew}
         self.status[original_id] = (code, txn, renewal)
@@ -67,6 +68,8 @@ class FakeApple:
 
         class _Client:
             def get_all_subscription_statuses(self, original_id):
+                if fake.api_error is not None:
+                    raise fake.api_error
                 code, txn, renewal = fake.status[original_id]
                 item = SimpleNamespace(
                     rawStatus=code,
@@ -265,7 +268,8 @@ class AppleIAPTests(TestCase):
         self.tenant.stripe_subscription_id = "sub_old"
         self.tenant.save()
         self.apple.set("3000", 1, token=str(self.tenant.user_id))
-        with patch("stripe.Subscription.modify"):
+        live = {"status": "active", "cancel_at_period_end": False}
+        with patch("stripe.Subscription.retrieve", return_value=live), patch("stripe.Subscription.modify"):
             apple_iap.sync_from_app(self.tenant, self.txn("3000"))
         services.handle_subscription_deleted(
             {"id": "sub_old", "customer": "", "metadata": {"user_id": str(self.tenant.user_id)}}
@@ -281,7 +285,8 @@ class AppleIAPTests(TestCase):
         self.tenant.stripe_subscription_id = "sub_live"
         self.tenant.save()
         self.apple.set("3001", 1, token=str(self.tenant.user_id))
-        with patch("stripe.Subscription.modify") as modify:
+        live = {"status": "active", "cancel_at_period_end": False}
+        with patch("stripe.Subscription.retrieve", return_value=live), patch("stripe.Subscription.modify") as modify:
             apple_iap.sync_from_app(self.tenant, self.txn("3001"))
         modify.assert_called_once_with("sub_live", cancel_at_period_end=True)
         self.alert.assert_called_once()
@@ -335,3 +340,163 @@ class AppleIAPTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         self.assertTrue(response.json()["apple_subscription_active"])
         self.assertIn("App Store subscription keeps billing", response.json()["detail"])
+
+    # ── review round 1 ────────────────────────────────────────────────────
+
+    def _active(self, original_id):
+        self.apple.set(original_id, 1, token=str(self.tenant.user_id))
+        return apple_iap.sync_from_app(self.tenant, self.txn(original_id))
+
+    def test_an_older_answer_never_overwrites_a_newer_one(self):
+        self._active("6000")
+        older = timezone.now() - timedelta(hours=1)
+        self.apple.set("6000", 2, token=str(self.tenant.user_id), signed_at=older)  # stale "expired"
+        apple_iap.refresh("6000", "Production")
+        self.assertTrue(AppStoreSubscription.objects.get(original_transaction_id="6000").entitles)
+        self.assertEqual(self.fresh().status, Tenant.Status.ACTIVE)
+
+    def test_expired_and_revoked_stop_the_plan(self):
+        for code, label in [(2, "expired"), (5, "revoked")]:
+            original = f"6{code}00"
+            self._active(original)
+            self.apple.set(original, code, token=str(self.tenant.user_id))
+            apple_iap.refresh(original, "Production")
+            sub = AppStoreSubscription.objects.get(original_transaction_id=original)
+            self.assertEqual((sub.status, sub.entitles), (label, False))
+        self.assertEqual(self.fresh().status, Tenant.Status.SUSPENDED)
+
+    def test_a_key_problem_is_retried_not_swallowed(self):
+        from appstoreserverlibrary.api_client import APIException
+
+        self._active("6100")
+        self.apple.api_error = APIException(401)
+        with self.assertRaises(apple_iap.TransientAppleError):
+            apple_iap.refresh("6100", "Production")
+        body = signed(kind="notification", notificationUUID="n-401", rawNotificationType="EXPIRED")
+        with patch.object(apple_iap, "_verify", side_effect=self._notification_verify("6100")):
+            response = APIClient().post("/api/v1/billing/apple/notifications/", {"signedPayload": body}, format="json")
+        self.assertEqual(response.status_code, 503)  # Apple will send it again
+        self.assertEqual(AppStoreNotification.objects.get(notification_uuid="n-401").outcome, "retry")
+
+    def test_restore_after_deleting_and_signing_up_again_moves_the_purchase(self):
+        old = create_tenant(display_name="Old me", telegram_chat_id=990010)
+        self.apple.set("6200", 1, token=str(old.user_id))
+        apple_iap.sync_from_app(old, self.txn("6200", token=str(old.user_id)))
+        old.user.delete()  # account deleted; Apple keeps billing
+        sub = AppStoreSubscription.objects.get(original_transaction_id="6200")
+        self.assertIsNone(sub.tenant_id)
+        apple_iap.sync_from_app(self.tenant, self.txn("6200", token=str(old.user_id)))
+        sub.refresh_from_db()
+        self.assertEqual(sub.tenant_id, self.tenant.id)
+        self.assertTrue(sub.entitles)
+        self.assertEqual(self.fresh().status, Tenant.Status.ACTIVE)
+        self.assertIn(("6200", str(self.tenant.user_id)), self.apple.tokens_set)
+
+    def test_an_activation_that_fails_is_redone_on_the_next_try(self):
+        self.tenant.status = Tenant.Status.DELETED
+        self.tenant.container_id = ""
+        self.tenant.save()
+        self.apple.set("6300", 1, token=str(self.tenant.user_id))
+        self.publish_task.side_effect = RuntimeError("QStash down")
+        response = self.client_for(self.tenant).post(
+            "/api/v1/billing/apple/sync/", {"signed_transaction": self.txn("6300")}, format="json"
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.fresh().status, Tenant.Status.DELETED)  # put back, not stuck in PROVISIONING
+        self.publish_task.side_effect = None
+        apple_iap.sync_from_app(self.tenant, self.txn("6300"))
+        self.assertEqual(self.fresh().status, Tenant.Status.PROVISIONING)
+
+    def test_a_wake_that_fails_leaves_the_assistant_wakeable(self):
+        self.mocks[2].return_value = False  # restore_tenant_runtime
+        self._active("6400")
+        tenant = self.fresh()
+        self.assertEqual(tenant.status, Tenant.Status.ACTIVE)
+        self.assertIsNotNone(tenant.hibernated_at)
+
+    def test_a_tenant_being_torn_down_is_activated_later_not_now(self):
+        self.tenant.status = Tenant.Status.DEPROVISIONING
+        self.tenant.save()
+        self.apple.set("6500", 1, token=str(self.tenant.user_id))
+        with self.assertRaises(apple_iap.TransientAppleError):
+            apple_iap.sync_from_app(self.tenant, self.txn("6500"))
+        self.assertEqual(self.fresh().status, Tenant.Status.DEPROVISIONING)
+
+    def test_several_app_store_rows_never_duplicate_a_tenant(self):
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.is_budget_exempt = True
+        self.tenant.save()
+        self._active("6600")
+        with override_settings(APPLE_IAP_SANDBOX_USER_IDS=[str(self.tenant.user_id)]):
+            self.apple.set("6601", 1, env="Sandbox", token=str(self.tenant.user_id))
+            apple_iap.sync_from_app(self.tenant, self.txn("6601", env="Sandbox"))
+        ids = list(Tenant.entitled_active().filter(id=self.tenant.id).values_list("id", flat=True))
+        self.assertEqual(len(ids), 1)
+
+    def test_paying_on_the_iphone_cancels_a_scheduled_deletion_and_stripe_end_never_hard_deletes(self):
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.pending_deletion = True
+        self.tenant.stripe_subscription_id = "sub_leaving"
+        self.tenant.save()
+        ending = {"status": "active", "cancel_at_period_end": True}
+        with patch("stripe.Subscription.retrieve", return_value=ending):
+            self._active("6700")
+        self.assertFalse(self.fresh().pending_deletion)
+        Tenant.objects.filter(id=self.tenant.id).update(pending_deletion=True)  # e.g. set again by a race
+        with patch("apps.tenants.views._do_hard_delete") as hard_delete:
+            services.handle_subscription_deleted(
+                {"id": "sub_leaving", "customer": "", "metadata": {"user_id": str(self.tenant.user_id)}}
+            )
+        hard_delete.assert_not_called()
+
+    def test_a_dead_stripe_id_is_cleared_quietly_not_alerted(self):
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.stripe_subscription_id = "sub_dead"
+        self.tenant.save()
+        with patch("stripe.Subscription.retrieve", return_value={"status": "canceled"}):
+            self._active("6800")
+        self.assertEqual(self.fresh().stripe_subscription_id, "")
+        self.alert.assert_not_called()
+
+    def test_the_daily_recheck_catches_a_lost_expiry(self):
+        self._active("6900")
+        AppStoreSubscription.objects.filter(original_transaction_id="6900").update(
+            expires_at=timezone.now() - timedelta(days=3)
+        )
+        self.apple.set("6900", 2, token=str(self.tenant.user_id))
+        result = apple_iap.recheck_lapsed()
+        self.assertEqual(result["checked"], 1)
+        self.assertFalse(AppStoreSubscription.objects.get(original_transaction_id="6900").entitles)
+        self.assertEqual(self.fresh().status, Tenant.Status.SUSPENDED)
+
+    def test_a_purchase_bound_elsewhere_is_still_recorded(self):
+        other = create_tenant(display_name="Ben", telegram_chat_id=990011)
+        self.apple.set("6950", 1, token=str(other.user_id))
+        with self.assertRaises(apple_iap.AccountMismatch):
+            apple_iap.sync_from_app(self.tenant, self.txn("6950", token=str(other.user_id)))
+        self.assertTrue(AppStoreSubscription.objects.filter(original_transaction_id="6950").exists())
+
+    def test_the_library_parses_apples_real_shapes(self):
+        """Guards the attribute names the code reads against library drift."""
+        from appstoreserverlibrary.models.LibraryUtility import _get_cattrs_converter
+        from appstoreserverlibrary.models.StatusResponse import StatusResponse
+
+        raw = {
+            "environment": "Sandbox",
+            "data": [
+                {
+                    "subscriptionGroupIdentifier": "g",
+                    "lastTransactions": [
+                        {
+                            "status": 4,
+                            "originalTransactionId": "x1",
+                            "signedTransactionInfo": "a",
+                            "signedRenewalInfo": "b",
+                        }
+                    ],
+                }
+            ],
+        }
+        parsed = _get_cattrs_converter(StatusResponse).structure(raw, StatusResponse)
+        item = parsed.data[0].lastTransactions[0]
+        self.assertEqual((item.rawStatus, item.originalTransactionId, item.signedTransactionInfo), (4, "x1", "a"))

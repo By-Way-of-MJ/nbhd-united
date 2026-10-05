@@ -997,9 +997,14 @@ def _suspend_unentitled_tenant(tenant):
     hibernated = False
 
     # An App Store subscription whose stored state looks lapsed may only be waiting
-    # for a late renewal notification: ask Apple before pausing anyone.
-    if still_paying_on_apple(tenant):
-        return {"crons_disabled": 0, "hibernated": False, "skipped": "apple"}
+    # for a late renewal notification: ask Apple before pausing anyone. Any error
+    # here skips this tenant for today rather than aborting the whole sweep.
+    try:
+        if still_paying_on_apple(tenant):
+            return {"crons_disabled": 0, "hibernated": False, "skipped": "apple"}
+    except Exception:  # noqa: BLE001
+        logger.exception("enforce_entitlement: Apple re-check failed for tenant %s — skipped today", tenant.id)
+        return {"crons_disabled": 0, "hibernated": False, "skipped": "apple_error"}
 
     if tenant.container_fqdn:
         try:
@@ -1051,14 +1056,29 @@ def expire_trials(request):
     hibernated = 0
     already_hibernated = 0
 
+    skipped_apple = 0
     for tenant in _unentitled_active_tenants():
+        result = _suspend_unentitled_tenant(tenant)
+        if result.get("skipped"):
+            skipped_apple += 1
+            continue
         if tenant.hibernated_at is not None:
             already_hibernated += 1
-        result = _suspend_unentitled_tenant(tenant)
         updated += 1
         crons_disabled += result["crons_disabled"]
         if result["hibernated"]:
             hibernated += 1
+
+    # Re-ask Apple about subscriptions we still count as paying past their period
+    # end (a lost EXPIRED/REFUND notification must not mean free service forever).
+    try:
+        from apps.billing.apple_iap import recheck_lapsed
+
+        apple_recheck = recheck_lapsed()
+    except Exception:  # noqa: BLE001
+        logger.exception("expire_trials: Apple re-check failed")
+        apple_recheck = {"error": True}
+    logger.info("expire_trials: %d kept by App Store re-check; recheck %s", skipped_apple, apple_recheck)
 
     logger.info(
         "expire_trials: suspended %d tenants (%d already hibernated, %d crons disabled, %d new hibernations)",
