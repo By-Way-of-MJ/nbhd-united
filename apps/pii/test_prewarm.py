@@ -100,6 +100,9 @@ class PiiWorkerPrewarmTests(SimpleTestCase):
         transformers.AutoModelForTokenClassification = SimpleNamespace(from_pretrained=Mock())
         transformers.pipeline = Mock()
 
+        # Load native dependencies outside patch.dict: restoring sys.modules
+        # must not unload torch's Python modules while its extension stays loaded.
+        engine.get_pattern_recognizers()
         with patch.dict(sys.modules, {"transformers": transformers}):
             _post_worker_init()(self.worker)
             result = redact_text("Email synthetic.person@example.com", tier="starter")
@@ -109,6 +112,18 @@ class PiiWorkerPrewarmTests(SimpleTestCase):
         self.worker.log.error.assert_called_once()
         self.assertNotIn("synthetic.person@example.com", result)
         self.assertIn("[EMAIL_ADDRESS_", result)
+
+    @patch("apps.crypto.prewarm.start_prewarm_thread")
+    def test_pattern_recognizers_warm_for_local_and_shared_workers(self, _dek_prewarm):
+        for transport in ("local", "shared"):
+            with (
+                patch.dict(os.environ, {"PII_DETECTOR_TRANSPORT": transport}),
+                patch("apps.pii.shared_client.ping_shared_detector", return_value=True),
+                patch("apps.pii.engine.get_pii_pipeline"),
+                patch("apps.pii.engine.get_pattern_recognizers") as patterns,
+            ):
+                _post_worker_init()(self.worker)
+            patterns.assert_called_once_with()
 
 
 class ModelFreeDjangoContextTests(SimpleTestCase):

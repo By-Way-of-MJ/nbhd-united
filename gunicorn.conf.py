@@ -75,6 +75,16 @@ def post_worker_init(worker):
                 exc,
             )
 
+    # Shared neural inference still uses local Presidio recognizers on every
+    # checked authoring pass. Import them here, before accepting requests too.
+    try:
+        from apps.pii.engine import get_pattern_recognizers
+
+        get_pattern_recognizers()
+        worker.log.info("post_worker_init: PII pattern recognizers warmed")
+    except Exception as exc:
+        worker.log.warning("post_worker_init: PII pattern warm failed (%s)", exc)
+
     # Encryption-at-rest Phase 1 (PR4): best-effort DEK cache pre-warm, dark
     # (nothing decrypts yet — this only populates apps.crypto.cache so a
     # later phase's first decrypt isn't a cold Key Vault unwrap). Runs on

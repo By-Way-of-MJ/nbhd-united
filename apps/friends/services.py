@@ -1689,7 +1689,7 @@ def _linked_goal_for(tenant, mission):
     return None
 
 
-def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None):
+def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None, linked_goal_id=...):
     """Author outside transactions, then persist only the caller's private Task."""
     from apps.journal.models import Task
 
@@ -1697,7 +1697,7 @@ def _mint_member_task(tenant, mission, title, description, due_date, *, step=Non
     return Task.objects.create(
         **values,
         due_date=due_date,
-        parent_goal_id=_linked_goal_for(tenant, mission),
+        parent_goal_id=_linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id,
         related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
         if step
         else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},

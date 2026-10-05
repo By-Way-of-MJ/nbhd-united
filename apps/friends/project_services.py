@@ -5,6 +5,7 @@ locked recheck is the lease validation: a changed step asks the caller to retry.
 No other tenant's journal is ever loaded or changed.
 """
 
+import logging
 from datetime import date
 from uuid import UUID
 
@@ -14,6 +15,8 @@ from rest_framework.exceptions import APIException, NotFound, PermissionDenied, 
 
 from . import access, plan_projection, services
 from .project_hygiene import clean_text
+
+logger = logging.getLogger(__name__)
 
 
 class Conflict(APIException):
@@ -231,6 +234,128 @@ def create_step(tenant, user, mission_id, data):
     services._append_update(goal, tenant, user, "step_added", text=step.title, payload={"step_id": str(step.id)})
     _refresh_milestones(goal, tenant, user)
     return step
+
+
+def prepare_step_tasks(tenant, items):
+    """Author private mirrors before acquiring the project lock (no network in it)."""
+    prepared = []
+    for data, take, _waits_on in items:
+        try:
+            prepared.append(services._prepare_member_task(tenant, data.get("title"), "") if take else None)
+        except APIException as exc:
+            prepared.append(exc)
+    return prepared
+
+
+def create_steps(tenant, user, mission_id, items, prepared_tasks, *, ignore_take_errors=False):
+    """Apply new steps in one locked pass; return a step or refusal for each item.
+
+    Items are (fields, take_myself, waits_on_ids); prepared_tasks comes from
+    prepare_step_tasks before any transaction. Draft publishing can keep an
+    unanswered ask when taking it is refused, as the individual respond path did.
+    Only NEW rows are batched: existing-step edits still use the versioned APIs.
+    The caller suppresses envelope signals and schedules one final crew refresh.
+    Journal Tasks use ordinary saves so extraction/linkage receivers still run.
+    Audit and self-assignment rows have no side effects except envelope refresh;
+    asking oneself sends no notification to any device.
+    """
+    with transaction.atomic():
+        goal, member = access.lock_project(tenant, mission_id)
+        step_ids = set(access.project_steps(goal).values_list("id", flat=True))
+        milestones = set(access.project_milestones(goal).values_list("id", flat=True))
+        edge_count = access.project_dependencies(goal).count()
+        linked_goal_id = services._linked_goal_for(tenant, goal)
+        updates, assignments, results = [], [], []
+        update_model = access.mission_updates().model
+        assignment_model = access.project_assignments(goal).model
+
+        def audit(kind, step, **payload):
+            if milestones:
+                # Milestone refresh can emit an intervening audit event; keep its
+                # ordering and even transient reached/unreached transitions.
+                services._append_update(
+                    goal,
+                    tenant,
+                    user,
+                    kind,
+                    text=step.title if kind == "step_added" else "",
+                    payload={"step_id": str(step.id), **payload},
+                )
+                return
+            updates.append(
+                update_model(
+                    shared_goal=goal,
+                    tenant=tenant,
+                    user=user,
+                    kind=kind,
+                    text=services.clean_text(step.title) if kind == "step_added" else "",
+                    payload={"step_id": str(step.id), **payload},
+                )
+            )
+
+        for (data, take, waits_on), prepared in zip(items, prepared_tasks, strict=True):
+            try:
+                fields = _fields(data, creating=True)
+                if fields.get("milestone_id") and fields["milestone_id"] not in milestones:
+                    raise NotFound("No such project item.")
+                # Dates use the same validator; milestone membership was read once.
+                _validate_step(goal, {k: v for k, v in fields.items() if k != "milestone_id"})
+                blockers = [_uuid(value) for value in waits_on]
+                if any(pk not in step_ids for pk in blockers):
+                    raise ValidationError("add_step: waits_on names a step outside this project")
+                if len(step_ids) >= 60:
+                    raise ValidationError("A project can have at most 60 steps.")
+                step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
+                step_ids.add(step.id)
+                audit("step_added", step)
+                if milestones:
+                    _refresh_milestones(goal, tenant, user)
+                # A new step has no outgoing edges: incoming edges cannot cycle.
+                # Keep legacy partial writes if the dependency cap refuses an edge.
+                for blocker_id in dict.fromkeys(blockers):
+                    if edge_count >= 120:
+                        raise ValidationError("A project can have at most 120 dependencies.")
+                    access.project_dependencies(goal).create(blocker_id=blocker_id, blocked=step)
+                    edge_count += 1
+                if take:
+                    assignment = assignment_model(
+                        step=step,
+                        membership=member,
+                        asked_by=tenant,
+                        asked_at=timezone.now(),
+                    )
+                    assignments.append(assignment)
+                    audit("step_assigned", step, membership_id=str(member.id))
+                    try:
+                        if isinstance(prepared, APIException):
+                            raise prepared
+                        if prepared is None:
+                            raise Conflict()
+                        assignment.task = services._mint_member_task(
+                            tenant,
+                            goal,
+                            step.title,
+                            "",
+                            step.due_date,
+                            step=step,
+                            prepared=prepared,
+                            linked_goal_id=linked_goal_id,
+                        )
+                        assignment.status = "accepted"
+                        assignment.responded_at = timezone.now()
+                        audit("step_answered", step, answer="yes")
+                    except APIException:
+                        if not ignore_take_errors:
+                            raise
+                        # Draft publication historically leaves an unanswered ask
+                        # when taking one's step is refused after publication.
+                        logger.warning("publish_draft: could not take step %s", step.id, exc_info=True)
+                results.append(step)
+            except APIException as exc:
+                results.append(exc)
+        access.project_assignments(goal).bulk_create(assignments)
+        access.mission_updates().bulk_create(updates)
+        return results
 
 
 def patch_step(tenant, mission_id, step_id, data):

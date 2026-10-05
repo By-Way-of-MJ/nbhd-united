@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -2059,6 +2061,24 @@ def _has_adjacent_address_label(ent: dict, model_results: list[dict], max_gap: i
     return False
 
 
+_detection_cache = ContextVar("pii_detection_cache", default=None)
+
+
+@contextmanager
+def reuse_detections():
+    """Reuse successful neural spans for identical text within one operation.
+
+    Cache only raw model output, never policy decisions, redacted text or receipts.
+    Each pass still applies its own thresholds, registry and pattern recognizers.
+    No failures or deadline-bound calls are cached; nothing survives the scope.
+    """
+    token = _detection_cache.set({})
+    try:
+        yield
+    finally:
+        _detection_cache.reset(token)
+
+
 def _detect_pii(
     text: str,
     entities: list[str],
@@ -2100,7 +2120,14 @@ def _detect_pii(
     try:
         pii_pipeline = get_pii_pipeline()
         if deadline is None:
-            model_results = pii_pipeline(detect_text)
+            cached = _detection_cache.get()
+            key = (id(pii_pipeline), detect_text)
+            if cached is not None and key in cached:
+                model_results = cached[key]
+            else:
+                model_results = pii_pipeline(detect_text)
+                if cached is not None:
+                    cached[key] = model_results
         else:
             from time import monotonic
 
