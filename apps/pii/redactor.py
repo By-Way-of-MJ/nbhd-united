@@ -2070,7 +2070,9 @@ def reuse_detections():
 
     Cache only raw model output, never policy decisions, redacted text or receipts.
     Each pass still applies its own thresholds, registry and pattern recognizers.
-    No failures or deadline-bound calls are cached; nothing survives the scope.
+    No failures or deadline-bound calls are cached. The cache is reset on exit
+    for synchronous callers. An async child created inside the scope inherits
+    the context and can retain its cache dictionary after the parent exits.
     """
     token = _detection_cache.set({})
     try:

@@ -291,54 +291,69 @@ def publish_draft(tenant, user, draft_id, extra_member_friendship_ids=None) -> d
     ]
     with reuse_detections():
         prepared = projects.prepare_step_tasks(tenant, items)
-    with suppress_refresh(), transaction.atomic():
-        goal = services.create_mission(
-            tenant, user, member_friendship_ids=sorted(friendship_ids), title=spec.title, description=spec.goal
-        )
-        milestone_ids = {}
-        for index, m in enumerate(spec.milestones):
-            row = projects.milestone_write(
-                tenant,
-                goal.id,
-                {"title": m.title, "target_date": m.target_date.isoformat() if m.target_date else None, "order": index},
+    goal = None
+    try:
+        with suppress_refresh(), transaction.atomic():
+            goal = services.create_mission(
+                tenant, user, member_friendship_ids=sorted(friendship_ids), title=spec.title, description=spec.goal
             )
-            milestone_ids[m.key] = row.id
-        for step, (fields, _take, _waits_on) in zip(spec.steps, items, strict=True):
-            fields["milestone_id"] = str(milestone_ids[step.milestone_key]) if step.milestone_key else None
-        rows = projects.create_steps(tenant, user, goal.id, items, prepared, ignore_take_errors=True)
-        step_ids = {}
-        for step, row in zip(spec.steps, rows, strict=True):
-            if isinstance(row, APIException):
-                raise row
-            step_ids[step.key] = row.id
-        for s in spec.steps:
-            for dep in s.depends_on:
-                projects.dependency_write(
-                    tenant, goal.id, {"blocker_id": str(step_ids[dep]), "blocked_id": str(step_ids[s.key])}
+            milestone_ids = {}
+            for index, m in enumerate(spec.milestones):
+                row = projects.milestone_write(
+                    tenant,
+                    goal.id,
+                    {
+                        "title": m.title,
+                        "target_date": m.target_date.isoformat() if m.target_date else None,
+                        "order": index,
+                    },
                 )
-        members = {
-            str(m.tenant_id): m for m in access.mission_memberships().filter(shared_goal=goal).select_related("tenant")
-        }
-        by_handle = {
-            h: members.get(str(e.addressee_id if e.requester_id == tenant.id else e.requester_id))
-            for h, e in neighbors.items()
-        }
-        for s in spec.steps:
-            owner = (s.owner or "").lstrip("@").lower()
-            if not owner:
-                continue
-            if owner == "me":
-                continue
-            member = by_handle.get(owner)
-            if member is None or not projects_v2_enabled(member.tenant):
-                skipped.append(f"@{owner}: {s.title}")
-                continue
-            projects.ask(tenant, user, goal.id, step_ids[s.key], [str(member.id)])
-        draft.published_goal = goal
-        draft.save(update_fields=["published_goal"])
-    from .envelope import refresh_project_members
+                milestone_ids[m.key] = row.id
+            for step, (fields, _take, _waits_on) in zip(spec.steps, items, strict=True):
+                fields["milestone_id"] = str(milestone_ids[step.milestone_key]) if step.milestone_key else None
+            rows = projects.create_steps(
+                tenant, user, goal.id, [(fields, False, waits) for fields, _, waits in items], [None] * len(items)
+            )
+            step_ids = {}
+            for step, row in zip(spec.steps, rows, strict=True):
+                if isinstance(row, APIException):
+                    raise row
+                step_ids[step.key] = row.id
+            for s in spec.steps:
+                for dep in s.depends_on:
+                    projects.dependency_write(
+                        tenant, goal.id, {"blocker_id": str(step_ids[dep]), "blocked_id": str(step_ids[s.key])}
+                    )
+            members = {
+                str(m.tenant_id): m
+                for m in access.mission_memberships().filter(shared_goal=goal).select_related("tenant")
+            }
+            by_handle = {
+                h: members.get(str(e.addressee_id if e.requester_id == tenant.id else e.requester_id))
+                for h, e in neighbors.items()
+            }
 
-    refresh_project_members(goal.id, include_invited=True)
+            def ask_other(index, step):
+                s = spec.steps[index]
+                owner = (s.owner or "").lstrip("@").lower()
+                if not owner:
+                    return
+                member = by_handle.get(owner)
+                if member is None or not projects_v2_enabled(member.tenant):
+                    skipped.append(f"@{owner}: {s.title}")
+                    return
+                projects.ask(tenant, user, goal.id, step.id, [str(member.id)])
+
+            projects.assign_published_steps(tenant, user, goal, rows, items, prepared, ask_other)
+            draft.published_goal = goal
+            draft.save(update_fields=["published_goal"])
+    finally:
+        # on_commit callbacks can raise after publication is already durable.
+        # A rolled-back creation must not schedule a replacement refresh.
+        if goal is not None and access.get_mission(goal.id) is not None:
+            from .envelope import refresh_project_members
+
+            refresh_project_members(goal.id, include_invited=True)
     return {"mission_id": str(goal.id), "not_asked": skipped}
 
 
@@ -600,19 +615,20 @@ def approve(tenant, user, proposal_id) -> dict:
                 prepared = projects.prepare_step_tasks(tenant, items)
                 try:
                     outcomes = projects.create_steps(tenant, user, goal.id, items, prepared) if items else []
-                except APIException as exc:
-                    # Membership may have changed while privacy authoring ran.
-                    outcomes = [exc] * len(items)
+                except Exception as exc:  # noqa: BLE001
+                    # The batch transaction rolled back: report every item honestly.
+                    outcomes = [projects.step_failure(exc)] * len(items)
                 by_index = {index: outcome for (index, _), outcome in zip(valid, outcomes, strict=True)}
                 by_index.update(refused)
                 results.extend(result(c, by_index[i]) for i, c in enumerate(changes))
+        applied = sum(r["outcome"] == "applied" for r in results)
+        row.status = "approved" if applied == len(results) else "partial"
+        row.result = {"changes": results}
+        row.save(update_fields=["status", "result"])
     finally:
+        # Persist outcomes before dispatch, which can fail after durable writes.
         # Existing after-commit background dispatch and push_user_md coalescing.
         refresh_project_members(goal.id)
-    applied = sum(r["outcome"] == "applied" for r in results)
-    row.status = "approved" if applied == len(results) else "partial"
-    row.result = {"changes": results}
-    row.save(update_fields=["status", "result"])
     return {"proposal_id": str(row.id), "status": row.status, "changes": results}
 
 
