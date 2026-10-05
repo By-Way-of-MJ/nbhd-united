@@ -564,3 +564,13 @@ class AppleIAPTests(TestCase):
             {"id": "sub_x", "customer": "", "metadata": {"user_id": str(self.tenant.user_id)}}
         )
         self.assertTrue(any("skipped scheduled deletion" in c.args[0] for c in self.alert.call_args_list))
+
+    def test_a_trial_user_whose_assistant_is_still_being_built_stops_being_a_trial(self):
+        self.tenant.status = Tenant.Status.PROVISIONING
+        self.tenant.container_id = ""
+        self.tenant.is_trial = True
+        self.tenant.save()
+        self._active("7400")
+        self.assertFalse(self.fresh().is_trial)
+        self.assertEqual(self.fresh().status, Tenant.Status.PROVISIONING)
+        self.publish_task.assert_not_called()

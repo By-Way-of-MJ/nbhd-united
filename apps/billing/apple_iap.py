@@ -318,7 +318,7 @@ def _apply_to_tenant(sub: AppStoreSubscription) -> None:
             logger.warning("apple_iap: cleared scheduled deletion for %s (now pays through the App Store)", tenant.id)
         running = tenant.status == Tenant.Status.ACTIVE and bool(tenant.container_id)
         # A running trial user who buys still needs is_trial cleared (activate's no-op path).
-        if (not running or tenant.is_trial) and tenant.status != Tenant.Status.PROVISIONING:
+        if tenant.is_trial or (not running and tenant.status != Tenant.Status.PROVISIONING):
             try:
                 outcome = services.activate_paid_tenant(tenant)
             except services.ActivationDeferred as exc:
