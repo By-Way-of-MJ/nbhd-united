@@ -256,6 +256,10 @@ class Tenant(models.Model):
     # Stripe (dj-stripe handles subscription objects; this is a quick-lookup cache)
     stripe_customer_id = models.CharField(max_length=255, blank=True, default="")
     stripe_subscription_id = models.CharField(max_length=255, blank=True, default="")
+    # When the Stripe subscription last ended (cancelled or finally unpaid). The id
+    # above is now cleared at that point so "paying" means paying; win-back targeting
+    # uses this instead of a lingering id.
+    stripe_subscription_ended_at = models.DateTimeField(null=True, blank=True)
 
     # Scheduled deletion
     pending_deletion = models.BooleanField(
@@ -1130,9 +1134,10 @@ class Tenant(models.Model):
         """
         from django.utils import timezone
 
-        has_subscription = bool(self.stripe_subscription_id)
+        from apps.billing.entitlement import is_paying
+
         on_valid_trial = bool(self.is_trial) and self.trial_ends_at and self.trial_ends_at > timezone.now()
-        return has_subscription or on_valid_trial or bool(self.is_budget_exempt)
+        return is_paying(self) or bool(on_valid_trial) or bool(self.is_budget_exempt)
 
     @classmethod
     def entitled_active(cls):
@@ -1148,14 +1153,14 @@ class Tenant(models.Model):
         """
         from django.utils import timezone
 
+        from apps.billing.entitlement import paying_q
+
         now = timezone.now()
         return cls.objects.filter(
             status=cls.Status.ACTIVE,
             container_id__gt="",
         ).filter(
-            models.Q(stripe_subscription_id__gt="")
-            | models.Q(is_trial=True, trial_ends_at__gt=now)
-            | models.Q(is_budget_exempt=True),
+            paying_q() | models.Q(is_trial=True, trial_ends_at__gt=now) | models.Q(is_budget_exempt=True),
         )
 
     @property

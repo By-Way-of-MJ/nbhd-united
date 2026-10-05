@@ -575,6 +575,17 @@ def handle_subscription_deleted(subscription_data: dict) -> None:
         )
         return
 
+    # The Stripe subscription is over: "paying" must stop meaning it.
+    _end_stripe_subscription(tenant)
+
+    from .entitlement import has_apple_subscription
+
+    if has_apple_subscription(tenant):
+        # They moved to (or also hold) an App Store subscription — switching from
+        # the web to the iPhone must never delete their assistant and memory.
+        logger.info("Stripe subscription ended for tenant %s, who pays through the App Store — keeping", tenant.id)
+        return
+
     # Normal cancellation — deprovision container but keep user record.
     tenant.status = Tenant.Status.DEPROVISIONING
     tenant.save(update_fields=["status", "updated_at"])
@@ -676,6 +687,16 @@ def handle_invoice_payment_failed(invoice_data: dict) -> None:
             logger.exception("dunning: failed to send retry notice for tenant %s", tenant.id)
         return
 
+    # Stripe has given up: the Stripe subscription no longer makes them a payer.
+    # (invoice.paid re-sets the id if a late payment still clears.)
+    _end_stripe_subscription(tenant)
+
+    from .entitlement import has_apple_subscription
+
+    if has_apple_subscription(tenant):
+        logger.info("Stripe gave up on tenant %s, who pays through the App Store — not pausing", tenant.id)
+        return
+
     logger.warning(
         "Invoice %s failed for tenant %s with no further Stripe retry — suspending",
         invoice_id,
@@ -696,10 +717,30 @@ def handle_invoice_payment_failed(invoice_data: dict) -> None:
         except Exception:
             logger.exception("Failed to suspend crons for tenant %s", tenant.id)
 
+    _pause_runtime(tenant)
+    logger.warning("Paused tenant %s after failed invoice", tenant.id)
+
+
+def _end_stripe_subscription(tenant: Tenant) -> None:
+    """The Stripe subscription has ended: clear the id (so ``is_paying`` stops
+    counting it) and stamp when, for win-back targeting."""
+    from django.utils import timezone
+
+    if not tenant.stripe_subscription_id:
+        return
+    logger.info("Stripe subscription %s ended for tenant %s", tenant.stripe_subscription_id, tenant.id)
+    tenant.stripe_subscription_id = ""
+    tenant.stripe_subscription_ended_at = timezone.now()
+    tenant.save(update_fields=["stripe_subscription_id", "stripe_subscription_ended_at", "updated_at"])
+
+
+def _pause_runtime(tenant: Tenant) -> None:
+    """The billing pause: SUSPENDED with ``hibernated_at`` cleared (so an incoming
+    message can't wake the container through the idle-wake path) and the container
+    scaled to zero. Crons are disabled by the caller first, while it is reachable."""
     tenant.status = Tenant.Status.SUSPENDED
     tenant.hibernated_at = None  # Billing suspension supersedes idle hibernation
     tenant.save(update_fields=["status", "hibernated_at", "updated_at"])
-    logger.warning("Paused tenant %s after failed invoice", tenant.id)
 
     # Hibernate the container (scale to zero) to stop resource costs
     if tenant.container_id:
@@ -710,6 +751,54 @@ def handle_invoice_payment_failed(invoice_data: dict) -> None:
             logger.info("Hibernated container %s for suspended tenant %s", tenant.container_id, tenant.id)
         except Exception:
             logger.exception("Failed to hibernate container %s for tenant %s", tenant.container_id, tenant.id)
+
+
+def pause_tenant_for_billing(tenant: Tenant) -> bool:
+    """Pause a tenant whose payment ended (Apple expiry/refund/revoke): disable crons,
+    then the billing pause. Never pauses a tenant that is still entitled another way
+    (Stripe, trial, budget-exempt). Returns True if it paused."""
+    if tenant.status != Tenant.Status.ACTIVE or tenant.has_entitlement:
+        return False
+    if tenant.container_fqdn:
+        try:
+            from apps.cron.suspension import suspend_tenant_crons
+
+            suspend_tenant_crons(tenant)
+        except Exception:
+            logger.exception("Failed to suspend crons for tenant %s", tenant.id)
+    _pause_runtime(tenant)
+    logger.warning("Paused tenant %s: no current payment", tenant.id)
+    return True
+
+
+def activate_paid_tenant(tenant: Tenant) -> str:
+    """A payment started or resumed outside Stripe Checkout (the App Store): make the
+    assistant run. Mirrors the checkout branch — wake a paused container, or build a
+    new one when the account has none (a churned user whose assistant was deleted).
+    Returns "noop" | "woken" | "provisioning"."""
+    from apps.cron.publish import publish_task
+
+    fields = ["is_trial", "monthly_token_budget", "monthly_cost_budget", "updated_at"]
+    tenant.is_trial = False
+    tenant.monthly_token_budget = 0
+    tenant.monthly_cost_budget = 0
+    if tenant.status == Tenant.Status.ACTIVE and tenant.container_id:
+        tenant.save(update_fields=fields)
+        return "noop"
+    if tenant.status == Tenant.Status.PROVISIONING:
+        tenant.save(update_fields=fields)
+        return "noop"
+    if tenant.status == Tenant.Status.SUSPENDED and tenant.container_id:
+        tenant.status = Tenant.Status.ACTIVE
+        tenant.hibernated_at = None
+        tenant.save(update_fields=[*fields, "status", "hibernated_at"])
+        restore_tenant_runtime(tenant)
+        return "woken"
+    tenant.status = Tenant.Status.PROVISIONING
+    tenant.save(update_fields=[*fields, "status"])
+    publish_task("provision_tenant", str(tenant.id), idempotency_key=f"provision-{tenant.id}")
+    logger.info("Triggered provisioning for App Store payer %s", tenant.id)
+    return "provisioning"
 
 
 def handle_invoice_paid(invoice_data: dict) -> None:

@@ -283,8 +283,10 @@ def send_comeback_2026_08_campaign_task(tenant_ids: list[str]) -> dict:
         if tenant is None:
             skip(tenant_id, "tenant_not_found")
             continue
-        if tenant.stripe_subscription_id:
-            skip(tenant_id, "stripe_subscription_id")
+        from apps.billing.entitlement import is_paying
+
+        if is_paying(tenant):
+            skip(tenant_id, "stripe_subscription_id")  # reason label kept for log continuity
             continue
         if tenant.is_synthetic:
             skip(tenant_id, "is_synthetic")

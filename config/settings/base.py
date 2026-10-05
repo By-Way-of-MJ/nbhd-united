@@ -820,6 +820,18 @@ AZURE_STORAGE_ACCOUNT_NAME = env("AZURE_STORAGE_ACCOUNT_NAME", default="")
 AZURE_KEK_VAULT_NAME = env("AZURE_KEK_VAULT_NAME", default="kv-nbhd-keks")
 AZURE_DECRYPT_BROKER_CLIENT_ID = env("AZURE_DECRYPT_BROKER_CLIENT_ID", default="")
 
+# Apple in-app subscriptions (DIRECTIVE_ios_in_app_purchase.md). The private key is an
+# App Store Connect "In-App Purchase" key (.p8), stored in Key Vault and injected as
+# env text; until all four of issuer/key id/key/bundle are set the endpoints answer 503.
+APPLE_IAP_ISSUER_ID = env("APPLE_IAP_ISSUER_ID", default="")
+APPLE_IAP_KEY_ID = env("APPLE_IAP_KEY_ID", default="")
+APPLE_IAP_PRIVATE_KEY = env("APPLE_IAP_PRIVATE_KEY", default="").replace("\\n", "\n")
+APPLE_IAP_BUNDLE_ID = env("APPLE_IAP_BUNDLE_ID", default="org.hoodunited.nbhd")
+APPLE_IAP_APP_APPLE_ID = env.int("APPLE_IAP_APP_APPLE_ID", default=6779158519)
+APPLE_IAP_PRODUCT_IDS = env.list("APPLE_IAP_PRODUCT_IDS", default=["org.hoodunited.nbhd.standard.monthly"])
+# Sandbox purchases (App Review, TestFlight) entitle only these user UUIDs.
+APPLE_IAP_SANDBOX_USER_IDS = env.list("APPLE_IAP_SANDBOX_USER_IDS", default=[])
+
 # Stripe pricing — single plan.
 # NOTE: the Django setting is STRIPE_PRICE_ID, but the env var it reads is
 # STRIPE_PRICE_STARTER. When configuring the Container App, set

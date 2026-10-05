@@ -770,7 +770,14 @@ class DeleteAccountView(APIView):
                 status=status.HTTP_200_OK,
             )
 
+        # Deliberately Stripe-only (DIRECTIVE_ios_in_app_purchase.md §2.5): only a Stripe
+        # subscription can be cancelled from here. An App Store subscription can't — the
+        # app shows "Manage subscription" before calling this, and the account is
+        # deleted now; Apple's later notifications for it are answered and ignored.
         has_active_sub = bool(tenant and tenant.stripe_subscription_id)
+        from apps.billing.entitlement import has_apple_subscription
+
+        apple_still_billing = bool(tenant) and has_apple_subscription(tenant)
 
         if has_active_sub:
             # ── Has subscription: cancel at period end, schedule deletion ──────
@@ -848,7 +855,13 @@ class DeleteAccountView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-            return Response({"scheduled": False, "detail": "Account deleted."}, status=status.HTTP_200_OK)
+            detail = "Account deleted."
+            if apple_still_billing:
+                detail += " Your App Store subscription keeps billing until you cancel it in iPhone Settings."
+            return Response(
+                {"scheduled": False, "detail": detail, "apple_subscription_active": apple_still_billing},
+                status=status.HTTP_200_OK,
+            )
 
 
 class PreferredModelView(APIView):

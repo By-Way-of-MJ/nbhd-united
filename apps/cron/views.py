@@ -966,9 +966,11 @@ def _unentitled_active_tenants():
     Production had 17 such ghost tenants accumulating LLM cost since their
     trials ended 2026-04-15.
     """
+    from apps.billing.entitlement import paying_q
+
     now = timezone.now()
     return Tenant.objects.filter(status=Tenant.Status.ACTIVE).exclude(
-        models.Q(stripe_subscription_id__gt="")
+        paying_q()
         | models.Q(is_trial=True, trial_ends_at__gt=now)
         # Budget-exempt tenants (canary, internal accounts) live outside the
         # billing lifecycle — they never carry a real subscription, so without
@@ -987,11 +989,17 @@ def _suspend_unentitled_tenant(tenant):
     (which stops Azure costs). Reused by ``expire_trials`` and the
     ``enforce_entitlement`` management command.
     """
+    from apps.billing.apple_iap import still_paying_on_apple
     from apps.cron.suspension import suspend_tenant_crons
     from apps.orchestrator.azure_client import hibernate_container_app
 
     crons_disabled = 0
     hibernated = False
+
+    # An App Store subscription whose stored state looks lapsed may only be waiting
+    # for a late renewal notification: ask Apple before pausing anyone.
+    if still_paying_on_apple(tenant):
+        return {"crons_disabled": 0, "hibernated": False, "skipped": "apple"}
 
     if tenant.container_fqdn:
         try:

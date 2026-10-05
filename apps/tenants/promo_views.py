@@ -103,7 +103,9 @@ def redeem_promo(request):
     # comeback offer targets, so let them redeem (extend + restore runtime).
     # Only the ACTIVE-with-subscription case is a real paying subscriber to
     # protect from a trial flip.
-    if tenant.status != Tenant.Status.SUSPENDED and tenant.stripe_subscription_id:
+    from apps.billing.entitlement import is_paying
+
+    if tenant.status != Tenant.Status.SUSPENDED and is_paying(tenant):
         _record_redemption(campaign, user, PromoRedemption.Outcome.ALREADY_SUBSCRIBED, new_trial_ends_at=None)
         return _redirect("active_subscription")
 
