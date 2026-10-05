@@ -591,3 +591,25 @@ class AppleIAPTests(TestCase):
         apple_iap.refresh("7500", "Production")
         self.assertEqual(apple_iap.subscription_summary(self.fresh())["apple_status"], "expired")
         self.assertEqual(apple_iap.subscription_summary(None)["apple_status"], "")
+
+    def test_a_renewal_alone_refreshes_the_cached_plan(self):
+        """Only the App Store row changes on a renewal; /tenants/me/ must not stay stale."""
+        from apps.common.cache import get_tag_version
+
+        self._active("7600")
+        self.tenant.refresh_from_db()
+        before = get_tag_version(self.tenant.id, "tenant")
+        self.apple.set("7600", 1, token=str(self.tenant.user_id), expires_in_days=60)  # renewed
+        apple_iap.refresh("7600", "Production")
+        self.assertGreater(get_tag_version(self.tenant.id, "tenant"), before)
+
+    def test_the_cached_plan_is_refreshed_even_when_activation_must_retry(self):
+        from apps.common.cache import get_tag_version
+
+        self.tenant.status = Tenant.Status.DEPROVISIONING
+        self.tenant.save()
+        before = get_tag_version(self.tenant.id, "tenant")
+        self.apple.set("7700", 1, token=str(self.tenant.user_id))
+        with self.assertRaises(apple_iap.TransientAppleError):
+            apple_iap.sync_from_app(self.tenant, self.txn("7700"))
+        self.assertGreater(get_tag_version(self.tenant.id, "tenant"), before)

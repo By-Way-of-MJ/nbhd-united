@@ -292,13 +292,16 @@ def refresh(original_transaction_id: str, env_name: str, *, bind_to=None) -> App
     if mismatch:
         raise AccountMismatch("This Apple ID's subscription belongs to another NBHD account.")
     if not stale:
-        _apply_to_tenant(sub)
-        if sub.tenant_id:
-            # GET /tenants/me/ is cached per tenant and only refreshed when the Tenant row
-            # saves; a renewal or billing problem changes only this row.
-            from apps.common.cache import bump_tag
+        try:
+            _apply_to_tenant(sub)
+        finally:
+            if sub.tenant_id:
+                # GET /tenants/me/ is cached per tenant and only refreshed when the Tenant
+                # row saves; a renewal or billing problem changes only this row — and the
+                # row is already saved even when activation must be retried.
+                from apps.common.cache import bump_tag
 
-            bump_tag(sub.tenant_id, "tenant")
+                bump_tag(sub.tenant_id, "tenant")
     return sub
 
 
