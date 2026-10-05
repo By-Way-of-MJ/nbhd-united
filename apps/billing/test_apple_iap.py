@@ -574,3 +574,20 @@ class AppleIAPTests(TestCase):
         self.assertFalse(self.fresh().is_trial)
         self.assertEqual(self.fresh().status, Tenant.Status.PROVISIONING)
         self.publish_task.assert_not_called()
+
+    # ── plan screen (iOS phase C review) ─────────────────────────────────────
+
+    def test_the_plan_screen_learns_a_card_problem_and_a_lapse(self):
+        from apps.common.cache import get_tag_version
+
+        self._active("7500")
+        before = get_tag_version(self.tenant.id, "tenant")
+        self.apple.set("7500", 3, token=str(self.tenant.user_id))  # billing retry
+        apple_iap.refresh("7500", "Production")
+        summary = apple_iap.subscription_summary(self.fresh())
+        self.assertEqual((summary["active"], summary["source"], summary["apple_status"]), (False, "", "billing_retry"))
+        self.assertGreater(get_tag_version(self.tenant.id, "tenant"), before)
+        self.apple.set("7500", 2, token=str(self.tenant.user_id))
+        apple_iap.refresh("7500", "Production")
+        self.assertEqual(apple_iap.subscription_summary(self.fresh())["apple_status"], "expired")
+        self.assertEqual(apple_iap.subscription_summary(None)["apple_status"], "")

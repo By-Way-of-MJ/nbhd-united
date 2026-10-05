@@ -293,6 +293,12 @@ def refresh(original_transaction_id: str, env_name: str, *, bind_to=None) -> App
         raise AccountMismatch("This Apple ID's subscription belongs to another NBHD account.")
     if not stale:
         _apply_to_tenant(sub)
+        if sub.tenant_id:
+            # GET /tenants/me/ is cached per tenant and only refreshed when the Tenant row
+            # saves; a renewal or billing problem changes only this row.
+            from apps.common.cache import bump_tag
+
+            bump_tag(sub.tenant_id, "tenant")
     return sub
 
 
@@ -516,6 +522,9 @@ def subscription_summary(tenant) -> dict:
     )
     trial_ends = tenant.trial_ends_at if (tenant is not None and tenant.is_trial) else None
     return {
+        # The latest App Store subscription's own state, even when it no longer pays
+        # ("billing_retry": fix the card; "expired": resubscribe). "" when there is none.
+        "apple_status": apple.status if apple else "",
         "active": bool(tenant is not None and tenant.has_entitlement),
         "source": source,
         "status": apple.status if (apple and source == "apple") else ("active" if source == "stripe" else ""),
