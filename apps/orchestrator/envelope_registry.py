@@ -118,6 +118,11 @@ def suppress_refresh():
         _SUPPRESS.active = prev
 
 
+def refresh_suppressed() -> bool:
+    """Explicit multi-recipient receivers must honor the same batch boundary."""
+    return getattr(_SUPPRESS, "active", False)
+
+
 def register_section(
     *,
     key: str,
@@ -181,7 +186,7 @@ def _universal_refresh_receiver(sender, instance, **kwargs) -> None:
     dev) the push runs synchronously inside the on_commit callback — no
     thread, behavior is deterministic.
     """
-    if getattr(_SUPPRESS, "active", False):
+    if refresh_suppressed():
         return
     tenant_id = _resolve_tenant_id(instance)
     if tenant_id is None:

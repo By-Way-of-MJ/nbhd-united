@@ -88,10 +88,16 @@ def _dispatch(fn) -> None:
         except Exception:  # noqa: BLE001
             logger.exception("project push dispatch failed")
 
+    def _start():
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception:  # noqa: BLE001
+            logger.exception("project push thread start failed")
+
     if getattr(settings, "NBHD_DISABLE_BACKGROUND_THREADS", False):
         transaction.on_commit(_run)
     else:
-        transaction.on_commit(lambda: threading.Thread(target=_run, daemon=True).start())
+        transaction.on_commit(_start)
 
 
 def _members(goal, *, ids=None, statuses=("active",)):

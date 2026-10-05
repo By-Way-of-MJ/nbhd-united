@@ -293,10 +293,19 @@ def _refresh_mission_crew(sender, instance, **kwargs) -> None:
     """A crew member's activity changes everyone's crew line — refresh ALL active
     members' USER.md (the registry's tenant-FK receiver would only refresh the
     update's author). Defensive: never raises."""
+    from apps.orchestrator.envelope_registry import refresh_suppressed
+
+    if refresh_suppressed():
+        return
+    refresh_project_members(instance.shared_goal_id)
+
+
+def refresh_project_members(mission_id, *, include_invited=False):
+    """One final refresh per active member after a project batch commits."""
     try:
         member_ids = (
             access.mission_memberships()
-            .filter(shared_goal_id=instance.shared_goal_id, status="active")
+            .filter(shared_goal_id=mission_id, status__in=["active", "invited"] if include_invited else ["active"])
             .values_list("tenant_id", flat=True)
         )
         for tenant_id in member_ids:
