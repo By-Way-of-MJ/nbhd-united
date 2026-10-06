@@ -18,6 +18,7 @@ from apps.common.llm_lookups import (
     CARDIO_RECOVERY_EFFORTS,
     CARDIO_TERRAINS,
 )
+from apps.fuel.machine_fields import WORKOUT_MACHINE_PATHS, valid_workout_machine_scalar, workout_machine_signature
 
 
 @dataclass(frozen=True)
@@ -141,8 +142,11 @@ def rewrite_json_path(
     _path: tuple = (),
 ) -> tuple[Any, bool]:
     """Copy-on-write transform of string leaves selected by one parsed path."""
-    if _valid_cardio_scalar(_path, value) and any(_path_matches(_path, pattern) for pattern in exclude_paths):
-        return value, False
+    if exclude_paths and any(_path_matches(_path, pattern) for pattern in exclude_paths):
+        # Ingress validation alone cannot protect repair or legacy rows. An
+        # exclusion applies only while the actual leaf still meets its schema.
+        if _valid_cardio_scalar(_path, value) or valid_workout_machine_scalar(_path, value):
+            return value, False
     if not parts:
         if not isinstance(value, str):
             return value, False
@@ -342,7 +346,7 @@ _STORES = (
         flat_fields=("skip_reason", "activity", "notes"),
         json_paths=("notes_thread[].text", "detail_json.**"),
         receipts_field="pii_receipts",
-        json_exclude_paths=tuple(f"{prefix}.{path}" for prefix in ("detail_json",) for path in CARDIO_MACHINE_PATHS),
+        json_exclude_paths=tuple(f"detail_json.{path}" for path in (*CARDIO_MACHINE_PATHS, *WORKOUT_MACHINE_PATHS)),
     ),
     PlaceholderStore(
         model_label="fuel.FuelProfile",
@@ -538,6 +542,7 @@ CARDIO_TRAVERSAL_VERSION = hashlib.sha256(
             CARDIO_RECOVERY_EFFORTS,
             CARDIO_TERRAINS,
             CARDIO_PACE_REGEX,
+            workout_machine_signature(),
         )
     ).encode()
 ).hexdigest()[:16]

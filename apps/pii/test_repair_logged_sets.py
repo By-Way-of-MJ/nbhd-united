@@ -86,21 +86,28 @@ class LoggedRepairTraversalTests(SimpleTestCase):
             self.assertIn("[PERSON_2] coached", str(chunk.value))
             self.assertEqual(value, before)
 
-    def test_invalid_logged_and_non_fuel_payloads_are_not_exempt(self):
+    def test_invalid_logged_text_is_scanned_but_valid_timestamp_leaf_is_exempt(self):
         for logged in ({"reps": "Alice", "at": AT}, {"reps": 1, "at": AT, "notes": "Alice"}):
             with self.subTest(logged=logged), patch("apps.pii.repair_sweep.author_text", side_effect=redact):
                 value = {"exercises": [{"sets": [{"reps": 1, "logged": logged}]}]}
                 result = self.chunk(value).value
-                self.assertNotIn(AT, str(result))
+                self.assertIn(AT, str(result))
                 self.assertNotIn("Alice", str(result))
+        # Invalid siblings do not turn a schema-valid UTC leaf into prose.
+        # Non-Fuel blobs still have no such registered exclusion.
         with patch("apps.pii.repair_sweep.author_text", side_effect=redact):
             chunk = self.chunk(detail(), "finance.PayoffPlan", "schedule_json")
         self.assertNotIn(AT, str(chunk.value))
         self.assertNotIn("Alice", str(chunk.value))
+
+        with patch("apps.pii.repair_sweep.author_text", side_effect=redact):
+            value = {"exercises": [{"sets": [{"reps": 1, "logged": {"reps": 1, "at": "Alice"}}]}]}
+            chunk = self.chunk(value)
+        self.assertNotIn("Alice", str(chunk.value))
         with patch("apps.pii.repair_sweep.author_text", side_effect=redact):
             value = {"exercises": [{"sets": [{"type": [], "logged": {"reps": 1, "at": AT}}]}]}
             chunk = self.chunk(value)
-        self.assertNotIn(AT, str(chunk.value))
+        self.assertIn(AT, str(chunk.value))
 
     def test_logged_only_payload_uses_zero_leaf_fallback_without_corruption(self):
         value = {"exercises": [{"sets": [{"reps": 1, "logged": {"reps": 2, "at": AT}}]}]}
@@ -143,6 +150,26 @@ class LoggedRepairTraversalTests(SimpleTestCase):
         self.assertEqual(second.value["last"], "[PERSON_2] last")
         self.assertEqual(logged_actuals_paths(second.value), logged_actuals_paths(value))
         self.assertEqual([call.args[1] for call in author.call_args_list], ["Alice first", "Alice last"])
+
+    def test_cursor_from_before_workout_machine_exclusions_cannot_skip_a_name(self):
+        value = {"exercises": [{"role": "primary", "name": "Alice"}]}
+        old = {
+            "reason": "repair-batch-partial",
+            "repair_progress": {
+                "cursor": 1,  # Previously consumed role; name still needs repair.
+                "source_digest": _json_digest(value),
+                # Actual origin/main traversal version before these exclusions.
+                "traversal_version": "45134d543a8f7514:logged-actuals-v1",
+                "aggregate": {"state": "placeholder"},
+            },
+        }
+        cursor, aggregate = _json_progress(old, value)
+        self.assertEqual((cursor, aggregate), (0, None))
+        with patch("apps.pii.repair_sweep.author_text", side_effect=redact) as author:
+            chunk = self.chunk(value, cursor=cursor, limit=1)
+        self.assertTrue(chunk.complete)
+        self.assertEqual(chunk.value["exercises"][0], {"role": "primary", "name": "[PERSON_2]"})
+        self.assertEqual([call.args[1] for call in author.call_args_list], ["Alice"])
 
 
 @override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True, NBHD_INTERNAL_API_KEY="test-internal-key")
