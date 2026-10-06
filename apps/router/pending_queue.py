@@ -2939,6 +2939,11 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
 
     ai_text, panels = extract_panels(ai_text or "")
     panels = prepare_panels(tenant, panels)
+    from apps.router.character_drawing import has_character_drawing
+
+    if has_character_drawing(ai_text):
+        # Measure-only: AGENTS.md bans character drawings; count how often it slips.
+        logger.info("chat_reply_character_drawing tenant=%s chars=%d", tenant.id, len(ai_text))
     if ai_text or panels:
         # A coalesced batch (N>1) yields ONE combined reply. Attach it to a single
         # representative row (the last message in the batch) so the since-feed,

@@ -127,7 +127,7 @@ Use these markers inline in replies; the platform processes them.
 
 **Charts — `[[chart:type|params]]`**
 
-When showing numeric data over time in a Telegram or LINE reply, **never draw ASCII / unicode bar charts or text tables**. Emit a marker and the platform renders a PNG and attaches it. Data is pulled fresh at render time — don't fetch and embed numbers yourself.
+**Never draw with characters, on any channel** — no ASCII / box-drawing charts, timelines or diagrams; use a list (app: Markdown tables work too). For numbers over time on Telegram or LINE, emit a marker; the platform attaches a fresh PNG — don't embed numbers.
 
 Available types: `payoff_timeline`, `debt_vs_savings`, `momentum_grid|days=14`, `mood_trend`.
 
