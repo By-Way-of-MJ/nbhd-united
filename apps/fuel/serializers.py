@@ -234,10 +234,9 @@ class WorkoutSerializer(_FuelPiiSerializerMixin, serializers.ModelSerializer):
         """Basic shape validation per category."""
         if not isinstance(value, dict):
             raise serializers.ValidationError("detail_json must be an object.")
-        from .machine_fields import workout_machine_errors
         from .set_contract import logged_detail_errors
 
-        errors = workout_machine_errors(value) or logged_detail_errors(value)
+        errors = logged_detail_errors(value)
         if errors:
             raise serializers.ValidationError([f"{_loc_path(e['loc'])}: {e['msg']}" for e in errors])
         return value

@@ -1,7 +1,7 @@
-"""Strict leaf validation shared by workout ingress and PII exclusions.
+"""Value guards for workout PII exclusions, never ingress requirements.
 
-Only these exact locations qualify. Legacy rows and non-serializer writers
-still get value checks during PII traversal; malformed values remain prose.
+Only conforming values at these exact locations qualify. Unknown and legacy
+values remain prose and receive normal authoring without adding save errors.
 """
 
 from typing import Annotated, Literal
@@ -55,31 +55,3 @@ def valid_workout_machine_scalar(path, value):
     except ValidationError:
         return False
     return True
-
-
-def _leaves(value, parts, path=()):
-    if not parts:
-        yield path, value
-    elif parts[0] == "*" and isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _leaves(child, parts[1:], (*path, index))
-    elif isinstance(value, dict) and parts[0] in value:
-        yield from _leaves(value[parts[0]], parts[1:], (*path, parts[0]))
-
-
-def workout_machine_errors(detail):
-    """Validate supplied leaves before normalization or legacy grandfathering.
-
-    Missing optional keys are allowed. Unknown extension keys are left to PII,
-    including catalog_ref metadata outside the two explicit string leaves.
-    """
-    errors = []
-    for container in ("exercises", "skills"):
-        for suffix, adapter in _LEAF_ADAPTERS.items():
-            for path, value in _leaves(detail, (container, "*", *suffix)):
-                try:
-                    adapter.validate_python(value, strict=True)
-                except ValidationError as exc:
-                    for error in exc.errors(include_url=False, include_context=False, include_input=False):
-                        errors.append({**error, "loc": [*path, *error["loc"]]})
-    return errors

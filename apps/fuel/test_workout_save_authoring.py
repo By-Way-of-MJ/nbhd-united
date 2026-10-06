@@ -52,9 +52,12 @@ class WorkoutSaveAuthoringTests(TestCase):
             tenant=self.tenant, date="2026-10-05", category="strength", status="planned", detail_json=live_detail()
         )
 
-    def save_detail(self, detail, detector):
+    def save_detail(self, detail, detector, **updates):
         serializer = WorkoutSerializer(
-            self.workout, data={"detail_json": deepcopy(detail)}, partial=True, context={"tenant": self.tenant}
+            self.workout,
+            data={"detail_json": deepcopy(detail), **updates},
+            partial=True,
+            context={"tenant": self.tenant},
         )
         self.assertTrue(serializer.is_valid(), serializer.errors)
         with (
@@ -78,6 +81,10 @@ class WorkoutSaveAuthoringTests(TestCase):
         self.assertEqual(saved.detail_json, detail)
         self.assertEqual(saved.pii_receipts, baseline_receipt)
         self.assertEqual(detector.call_count, 5)  # origin/main: 42
+        self.assertEqual(
+            [call.args[0] for call in detector.call_args_list],
+            [exercise["name"] for exercise in detail["exercises"]],
+        )
 
     def test_free_text_and_receipt_match_baseline(self):
         # Pin the origin/main result before changing exclusions. This exercises
@@ -105,51 +112,94 @@ class WorkoutSaveAuthoringTests(TestCase):
             {"state": "placeholder", "redactions": [{"placeholder": "[PERSON_1]"}], "writer": "owner"},
         )
 
-    def test_excluded_leaves_reject_non_machine_input_even_if_unchanged(self):
-        from apps.fuel.machine_fields import WORKOUT_MACHINE_PATHS
-
+    def test_legacy_machine_values_save_and_are_scanned_like_origin_main(self):
+        # The serializer is byte-identical to origin/main. Disabling exclusions
+        # replays its old authoring traversal for the same stored legacy row.
         cases = (
-            ("role",),
-            ("catalog_ref", "slug"),
-            ("catalog_ref", "matched_by"),
-            ("sets", 0, "type"),
-            ("sets", 0, "logged", "at"),
+            (("role",), "legacy-primary"),
+            (("catalog_ref", "slug"), "retired-exercise-v0"),
+            (("catalog_ref", "matched_by"), "legacy-exact"),
+            (("sets", 0, "type"), "legacy-weighted"),
         )
-        covered = set()
         for container in ("exercises", "skills"):
-            for suffix in cases:
-                path = (container, 0, *suffix)
-                covered.add(".".join(str(p) if p != 0 else "*" for p in path).replace(".*", "[]"))
-                for invalid in ("Alice Morgan", {"text": "Alice Morgan"}, ["Alice Morgan"]):
-                    for unchanged in (False, True):
-                        with self.subTest(path=path, invalid=invalid, unchanged=unchanged):
-                            detail = live_detail()
-                            detail[container] = detail.pop("exercises")
-                            node = detail
-                            for part in path[:-1]:
-                                node = node[part]
-                            node[path[-1]] = invalid
-                            self.workout.detail_json = deepcopy(detail) if unchanged else {}
-                            serializer = WorkoutSerializer(self.workout, data={"detail_json": detail}, partial=True)
-                            self.assertFalse(serializer.is_valid())
-                            self.assertIn("detail_json", serializer.errors)
-        self.assertEqual(covered, set(WORKOUT_MACHINE_PATHS))
+            for suffix, legacy in cases:
+                for invalid in ("Alice Morgan", legacy):
+                    with self.subTest(container=container, suffix=suffix, value=invalid):
+                        detail = live_detail()
+                        detail[container] = detail.pop("exercises")
+                        node = detail[container][0]
+                        for part in suffix[:-1]:
+                            node = node[part]
+                        node[suffix[-1]] = invalid
+                        self.workout.detail_json = deepcopy(detail)
+                        self.workout.save(update_fields=["detail_json"])
+                        detector = Mock(return_value=[])
+                        with patch("apps.pii.store_registry.PlaceholderStore.nested_json_exclusions", return_value=()):
+                            baseline = self.save_detail(detail, detector, status="done")
+                        expected = deepcopy(baseline.detail_json)
+                        receipt = deepcopy(baseline.pii_receipts)
+                        self.assertIn(invalid, [call.args[0] for call in detector.call_args_list])
+                        detector.reset_mock()
+                        saved = self.save_detail(detail, detector, status="done")
+                        self.assertEqual(saved.status, "done")
+                        self.assertEqual(saved.detail_json, expected)
+                        self.assertEqual(saved.detail_json, detail)
+                        self.assertEqual(saved.pii_receipts, receipt)
+                        self.assertIn(invalid, [call.args[0] for call in detector.call_args_list])
+                        self.assertEqual(detector.call_count, 6)
 
-    def test_exact_slug_and_real_utc_date_required(self):
-        for suffix, bad in (
-            (("catalog_ref", "slug"), "Bench Press"),
-            (("catalog_ref", "slug"), "bench-press-Alice"),
-            (("sets", 0, "logged", "at"), "2026-02-30T21:00:00Z"),
-            (("sets", 0, "logged", "at"), "2026-10-05T21:00:00+09:00"),
-        ):
-            with self.subTest(suffix=suffix, bad=bad):
-                detail = live_detail()
-                node = detail["exercises"][0]
-                for part in suffix[:-1]:
-                    node = node[part]
-                node[suffix[-1]] = bad
-                serializer = WorkoutSerializer(self.workout, data={"detail_json": detail}, partial=True)
-                self.assertFalse(serializer.is_valid())
+    def test_unknown_catalog_values_also_save_when_newly_supplied(self):
+        for key in ("slug", "matched_by"):
+            for invalid in ("Alice Morgan", "unknown-v0"):
+                with self.subTest(key=key, value=invalid):
+                    self.workout.detail_json = live_detail()
+                    detail = live_detail()
+                    detail["exercises"][0]["catalog_ref"][key] = invalid
+                    detector = Mock(return_value=[])
+                    saved = self.save_detail(detail, detector)
+                    self.assertEqual(saved.detail_json, detail)
+                    self.assertIn(invalid, [call.args[0] for call in detector.call_args_list])
+
+    def test_existing_logged_timestamp_errors_remain_visible_with_unknown_slug(self):
+        # origin/main already rejects these, even on otherwise unchanged rows.
+        # Removing the new guards must not weaken that contract or mask its errors.
+        for container in ("exercises", "skills"):
+            for invalid in ("Alice Morgan", "2026-10-05T21:00:00+09:00"):
+                with self.subTest(container=container, value=invalid):
+                    detail = live_detail()
+                    detail[container] = detail.pop("exercises")
+                    detail[container][0]["catalog_ref"]["slug"] = "unknown-v0"
+                    detail[container][0]["sets"][0]["logged"]["at"] = invalid
+                    self.workout.detail_json = deepcopy(detail)
+                    serializer = WorkoutSerializer(self.workout, data={"detail_json": detail}, partial=True)
+                    self.assertFalse(serializer.is_valid())
+                    self.assertIn("logged.at", str(serializer.errors))
+                    self.assertNotIn("catalog_ref", str(serializer.errors))
+
+    def test_legacy_invalid_timestamps_are_scanned_when_authoring_without_serializer(self):
+        from apps.fuel.authoring import author_store_fields
+
+        for container in ("exercises", "skills"):
+            for invalid in ("Alice Morgan", "2026-10-05T21:00:00+09:00"):
+                with self.subTest(container=container, value=invalid):
+                    detail = live_detail()
+                    detail[container] = detail.pop("exercises")
+                    detail[container][0]["sets"][0]["logged"]["at"] = invalid
+                    detector = Mock(return_value=[])
+                    with (
+                        patch("apps.pii.engine.get_pii_pipeline", return_value=detector),
+                        patch("apps.pii.engine.get_pattern_recognizers", return_value={}),
+                    ):
+                        authored, _ = author_store_fields(
+                            self.tenant,
+                            {"detail_json": detail},
+                            model_label="fuel.Workout",
+                            seam="test.legacy-workout",
+                            writer="owner",
+                        )
+                    self.assertEqual(authored["detail_json"], detail)
+                    self.assertIn(invalid, [call.args[0] for call in detector.call_args_list])
+                    self.assertEqual(detector.call_count, 6)
 
     def test_save_non_db_budget_with_simulated_detector_latency(self):
         db_seconds = 0
@@ -174,3 +224,38 @@ class WorkoutSaveAuthoringTests(TestCase):
         self.assertEqual(detector.call_count, 5)
         self.assertLess(non_db_seconds, 2)
         print(f"Synthetic workout save: detector_calls={detector.call_count} non_db_ms={non_db_seconds * 1000:.1f}")
+
+    def test_version_change_restarts_partial_repair_but_never_clean_rows(self):
+        from apps.pii.repair_sweep import _json_digest, repair_tenant
+
+        self.workout.pii_receipts = {
+            "detail_json": {
+                "state": "unconfirmed",
+                "reason": "repair-batch-partial",
+                "repair_progress": {
+                    "cursor": 4,
+                    "source_digest": _json_digest(self.workout.detail_json),
+                    "traversal_version": "45134d543a8f7514:logged-actuals-v1",
+                    "aggregate": {"state": "placeholder", "writer": "background", "redactions": []},
+                },
+            }
+        }
+        self.workout.save(update_fields=["pii_receipts"])
+        detector = Mock(return_value=[])
+        with (
+            patch("apps.pii.engine.get_pii_pipeline", return_value=detector),
+            patch("apps.pii.engine.get_pattern_recognizers", return_value={}),
+        ):
+            # The hourly sweep grants at most four text leaves per tenant.
+            first = repair_tenant(self.tenant, max_texts=4, alert=False)
+            self.assertEqual(first["texts_authored"], 4)
+            self.assertEqual(detector.call_count, 8)
+            second = repair_tenant(self.tenant, max_texts=4, alert=False)
+            self.assertEqual(second["texts_authored"], 1)
+            self.assertEqual(detector.call_count, 10)
+            self.workout.refresh_from_db()
+            self.assertEqual(self.workout.pii_receipts["detail_json"]["state"], "placeholder")
+            with patch("apps.pii.repair_sweep.CARDIO_TRAVERSAL_VERSION", "another-version"):
+                third = repair_tenant(self.tenant, max_texts=4, alert=False)
+            self.assertEqual(third["rows_seen"], 0)
+            self.assertEqual(detector.call_count, 10)
