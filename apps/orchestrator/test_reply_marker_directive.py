@@ -12,6 +12,11 @@ _LOAD_BEARING_PHRASES = (
     "Only mark a single, evidence-backed observation you believe; do not mark questions, generic advice, or "
     "tentative patterns.",
 )
+# Phones wrap character art into noise; the app was once exempt and drew ASCII timelines.
+_NO_CHARACTER_DRAWINGS = (
+    "**Never draw with characters, on any channel** — no ASCII / box-drawing charts, timelines or diagrams; "
+    "use a list (app: Markdown tables work too)."
+)
 _CHANNEL_BEHAVIOR = (
     "Insight markers fire on the app, Telegram, and LINE; quick replies on the app only; charts only on Telegram/LINE."
 )
@@ -36,6 +41,7 @@ class ReplyMarkerAlwaysLoadedTests(TestCase):
                 for phrase in _LOAD_BEARING_PHRASES:
                     self.assertIn(phrase, rendered)
                 self.assertIn(_CHANNEL_BEHAVIOR, rendered)
+                self.assertIn(_NO_CHARACTER_DRAWINGS, rendered)
 
 
 class InsightsToolDescriptionTests(SimpleTestCase):

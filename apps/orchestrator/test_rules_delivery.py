@@ -99,6 +99,7 @@ class RulesDeliveryTest(TestCase):
 
     def test_ungated_chat_is_byte_identical_to_pre_change_render(self):
         # Hash captured from the base implementation, before the inline block.
+        # Re-captured 2026-10-06: the chart sentence now bans character drawings on every channel.
         tenant = Tenant(user=User(username="synthetic", timezone="Asia/Tokyo", location_city="Tokyo"))
         for allowlist in ("", "00000000-0000-0000-0000-000000000001", "*"):
             with (
@@ -108,7 +109,7 @@ class RulesDeliveryTest(TestCase):
                 prompt = render_workspace_files("neighbor", tenant=tenant)["NBHD_AGENTS_MD"]
             self.assertEqual(
                 hashlib.sha256(prompt.encode()).hexdigest(),
-                "f34fe78edc990166db28379286d19178e4e34e62d025073c7a0bc09eeb280ddc",
+                "e05e3c7eb7f23aadaa0f38d4a59d4321a0c04da185678dccc620c0d21d0deee7",
             )
 
     def test_all_gates_render_within_pin(self):

@@ -210,6 +210,16 @@ def _check_chart_marker_contract(run: ScenarioRun, tenant, assertion: HardAssert
     return _two_turn_marker_contract(run, _CHART_MARKER, label="chart")
 
 
+def _check_no_character_drawing(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
+    """No reply draws a diagram with box-drawing / ASCII frame characters — the
+    always-loaded rule says use a list or a Markdown table instead."""
+    from apps.router.character_drawing import has_character_drawing
+
+    if any(has_character_drawing(reply) for reply in run.replies):
+        return False, "character_drawing_present"
+    return True, "clean"
+
+
 def _check_insight_marker_contract(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
     """A falsifiable user-specific observation carries a pillar/slug insight
     marker; the following generic advice reply does not."""
@@ -295,6 +305,7 @@ _CHECKERS = {
     "plan_search_before_write": _check_plan_search_before_write,
     "document_propose_then_save": _check_document_propose_then_save,
     "chart_marker_contract": _check_chart_marker_contract,
+    "no_character_drawing": _check_no_character_drawing,
     "insight_marker_contract": _check_insight_marker_contract,
     "lesson_capture_contract": _check_lesson_capture_contract,
     "redacted_identity_clarified": _check_redacted_identity_clarified,

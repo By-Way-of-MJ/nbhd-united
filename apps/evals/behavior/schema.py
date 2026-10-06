@@ -35,6 +35,7 @@ VALID_HARD_TYPES: frozenset[str] = frozenset(
         "plan_search_before_write",
         "document_propose_then_save",
         "chart_marker_contract",
+        "no_character_drawing",
         "insight_marker_contract",
         "lesson_capture_contract",
         "redacted_identity_clarified",
