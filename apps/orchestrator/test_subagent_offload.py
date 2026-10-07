@@ -83,6 +83,7 @@ class SubagentCanaryConfigTests(TestCase):
         self.assertNotIn("nbhd_send_to_user", SUBAGENT_READ_ONLY_TOOLS)
         self.assertNotIn("nbhd_generate_image", SUBAGENT_READ_ONLY_TOOLS)
         self.assertNotIn("publish_portfolio_image", SUBAGENT_READ_ONLY_TOOLS)
+        self.assertFalse([tool for tool in SUBAGENT_READ_ONLY_TOOLS if tool.startswith("shop_")])
         self.assertEqual(
             config["agents"]["defaults"]["subagents"],
             {

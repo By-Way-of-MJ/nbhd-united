@@ -116,7 +116,8 @@ class RulesDeliveryTest(TestCase):
         prompt = render_workspace_files("neighbor", tenant=self._all_gates_tenant())["NBHD_AGENTS_MD"]
 
         # Measured after rules-delivery W0: 21,920 chars (R0 ceiling 22,759). 2026-08-30 KSE-9: the approval-code Website edit gate yields 23,505; runtime cap BOOTSTRAP_MAX_CHARS=26,000.
-        self.assertLessEqual(len(prompt), 23_505)
+        # 2026-10-06: the one-line Shop gate (site-publishing tenants) yields 23,682; still 2,268 under the 25,950 alarm.
+        self.assertLessEqual(len(prompt), 23_682)
 
 
 class ToolsReferenceCronStubTest(SimpleTestCase):

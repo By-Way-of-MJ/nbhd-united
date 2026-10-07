@@ -226,6 +226,11 @@ describe("sub-agent read-only guard", () => {
       "nbhd_datebook_add_event",
       "nbhd_generate_image",
       "publish_portfolio_image",
+      "shop_add_item",
+      "shop_update_item",
+      "shop_mark_sold",
+      "shop_set_visibility",
+      "shop_confirm",
     ]) {
       const out = decideSubagentToolBlock({ toolName: id, params: {} }, helperKey);
       assert.equal(out?.block, true, id);

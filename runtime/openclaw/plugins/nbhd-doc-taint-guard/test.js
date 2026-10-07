@@ -114,6 +114,17 @@ describe("decideExfilGate", () => {
     assert.equal(decideExfilGate({ event: exfilEvent, mode: "bogus", tainted: true }).action, "log");
   });
 
+  it("lets a shop change be prepared on a photo turn, but only saved once the user answers", () => {
+    // shop_add_item & co. only stage a summary; shop_confirm is the write.
+    for (const id of ["shop_add_item", "shop_update_item", "shop_mark_sold", "shop_set_visibility", "shop_list_items"]) {
+      assert.equal(decideExfilGate({ event: { toolName: id, params: {} }, mode: "enforce", tainted: true }).action, "ignore", id);
+    }
+    const save = decideExfilGate({ event: { toolName: "shop_confirm", params: {} }, mode: "enforce", tainted: true });
+    assert.equal(save.action, "block");
+    assert.match(save.result.blockReason, /change the online shop/);
+    assert.equal(decideExfilGate({ event: { toolName: "shop_confirm", params: {} }, mode: "enforce", tainted: false }).action, "ignore");
+  });
+
   it("covers every EXFIL_TOOL_IDS entry with a distinct, sensible action phrase", () => {
     for (const id of EXFIL_TOOL_IDS) {
       const out = decideExfilGate({
@@ -393,7 +404,7 @@ describe("exported id sets", () => {
   it("EXFIL_TOOL_IDS matches the threat-model's exfil surface exactly", () => {
     assert.deepEqual(
       [...EXFIL_TOOL_IDS].sort(),
-      ["nbhd_reddit_post", "nbhd_reddit_reply", "publish_portfolio_image", "site_publish", "web_fetch"].sort(),
+      ["nbhd_reddit_post", "nbhd_reddit_reply", "publish_portfolio_image", "shop_confirm", "site_publish", "web_fetch"].sort(),
     );
   });
 

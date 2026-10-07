@@ -4,7 +4,8 @@
  * Lets a subscriber's assistant publish a portfolio image to the subscriber's
  * own website by writing directly to their Azure Blob Storage + Cosmos DB,
  * authenticating as the tenant's user-assigned managed identity (no stored
- * keys).
+ * keys). The shop_* tools (shop.js) manage the items for sale in the same
+ * Cosmos container, behind an approval code.
  *
  * Per-tenant and inert by default: the tool no-ops unless the tenant's
  * `site_config` (injected via api.pluginConfig by config_generator when
@@ -26,7 +27,25 @@ const path = require("path");
 const crypto = require("crypto");
 
 const { wrapTool } = require("../../tool-logger.js");
+const { createShop } = require("./shop.js");
 const wrap = (def) => wrapTool(def, { plugin: "nbhd-site-publishing" });
+
+// OpenClaw calls execute(toolCallId, params); a few legacy callers pass the
+// params object first. Accept both, like tool-logger's required-arg guard.
+function toolParams(args) {
+  const isPlainObject = (v) => v != null && typeof v === "object" && !Array.isArray(v);
+  if (isPlainObject(args[1])) return args[1];
+  if (isPlainObject(args[0])) return args[0];
+  return {};
+}
+
+const ITEM_PARAM = {
+  type: "string",
+  description: "The item's id or page name (slug) exactly as returned by shop_list_items.",
+};
+const APPROVAL_NOTE =
+  "This does NOT change the site: it checks the request and returns a summary plus an approval code. " +
+  "Show the user that summary, wait for their explicit yes, then call shop_confirm with the code.";
 
 // Lazy-require the Azure SDKs so a missing dependency degrades to a clear
 // tool-level error instead of crashing plugin load for the whole agent.
@@ -167,6 +186,178 @@ module.exports = function register(api) {
         const msg = (err && err.message ? err.message : String(err)).replace(/\s+/g, " ").slice(0, 300);
         return { content: [{ type: "text", text: `Couldn't publish the image: ${msg}` }] };
       }
+    },
+  }));
+
+  // ---------- shop (items for sale) ----------
+
+  const shop = createShop({
+    config: cfg,
+    env: process.env,
+    openStore() {
+      let Azure;
+      try {
+        Azure = loadAzure();
+      } catch {
+        throw new Error("Site publishing is temporarily unavailable (dependencies missing).");
+      }
+      const { DefaultAzureCredential, BlobServiceClient, CosmosClient } = Azure;
+      // Same identity and coordinates as publish_portfolio_image above.
+      const credential = new DefaultAzureCredential({
+        managedIdentityClientId: process.env.AZURE_CLIENT_ID,
+      });
+      return {
+        container: new CosmosClient({ endpoint: cfg.cosmosEndpoint, aadCredentials: credential })
+          .database(cfg.cosmosDatabase)
+          .container(cfg.cosmosContainer),
+        blobContainer: new BlobServiceClient(`https://${cfg.blobAccount}.blob.core.windows.net`, credential)
+          .getContainerClient(cfg.blobContainer),
+      };
+    },
+  });
+
+  api.registerTool(wrap({
+    name: "shop_list_items",
+    description:
+      "List every item for sale in the user's online shop: name, price, stock, whether it is visible, " +
+      "hidden or sold out, and its id and page name (slug). Call this to find the item before changing it.",
+    parameters: { type: "object", additionalProperties: false, properties: {} },
+    async execute() {
+      return shop.tools.shop_list_items();
+    },
+  }));
+
+  api.registerTool(wrap({
+    name: "shop_add_item",
+    description:
+      "Prepare a new item for sale in the user's online shop (a product with a price — not a gallery " +
+      "picture; gallery pictures use publish_portfolio_image). Needs a name, a price in yen the user " +
+      "actually stated (never guess or invent a price) and at least one photo. " + APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["title", "price_jpy"],
+      properties: {
+        title: { type: "string", description: "Item name shown in the shop." },
+        price_jpy: {
+          type: "string",
+          description: 'Price in whole Japanese yen exactly as the user gave it, e.g. "8000" or "¥8,000".',
+        },
+        image_paths: {
+          type: "array",
+          items: { type: "string" },
+          description: "Absolute paths of the photo files the user sent for this item (jpg, png, gif or webp).",
+        },
+        gallery_image_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Ids of pictures already in the site gallery to use as this item's photos.",
+        },
+        stock: {
+          type: "string",
+          description: 'How many exist, e.g. "10", or "unlimited" for made-to-order. Omit for made-to-order.',
+        },
+        one_of_a_kind: {
+          type: "boolean",
+          description: "True for an original: exactly one exists and it sells out after one purchase.",
+        },
+        product_type: {
+          type: "string",
+          enum: ["art", "original", "print", "merch"],
+          description: "Kind of item. Default: art.",
+        },
+        description: { type: "string", description: "Optional longer text shown on the item page." },
+        hidden: {
+          type: "boolean",
+          description: "True to add the item without showing it in the shop yet. Default: false.",
+        },
+      },
+    },
+    async execute(...args) {
+      return shop.tools.shop_add_item(toolParams(args));
+    },
+  }));
+
+  api.registerTool(wrap({
+    name: "shop_update_item",
+    description:
+      "Prepare a change to an existing shop item's price, stock, name or description. Pass only what " +
+      "the user asked to change; never guess a price. The page address stays the same when the name changes. " +
+      APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["item"],
+      properties: {
+        item: ITEM_PARAM,
+        title: { type: "string", description: "New item name." },
+        price_jpy: {
+          type: "string",
+          description: 'New price in whole Japanese yen exactly as the user gave it, e.g. "9000".',
+        },
+        stock: { type: "string", description: 'New number in stock, e.g. "3", or "unlimited" for made-to-order.' },
+        product_type: { type: "string", enum: ["art", "original", "print", "merch"], description: "New kind of item." },
+        description: { type: "string", description: "New text for the item page." },
+      },
+    },
+    async execute(...args) {
+      return shop.tools.shop_update_item(toolParams(args));
+    },
+  }));
+
+  api.registerTool(wrap({
+    name: "shop_mark_sold",
+    description:
+      "Prepare marking a shop item as sold out (for example it was sold in person). " + APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["item"],
+      properties: { item: ITEM_PARAM },
+    },
+    async execute(...args) {
+      return shop.tools.shop_mark_sold(toolParams(args));
+    },
+  }));
+
+  api.registerTool(wrap({
+    name: "shop_set_visibility",
+    description:
+      "Prepare hiding a shop item from the shop, or showing a hidden item again. " + APPROVAL_NOTE,
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["item", "visible"],
+      properties: {
+        item: ITEM_PARAM,
+        visible: { type: "boolean", description: "False to hide the item, true to show it again." },
+      },
+    },
+    async execute(...args) {
+      return shop.tools.shop_set_visibility(toolParams(args));
+    },
+  }));
+
+  api.registerTool(wrap({
+    name: "shop_confirm",
+    description:
+      "Save ONE prepared shop change to the live site. Call only after the user has seen the summary " +
+      "returned by shop_add_item / shop_update_item / shop_mark_sold / shop_set_visibility and explicitly " +
+      "said yes, passing that summary's approval code. Never say an item is added, changed, sold or hidden " +
+      "unless this call returned success this turn.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["approval_code"],
+      properties: {
+        approval_code: {
+          type: "string",
+          description: "Six-character code returned with the summary the user approved.",
+        },
+      },
+    },
+    async execute(...args) {
+      return shop.tools.shop_confirm(toolParams(args));
     },
   }));
 };

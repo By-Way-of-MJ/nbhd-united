@@ -95,6 +95,7 @@ export const WRAP_SOURCE_TOOL_IDS = new Set(["pdf", "image"]);
 export const EXFIL_TOOL_IDS = new Set([
   "publish_portfolio_image",
   "site_publish",
+  "shop_confirm",
   "nbhd_reddit_post",
   "nbhd_reddit_reply",
   "web_fetch",
@@ -115,6 +116,8 @@ function describeExfilAction(realId) {
       return "publish an image";
     case "site_publish":
       return "publish website changes";
+    case "shop_confirm":
+      return "change the online shop";
     case "nbhd_reddit_post":
       return "post to Reddit";
     case "nbhd_reddit_reply":

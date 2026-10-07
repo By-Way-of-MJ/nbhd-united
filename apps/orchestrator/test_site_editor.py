@@ -21,6 +21,7 @@ from apps.tenants.services import create_tenant
 
 _GATE = "## Website edit gate"
 _PORTFOLIO_GATE = "## Portfolio publish gate"
+_SHOP_GATE = "## Shop gate"
 _GRAVITY_GATE = "## Gravity Observation Mode"
 
 
@@ -534,6 +535,30 @@ class KihoShapeMaximalRenderTest(TestCase):
         self.assertIn("You are Pistachio.", agents)
         self.assertIn(_GRAVITY_GATE, agents)
         self.assertIn("CUSTOM_SOUL_TAIL", rendered["NBHD_SOUL_MD"])
-        self.assertLess(agents.index(_PORTFOLIO_GATE), agents.index(_GATE))
+        self.assertLess(agents.index(_PORTFOLIO_GATE), agents.index(_SHOP_GATE))
+        self.assertLess(agents.index(_SHOP_GATE), agents.index(_GATE))
         self.assertLess(agents.index(_GATE), agents.index(_GRAVITY_GATE))
         self.assertLess(len(agents), BOOTSTRAP_MAX_CHARS)
+
+    def test_shop_gate_rides_the_site_publishing_flag_and_requires_the_approval_code(self):
+        tenant = create_tenant(display_name="Shop Shape", telegram_chat_id=940005)
+        off = render_workspace_files("neighbor", tenant=tenant)["NBHD_AGENTS_MD"]
+        self.assertNotIn(_SHOP_GATE, off)
+        self.assertNotIn("shop_confirm", off)
+
+        tenant.site_publishing_enabled = True
+        tenant.save(update_fields=["site_publishing_enabled"])
+        on = render_workspace_files("neighbor", tenant=tenant)["NBHD_AGENTS_MD"]
+        gate = on[on.index(_SHOP_GATE) :].split("\n## ", 1)[0]
+        self.assertIn("`shop_*` tools via toolSearch, NOT `publish_portfolio_image`", gate)
+        self.assertIn("NEVER guess a price", gate)
+        self.assertIn("Nothing saves until `shop_confirm`", gate)
+        # The gate is a one-line router (AGENTS.md budget); the rules it can't
+        # afford to spell out must stay in the tool descriptions it points at.
+        plugin = Path(__file__).resolve().parents[2] / "runtime" / "openclaw" / "plugins" / "nbhd-site-publishing"
+        self.assertIn("shop_confirm", json.loads((plugin / "openclaw.plugin.json").read_text())["contracts"]["tools"])
+        source = (plugin / "index.js").read_text()
+        self.assertIn("This does NOT change the site", source)
+        self.assertIn("wait for their explicit yes, then call shop_confirm with the code", source)
+        self.assertIn("never guess or invent a price", source)
+        self.assertIn("unless this call returned success this turn", source)

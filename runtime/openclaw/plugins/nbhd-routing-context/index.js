@@ -134,6 +134,11 @@ export const SUBAGENT_READ_ONLY_NBHD_TOOL_IDS = new Set(
 
 const SUBAGENT_ALWAYS_BLOCKED_NON_NBHD_TOOL_IDS = new Set([
   "publish_portfolio_image",
+  "shop_add_item",
+  "shop_update_item",
+  "shop_mark_sold",
+  "shop_set_visibility",
+  "shop_confirm",
 ]);
 
 const SUBAGENT_OUTWARD_BLOCK_REASON =

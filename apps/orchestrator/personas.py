@@ -742,6 +742,17 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
             "or ask. If publishing isn't configured, do NOT retry — say so."
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_publish_gate
+        # Shop gate — same plugin, same flag. Deliberately one line: the all-gates
+        # AGENTS.md budget was full, so this only routes selling to the shop tools
+        # (without it "sell this photo" lands in the gallery via the gate above);
+        # the confirm-before-saving rules live in the tool descriptions and are
+        # enforced in code (only `shop_confirm` + approval code writes).
+        shop_gate = (
+            "## Shop gate\n\n"
+            "For-sale items (price, stock, sold, hide) → `shop_*` tools via toolSearch, NOT "
+            "`publish_portfolio_image`. NEVER guess a price. Nothing saves until `shop_confirm`."
+        )
+        result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + shop_gate
 
     if tenant is not None and getattr(tenant, "site_editor_enabled", False):
         site_editor_gate = (
