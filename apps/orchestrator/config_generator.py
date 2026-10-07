@@ -15,6 +15,7 @@ from django.conf import settings
 
 from apps.billing.constants import (
     ANTHROPIC_SONNET_MODEL,
+    DEEPSEEK_FLASH_41_MODEL,
     DEEPSEEK_FLASH_MODEL,
     DEEPSEEK_MODEL,
     GEMMA_DISPLAY,
@@ -1421,6 +1422,10 @@ TIER_MODEL_CONFIGS: dict[str, dict[str, Any]] = {
         DEEPSEEK_FLASH_MODEL: {"alias": "deepseek-flash"},
         DEEPSEEK_MODEL: {"alias": "deepseek"},
         GEMMA_MODEL: {"alias": "gemma"},
+        # Trial entry (2026-10-07). Kept LAST so it joins the end of every tenant's
+        # fallback chain (allowlist order minus the primary) rather than jumping
+        # ahead of the models already proven there.
+        DEEPSEEK_FLASH_41_MODEL: {"alias": "deepseek-flash-41"},
     },
 }
 

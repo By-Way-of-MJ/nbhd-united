@@ -48,6 +48,17 @@ DEEPSEEK_FLASH_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 DEEPSEEK_FLASH_DISPLAY = "DeepSeek V4 Flash"
 DEEPSEEK_FLASH_RATE = {"input": 0.09, "output": 0.18}
 
+# DeepSeek V4.1 Flash — the newer fast DeepSeek (text + image input, 1M context).
+# Selectable next to the 0731 snapshot while it is trialled as that slot's
+# replacement (added 2026-10-07). Nothing is pinned to it yet: crons, heartbeat,
+# compose and Siri stay on DEEPSEEK_FLASH_MODEL until the trial says to repoint.
+# Rate is provisional: OpenRouter's providers ranged $0.045–$0.14 in / $0.18–$1.20
+# out on 2026-10-07 and the routed price sat near the low end; revisit against
+# real UsageEvent cost before repointing anything to this model.
+DEEPSEEK_FLASH_41_MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
+DEEPSEEK_FLASH_41_DISPLAY = "DeepSeek V4.1 Flash"
+DEEPSEEK_FLASH_41_RATE = {"input": 0.09, "output": 0.30}
+
 # Gemma 4 31B — the cheap vision-capable worker (default compose model, agenda
 # hint fallback), and the pinned `pdfModel` for platform-key tenants. The rate
 # below is OpenRouter's live catalog price, verified 2026-08-06; it must stay in
@@ -146,6 +157,14 @@ MODEL_RATES: dict[str, dict[str, float]] = {
     DEEPSEEK_FLASH_MODEL.removeprefix("openrouter/"): {
         **DEEPSEEK_FLASH_RATE,
         "display_name": DEEPSEEK_FLASH_DISPLAY,
+    },
+    DEEPSEEK_FLASH_41_MODEL: {
+        **DEEPSEEK_FLASH_41_RATE,
+        "display_name": DEEPSEEK_FLASH_41_DISPLAY,
+    },
+    DEEPSEEK_FLASH_41_MODEL.removeprefix("openrouter/"): {
+        **DEEPSEEK_FLASH_41_RATE,
+        "display_name": DEEPSEEK_FLASH_41_DISPLAY,
     },
     GEMMA_MODEL: {
         **GEMMA_RATE,
