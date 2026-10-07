@@ -1,10 +1,16 @@
 {
   "id": "nbhd-site-publishing",
   "name": "NBHD Site Publishing",
-  "description": "Publish portfolio images to the subscriber's own website (Azure Blob + Cosmos DB) using the tenant's managed identity.",
+  "description": "Publish portfolio images and manage shop items on the subscriber's own website (Azure Blob + Cosmos DB) using the tenant's managed identity.",
   "contracts": {
     "tools": [
-      "publish_portfolio_image"
+      "publish_portfolio_image",
+      "shop_list_items",
+      "shop_add_item",
+      "shop_update_item",
+      "shop_mark_sold",
+      "shop_set_visibility",
+      "shop_confirm"
     ]
   },
   "configSchema": {
