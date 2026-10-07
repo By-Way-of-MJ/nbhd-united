@@ -105,13 +105,14 @@ class PanelToolConfigTests(SimpleTestCase):
     def test_off_gate_entire_config_matches_pre_review_bytes(self):
         # An old canary must remain safe even when shape is enabled.
         self.tenant.container_image_tag = "2026.9.4-cronfix"
-        # Captured from 1ee74fb0 before changing config generation in this round.
+        # Captured from 1ee74fb0 before changing config generation in that round;
+        # re-captured 2026-10-07 when DeepSeek V4.1 Flash joined the model allowlist.
         for gate in ("", "00000000-0000-4000-8000-000000000222", str(self.tenant.id)):
             with self.subTest(gate=gate), override_settings(CHAT_SHAPE_TENANT_IDS=gate):
                 config = generate_openclaw_config(self.tenant)
             self.assertEqual(
                 hashlib.sha256(self.config_bytes(config)).hexdigest(),
-                "d88c6883522e3f126a377b1a64067375989325041a6782501ce1591fa03cf7d5",
+                "f59a4361e1253921d5d57f48b25a8eda8a180eb012686a3f2e0e7c5f06b2b78d",
             )
             self.assertEqual(config["plugins"]["entries"]["nbhd-journal-tools"], {"enabled": True})
             assert_config_writable(config)
