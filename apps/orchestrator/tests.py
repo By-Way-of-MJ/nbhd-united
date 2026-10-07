@@ -82,7 +82,7 @@ class ConfigGeneratorTest(TestCase):
         config = generate_openclaw_config(self.tenant)
         models = config["agents"]["defaults"]["models"]
         aliases = sorted(v.get("alias") for v in models.values())
-        self.assertEqual(aliases, ["deepseek", "deepseek-flash", "gemma"])
+        self.assertEqual(aliases, ["deepseek", "deepseek-flash", "deepseek-flash-41", "gemma"])
 
     def test_deepseek_flash_snapshot_and_legacy_rates(self):
         from apps.billing.constants import (
