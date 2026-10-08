@@ -1,5 +1,6 @@
 """App-JWT-only project API; runtime credentials never authorize a mutation."""
 
+from django.db import transaction
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
@@ -12,6 +13,21 @@ from .views import FriendsView
 
 class ProjectView(FriendsView):
     authentication_classes = [JWTAuthenticationWithRLS]
+
+    def dispatch(self, request, *args, **kwargs):
+        """One database transaction per project request.
+
+        Steps, milestones, assignments and dependencies sit behind FORCE ROW LEVEL
+        SECURITY keyed on ``app.tenant_id``, which sign-in sets on the connection.
+        Production reaches Postgres through Supavisor in TRANSACTION mode (port 6543):
+        in autocommit each query is its own transaction and may run on a server
+        connection that never received the setting, so the policy hides every step
+        while the unprotected project row still loads. MJ 2026-10-08: "0 of 0 steps",
+        a different project each time, back after a refresh or two. Inside one
+        transaction, sign-in and every query share one server connection.
+        """
+        with transaction.atomic():
+            return super().dispatch(request, *args, **kwargs)
 
     def get_tenant(self, request):
         tenant = getattr(request.user, "tenant", None)
