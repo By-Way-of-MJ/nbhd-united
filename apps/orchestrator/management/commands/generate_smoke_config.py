@@ -87,6 +87,10 @@ class Command(BaseCommand):
                 tenant.datebook_manifest_ok = True
                 tenant.datebook_enabled = True
                 tenant.datebook_events_consent_at = timezone.now()
+                # The smoke boots the image built from this commit, which ships
+                # every plugin dir; stand in for its container-started report.
+                tenant.image_plugin_ids = ["nbhd-project-tools"]
+                tenant.image_plugins_tag = tenant.container_image_tag
                 tenant.save()
 
             if options["maximal"]:

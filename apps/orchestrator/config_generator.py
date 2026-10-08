@@ -2764,10 +2764,12 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     # Projects v2 plugin — read the user's shared projects, save a PRIVATE draft, and
     # SUGGEST changes the user approves in the app (DIRECTIVE_neighborhood_projects
     # §4). Deliberately NOT gated on friends_enabled: a user's part of a project is
-    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag.
-    from apps.friends.project_flags import projects_v2_enabled
+    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag,
+    # and on the running image having reported the plugin dir: 2026.9.4 never
+    # starts its gateway when this names a dir the image lacks (2026-10-08).
+    from apps.friends.project_flags import project_tools_ready
 
-    if getattr(tenant, "neighborhood_enabled", False) and projects_v2_enabled(tenant):
+    if getattr(tenant, "neighborhood_enabled", False) and project_tools_ready(tenant):
         _plugin_defs.append(
             (
                 str(getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_ID", "nbhd-project-tools") or "").strip(),
