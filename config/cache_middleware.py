@@ -1,26 +1,24 @@
 """ETag + default Cache-Control middleware.
 
-Sits after RequestTimingMiddleware. For 200 GETs with a renderable body we:
+Sits after RequestTimingMiddleware. For 200 GETs with a renderable body we hash the
+body to a strong ETag (handy for debugging and log correlation) and set
+``Cache-Control: private, no-store``.
 
-  1. Hash the response body to a strong ETag.
-  2. Compare to `If-None-Match`; on match, return 304 with empty body so the
-     client reuses its copy (saves transit, not server work).
-  3. Set `Cache-Control: private, max-age=10, stale-while-revalidate=60` so
-     browsers and React Query reuse the response for 10s and refetch in the
-     background for another 60s when stale.
+We deliberately never answer 304 and never let a client keep a copy. The iPhone
+app's URL cache was found serving a days-old body for a plan endpoint after a 304
+whose ETag matched the CURRENT body (2026-10-08: a project showed "0 of 0 steps" —
+its state before steps were added — until pulled to refresh twice). A cached copy
+of live account data is not worth that; every GET returns the real body.
 
-We deliberately skip non-GET, non-200, and streaming responses. ETag work
-runs after the view (and after `@tenant_cache`) so it covers both hits and
-misses identically.
+We skip non-GET, non-200, and streaming responses. A view that sets its own
+Cache-Control keeps it.
 """
 
 from __future__ import annotations
 
 import hashlib
 
-from django.http import HttpResponseNotModified
-
-_DEFAULT_CACHE_CONTROL = "private, max-age=10, stale-while-revalidate=60"
+_DEFAULT_CACHE_CONTROL = "private, no-store"
 
 
 class ETagMiddleware:
@@ -42,17 +40,6 @@ class ETagMiddleware:
 
         etag = '"' + hashlib.md5(response.content, usedforsecurity=False).hexdigest() + '"'
         response["ETag"] = etag
-
-        if request.META.get("HTTP_IF_NONE_MATCH") == etag:
-            not_modified = HttpResponseNotModified()
-            not_modified["ETag"] = etag
-            # Propagate cache-relevant headers (including X-Cache) so outer
-            # middleware logging can see whether the underlying response came
-            # from the decorator's cache.
-            for header in ("Cache-Control", "Vary", "X-Cache"):
-                if header in response:
-                    not_modified[header] = response[header]
-            return not_modified
 
         if "Cache-Control" not in response:
             response["Cache-Control"] = _DEFAULT_CACHE_CONTROL

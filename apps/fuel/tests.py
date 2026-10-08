@@ -6397,14 +6397,15 @@ class FuelOverviewViewTests(TestCase):
         self.assertEqual(self._as_json(overview["workouts"]), self._as_json(workouts))
         self.assertEqual(self._as_json(overview["calendar"]), self._as_json(cal))
 
-    def test_etag_repeat_returns_304(self):
+    def test_etag_repeat_still_returns_the_body(self):
+        """No 304s: a client cache must never stand in for live data (cache_middleware)."""
         FuelProfile.objects.create(tenant=self.tenant)
         resp = self.client.get("/api/v1/fuel/overview/")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("ETag", resp)
-        etag = resp["ETag"]
-        resp2 = self.client.get("/api/v1/fuel/overview/", HTTP_IF_NONE_MATCH=etag)
-        self.assertEqual(resp2.status_code, 304)
+        resp2 = self.client.get("/api/v1/fuel/overview/", HTTP_IF_NONE_MATCH=resp["ETag"])
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.content, resp.content)
 
     def test_tenant_isolation(self):
         other = create_tenant(display_name="Other Overview", telegram_chat_id=800078)
