@@ -96,6 +96,9 @@ class Command(BaseCommand):
                     SUBAGENT_TENANT_IDS=str(tenant.id),
                     USAGE_HOOKS_TENANT_IDS=str(tenant.id),
                     PROJECTS_V2_TENANT_IDS=str(tenant.id),
+                    # Seal-egress PR-B: let the real `openclaw doctor` judge the ZDR provider
+                    # params + OpenRouter speech-to-text entry before any tenant gets them.
+                    CONTAINER_ZDR_TENANT_IDS=str(tenant.id),
                 ):
                     config_json = config_to_json(generate_openclaw_config(tenant))
             else:
