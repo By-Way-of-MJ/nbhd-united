@@ -343,13 +343,26 @@ fi
 (
     if [ -n "${NBHD_API_BASE_URL:-}" ] && [ -n "${NBHD_INTERNAL_API_KEY:-}" ] && [ -n "${NBHD_TENANT_ID:-}" ]; then
         URL="${NBHD_API_BASE_URL%/}/api/cron/runtime/${NBHD_TENANT_ID}/container-started/"
+        # Report which plugin dirs this image ships. Django only puts an
+        # image-dependent plugin in openclaw.json after the image reported it:
+        # 2026.9.4 never starts its gateway on a config naming a missing dir.
+        PLUGIN_IDS=""
+        for manifest in /opt/nbhd/plugins/*/openclaw.plugin.json; do
+            [ -f "$manifest" ] || continue
+            plugin_id="$(basename "$(dirname "$manifest")")"
+            case "$plugin_id" in
+                ""|*[!a-z0-9-]*) continue ;;
+            esac
+            PLUGIN_IDS="${PLUGIN_IDS:+$PLUGIN_IDS,}\"$plugin_id\""
+        done
         # -sS keeps curl quiet on success but still prints its error to stderr
         # (visible in container logs); we also capture the exit code so a silent
         # failure is impossible. Fire-and-forget + non-fatal by design.
         if curl -sS -X POST -m 10 \
             -H "X-NBHD-Internal-Key: ${NBHD_INTERNAL_API_KEY}" \
             -H "X-NBHD-Tenant-Id: ${NBHD_TENANT_ID}" \
-            -H "Content-Length: 0" \
+            -H "Content-Type: application/json" \
+            --data "{\"plugins\":[${PLUGIN_IDS}]}" \
             "$URL" \
             >/dev/null; then
             echo "[entrypoint] container-started hook OK"
