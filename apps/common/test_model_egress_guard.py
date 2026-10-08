@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import re
 import subprocess
 import tempfile
@@ -55,6 +56,12 @@ _ALLOWED_MATCHES = {
     ("apps/orchestrator/azure_client.py", "provider_key_read"),
     ("runtime/openclaw/plugins/nbhd-image-gen/index.js", "model_hostname"),
     ("runtime/openclaw/plugins/nbhd-image-gen/index.js", "provider_key_read"),
+    # Named exception (MJ 2026-10-08): a profile photo is sent to OpenAI's moderation
+    # model before it is stored, so an unsafe photo never reaches neighbors. It is the
+    # one direct provider call kept on purpose; replace it with a local safety model
+    # rather than widening this list. The photo is never given to the assistant.
+    ("apps/friends/photos.py", "provider_key_read"),
+    ("apps/friends/photos.py", "sdk_usage"),
 }
 
 _EGRESS_PATTERNS = (
@@ -98,16 +105,35 @@ def _is_deployable(relative: Path) -> bool:
     return root_special or deployable_source
 
 
-def _deployable_files():
-    tracked = subprocess.run(
-        ["git", "-C", str(_ROOT), "ls-files", "-z"],
-        check=True,
-        capture_output=True,
-    ).stdout
+_UNTRACKED_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".claude", ".dd"}
+
+
+def _candidate_relatives():
+    """Tracked files when git can answer; otherwise every file on disk.
+
+    The docker gate and CI test a snapshot with no ``.git``, where ``git ls-files``
+    exits 128. Walking the tree there scans a superset of the tracked files, so the
+    guard still runs (and can only be stricter) instead of erroring out.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(_ROOT), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        for directory, subdirectories, filenames in os.walk(_ROOT):
+            subdirectories[:] = [name for name in subdirectories if name not in _UNTRACKED_DIRS]
+            for filename in filenames:
+                yield (Path(directory) / filename).relative_to(_ROOT)
+        return
     for encoded_relative in tracked.split(b"\0"):
-        if not encoded_relative:
-            continue
-        relative = Path(encoded_relative.decode("utf-8"))
+        if encoded_relative:
+            yield Path(encoded_relative.decode("utf-8"))
+
+
+def _deployable_files():
+    for relative in _candidate_relatives():
         path = _ROOT / relative
         if not path.is_file():
             continue
