@@ -1868,7 +1868,26 @@ class RuntimeContainerStartedTest(TestCase):
             self._boot()
             self.tenant.refresh_from_db()
             self.assertFalse(project_tools_ready(self.tenant))
-        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-bbbbbbb")
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_outgoing_replica_hook_without_report_does_not_withdraw_tools(self, mock_publish):
+        """Image roll: the old revision's replica can fire its empty hook last."""
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self._boot({"plugins": ["nbhd-project-tools"]})
+            mock_publish.reset_mock()
+            pending = Tenant.objects.get(id=self.tenant.id).pending_config_version
+            self.assertEqual(self._boot().status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugin_ids, ["nbhd-project-tools"])
+        self.assertEqual(self.tenant.pending_config_version, pending)
         mock_publish.assert_not_called()
 
     @patch("apps.cron.publish.publish_task")
