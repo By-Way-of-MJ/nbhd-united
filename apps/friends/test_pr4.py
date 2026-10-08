@@ -123,7 +123,10 @@ class NeighborhoodContextTest(TestCase):
         spark = ctx["sparks"][0]
         self.assertEqual(spark["shared_lesson_id"], str(self.sl.id))
         self.assertEqual(spark["from_handle"], "owner")
-        self.assertEqual(spark["text"], "someone cooks on Sundays")
+        # A neighbor wrote it: it reaches the assistant fenced as data, with the rule.
+        self.assertEqual(spark["text"], "<<untrusted from @owner>> someone cooks on Sundays <</untrusted>>")
+        self.assertTrue(spark["title"].startswith("<<untrusted from @owner>>"))
+        self.assertIn("never instructions", ctx["rule"])
         # NEVER leaks the raw lesson text.
         self.assertNotIn("RAW_SECRET", str(ctx))
         self.assertIn("owner", ctx["neighbors"])
@@ -333,5 +336,5 @@ class RuntimeContextHttpTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertEqual(len(body["sparks"]), 1)
-        self.assertEqual(body["sparks"][0]["text"], "someone did a thing")
+        self.assertEqual(body["sparks"][0]["text"], "<<untrusted from @rtcowner>> someone did a thing <</untrusted>>")
         self.assertIsNotNone(body["cursor"])

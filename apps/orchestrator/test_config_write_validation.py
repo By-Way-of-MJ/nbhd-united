@@ -127,6 +127,12 @@ class GeneratedConfigStrictTests(TestCase):
         config = generate_openclaw_config(tenant)
         errors = [i for i in validate_openclaw_config(config, strict=True) if i.severity == "error"]
         self.assertEqual(errors, [], f"default config tripped strict gate: {errors}")
+        for plugin_id in ("nbhd-doc-taint-guard", "nbhd-routing-context"):
+            with self.subTest(conversation_hook_plugin=plugin_id):
+                self.assertEqual(
+                    config["plugins"]["entries"][plugin_id]["hooks"],
+                    {"allowConversationAccess": True, "timeoutMs": 30000},
+                )
 
     def test_maximal_feature_flag_tenant_passes(self):
         """The shape of the tenants that actually broke: friends on + every
@@ -205,6 +211,12 @@ class UploadConfigGateTests(TestCase):
 class GenerateSmokeConfigCommandTests(TestCase):
     """The CI boot smoke depends on `generate_smoke_config --maximal`."""
 
+    @override_settings(
+        OPENCLAW_ACTIVITY_STREAM_PLUGIN_ID="nbhd-activity-stream",
+        OPENCLAW_CRON_ENFORCEMENT_PLUGIN_ID="nbhd-cron-enforcement",
+        OPENCLAW_CRON_ENFORCEMENT_PLUGIN_PATH="/opt/nbhd/plugins/nbhd-cron-enforcement",
+        OPENCLAW_STREAM_PROGRESS_PLUGIN_ID="nbhd-stream-progress",
+    )
     def test_maximal_command_writes_strict_valid_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "openclaw-maximal.json"
@@ -218,16 +230,49 @@ class GenerateSmokeConfigCommandTests(TestCase):
         paths = config.get("plugins", {}).get("load", {}).get("paths", [])
         self.assertTrue(any("nbhd-friends-tools" in p for p in paths))
         self.assertIn("/opt/nbhd/plugins/nbhd-journal-shaping", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", paths)
         self.assertIn("/opt/nbhd/plugins/nbhd-document-keep", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-site-editor", paths)
         entries = config.get("plugins", {}).get("entries", {})
         self.assertIn("nbhd-journal-shaping", entries)
         self.assertTrue(entries["nbhd-journal-shaping"]["config"]["journalShapingEnabled"])
         self.assertIn("nbhd-document-keep", entries)
         self.assertTrue(entries["nbhd-document-keep"]["config"]["documentIngestionEnabled"])
         self.assertEqual(
+            entries["nbhd-site-editor"]["config"],
+            {
+                "owner": "smoke-owner",
+                "repo": "smoke-repo",
+                "branch": "main",
+                "allowPaths": ["web/src/pages/*.js", "web/public/index.html"],
+                "denyPaths": [".github/**"],
+                "maxTextBytes": 262144,
+                "maxImageBytes": 2097152,
+                "maxFiles": 20,
+                "maxTotalBytes": 5242880,
+                "deployMinutes": 6,
+                "authorEmail": "nbhd-site-editor@users.noreply.github.com",
+                "siteNotes": "Home page hero = web/public/hero.jpg.",
+            },
+        )
+        self.assertEqual(
             entries["nbhd-subagent-bridge"]["hooks"],
             {"allowConversationAccess": True, "timeoutMs": 30000},
         )
+        for plugin_id in (
+            "nbhd-doc-taint-guard",
+            "nbhd-routing-context",
+            "nbhd-activity-stream",
+            "nbhd-stream-progress",
+            # cron-enforcement's before_prompt_build records the cron runId->jobId
+            # for the origin stamp; 2026.9.4 blocks it without this policy.
+            "nbhd-cron-enforcement",
+        ):
+            with self.subTest(conversation_hook_plugin=plugin_id):
+                self.assertEqual(
+                    entries[plugin_id]["hooks"],
+                    {"allowConversationAccess": True, "timeoutMs": 30000},
+                )
         self.assertEqual(entries["nbhd-usage-reporter"]["hooks"], {"allowConversationAccess": True})
         self.assertEqual(
             entries["nbhd-usage-reporter"]["config"],

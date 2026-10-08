@@ -2,6 +2,7 @@ from django.urls import path
 
 from .document_views import (
     DocumentAppendView,
+    DocumentBlockReplaceView,
     DocumentClearView,
     DocumentDetailView,
     DocumentListCreateView,
@@ -44,6 +45,7 @@ from .views import (
     JournalEntryDetailView,
     JournalEntryListCreateView,
     MemoryView,
+    MoodCheckInView,
     TemplateDetailView,
     TemplateListCreateView,
     WeeklyReviewDetailView,
@@ -51,10 +53,16 @@ from .views import (
 )
 
 urlpatterns = [
+    path("mood/", MoodCheckInView.as_view(), name="journal-mood"),
     # ── v2 Document API ──────────────────────────────────────────────────
     path("documents/", DocumentListCreateView.as_view(), name="document-list-create"),
     path("documents/<str:kind>/<path:slug>/append/", DocumentAppendView.as_view(), name="document-append"),
     path("documents/<str:kind>/<path:slug>/clear/", DocumentClearView.as_view(), name="document-clear"),
+    path(
+        "documents/<str:kind>/<path:slug>/blocks/replace/",
+        DocumentBlockReplaceView.as_view(),
+        name="document-block-replace",
+    ),
     path("documents/<str:kind>/<path:slug>/", DocumentDetailView.as_view(), name="document-detail"),
     path("today/", TodayView.as_view(), name="today"),
     path("tree/", SidebarTreeView.as_view(), name="sidebar-tree"),

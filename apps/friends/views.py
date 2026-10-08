@@ -11,11 +11,12 @@ from __future__ import annotations
 from django.conf import settings
 from rest_framework import status
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from . import circles, services
+from . import access, circles, services
 from .serializers import InviteCreateSerializer, NeighborProfileSerializer, WaveCreateSerializer
 from .throttling import AdoptDayThrottle, MessageSendHourThrottle, WaveSendDayThrottle
 
@@ -29,7 +30,7 @@ class FriendsView(APIView):
         tenant = getattr(request.user, "tenant", None)
         if tenant is None:
             raise NotFound("No tenant for this account.")
-        if not tenant.friends_enabled:
+        if not tenant.neighborhood_enabled:
             raise PermissionDenied("The Neighborhood is not enabled for this account.")
         return tenant
 
@@ -105,6 +106,54 @@ class ProfileView(FriendsView):
         return Response(serializer.data)
 
 
+class ProfilePhotoView(FriendsView):
+    """POST (multipart ``photo``) / DELETE /api/v1/friends/profile/photo/ — set,
+    replace or remove MY profile photo. Uploads are cleaned and safety-checked
+    before anything is stored (``apps/friends/photos.py``)."""
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        from . import photos
+
+        tenant = self.get_tenant(request)
+        profile = services.ensure_neighbor_profile(tenant, request.user)
+        upload = request.FILES.get("photo")
+        raw = upload.read(photos.MAX_UPLOAD_BYTES + 1) if upload else b""
+        return Response({"photo_url": photos.set_photo(profile, raw)})
+
+    def delete(self, request):
+        from . import photos
+
+        tenant = self.get_tenant(request)
+        profile = services.ensure_neighbor_profile(tenant, request.user)
+        photos.remove_photo(profile)
+        return Response({"photo_url": None})
+
+
+class PhotoView(FriendsView):
+    """GET /api/v1/friends/photos/<profile_id>/?v=<n> — a person's photo bytes, only
+    for someone ``access.can_view_photo`` allows. Anyone else (or a missing photo)
+    gets the same 404, so the endpoint never reveals who has a photo."""
+
+    def get(self, request, profile_id):
+        from django.http import HttpResponse
+
+        from . import access
+        from .models import NeighborProfile
+
+        tenant = self.get_tenant(request)
+        profile = NeighborProfile.objects.filter(id=profile_id).first()
+        row = access.photo_bytes(profile_id) if profile and access.can_view_photo(tenant, profile) else None
+        if not row:
+            raise NotFound("No photo.")
+        image, content_type = row
+        response = HttpResponse(bytes(image), content_type=content_type)
+        current = str(request.query_params.get("v", "")) == str(profile.photo_version)
+        response["Cache-Control"] = "private, max-age=31536000, immutable" if current else "private, max-age=60"
+        return response
+
+
 class InviteCreateView(FriendsView):
     """POST /api/v1/friends/invites/ — mint a wave link/QR token."""
 
@@ -160,6 +209,7 @@ def _wave_result(edge, viewer_tenant) -> dict:
         "display_name": profile.display_name if profile else (getattr(other.user, "display_name", None) or "Neighbor"),
         "handle": profile.handle if profile else None,
         "avatar_hue": profile.avatar_hue if profile else 210,
+        "photo_url": access.photo_url(profile),
     }
 
 
@@ -320,6 +370,18 @@ class AbsorbedPurgeView(FriendsView):
         return Response({"id": str(item.id), "purged": True})
 
 
+class AbsorbedPurgeGroupView(FriendsView):
+    """POST /api/v1/friends/absorbed/purge-group/ {group_key} — tombstone every
+    item in one ledger group (the list's ``group_key``). Idempotent."""
+
+    def post(self, request):
+        tenant = self.get_tenant(request)
+        group_key = request.data.get("group_key")
+        if not isinstance(group_key, str) or not group_key.strip():
+            raise ValidationError({"group_key": "Required."})
+        return Response({"group_key": group_key, "purged": services.purge_absorbed_group(tenant, group_key.strip())})
+
+
 # ── Friend chat (1:1) — poll-is-truth, thread addressed by thread_id only ────
 
 
@@ -334,7 +396,13 @@ class ThreadsView(FriendsView):
     def post(self, request):
         tenant = self.get_tenant(request)
         friendship_id = request.data.get("friendship_id")
-        if not friendship_id:
+        member_ids = request.data.get("member_friendship_ids")
+        if member_ids is not None:
+            from .project_flags import projects_v2_enabled
+
+            if not projects_v2_enabled(tenant):
+                raise NotFound("No such endpoint.")
+        if not friendship_id and member_ids is None:
             raise ValidationError("friendship_id is required.")
         thread = services.open_thread(tenant, friendship_id)
         return Response(
@@ -419,17 +487,26 @@ class MissionsView(FriendsView):
 
     def get(self, request):
         tenant = self.get_tenant(request)
-        return Response(services.list_missions(tenant))
+        return Response(
+            services.list_missions(tenant, include_invited=_is_truthy(request.query_params.get("include_invited")))
+        )
 
     def post(self, request):
         tenant = self.get_tenant(request)
         friendship_id = request.data.get("friendship_id")
-        if not friendship_id:
+        member_ids = request.data.get("member_friendship_ids")
+        if member_ids is not None:
+            from .project_flags import projects_v2_enabled
+
+            if not projects_v2_enabled(tenant):
+                raise NotFound("No such endpoint.")
+        if not friendship_id and member_ids is None:
             raise ValidationError("friendship_id is required.")
         mission = services.create_mission(
             tenant,
             request.user,
             friendship_id,
+            member_friendship_ids=member_ids,
             title=request.data.get("title", ""),
             description=request.data.get("description", ""),
             pillar=request.data.get("pillar", ""),
@@ -466,6 +543,11 @@ class MissionJoinView(FriendsView):
     def post(self, request, mission_id):
         tenant = self.get_tenant(request)
         return Response(services.join_mission(tenant, request.user, mission_id, request.data.get("commitment", "")))
+
+
+class MissionDeclineView(FriendsView):
+    def post(self, request, mission_id):
+        return Response(services.decline_mission(self.get_tenant(request), mission_id))
 
 
 class MissionLeaveView(FriendsView):
@@ -532,6 +614,27 @@ def _is_truthy(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+class NetworkCapabilitiesView(FriendsView):
+    def get(self, request):
+        self.get_tenant(request)
+        return Response(
+            {
+                "version": 1,
+                "circle_authors": True,
+                "project_invitations": True,
+                "project_history": True,
+                "circle_assistant_choice": True,
+            }
+        )
+
+
+def _assistant_choice(request, default=None):
+    value = request.data.get("agent_absorb_enabled", default)
+    if value is not None and not isinstance(value, bool):
+        raise ValidationError("agent_absorb_enabled must be a boolean.")
+    return value
+
+
 class CirclesView(FriendsView):
     """GET /api/v1/friends/circles/ — my circles. POST — create one (I'm admin)."""
 
@@ -547,6 +650,7 @@ class CirclesView(FriendsView):
             name=request.data.get("name", ""),
             description=request.data.get("description", ""),
             hue=request.data.get("hue", 210),
+            agent_absorb_enabled=_assistant_choice(request, True),
         )
         return Response({"circle_id": str(circle.id)}, status=status.HTTP_201_CREATED)
 
@@ -557,7 +661,14 @@ class CircleJoinView(FriendsView):
 
     def post(self, request):
         tenant = self.get_tenant(request)
-        return Response(circles.join_circle(tenant, request.user, request.data.get("invite_code", "")))
+        return Response(
+            circles.join_circle(
+                tenant,
+                request.user,
+                request.data.get("invite_code", ""),
+                agent_absorb_enabled=_assistant_choice(request),
+            )
+        )
 
 
 class CircleDetailView(FriendsView):

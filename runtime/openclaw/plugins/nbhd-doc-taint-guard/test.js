@@ -114,6 +114,17 @@ describe("decideExfilGate", () => {
     assert.equal(decideExfilGate({ event: exfilEvent, mode: "bogus", tainted: true }).action, "log");
   });
 
+  it("lets a shop change be prepared on a photo turn, but only saved once the user answers", () => {
+    // shop_add_item & co. only stage a summary; shop_confirm is the write.
+    for (const id of ["shop_add_item", "shop_update_item", "shop_mark_sold", "shop_set_visibility", "shop_list_items"]) {
+      assert.equal(decideExfilGate({ event: { toolName: id, params: {} }, mode: "enforce", tainted: true }).action, "ignore", id);
+    }
+    const save = decideExfilGate({ event: { toolName: "shop_confirm", params: {} }, mode: "enforce", tainted: true });
+    assert.equal(save.action, "block");
+    assert.match(save.result.blockReason, /change the online shop/);
+    assert.equal(decideExfilGate({ event: { toolName: "shop_confirm", params: {} }, mode: "enforce", tainted: false }).action, "ignore");
+  });
+
   it("covers every EXFIL_TOOL_IDS entry with a distinct, sensible action phrase", () => {
     for (const id of EXFIL_TOOL_IDS) {
       const out = decideExfilGate({
@@ -393,11 +404,60 @@ describe("exported id sets", () => {
   it("EXFIL_TOOL_IDS matches the threat-model's exfil surface exactly", () => {
     assert.deepEqual(
       [...EXFIL_TOOL_IDS].sort(),
-      ["nbhd_reddit_post", "nbhd_reddit_reply", "publish_portfolio_image", "web_fetch"].sort(),
+      ["nbhd_reddit_post", "nbhd_reddit_reply", "publish_portfolio_image", "shop_confirm", "site_publish", "web_fetch"].sort(),
     );
   });
 
   it("WRAP_SOURCE_TOOL_IDS is exactly pdf + image", () => {
     assert.deepEqual([...WRAP_SOURCE_TOOL_IDS].sort(), ["image", "pdf"]);
+  });
+});
+
+// ── Projects v2 §6.3: reading other people's project text taints the turn ─
+
+describe("project text taints the turn like an upload", () => {
+  function makeFakeApi(pluginConfig) {
+    const handlers = {};
+    return {
+      on: (event, fn) => {
+        handlers[event] = fn;
+      },
+      logger: { info() {}, warn() {}, error() {} },
+      pluginConfig: pluginConfig || {},
+      _handlers: handlers,
+    };
+  }
+
+  it("blocks exfil after nbhd_project_context in the same run, with a project reason", () => {
+    const api = makeFakeApi({ mode: "enforce" });
+    register(api);
+    const { before_tool_call, agent_end } = api._handlers;
+    assert.equal(before_tool_call({ toolName: "web_fetch", params: {} }, { runId: "p-1" }), undefined);
+    before_tool_call({ toolName: "tool_call", params: { id: "nbhd_project_context" } }, { runId: "p-1" });
+    const blocked = before_tool_call({ toolName: "web_fetch", params: {} }, { runId: "p-1" });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked.blockReason, /shared project/);
+    // Another run is untouched; agent_end clears this one.
+    assert.equal(before_tool_call({ toolName: "web_fetch", params: {} }, { runId: "p-2" }), undefined);
+    agent_end({ runId: "p-1" });
+    assert.equal(before_tool_call({ toolName: "web_fetch", params: {} }, { runId: "p-1" }), undefined);
+  });
+
+  it("the older neighborhood/mission context tools taint too", () => {
+    for (const tool of ["nbhd_mission_context", "nbhd_neighborhood_context"]) {
+      const api = makeFakeApi({ mode: "enforce" });
+      register(api);
+      api._handlers.before_tool_call({ toolName: tool, params: {} }, { runId: `r-${tool}` });
+      assert.equal(api._handlers.before_tool_call({ toolName: "nbhd_reddit_post", params: {} }, { runId: `r-${tool}` })?.block, true);
+    }
+  });
+
+  it("an upload-tainted run keeps the document reason", () => {
+    const api = makeFakeApi({ mode: "enforce" });
+    register(api);
+    api._handlers.before_agent_run({ prompt: "[Photo attached: x.jpg]" }, { runId: "d-1" });
+    api._handlers.before_tool_call({ toolName: "nbhd_project_context", params: {} }, { runId: "d-1" });
+    const blocked = api._handlers.before_tool_call({ toolName: "site_publish", params: {} }, { runId: "d-1" });
+    assert.match(blocked.blockReason, /document or photo/);
   });
 });

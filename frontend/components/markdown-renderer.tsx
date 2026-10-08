@@ -10,6 +10,7 @@ import type { Element } from "hast";
 
 interface MarkdownRendererProps {
   content: string;
+  plainCheckboxes?: boolean;
   onCheckboxToggle?: (lineIndex: number, checked: boolean) => void;
 }
 
@@ -23,9 +24,11 @@ const REMARK_PLUGINS = [remarkGfm, remarkBreaks];
 export const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
   onCheckboxToggle,
+  plainCheckboxes = false,
 }: MarkdownRendererProps) {
   const components = useMemo<Components>(
     () => ({
+      ...(plainCheckboxes ? { input: () => null } : {}),
       // Wire interactive task-list checkboxes by overriding the <li>, NOT the
       // <input>. remark-gfm emits a SYNTHETIC checkbox <input> node that has no
       // source position, so neither node.position nor a regex/ordinal scan can
@@ -45,7 +48,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
       } & React.LiHTMLAttributes<HTMLLIElement>) => {
         const line = node?.position?.start?.line;
         if (!onCheckboxToggle || line == null) {
-          return <li {...props}>{children}</li>;
+          return <li {...props} className={plainCheckboxes ? undefined : props.className}>{children}</li>;
         }
         // markdown lines are 1-based; handleCheckboxToggle expects 0-based.
         const sourceLine = line - 1;
@@ -87,12 +90,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-xs text-accent no-underline hover:underline"
           >
-            🔗 {alt ? `${alt} ` : ""}image (tap to view)
+            {plainCheckboxes ? "" : "🔗 "}{alt ? `${alt} ` : ""}image (tap to view)
           </a>
         );
       },
     }),
-    [onCheckboxToggle],
+    [onCheckboxToggle, plainCheckboxes],
   );
 
   return (

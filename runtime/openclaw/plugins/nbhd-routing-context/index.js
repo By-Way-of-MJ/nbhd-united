@@ -86,9 +86,12 @@ export const SUBAGENT_READ_ONLY_TOOL_IDS = new Set([
   "nbhd_finance_summary",
   "nbhd_gravity_query",
   "nbhd_mission_context",
+  "nbhd_project_context",
   "nbhd_neighborhood_context",
   "nbhd_fuel_audit",
+  "nbhd_fuel_get_plan",
   "nbhd_fuel_get_workout",
+  "nbhd_fuel_search_exercises",
   "nbhd_fuel_summary",
   "nbhd_insights_baseline",
   "nbhd_insights_compare",
@@ -131,6 +134,11 @@ export const SUBAGENT_READ_ONLY_NBHD_TOOL_IDS = new Set(
 
 const SUBAGENT_ALWAYS_BLOCKED_NON_NBHD_TOOL_IDS = new Set([
   "publish_portfolio_image",
+  "shop_add_item",
+  "shop_update_item",
+  "shop_mark_sold",
+  "shop_set_visibility",
+  "shop_confirm",
 ]);
 
 const SUBAGENT_OUTWARD_BLOCK_REASON =
@@ -203,7 +211,7 @@ export default function register(api) {
   if (!api || typeof api.on !== "function") {
     return;
   }
-  api.logger.info("NBHD routing context plugin registered (output-guard only)");
+  api.logger.warn("NBHD routing context plugin registered (output-guard only)");
 
   api.on("before_agent_finalize", (event) => {
     const lastReply = asTrimmedString(event && event.lastAssistantMessage);

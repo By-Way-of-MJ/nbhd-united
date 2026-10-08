@@ -94,15 +94,30 @@ export const WRAP_SOURCE_TOOL_IDS = new Set(["pdf", "image"]);
 // (docs/upload-security-threat-model.md AC-5 / exfiltration surface inventory).
 export const EXFIL_TOOL_IDS = new Set([
   "publish_portfolio_image",
+  "site_publish",
+  "shop_confirm",
   "nbhd_reddit_post",
   "nbhd_reddit_reply",
   "web_fetch",
+]);
+
+// Tools whose RESULT carries text other people wrote (Projects v2 §6.3). Calling one
+// taints the rest of the turn exactly like an upload does: the exfil tools above are
+// blocked unless the user asks again in their own words.
+export const TAINT_SOURCE_TOOL_IDS = new Set([
+  "nbhd_project_context",
+  "nbhd_mission_context",
+  "nbhd_neighborhood_context",
 ]);
 
 function describeExfilAction(realId) {
   switch (realId) {
     case "publish_portfolio_image":
       return "publish an image";
+    case "site_publish":
+      return "publish website changes";
+    case "shop_confirm":
+      return "change the online shop";
     case "nbhd_reddit_post":
       return "post to Reddit";
     case "nbhd_reddit_reply":
@@ -114,9 +129,13 @@ function describeExfilAction(realId) {
   }
 }
 
-function buildBlockReason(realId) {
+function buildBlockReason(realId, source = "document") {
+  const what =
+    source === "project"
+      ? "Text from a shared project was read this turn and may contain hidden instructions from someone else. "
+      : "A document or photo you uploaded this turn may contain hidden instructions. ";
   return (
-    "A document or photo you uploaded this turn may contain hidden instructions. " +
+    what +
     `I won't ${describeExfilAction(realId)} based on it without you explicitly asking in your own words. ` +
     "Ask me directly and I'll proceed."
   );
@@ -139,7 +158,7 @@ export function decideExfilGate({ event, mode, tainted }) {
     return {
       realId,
       action: "block",
-      result: { block: true, blockReason: buildBlockReason(realId) },
+      result: { block: true, blockReason: buildBlockReason(realId, tainted === "project" ? "project" : "document") },
     };
   }
   return { realId, action: "log" };
@@ -253,7 +272,7 @@ const MAX_TRACKED_TOOL_CALLS = 500;
 const taintedRuns = new Map();
 
 export function isDocumentTaintedRun(runId) {
-  return typeof runId === "string" && runId.length > 0 && taintedRuns.get(runId) === true;
+  return typeof runId === "string" && runId.length > 0 && Boolean(taintedRuns.get(runId));
 }
 
 export default function register(api) {
@@ -272,7 +291,11 @@ export default function register(api) {
   // doesn't).
   const toolCallResolvedId = new Map();
 
-  api.logger.info(`NBHD document taint guard plugin registered (mode=${mode})`);
+  try {
+    api.logger.warn(`NBHD document taint guard plugin registered (mode=${mode})`);
+  } catch (_ignored) {
+    // Logging must never disable the security hooks during registration.
+  }
 
   api.on("before_agent_run", (event, ctx) => {
     try {
@@ -303,9 +326,15 @@ export default function register(api) {
         setWithCap(toolCallResolvedId, toolCallId, realId, MAX_TRACKED_TOOL_CALLS);
       }
 
-      // (ii) Exfil gate — only matters on a document-tainted turn.
       const runId = ctx && ctx.runId;
-      const tainted = Boolean(runId && taintedRuns.get(runId));
+      // (ii) Reading other people's project text taints the rest of this turn.
+      if (realId && TAINT_SOURCE_TOOL_IDS.has(realId) && runId && !taintedRuns.get(runId)) {
+        setWithCap(taintedRuns, runId, "project", MAX_TAINTED_RUNS);
+        api.logger.warn(`project_text_taint tool=${realId} run=${runId}`);
+      }
+
+      // (iii) Exfil gate — only matters on a tainted turn (upload or project text).
+      const tainted = runId ? taintedRuns.get(runId) || false : false;
       const decision = decideExfilGate({ event, mode, tainted });
       if (decision.action === "block") {
         api.logger.warn(`doc_exfil_blocked tool=${decision.realId} run=${runId ?? "?"}`);

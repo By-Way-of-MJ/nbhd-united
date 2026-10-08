@@ -34,6 +34,12 @@ class ConfigGeneratorTest(TestCase):
             display_name="Config Test",
             telegram_chat_id=999888777,
         )
+        # These config-shape assertions document the 2026.5.28 schema (audio
+        # models under tools.media.audio, memorySearch under agents.defaults).
+        # Pin to it; the 2026.9.4 migration is covered by
+        # test_openclaw_9_4_migration and the openclaw doctor smoke.
+        self.tenant.openclaw_version = "2026.5.28"
+        self.tenant.save(update_fields=["openclaw_version"])
 
     def test_generates_valid_config(self):
         config = generate_openclaw_config(self.tenant)
@@ -76,7 +82,7 @@ class ConfigGeneratorTest(TestCase):
         config = generate_openclaw_config(self.tenant)
         models = config["agents"]["defaults"]["models"]
         aliases = sorted(v.get("alias") for v in models.values())
-        self.assertEqual(aliases, ["deepseek", "deepseek-flash", "gemma"])
+        self.assertEqual(aliases, ["deepseek", "deepseek-flash", "deepseek-flash-41", "gemma"])
 
     def test_deepseek_flash_snapshot_and_legacy_rates(self):
         from apps.billing.constants import (
@@ -189,7 +195,11 @@ class ConfigGeneratorTest(TestCase):
         self.assertIn("nbhd-doc-taint-guard", config["plugins"]["allow"])
         self.assertEqual(
             config["plugins"]["entries"]["nbhd-doc-taint-guard"],
-            {"enabled": True, "config": {"mode": "log_only"}},
+            {
+                "enabled": True,
+                "config": {"mode": "log_only"},
+                "hooks": {"allowConversationAccess": True, "timeoutMs": 30000},
+            },
         )
         self.assertIn("/opt/nbhd/plugins/nbhd-doc-taint-guard", config["plugins"]["load"]["paths"])
 
@@ -676,6 +686,61 @@ class ConfigGeneratorTest(TestCase):
     def test_morning_briefing_prompt_degrades_gracefully_on_search_failure(self):
         prompt = self._morning_briefing_prompt()
         self.assertIn("Weather unavailable", prompt)
+        # Search lane honesty sentence: the model must never narrate weather it didn't get.
+        self.assertIn(
+            "If you could not get weather in step 1, write `Weather couldn't be fetched this morning.`", prompt
+        )
+        self.assertIn("never describe weather you didn't get", prompt)
+
+    # ── Programmatic weather lane (BRIEFING_WEATHER_TOOL_TENANT_IDS) ──
+
+    def _gated_morning_briefing_prompt(self) -> str:
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=str(self.tenant.id)):
+            return self._morning_briefing_prompt()
+
+    def test_gated_morning_briefing_uses_weather_tool_not_search(self):
+        """Weather is programmatic (apps/orchestrator/briefing_weather.py): the
+        prompt tells the model to call `nbhd_weather_briefing` once and relay
+        its `message_line` verbatim. It must not tell the model to search for
+        weather, fetch a URL, or compose weather itself."""
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("call `nbhd_weather_briefing` ONCE", prompt)
+        self.assertIn("VERBATIM", prompt)
+        self.assertIn("NEVER use web_search, web_fetch, curl, or exec for weather", prompt)
+        self.assertNotIn("weather forecast today", prompt)
+        self.assertNotIn("web_search is the only weather tool", prompt)
+        self.assertNotIn("api.open-meteo.com", prompt)
+        self.assertNotIn("SNAPSHOT home base", prompt)
+        # web_search stays for news.
+        self.assertIn("web_search", prompt)
+
+    def test_gated_morning_briefing_degrades_gracefully_when_tool_missing(self):
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("If the tool is not available in this session, treat the weather as unavailable", prompt)
+        self.assertIn("`Weather couldn't be fetched this morning.`", prompt)
+
+    def test_gated_morning_briefing_does_not_ask_model_to_write_weather_section(self):
+        prompt = self._gated_morning_briefing_prompt()
+        self.assertIn("**weather section:** already written by `nbhd_weather_briefing`", prompt)
+        self.assertNotIn("**Today:** temp range", prompt)
+        self.assertNotIn("**Intraday:**", prompt)
+        self.assertNotIn("temperature swing", prompt)
+        self.assertNotIn("Sunny all day", prompt)
+
+    def test_briefing_weather_gate_parser(self):
+        from apps.router.chat_gates import briefing_weather_tool_enabled
+
+        for raw, expected in (
+            ("", False),
+            (None, False),
+            ("*", True),
+            (str(self.tenant.id), True),
+            (f" , {str(self.tenant.id).upper()} , ", True),
+            ("00000000-0000-0000-0000-000000000000", False),
+            ("not-a-uuid,*x", False),
+        ):
+            with self.subTest(raw=raw), override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=raw):
+                self.assertIs(briefing_weather_tool_enabled(self.tenant), expected)
 
     def test_morning_briefing_prompt_has_intraday_threshold_rule(self):
         prompt = self._morning_briefing_prompt()
@@ -687,6 +752,29 @@ class ConfigGeneratorTest(TestCase):
         self.assertIn("thunderstorm", prompt.lower())
         # And told NOT to enumerate stable days
         self.assertIn("Sunny all day", prompt)
+
+    def test_calendar_prompts_require_completion_evidence(self):
+        jobs = build_cron_seed_jobs(self.tenant) + [_build_heartbeat_cron(self.tenant)]
+        expected = {"Morning Briefing", "Evening Check-in", "Heartbeat Check-in", "Week Ahead Review"}
+        checked = set()
+        for job in jobs:
+            if job["name"] not in expected:
+                continue
+            checked.add(job["name"])
+            with self.subTest(job=job["name"]):
+                prompt = job["payload"]["message"]
+                self.assertIn("Core meditation or Fuel workout marked done with completed_at", prompt)
+                self.assertIn("a task marked done, or the user's explicit confirmation of that activity", prompt)
+                self.assertIn("Elapsed calendar events and assistant-written daily-note lines are not proof", prompt)
+                self.assertIn("say 'planned' or 'on the calendar', or ask", prompt)
+                self.assertIn("do not claim it was done or skipped", prompt)
+                self.assertIn("Calendar entries are plans, even after their end time", prompt)
+                self.assertIn('never write "done", "banked", "already done", or ✅ unless', prompt)
+                self.assertIn("for that activity, or the user confirms it", prompt)
+                self.assertNotIn("verify against today's daily note and journal entries", prompt)
+                self.assertNotIn("daily note, tasks, and goals loaded above as your ground truth", prompt)
+                self.assertNotIn("Was it marked done or addressed anywhere in the note?", prompt)
+        self.assertEqual(checked, expected)
 
     def test_morning_briefing_prompt_has_intraday_section_template(self):
         prompt = self._morning_briefing_prompt()
@@ -817,7 +905,7 @@ class SautaiAgentsMdGateTest(TestCase):
         md = self._agents_md(self.flagged)
         self.assertIn("nbhd_generate_meal_plan", md)
         self.assertIn("nbhd_get_meal_plan", md)
-        self.assertIn("search the tool catalog", md)
+        self.assertIn("search the catalog", md)
         self.assertIn("not pre-loaded", md)
 
     def test_gate_absent_for_plain_tenant(self):
@@ -989,6 +1077,7 @@ class ImageUpdateCronRestoreTest(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-test-container"
         self.tenant.container_fqdn = "oc-test.internal.example.io"
+        self.tenant.openclaw_version = "2026.5.28"  # gateway snapshot/restore path
         self.tenant.save()
 
     @patch("apps.cron.publish.publish_task")
@@ -1357,7 +1446,9 @@ class RegenerateFuelCronsTest(TestCase):
         self.tenant = create_tenant(display_name="Regen Test", telegram_chat_id=999333444)
         self.tenant.fuel_enabled = True
         self.tenant.container_fqdn = "oc-regen.example.com"
-        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn"])
+        # The gateway cron.* path; 9.4 tenants use the signed file instead.
+        self.tenant.openclaw_version = "2026.5.28"
+        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn", "openclaw_version"])
         FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=True)
 
     def _make_workout(self, **kw):
@@ -2010,7 +2101,9 @@ class FuelEndToEndTest(TestCase):
         self.tenant = create_tenant(display_name="E2E Test", telegram_chat_id=999666777)
         self.tenant.fuel_enabled = True
         self.tenant.container_fqdn = "oc-e2e.example.com"
-        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn"])
+        # The gateway cron.* path; 9.4 tenants use the signed file instead.
+        self.tenant.openclaw_version = "2026.5.28"
+        self.tenant.save(update_fields=["fuel_enabled", "container_fqdn", "openclaw_version"])
         FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=True)
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")

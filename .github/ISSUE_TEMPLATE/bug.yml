@@ -1,0 +1,80 @@
+# Dropdown values (area, platform, size) are copied from the team hub label taxonomy.
+# Source of truth: local-flows runner/teamhub_io.py. Change it there first, then here.
+name: Bug
+description: Something is broken or behaves wrong.
+title: "Bug: "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks! Plain words are perfect. Never paste passwords, tokens or anyone's private data.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      placeholder: When I tap Save on a journal entry, nothing happens.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we see it?
+      description: Steps to make it happen again, if you know them.
+      placeholder: |
+        1. Open the Journal tab
+        2. Type a line
+        3. Tap Save
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the app?
+      description: Pick the closest one. "unclear" is fine.
+      options:
+        - assistant      # chatting with the assistant and what it does on its own
+        - journal        # journal entries, daily notes, documents
+        - horizons       # goals, to-dos, home overview
+        - fuel           # workouts, meals, sleep, weight, Apple Health
+        - mindfulness    # Core: guided meditations
+        - finance        # budgets, debt payoff
+        - calendar       # calendar sync and event approvals
+        - neighborhood   # friends, circles, sharing, mutual aid
+        - constellation  # lessons and the star map
+        - accounts       # sign-up, login, onboarding, settings, connected services
+        - billing        # plans, payments, usage limits, promo codes
+        - infra          # servers, deploys, CI, build setup
+        - unclear        # not sure
+      default: 12
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where?
+      description: Pick every one that applies. Leave empty if you are not sure.
+      multiple: true
+      options:
+        - backend  # the server / API
+        - web      # the website
+        - ios      # the iPhone app
+  - type: dropdown
+    id: size
+    attributes:
+      label: How big does it feel?
+      description: "A guess is fine. S = an hour or two, M = about a day, L = several days."
+      options:
+        - S
+        - M
+        - L
+        - unclear
+      default: 3
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or anything else
+      description: Drag images in here. Add the app version or browser if you know it.

@@ -269,6 +269,7 @@ TASK_MAP = {
     "scrub_shared_lesson": "apps.friends.tasks.scrub_shared_lesson_task",
     # Neighborhood: weekly Mission digest (one warm nudge per member, idempotent)
     "mission_weekly_digest": "apps.friends.tasks.mission_weekly_digest_task",
+    "project_due_nudges": "apps.friends.tasks.project_due_nudges_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)
@@ -301,6 +302,8 @@ TASK_MAP = {
     # Delete disabled internal one-shot rows after 24 hours. The gateway has
     # already auto-deleted these jobs; this bounds control-plane residue.
     "cleanup_internal_crons": "apps.cron.tasks.cleanup_internal_crons_task",
+    # Daily 30-day retention for the metadata-only RuntimeWriteEvent feed.
+    "purge_runtime_write_events": "apps.router.tasks.purge_runtime_write_events_task",
     # Daily infra cost refresh from Azure billing
     "refresh_infra_costs": "apps.billing.tasks.refresh_infra_costs_task",
     # Monthly donation ledger — records each paying subscriber's revenue-%
@@ -320,6 +323,10 @@ TASK_MAP = {
     # Cron-aware wake — wake hibernated containers for scheduled crons
     "wake_for_cron": "apps.orchestrator.hibernation.wake_for_cron_task",
     "check_cron_wake_idle": "apps.orchestrator.hibernation.check_cron_wake_idle_task",
+    "verify_wake_image_refresh": "apps.orchestrator.hibernation.verify_wake_image_refresh_task",
+    # OpenClaw 5.28 -> 9.4 auto-upgrade at idle time (enqueued by the idle
+    # sweep; phases re-publish themselves with delays). Default off.
+    "auto_upgrade_openclaw": "apps.orchestrator.openclaw_auto_upgrade.auto_upgrade_openclaw_task",
     # Cleanup delivered message buffers
     "cleanup_delivered_buffers": "apps.orchestrator.hibernation.cleanup_delivered_buffers_task",
     # Nightly extraction — goals/tasks/lessons from daily notes
@@ -338,6 +345,8 @@ TASK_MAP = {
     "render_meditation": "apps.core.tasks.render_meditation_task",
     "compose_meditation": "apps.core.tasks.compose_meditation_task",
     "reap_meditations": "apps.core.tasks.reap_meditations",
+    # Daily bounded retention sweep for content-free diagnostic telemetry.
+    "purge_tool_events": "apps.platform_logs.tasks.purge_tool_events_task",
     # Fuel session-scheduling cutover — derived from Workout.scheduled_at
     "regenerate_fuel_crons": "apps.orchestrator.tasks.regenerate_fuel_crons_task",
     "reconcile_fuel_crons": "apps.orchestrator.tasks.reconcile_fuel_crons_task",
@@ -406,6 +415,7 @@ TASK_MAP = {
     # ``pii_arbiter`` (which shipped span text to a cloud LLM). Residual
     # ambiguous cases go to the on-device review flow. See apps/pii/junk_sweep.py.
     "pii_junk_sweep": "apps.pii.junk_sweep.pii_junk_sweep_task",
+    "expire_provisional_bindings": "apps.pii.provisional_expiry.expire_provisional_bindings_task",
     # Hourly bounded repair of Task/Goal fields whose per-field receipt is
     # unconfirmed or residual. QStash retries feed its DLQ; the task is
     # idempotent because successful fields leave the repair states.
@@ -759,8 +769,16 @@ def apply_pending_configs(request):
         )
 
         from apps.orchestrator.hibernation import _cron_active_or_imminent
+        from apps.orchestrator.image_rollout import image_rollout_allowed
 
         for tenant in stale_image_tenants:
+            # Per-tenant rollout allowlist. A deploy bumps OPENCLAW_IMAGE_TAG on
+            # every merge; without this gate the whole fleet would auto-roll onto
+            # the new image within the hour — catastrophic for a schema/storage-
+            # crossing image like 2026.9.4. Default allows NOBODY; a staged
+            # rollout opts tenants in via OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS.
+            if not image_rollout_allowed(tenant.id):
+                continue
             # Mirror the safeguard in hibernate_idle_tenants_task: image
             # bump triggers a revision update that SIGTERMs the container,
             # so an in-flight or imminent user cron would get interrupted.
@@ -835,6 +853,9 @@ def apply_pending_configs(request):
     all_tasks = config_tasks + image_tasks
     success = enqueued == len(all_tasks) if all_tasks else True
 
+    # A 200 acknowledges this sweep even if publishing exhausted its retries.
+    # Let QStash redeliver a failed sweep: tenant state is advanced by the tasks,
+    # so still-pending work is selected again without waiting for the next hour.
     return JsonResponse(
         {
             "config_enqueued": config_count if success else 0,
@@ -847,7 +868,8 @@ def apply_pending_configs(request):
             "cron_seed_failed": 0 if success else cron_seed_count,
             "batch_total": len(all_tasks),
             "batch_enqueued": enqueued,
-        }
+        },
+        status=200 if success else 503,
     )
 
 
@@ -944,9 +966,11 @@ def _unentitled_active_tenants():
     Production had 17 such ghost tenants accumulating LLM cost since their
     trials ended 2026-04-15.
     """
+    from apps.billing.entitlement import paying_q
+
     now = timezone.now()
     return Tenant.objects.filter(status=Tenant.Status.ACTIVE).exclude(
-        models.Q(stripe_subscription_id__gt="")
+        paying_q()
         | models.Q(is_trial=True, trial_ends_at__gt=now)
         # Budget-exempt tenants (canary, internal accounts) live outside the
         # billing lifecycle — they never carry a real subscription, so without
@@ -965,11 +989,22 @@ def _suspend_unentitled_tenant(tenant):
     (which stops Azure costs). Reused by ``expire_trials`` and the
     ``enforce_entitlement`` management command.
     """
+    from apps.billing.apple_iap import still_paying_on_apple
     from apps.cron.suspension import suspend_tenant_crons
     from apps.orchestrator.azure_client import hibernate_container_app
 
     crons_disabled = 0
     hibernated = False
+
+    # An App Store subscription whose stored state looks lapsed may only be waiting
+    # for a late renewal notification: ask Apple before pausing anyone. Any error
+    # here skips this tenant for today rather than aborting the whole sweep.
+    try:
+        if still_paying_on_apple(tenant):
+            return {"crons_disabled": 0, "hibernated": False, "skipped": "apple"}
+    except Exception:  # noqa: BLE001
+        logger.exception("enforce_entitlement: Apple re-check failed for tenant %s — skipped today", tenant.id)
+        return {"crons_disabled": 0, "hibernated": False, "skipped": "apple_error"}
 
     if tenant.container_fqdn:
         try:
@@ -1021,14 +1056,29 @@ def expire_trials(request):
     hibernated = 0
     already_hibernated = 0
 
+    skipped_apple = 0
     for tenant in _unentitled_active_tenants():
+        result = _suspend_unentitled_tenant(tenant)
+        if result.get("skipped"):
+            skipped_apple += 1
+            continue
         if tenant.hibernated_at is not None:
             already_hibernated += 1
-        result = _suspend_unentitled_tenant(tenant)
         updated += 1
         crons_disabled += result["crons_disabled"]
         if result["hibernated"]:
             hibernated += 1
+
+    # Re-ask Apple about subscriptions we still count as paying past their period
+    # end (a lost EXPIRED/REFUND notification must not mean free service forever).
+    try:
+        from apps.billing.apple_iap import recheck_lapsed
+
+        apple_recheck = recheck_lapsed()
+    except Exception:  # noqa: BLE001
+        logger.exception("expire_trials: Apple re-check failed")
+        apple_recheck = {"error": True}
+    logger.info("expire_trials: %d kept by App Store re-check; recheck %s", skipped_apple, apple_recheck)
 
     logger.info(
         "expire_trials: suspended %d tenants (%d already hibernated, %d crons disabled, %d new hibernations)",
@@ -1374,9 +1424,11 @@ def verify_gateway_tools(request):
         return JsonResponse({"ok": True, "skipped": True, "reason": "no active tenants with containers"})
 
     try:
-        from apps.cron.gateway_client import invoke_gateway_tool
+        from apps.cron.gateway_client import list_tenant_crons
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
+        # 9.4 gates the gateway cron.list; list_tenant_crons reads the container's
+        # cron-state readback there, so a healthy 9.4 tenant passes.
+        list_tenant_crons(tenant, {"includeDisabled": True})
         logger.info("verify_gateway_tools: cron.list succeeded for tenant %s", str(tenant.id)[:8])
         return JsonResponse({"ok": True, "tenant": str(tenant.id)[:8], "cron_tool": "available"})
     except Exception as exc:
@@ -1713,6 +1765,11 @@ def delete_registry_cron(request):
     except (Tenant.DoesNotExist, ValueError, TypeError):
         return JsonResponse({"error": "Cron job not found"}, status=404)
 
+    from apps.orchestrator.migration_cron_fence import cron_edits_fenced
+
+    if cron_edits_fenced(tenant):
+        return JsonResponse({"error": "assistant_updating", "retry_after": 60}, status=409)
+
     from apps.cron import postgres_canonical as pg
     from apps.cron.gateway_client import GatewayError, cron_remove
     from apps.cron.models import CronJob
@@ -1901,129 +1958,90 @@ _HEALTH_ALERT_COOLDOWN_SECONDS = 30 * 60  # 30 minutes
 # cold start): long enough to stop the every-5-min storm, short enough to retry
 # and actually deliver once the gateway warms.
 _HEALTH_ALERT_TIMEOUT_COOLDOWN_SECONDS = 10 * 60  # 10 minutes
+# Debounce for the "two consecutive failed ticks before alerting" rule: how long to
+# remember the previous tick's unhealthy tenant set. Must comfortably exceed the
+# 5-min health-check interval (so the prior tick is still remembered) yet not linger
+# so long that a stale entry outlives a real recovery.
+_HEALTH_PREV_UNHEALTHY_TTL_SECONDS = 15 * 60  # 15 minutes
 
 
-def _send_alert_to_personal_openclaw(message: str) -> str:
-    """Send a health alert to MJ's personal OpenClaw agent.
+def _send_alert_via_pushover(message: str) -> str:
+    """Push a health alert straight to MJ's phone via Pushover.
 
-    Routes through the Cloudflare tunnel to the personal gateway. The agent
-    receives the alert and can propose fixes without acting.
+    Deliberately dependency-free: a single HTTPS POST to Pushover's API, no
+    Cloudflare tunnel, no personal gateway, no agent in the path. The old
+    gateway route silently 530'd for 13 days (2026-09-01 → 09-14) after its
+    origin VPS was removed, because a health-alert channel that depends on a
+    fragile custom chain can rot unnoticed. Keep this one boring.
 
-    Returns a delivery status:
-      - "delivered"    — the gateway accepted it (HTTP 200). Full cooldown.
-      - "undeliverable" — a config/auth problem that retrying won't fix
-                          (missing env, a 3xx CF-Access login redirect, or a 4xx).
-                          Full cooldown so we don't POST a doomed request every 5 minutes.
-      - "timeout"      — we connected but the gateway was slow/cold: a client-side
-                          read timeout, or a 5xx (incl. Cloudflare 52x) from a
-                          cold/waking origin. The personal gateway is itself an
-                          idle-hibernating Container App behind Cloudflare, so a
-                          real-outage alert often wakes a cold gateway. The caller
-                          starts a SHORT backoff — stops the every-tick storm but
-                          retries soon enough to land the alert once it warms.
-      - "transient"    — a fast connect-side failure (DNS/TCP/connect timeout) or
-                          an odd error; the caller leaves the cooldown unset so the
-                          next tick retries immediately against a hopefully-up gateway.
+    Returns the same delivery-status vocabulary the caller's cooldown map
+    already understands:
+      - "delivered"     — Pushover accepted it (HTTP 200, status:1). Full cooldown.
+      - "undeliverable" — missing config, or Pushover rejected the request
+                          (4xx / status:0 — bad token/user/params, or the monthly
+                          message quota is exhausted). Retrying won't fix it, so
+                          take the full cooldown instead of POSTing every tick.
+      - "timeout"       — a read timeout or a 5xx from Pushover: the service is
+                          briefly unavailable. Short backoff, then retry.
+      - "transient"     — a fast connect-side failure (DNS/TCP/connect) or an odd
+                          error; leave the cooldown unset so the next tick retries.
     """
     import httpx
 
-    gateway_url = getattr(settings, "ADMIN_OPENCLAW_GATEWAY_URL", "").strip()
-    gateway_token = getattr(settings, "ADMIN_OPENCLAW_GATEWAY_TOKEN", "").strip()
-    cf_client_id = getattr(settings, "CF_ACCESS_CLIENT_ID", "").strip()
-    cf_client_secret = getattr(settings, "CF_ACCESS_CLIENT_SECRET", "").strip()
+    token = getattr(settings, "PUSHOVER_API_TOKEN", "").strip()
+    user = getattr(settings, "PUSHOVER_USER_KEY", "").strip()
 
-    if not gateway_url or not gateway_token:
-        logger.warning("ADMIN_OPENCLAW_GATEWAY_URL or TOKEN not configured")
+    if not token or not user:
+        logger.warning("PUSHOVER_API_TOKEN or PUSHOVER_USER_KEY not configured — alert not sent")
         return "undeliverable"
-
-    headers = {
-        "Authorization": f"Bearer {gateway_token}",
-        "Content-Type": "application/json",
-    }
-    if cf_client_id and cf_client_secret:
-        headers["CF-Access-Client-Id"] = cf_client_id
-        headers["CF-Access-Client-Secret"] = cf_client_secret
-
-    url = f"{gateway_url.rstrip('/')}/v1/chat/completions"
 
     try:
         resp = httpx.post(
-            url,
-            headers=headers,
-            json={
-                "model": "openclaw",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are receiving an automated NBHD United platform health alert. "
-                            "Review the issue, propose fixes, but do NOT take any action. "
-                            "Summarize what happened and what MJ should consider doing."
-                        ),
-                    },
-                    {"role": "user", "content": message},
-                ],
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": token,
+                "user": user,
+                "title": "NBHD Health Alert",
+                "message": message,
+                # priority 1 = high: bypasses the phone's quiet hours so a real
+                # outage isn't muted overnight. (2 would require ack/retry config.)
+                "priority": 1,
             },
-            # httpx does NOT follow redirects by default — a 302 is returned as-is
-            # (which is what we want: a CF-Access login redirect must read as a
-            # failure, not be chased to an HTML login page).
-            # Split timeout: a connect/DNS/TCP failure fast-fails in ~10s
-            # (-> transient) so it's cleanly separated from "reached the gateway,
-            # the LLM round-trip is just slow" (read=75 covers a cold start +
-            # generation). The body is tiny, so write/pool never bind.
-            timeout=httpx.Timeout(connect=10.0, read=75.0, write=10.0, pool=10.0),
+            # Body is tiny. connect fast-fails a dead network (-> transient);
+            # read covers Pushover being briefly slow (-> timeout).
+            timeout=httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0),
         )
     # Exception order is LOAD-BEARING: ReadTimeout and ConnectTimeout both subclass
     # httpx.TimeoutException, so the specific types MUST precede the broad
-    # `except httpx.TimeoutException`; the bare `except Exception` MUST stay last
-    # (a plain Exception -> transient, which test_network_error_is_transient pins).
+    # `except httpx.TimeoutException`; the bare `except Exception` MUST stay last.
     except httpx.ReadTimeout:
-        # Connected fine; the gateway (cold start + LLM round-trip) didn't answer
-        # within the read window. It's warming now — back off briefly and retry.
-        logger.warning("Personal OpenClaw alert read-timed-out (gateway slow/cold) — backing off")
+        logger.warning("Pushover alert read-timed-out — backing off")
         return "timeout"
     except httpx.ConnectTimeout:
-        logger.warning("Personal OpenClaw alert connect-timed-out (gateway unreachable) — transient")
+        logger.warning("Pushover alert connect-timed-out — transient")
         return "transient"
     except httpx.ConnectError:
-        logger.warning("Personal OpenClaw alert connection error (gateway unreachable) — transient")
+        logger.warning("Pushover alert connection error — transient")
         return "transient"
     except httpx.TimeoutException:
-        # Write/pool timeout — unusual; treat as a quick transient retry.
-        logger.warning("Personal OpenClaw alert timed out (write/pool) — transient")
+        logger.warning("Pushover alert timed out (write/pool) — transient")
         return "transient"
     except Exception:
-        logger.exception("Failed to send alert to personal OpenClaw (transient)")
+        logger.exception("Failed to send Pushover alert (transient)")
         return "transient"
 
     if resp.status_code == 200:
-        logger.info("Health alert delivered to personal OpenClaw")
+        logger.info("Health alert delivered to Pushover")
         return "delivered"
-    if resp.status_code in (301, 302, 303, 307, 308):
-        # A 3xx to the gateway means Cloudflare Access bounced us to its login page:
-        # the CF-Access service token (CF_ACCESS_CLIENT_ID/SECRET) is missing/stale,
-        # or the CF-Access app has no Service-Auth policy admitting it. Retrying every
-        # tick won't help — fix the token/policy in Cloudflare Zero Trust.
-        logger.error(
-            "Personal OpenClaw alert redirected (HTTP %d) — Cloudflare Access rejected "
-            "the service token; alert NOT delivered. Check CF_ACCESS_CLIENT_ID/SECRET "
-            "and the CF-Access Service-Auth policy for the admin gateway.",
-            resp.status_code,
-        )
-        return "undeliverable"
     if 400 <= resp.status_code < 500:
-        logger.error("Personal OpenClaw alert rejected (HTTP %d): %s", resp.status_code, resp.text[:200])
+        # Pushover uses 4xx for bad token/user/params AND 429 for the monthly
+        # quota — none fixable by retrying this cycle, so take the full cooldown.
+        logger.error("Pushover rejected the alert (HTTP %d): %s", resp.status_code, resp.text[:200])
         return "undeliverable"
     if resp.status_code >= 500:
-        # 5xx (incl. Cloudflare 520-526) usually means the gateway origin is
-        # cold/waking behind CF — operationally the same as a slow read, so back
-        # off ~10 min rather than re-POSTing every 5-min tick (the storm fix for
-        # the real-outage path, where a cold gateway answers 5xx before read=75).
-        logger.warning(
-            "Personal OpenClaw returned %d (gateway slow/cold) — backing off: %s", resp.status_code, resp.text[:200]
-        )
+        logger.warning("Pushover returned %d (service issue) — backing off: %s", resp.status_code, resp.text[:200])
         return "timeout"
-    logger.warning("Personal OpenClaw returned %d (transient): %s", resp.status_code, resp.text[:200])
+    logger.warning("Pushover returned %d (transient): %s", resp.status_code, resp.text[:200])
     return "transient"
 
 
@@ -2058,24 +2076,45 @@ def run_health_check(request):
         "unhealthy": len(unhealthy),
     }
 
+    # Debounce: a tenant must be unhealthy on TWO consecutive ticks before it
+    # alerts. A single failed probe is almost always a transient blip — most often
+    # the 5-min health tick landing on the exact second a just-woken container fires
+    # its top-of-hour cron (a one-off 502 from the in-container proxy that is 200
+    # again by the next tick). We remember this tick's unhealthy set in the shared
+    # cache and only alert on tenants that were ALSO unhealthy last tick. A genuine
+    # outage still alerts on the very next tick (~5 min later).
+    prev_unhealthy = set(cache.get("health_prev_unhealthy") or [])
+    this_unhealthy_ids = [r.get("tenant_id") for r in unhealthy if r.get("tenant_id")]
+    cache.set("health_prev_unhealthy", this_unhealthy_ids, _HEALTH_PREV_UNHEALTHY_TTL_SECONDS)
+    confirmed = [r for r in unhealthy if r.get("tenant_id") in prev_unhealthy]
+
     if unhealthy:
+        summary["details"] = unhealthy
+        summary["confirmed_unhealthy"] = len(confirmed)
+        if not confirmed:
+            logger.info(
+                "Health check: %d unhealthy (first failing tick, unconfirmed) — alert deferred",
+                len(unhealthy),
+            )
+
+    if confirmed:
         # Rate-limit alerts — skip if we already alerted recently
         cache_key = "health_alert_sent"
         already_alerted = cache.get(cache_key)
 
         if not already_alerted:
-            lines = [f"NBHD Health Alert — {len(unhealthy)}/{len(results)} tenant(s) unhealthy:"]
-            for r in unhealthy[:10]:
+            lines = [f"NBHD Health Alert — {len(confirmed)}/{len(results)} tenant(s) unhealthy:"]
+            for r in confirmed[:10]:
                 name = r.get("display_name", "?")
                 container = r.get("container", "?")
                 checks = r.get("checks", {})
                 failed = [k for k, v in checks.items() if not v.get("ok")]
                 detail = ", ".join(failed) if failed else r.get("error", "unknown")
                 lines.append(f"  - {name} ({container}): {detail}")
-            if len(unhealthy) > 10:
-                lines.append(f"  ... and {len(unhealthy) - 10} more")
+            if len(confirmed) > 10:
+                lines.append(f"  ... and {len(confirmed) - 10} more")
 
-            status = _send_alert_to_personal_openclaw("\n".join(lines))
+            status = _send_alert_via_pushover("\n".join(lines))
             # Cooldown policy:
             #   delivered / undeliverable -> full 30-min cooldown (it landed, or
             #     retrying won't fix it: missing config / CF-Access 302 / 4xx).
@@ -2091,11 +2130,9 @@ def run_health_check(request):
             summary["alerted"] = status == "delivered"
             summary["alert_status"] = status
         else:
-            logger.info("Health check: %d unhealthy, alert suppressed (cooldown)", len(unhealthy))
+            logger.info("Health check: %d confirmed unhealthy, alert suppressed (cooldown)", len(confirmed))
             summary["alerted"] = False
             summary["cooldown"] = True
-
-        summary["details"] = unhealthy
 
     return JsonResponse(summary)
 
@@ -2145,7 +2182,7 @@ def admin_health_status(request):
 @csrf_exempt
 @require_POST
 def rollout_byo_image_bump(request):
-    """One-shot: bump every active tenant to the current OpenClaw image.
+    """Manually bump an explicit same-family scope to the current image.
 
     URL: /api/cron/rollout-byo-image-bump/
     Auth: X-Deploy-Secret header.
@@ -2155,8 +2192,8 @@ def rollout_byo_image_bump(request):
     ships, then never again — the routine ``apply_pending_configs`` cron
     handles future image rollouts via the per-message bump path.
 
-    POST body (optional):
-      ``{"include_hibernated": true}`` to also bump hibernated tenants.
+    POST body requires ``tenant_id`` or a non-empty ``tenant_ids`` UUID list.
+    Optional ``include_hibernated: true`` also bumps scoped hibernated tenants.
 
     Returns JSON: ``{"succeeded": N, "failed": N, "skipped_idempotent": N}``.
     """
@@ -2168,13 +2205,25 @@ def rollout_byo_image_bump(request):
         logger.warning("Unauthorized rollout_byo_image_bump attempt")
         return JsonResponse({"error": "Unauthorized"}, status=401)
 
-    body = {}
-    if request.body:
-        try:
-            body = json.loads(request.body)
-        except Exception:
-            body = {}
-    include_hibernated = bool(body.get("include_hibernated", False))
+    from apps.orchestrator.manual_scope import tenant_scope
+    from apps.orchestrator.runtime_guard import MIGRATION_REQUIRED, image_only_update_allowed
+
+    try:
+        body = json.loads(request.body)
+        if not isinstance(body, dict) or set(body) - {"tenant_id", "tenant_ids", "include_hibernated"}:
+            raise ValueError
+        ids = tenant_scope(body.get("tenant_id"), body.get("tenant_ids"))
+        if "include_hibernated" in body and not isinstance(body["include_hibernated"], bool):
+            raise ValueError
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Explicit non-empty UUID scope and valid JSON object required"}, status=400)
+    selected = list(Tenant.objects.filter(pk__in=ids))
+    if len(selected) != len(ids):
+        return JsonResponse({"error": "Unknown tenant in scope"}, status=400)
+    target = getattr(settings, "OPENCLAW_IMAGE_TAG", "")
+    if any(not image_only_update_allowed(t, target) for t in selected):
+        return JsonResponse({"error": MIGRATION_REQUIRED}, status=400)
+    include_hibernated = body.get("include_hibernated", False)
 
     from io import StringIO
 
@@ -2182,7 +2231,7 @@ def rollout_byo_image_bump(request):
 
     out = StringIO()
     err = StringIO()
-    args = []
+    args = ["--tenants", ",".join(ids)]
     if include_hibernated:
         args.append("--include-hibernated")
 
@@ -2292,7 +2341,7 @@ _ATOMIC_BUMP_LOCK_TTL_SECONDS = 60 * 5
 @csrf_exempt
 @require_POST
 def rollout_atomic_bump(request):
-    """Atomic fleet bump: fan out per-tenant config + image + version updates.
+    """Fan out config + image + version updates within an explicit same-family scope.
 
     URL: /api/cron/rollout-atomic-bump/
     Auth: X-Deploy-Secret header.
@@ -2301,14 +2350,13 @@ def rollout_atomic_bump(request):
     relies on the ``apply_pending_configs`` cron to lazily refresh
     configs), this endpoint enqueues a per-tenant QStash task that
     atomically updates the version field, openclaw.json on the file
-    share, and the container image — required when a release crosses an
-    OpenClaw config schema boundary.
+    share, and the container image. Runtime-family jumps require the migration.
 
-    POST body (all optional):
+    POST body (tenant_id or non-empty tenant_ids required; other fields optional):
         {
             "oc_version": "2026.5.7",   // default: settings.OPENCLAW_CURRENT_VERSION
             "image_tag":  "<sha>",       // default: settings.OPENCLAW_IMAGE_TAG
-            "tenant_id":  "<uuid>",      // optional canary mode — bump only this tenant
+            "tenant_id":  "<uuid>",      // required explicit scope
             "dry_run":    false
         }
 
@@ -2335,18 +2383,27 @@ def rollout_atomic_bump(request):
         logger.warning("Unauthorized rollout_atomic_bump attempt")
         return JsonResponse({"error": "Unauthorized"}, status=401)
 
-    body: dict = {}
-    if request.body:
-        try:
-            body = json.loads(request.body)
-        except Exception:
-            body = {}
+    try:
+        from apps.orchestrator.manual_scope import tenant_scope
+
+        body = json.loads(request.body)
+        if not isinstance(body, dict) or set(body) - {"tenant_id", "tenant_ids", "oc_version", "image_tag", "dry_run"}:
+            raise ValueError
+        scoped_ids = tenant_scope(body.get("tenant_id"), body.get("tenant_ids"))
+        for field in ("oc_version", "image_tag"):
+            if field in body and (not isinstance(body[field], str) or not body[field].strip()):
+                raise ValueError
+        if "dry_run" in body and not isinstance(body["dry_run"], bool):
+            raise ValueError
+    except (ValueError, TypeError):
+        return JsonResponse(
+            {"error": "An explicit valid tenant_id and a well-formed JSON object are required"}, status=400
+        )
 
     from apps.orchestrator.tool_policy import OPENCLAW_CURRENT_VERSION
 
     oc_version = str(body.get("oc_version") or OPENCLAW_CURRENT_VERSION).strip()
     image_tag = str(body.get("image_tag") or getattr(settings, "OPENCLAW_IMAGE_TAG", "") or "").strip()
-    tenant_filter = str(body.get("tenant_id") or "").strip()
     dry_run = bool(body.get("dry_run", False))
 
     if not image_tag or image_tag == "latest":
@@ -2378,8 +2435,13 @@ def rollout_atomic_bump(request):
             status=Tenant.Status.ACTIVE,
             container_id__gt="",
         )
-        if tenant_filter:
-            eligible = eligible.filter(id=tenant_filter)
+        eligible = eligible.filter(id__in=scoped_ids)
+        from apps.orchestrator.runtime_guard import MIGRATION_REQUIRED, manual_version_update_allowed
+
+        if eligible.count() != len(scoped_ids):
+            return JsonResponse({"error": "Unknown or ineligible tenant_id"}, status=400)
+        if any(not manual_version_update_allowed(t, image_tag, oc_version) for t in eligible):
+            return JsonResponse({"error": MIGRATION_REQUIRED}, status=400)
         # Idempotency: skip tenants already at target on BOTH version + image_tag.
         # A version-only match isn't enough (a prior partial failure could leave
         # version=target but image_tag stale).

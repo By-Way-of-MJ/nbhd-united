@@ -859,6 +859,30 @@ class PendingMessageTimeoutResolutionTest(TestCase):
 
         self.assertEqual(_resolve_chat_timeout(tenant), REASONING_MODEL_TIMEOUT)
 
+    def test_local_test_timeout_applies_only_when_both_settings_set(self):
+        from apps.billing.constants import (
+            ANTHROPIC_SONNET_MODEL,
+            DEFAULT_CHAT_TIMEOUT,
+            MINIMAX_MODEL,
+            REASONING_MODEL_TIMEOUT,
+        )
+        from apps.router.pending_queue import _resolve_chat_timeout
+
+        user = _make_user(line_user_id="U_to_local")
+        tenant = _make_tenant(user)
+        for model, fleet_timeout in (
+            (MINIMAX_MODEL, DEFAULT_CHAT_TIMEOUT),
+            (ANTHROPIC_SONNET_MODEL, REASONING_MODEL_TIMEOUT),
+        ):
+            tenant.preferred_model = model
+            with self.subTest(model=model):
+                with override_settings(LOCAL_TEST_ROOT="/tmp/local-test", LOCAL_TEST_CHAT_TIMEOUT=840):
+                    self.assertEqual(_resolve_chat_timeout(tenant), 840.0)
+                with override_settings(LOCAL_TEST_ROOT="", LOCAL_TEST_CHAT_TIMEOUT=840):
+                    self.assertEqual(_resolve_chat_timeout(tenant), fleet_timeout)
+                with override_settings(LOCAL_TEST_ROOT="/tmp/local-test", LOCAL_TEST_CHAT_TIMEOUT=None):
+                    self.assertEqual(_resolve_chat_timeout(tenant), fleet_timeout)
+
 
 # ---------------------------------------------------------------------------
 # Reaper tests — closes the gap when a drain task's original publish
@@ -1935,22 +1959,10 @@ class WakeBootGraceTest(TestCase):
         self.assertIsNone(msg.delivery_in_flight_until)
         mock_publish.assert_not_called()
 
-    @patch("apps.cron.publish.publish_task")
-    @patch("apps.orchestrator.hibernation.wake_hibernated_tenant")
-    @patch("apps.billing.services.check_budget", return_value="")
-    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
-    @patch("apps.router.pending_queue.httpx.post")
-    def test_ios_wake_stamps_waking_at_for_polling_clients(
-        self, mock_post, _mock_credit, _mock_budget, _mock_wake, _mock_publish
-    ):
-        from apps.router.models import AppChatMessage, ChatThread
-
-        mock_post.side_effect = self._container_404
-
-        user = _make_user(telegram_chat_id=63636363)
+    def _ios_wake_batch(self):
+        user = _make_user()
         tenant = _make_tenant(user)
         Tenant.objects.filter(id=tenant.id).update(hibernated_at=timezone.now())
-
         thread = ChatThread.objects.create(tenant=tenant, user=user, title="", is_main=True)
         turn = AppChatMessage.objects.create(
             tenant=tenant,
@@ -1959,7 +1971,7 @@ class WakeBootGraceTest(TestCase):
             client_msg_id="cmid-wake-1",
             user_text="good morning",
         )
-        PendingMessage.objects.create(
+        row = PendingMessage.objects.create(
             tenant=tenant,
             channel=PendingMessage.Channel.IOS,
             channel_user_id=str(thread.id),
@@ -1967,17 +1979,103 @@ class WakeBootGraceTest(TestCase):
                 "message_text": "good morning",
                 "user_param": f"thread:{thread.id}",
                 "user_timezone": "UTC",
-                "client_msg_id": "cmid-wake-1",
+                "client_msg_id": turn.client_msg_id,
             },
             user_text="good morning",
         )
+        return tenant, turn, row
 
-        result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", str(thread.id))
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.hibernation.wake_hibernated_tenant")
+    @patch("apps.billing.services.check_budget", return_value="")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_ios_wake_stamps_waking_at_before_wake_and_preserves_first_stamp(
+        self, mock_post, _mock_credit, _mock_budget, mock_wake, mock_publish
+    ):
+        mock_post.side_effect = self._container_404
+        for first_stamp in (None, timezone.now() - timedelta(seconds=30)):
+            with self.subTest(first_stamp=first_stamp):
+                tenant, turn, row = self._ios_wake_batch()
+                AppChatMessage.objects.filter(pk=turn.pk).update(waking_at=first_stamp)
+                stamps_at_wake = []
 
-        self.assertTrue(result.get("woke"))
-        turn.refresh_from_db()
-        self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
-        self.assertIsNotNone(turn.waking_at)
+                def wake(_tenant, turn=turn, first_stamp=first_stamp, stamps_at_wake=stamps_at_wake):
+                    turn.refresh_from_db()
+                    self.assertIsNotNone(turn.waking_at)
+                    if first_stamp is not None:
+                        self.assertEqual(turn.waking_at, first_stamp)
+                    stamps_at_wake.append(turn.waking_at)
+                    return True
+
+                mock_wake.reset_mock()
+                mock_wake.side_effect = wake
+                result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+
+                mock_wake.assert_called_once()
+                self.assertTrue(result.get("woke"))
+                turn.refresh_from_db()
+                self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
+                self.assertEqual(turn.waking_at, stamps_at_wake[0])
+                row.refresh_from_db()
+                self.assertEqual(row.delivery_attempts, 0)
+                self.assertIsNone(row.delivery_in_flight_until)
+                self.assertEqual(mock_publish.call_args.kwargs["delay_seconds"], _WAKE_DEFER_SECONDS)
+
+                # Subsequent boot-grace drains must keep the original wake time.
+                Tenant.objects.filter(pk=tenant.pk).update(hibernated_at=None, last_wake_at=timezone.now())
+                result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+                self.assertTrue(result.get("booting"))
+                mock_wake.assert_called_once()
+                turn.refresh_from_db()
+                self.assertEqual(turn.waking_at, stamps_at_wake[0])
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.hibernation.wake_hibernated_tenant")
+    @patch("apps.billing.services.check_budget", return_value="")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_ios_failed_wake_clears_waking_at(self, mock_post, _mock_credit, _mock_budget, mock_wake, mock_publish):
+        mock_post.side_effect = self._container_404
+        for raises, recent_wake in ((False, False), (True, False), (False, True)):
+            with self.subTest(raises=raises, recent_wake=recent_wake):
+                tenant, turn, row = self._ios_wake_batch()
+                if recent_wake:
+                    Tenant.objects.filter(pk=tenant.pk).update(last_wake_at=timezone.now())
+
+                def wake(_tenant, turn=turn, raises=raises):
+                    turn.refresh_from_db()
+                    self.assertIsNotNone(turn.waking_at)
+                    if raises:
+                        raise ValueError("wake failed")
+                    return False
+
+                mock_wake.reset_mock()
+                mock_publish.reset_mock()
+                mock_wake.side_effect = wake
+                if recent_wake:
+                    result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+                    self.assertTrue(result.get("booting"))
+                    self.assertEqual(mock_publish.call_args.kwargs["delay_seconds"], _WAKE_DEFER_SECONDS)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError if raises else RuntimeError, "wake failed" if raises else "batch"
+                    ):
+                        drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+                    mock_publish.assert_not_called()
+
+                mock_wake.assert_called_once()
+                turn.refresh_from_db()
+                self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
+                self.assertIsNone(turn.waking_at)
+                row.refresh_from_db()
+                self.assertEqual(row.delivery_status, PendingMessage.Status.PENDING)
+                self.assertEqual(row.delivery_attempts, 0 if raises or recent_wake else 1)
+                if raises:
+                    # Preserve the existing exception/lease behavior for QStash.
+                    self.assertIsNotNone(row.delivery_in_flight_until)
+                else:
+                    self.assertIsNone(row.delivery_in_flight_until)
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="test-key", LINE_CHANNEL_ACCESS_TOKEN="test-token")
@@ -2116,6 +2214,11 @@ class DrainDuringProvisioningTest(TestCase):
         # iOS renders "setting up / waking" off waking_at instead of a blind spinner.
         self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
         self.assertIsNotNone(turn.waking_at)
+        first_stamp = turn.waking_at
+        result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", str(thread.id))
+        self.assertTrue(result.get("provisioning"))
+        turn.refresh_from_db()
+        self.assertEqual(turn.waking_at, first_stamp)
         mock_post.assert_not_called()
 
 

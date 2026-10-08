@@ -256,7 +256,72 @@ const SCHEDULE_SCHEMA = {
 const NAME_DESCRIPTION =
   "Short human-readable name for the cron, shown in the user's automations list. Must be unique per tenant. 3-80 characters.";
 
+// Internal provenance stamp injected by nbhd-cron-enforcement's before_tool_call
+// hook AFTER the model produces the call (null for user-initiated calls, a signed
+// object for cron-triggered ones). 2026.9.4 strict-validates tool input against
+// this schema POST-hook, so the property MUST be declared here or the whole call
+// is rejected with "must not have additional properties: _nbhd_origin". The hook
+// sets it authoritatively, so any model-supplied value is overwritten and harmless;
+// `hiddenOrigin(input)` forwards it to the runtime for verify_origin_stamp.
+const ORIGIN_STAMP_SCHEMA = {
+  description:
+    "Internal runtime provenance stamp — injected automatically. Do not set this; any value you provide is ignored.",
+};
+
 export default function register(api) {
+  api.registerTool(
+    () => wrap({
+      name: "nbhd_cron_list_reminders",
+      description:
+        "List active chat reminders. When the user asks to stop, cancel, or turn off a reminder, list first and pick the matching reminder; ask if more than one fits. Then call nbhd_cron_cancel_reminder.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          include_disabled: { type: "boolean", description: "Include already cancelled reminders. Defaults to false." },
+        },
+      },
+      async execute(_toolCallId, params) {
+        const input = asObject(params);
+        const suffix = input.include_disabled === true ? "?include_disabled=true" : "";
+        const payload = await callRuntime(api, {
+          path: tenantPath(api, `/crons/reminders/${suffix}`),
+          method: "GET",
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
+  api.registerTool(
+    () => wrap({
+      name: "nbhd_cron_cancel_reminder",
+      description:
+        "Turn off the matching chat reminder using its id from nbhd_cron_list_reminders. Ask if more than one fits. After a successful cancel call, tell the user exactly which reminder was turned off. Never claim a reminder is stopped without a successful cancel call.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          cron_id: { type: "integer", minimum: 1, description: "Reminder id returned by nbhd_cron_list_reminders." },
+          _nbhd_origin: ORIGIN_STAMP_SCHEMA,
+        },
+        required: ["cron_id"],
+      },
+      async execute(_toolCallId, params) {
+        const input = asObject(params);
+        const payload = await callRuntime(api, {
+          path: tenantPath(api, "/crons/cancel/"),
+          method: "POST",
+          body: { cron_id: input.cron_id, ...hiddenOrigin(input) },
+        });
+        if (payload.cancelled !== true) throw new Error("Reminder cancellation was not confirmed. Retry the cancel call.");
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
   // ── pure_reminder ─────────────────────────────────────────────────────
   api.registerTool(
     (toolContext) => wrap({
@@ -270,6 +335,7 @@ export default function register(api) {
         properties: {
           name: { type: "string", description: NAME_DESCRIPTION },
           schedule: SCHEDULE_SCHEMA,
+          _nbhd_origin: ORIGIN_STAMP_SCHEMA,
           text: {
             type: "string",
             description:
@@ -310,6 +376,7 @@ export default function register(api) {
         properties: {
           name: { type: "string", description: NAME_DESCRIPTION },
           schedule: SCHEDULE_SCHEMA,
+          _nbhd_origin: ORIGIN_STAMP_SCHEMA,
           text: {
             type: "string",
             description:
@@ -367,6 +434,7 @@ export default function register(api) {
         properties: {
           name: { type: "string", description: NAME_DESCRIPTION },
           schedule: SCHEDULE_SCHEMA,
+          _nbhd_origin: ORIGIN_STAMP_SCHEMA,
           query_tool: {
             type: "string",
             enum: [

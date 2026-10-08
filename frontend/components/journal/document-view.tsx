@@ -4,6 +4,7 @@ import clsx from "clsx";
 import dynamic from "next/dynamic";
 import { type MouseEvent, type TouchEvent as ReactTouchEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
+import { DailyBlocks } from "@/components/journal/daily-blocks";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { type Editor } from "@tiptap/react";
 import { MarkdownHelpSheet } from "@/components/journal/markdown-help-sheet";
@@ -13,6 +14,7 @@ import { DocumentHeader } from "@/components/journal/document-header";
 import { CurrentStatusCard } from "@/components/journal/current-status-card";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  useTenantQuery,
   useDocumentQuery,
   useJournalStatusQuery,
   useUpdateDocumentMutation,
@@ -50,7 +52,8 @@ const EditorToolbar = dynamic(
 interface DocumentViewProps {
   kind: string;
   slug: string;
-  onNavigate?: (kind: string, slug: string) => void;
+  onNavigate?: (kind: string, slug: string, revealLatest?: boolean) => void;
+  revealLatestOnLoad?: boolean;
   onToggleSidebar?: () => void;
 }
 
@@ -117,7 +120,12 @@ function SaveStatusIndicator({ status }: { status: SaveStatus }) {
   );
 }
 
-export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: DocumentViewProps) {
+export function DocumentView({ kind, slug, onNavigate, onToggleSidebar, revealLatestOnLoad = false }: DocumentViewProps) {
+  const { data: tenant } = useTenantQuery();
+  const blockMode = !!tenant?.web_redesign && kind === "daily";
+  const [revealLatest, setRevealLatest] = useState(revealLatestOnLoad ? 1 : 0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const writeBarRef = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraftState] = useState("");
   // Mirror of `draft` readable synchronously — the editor debounces its
@@ -255,6 +263,18 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
   const updateMutation = useUpdateDocumentMutation();
   const appendMutation = useAppendDocumentMutation();
 
+  useEffect(() => {
+    if (!blockMode || isLoading || editing) return;
+    const bar = writeBarRef.current;
+    const scroll = scrollRef.current;
+    if (!bar || !scroll) return;
+    const measure = () => scroll.style.setProperty("--os-write-bar-height", `${Math.ceil(bar.getBoundingClientRect().height)}px`);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, [blockMode, isLoading, editing, isMobile]);
+
   // tasks/goal docs are rendered from typed rows when the lifecycle flag is on,
   // so markdown writes are discarded (backend now 409s them). Make them
   // read-only here and route status changes through the typed Current-status
@@ -336,11 +356,17 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
   };
 
   const handleQuickLog = async (content: string) => {
-    await appendMutation.mutateAsync({
+    const appended = await appendMutation.mutateAsync({
       kind,
-      slug,
+      slug: blockMode ? todayISO() : slug,
       content,
     });
+    if (blockMode) {
+      // Use the append response immediately so scrolling never races a refetch.
+      queryClient.setQueryData(["document", "daily", appended.slug], appended);
+      if (slug !== appended.slug && onNavigate) onNavigate("daily", appended.slug, true);
+      else setRevealLatest((value) => value + 1);
+    }
   };
 
   const handleCheckboxToggle = useCallback(
@@ -474,16 +500,17 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
         showSavedIndicator={savedIndicator}
         onToggleSidebar={onToggleSidebar}
         readOnly={typedManaged}
+        blockMode={blockMode}
       />
 
       {/* Content */}
-      <div className="flex-1 overflow-x-hidden overflow-y-auto">
+      <div ref={scrollRef} data-os-block-scroll={blockMode && !editing || undefined} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
         {/* Live current-status surface — read-only, beside the editable log. */}
-        {kind === "daily" && !editing ? <CurrentStatusCard /> : null}
+        {kind === "daily" && !editing && !blockMode ? <CurrentStatusCard /> : null}
         {editing && isMobile !== true ? (
           <div className="p-4 lg:p-8">
             {/* Premium writing surface */}
-            <div className="rounded-2xl border border-white/[0.04] bg-white/[0.015] shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)] overflow-hidden">
+            <div data-os-document-body className="rounded-2xl border border-white/[0.04] bg-white/[0.015] shadow-[inset_0_1px_2px_rgba(0,0,0,0.3)] overflow-hidden">
               <MarkdownEditor
                 value={draft}
                 onChange={setDraft}
@@ -502,8 +529,11 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
               </p>
             )}
           </div>
+        ) : blockMode ? (
+          <DailyBlocks key={slug} document={doc} slug={slug} revealLatest={revealLatest} />
         ) : (
           <div
+            data-os-document-body
             className={clsx(
               "bg-white/[0.01] transition-all duration-300",
               isMobile === true
@@ -547,11 +577,12 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
 
       {/* Mobile bottom action bar — quick-log + open-editor in one row. */}
       {isMobile === true && !editing && (
-        <div className="shrink-0 border-t border-white/[0.04] px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+        <div ref={writeBarRef} data-os-write-bar={blockMode || undefined} className="shrink-0 border-t border-white/[0.04] px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           <div className="flex items-center gap-2">
             {kind === "daily" ? (
               <div className="min-w-0 flex-1">
                 <QuickLogInput
+                  writeFirst={blockMode}
                   onSubmit={handleQuickLog}
                   isPending={appendMutation.isPending}
                 />
@@ -559,7 +590,7 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
             ) : (
               <div className="flex-1" />
             )}
-            {!typedManaged && <PencilButton onClick={handleEdit} />}
+            {!typedManaged && !blockMode && <PencilButton onClick={handleEdit} />}
           </div>
           {appendMutation.isError && (
             <p className="mt-1 text-xs text-rose-text">Failed to add entry.</p>
@@ -569,8 +600,9 @@ export function DocumentView({ kind, slug, onNavigate, onToggleSidebar }: Docume
 
       {/* Desktop quick log (daily only) */}
       {kind === "daily" && !editing && isMobile !== true && (
-        <div className="border-t border-white/[0.04] px-4 py-2.5 lg:px-6 lg:py-3">
+        <div ref={writeBarRef} data-os-write-bar={blockMode || undefined} className="shrink-0 border-t border-white/[0.04] px-4 py-2.5 lg:px-6 lg:py-3">
           <QuickLogInput
+            writeFirst={blockMode}
             onSubmit={handleQuickLog}
             isPending={appendMutation.isPending}
           />

@@ -21,12 +21,14 @@ import threading
 
 import httpx
 from django.conf import settings
+from django.db import InterfaceError, OperationalError
 from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
+from apps.billing.entitlement import is_paying
 from apps.billing.services import (
     check_budget,
     record_usage,
@@ -704,8 +706,10 @@ def relay_ai_response_to_line(
     # The journal deep-link chip is likewise iOS-only — LINE has no transport
     # for it, so strip its marker too.
     from apps.router.journal_link import extract_journal_link
+    from apps.router.panels import extract_panels
     from apps.router.quick_replies import extract_quick_replies
 
+    ai_text, _panels = extract_panels(ai_text)
     ai_text, _quick_replies = extract_quick_replies(ai_text, tenant_id=tenant.id, channel="line")
     ai_text, _journal_link = extract_journal_link(ai_text, tenant_id=tenant.id, channel="line")
 
@@ -920,7 +924,21 @@ class LineWebhookView(View):
                 self._handle_postback(event)
             else:
                 logger.debug("LINE webhook: unhandled event type %s", event_type)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, (OperationalError, InterfaceError)):
+                logger.error(
+                    "inbound_lost_infra channel=line event=%s type=%s exc=%s",
+                    webhook_event_id,
+                    event.get("type"),
+                    exc,
+                )
+            else:
+                logger.error(
+                    "inbound_lost_poison channel=line event=%s type=%s exc=%s",
+                    webhook_event_id,
+                    event.get("type"),
+                    exc,
+                )
             logger.exception("Error handling LINE event: %s", event.get("type"))
 
     def _handle_follow(self, event: dict) -> None:
@@ -1100,6 +1118,18 @@ class LineWebhookView(View):
 
         if not text or not line_user_id:
             return
+        owner_text = transcript if msg_type == "audio" else text if msg_type == "text" else None
+        from apps.pii.provisional import PiiIngress
+
+        pii_ingress = (
+            PiiIngress(
+                channel="line",
+                provider_event_id=event.get("webhookEventId"),
+                occurred_at=timezone.now(),
+            )
+            if owner_text is not None
+            else None
+        )
 
         # Check for link token (format: link_TOKEN)
         if text.startswith("link_"):
@@ -1141,7 +1171,7 @@ class LineWebhookView(View):
 
         # Paused tenant — trial ended or payment lapsed
         frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
             lang = tenant.user.language or "en"
             _send_line_flex(
                 line_user_id,
@@ -1186,7 +1216,13 @@ class LineWebhookView(View):
             handle_hibernated_message,
         )
 
-        wake_result = handle_hibernated_message(tenant, "line", event, text)
+        wake_result = handle_hibernated_message(
+            tenant,
+            "line",
+            event,
+            owner_text if owner_text is not None else text,
+            pii_ingress=pii_ingress,
+        )
         if wake_result == ACK_FRESH:
             lang = tenant.user.language or "en"
             _send_line_flex(
@@ -1236,7 +1272,7 @@ class LineWebhookView(View):
         # ``_extract_reply_context`` in poller.py.
         reply_prefix = _extract_line_reply_context(tenant, message)
         forwarded_text = f"{reply_prefix}{text}" if reply_prefix else text
-        raw_user_text = text  # apology fallback should not include the prefix
+        raw_user_text = owner_text  # apology fallback should not include framing
 
         # Forward to container (pass reply_token for free Reply API)
         self._forward_to_container(
@@ -1247,6 +1283,7 @@ class LineWebhookView(View):
             is_voice=msg_type == "audio",
             raw_user_text=raw_user_text,
             webhook_event_id=event.get("webhookEventId"),
+            pii_ingress=pii_ingress,
         )
 
     def _send_onboarding_reply(self, line_user_id: str, reply) -> None:
@@ -1309,6 +1346,7 @@ class LineWebhookView(View):
         is_voice: bool = False,
         raw_user_text: str | None = None,
         webhook_event_id: str | None = None,
+        pii_ingress=None,
     ) -> None:
         """Pre-process the message and enqueue it on the per-tenant
         serialization queue.
@@ -1343,11 +1381,27 @@ class LineWebhookView(View):
         # rehydration is already wired (line 657), so [PERSON_N] placeholders
         # round-trip. The checked wrapper preserves fail-open delivery text and
         # records whether the redactor genuinely completed for this queue row.
+        from apps.pii.provisional import record_provisional_sightings
         from apps.pii.redactor import redact_user_message_checked
 
-        message_redaction = redact_user_message_checked(message_text, tenant)
+        owner_text = raw_user_text
+
+        if pii_ingress is not None:
+            raw_redaction = redact_user_message_checked(raw_user_text, tenant, ingress=pii_ingress)
+            record_provisional_sightings(tenant, owner_text, pii_ingress)
+            message_redaction = (
+                raw_redaction
+                if message_text == owner_text
+                else redact_user_message_checked(message_text, tenant, ingress=None)
+            )
+        else:
+            message_redaction = redact_user_message_checked(message_text, tenant, ingress=None)
+            raw_redaction = (
+                message_redaction
+                if raw_user_text == message_text
+                else redact_user_message_checked(raw_user_text, tenant, ingress=None)
+            )
         message_text = message_redaction.text
-        raw_redaction = redact_user_message_checked(raw_user_text, tenant)
         raw_user_text = raw_redaction.text
 
         lang = tenant.user.language or "en"
@@ -1470,7 +1524,7 @@ class LineWebhookView(View):
         # billable turn on a suspended/over-budget tenant. (The special-prefix
         # branches above act on stored DB state and don't spawn turns.)
         frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+        if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
             lang = tenant.user.language or "en"
             _send_line_flex(
                 line_user_id,

@@ -9,6 +9,7 @@ from rest_framework.test import APIClient
 from apps.tenants.services import create_tenant
 from apps.tenants.test_utils import seed_internal_key
 
+from .catalog_annotation import annotate_incoming, incoming_name_paths
 from .models import PlanSlot, Workout, WorkoutPlan
 from .runtime_views import _normalize_stored_schedule_keys
 
@@ -20,6 +21,15 @@ _PRESCRIPTION = {
         }
     ]
 }
+_MOBILITY_PRESCRIPTION = {
+    "skills": [
+        {"name": "Hip flexor stretch", "sets": [{"type": "hold_time", "hold_s": 45}]},
+    ]
+}
+
+
+def _cataloged(detail):
+    return annotate_incoming(detail, incoming_name_paths(detail))[0]
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="test-internal-key")
@@ -80,8 +90,16 @@ class RuntimeUpdatePlanMergeTests(TestCase):
             self._plan_url(plan),
             {
                 "schedule_json": {
-                    "saturday": {"category": "mobility", "activity": "Mobility"},
-                    "sunday": {"category": "mobility", "activity": "Recovery Flow"},
+                    "saturday": {
+                        "category": "mobility",
+                        "activity": "Mobility",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    },
+                    "sunday": {
+                        "category": "mobility",
+                        "activity": "Recovery Flow",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    },
                 }
             },
             format="json",
@@ -115,7 +133,13 @@ class RuntimeUpdatePlanMergeTests(TestCase):
         response = self.client.patch(
             self._plan_url(plan),
             {
-                "schedule_json": {"saturday": {"category": "mobility", "activity": "Mobility"}},
+                "schedule_json": {
+                    "saturday": {
+                        "category": "mobility",
+                        "activity": "Mobility",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    }
+                },
                 "replace_schedule": False,
             },
             format="json",
@@ -156,12 +180,12 @@ class RuntimeUpdatePlanMergeTests(TestCase):
                 "activity": "Renamed Heavy Day",
                 "duration_minutes": 65,
                 "target_rpe": 8,
-                "detail_json": _PRESCRIPTION,
+                "detail_json": _cataloged(_PRESCRIPTION),
             },
         )
         monday = Workout.objects.get(plan=plan, date=self.plan_start)
         self.assertEqual(monday.category, "strength")
-        self.assertEqual(monday.detail_json, _PRESCRIPTION)
+        self.assertEqual(monday.detail_json, _cataloged(_PRESCRIPTION))
         self.assertEqual(monday.activity, "Renamed Heavy Day")
         self.assertEqual(monday.duration_minutes, 65)
         self.assertEqual(monday.rpe, 8)
@@ -326,7 +350,15 @@ class RuntimeUpdatePlanMergeTests(TestCase):
         self.assertEqual(response.data["details"][0]["msg"], "drop the key from schedule_json or use remove_days")
 
     def test_category_flip_omitting_detail_requires_prescription(self):
-        plan = self._create_plan({"monday": {"category": "mobility", "activity": "Mobility", "detail_json": {}}})
+        plan = self._create_plan(
+            {
+                "monday": {
+                    "category": "mobility",
+                    "activity": "Mobility",
+                    "detail_json": _MOBILITY_PRESCRIPTION,
+                }
+            }
+        )
         original_schedule = plan.schedule_json
 
         response = self.client.patch(
@@ -342,8 +374,9 @@ class RuntimeUpdatePlanMergeTests(TestCase):
         plan.refresh_from_db()
         self.assertEqual(plan.schedule_json, original_schedule)
 
-    def test_strength_to_mobility_flip_drops_old_prescription(self):
+    def test_strength_to_mobility_flip_without_detail_requires_prescription(self):
         plan = self._create_plan({"monday": {"category": "strength", "activity": "Lift", "detail_json": _PRESCRIPTION}})
+        original_schedule = plan.schedule_json
 
         response = self.client.patch(
             self._plan_url(plan),
@@ -352,16 +385,23 @@ class RuntimeUpdatePlanMergeTests(TestCase):
             **self.headers,
         )
 
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 400, response.data)
         plan.refresh_from_db()
-        self.assertEqual(plan.schedule_json["0"]["category"], "mobility")
-        self.assertEqual(plan.schedule_json["0"]["detail_json"], {})
+        self.assertEqual(plan.schedule_json, original_schedule)
         monday = Workout.objects.get(plan=plan, date=self.plan_start)
-        self.assertEqual(monday.category, "mobility")
-        self.assertEqual(monday.detail_json, {})
+        self.assertEqual(monday.category, "strength")
+        self.assertEqual(monday.detail_json, _cataloged(_PRESCRIPTION))
 
     def test_category_flip_with_detail_is_accepted(self):
-        plan = self._create_plan({"monday": {"category": "mobility", "activity": "Mobility", "detail_json": {}}})
+        plan = self._create_plan(
+            {
+                "monday": {
+                    "category": "mobility",
+                    "activity": "Mobility",
+                    "detail_json": _MOBILITY_PRESCRIPTION,
+                }
+            }
+        )
 
         response = self.client.patch(
             self._plan_url(plan),
@@ -381,9 +421,9 @@ class RuntimeUpdatePlanMergeTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         plan.refresh_from_db()
         self.assertEqual(plan.schedule_json["0"]["category"], "strength")
-        self.assertEqual(plan.schedule_json["0"]["detail_json"], _PRESCRIPTION)
+        self.assertEqual(plan.schedule_json["0"]["detail_json"], _cataloged(_PRESCRIPTION))
         monday = Workout.objects.get(plan=plan, date=self.plan_start)
-        self.assertEqual(monday.detail_json, _PRESCRIPTION)
+        self.assertEqual(monday.detail_json, _cataloged(_PRESCRIPTION))
 
     def test_merge_normalizes_legacy_name_keyed_stored_schedule(self):
         plan = self._create_weekday_plan()
@@ -394,7 +434,15 @@ class RuntimeUpdatePlanMergeTests(TestCase):
 
         response = self.client.patch(
             self._plan_url(plan),
-            {"schedule_json": {"saturday": {"category": "mobility", "activity": "Mobility"}}},
+            {
+                "schedule_json": {
+                    "saturday": {
+                        "category": "mobility",
+                        "activity": "Mobility",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    }
+                }
+            },
             format="json",
             **self.headers,
         )
@@ -459,8 +507,16 @@ class RuntimeUpdatePlanMergeTests(TestCase):
             self._plan_url(plan),
             {
                 "schedule_json": {
-                    "4": {"category": "mobility", "activity": "Mobility A"},
-                    "friday": {"category": "mobility", "activity": "Mobility B"},
+                    "4": {
+                        "category": "mobility",
+                        "activity": "Mobility A",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    },
+                    "friday": {
+                        "category": "mobility",
+                        "activity": "Mobility B",
+                        "detail_json": _MOBILITY_PRESCRIPTION,
+                    },
                 }
             },
             format="json",

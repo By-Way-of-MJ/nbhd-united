@@ -1,7 +1,7 @@
 "use client";
 
 import clsx from "clsx";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useSyncExternalStore } from "react";
 import { Sidebar } from "@/components/journal/sidebar";
 import { DocumentView } from "@/components/journal/document-view";
 import { WelcomeMessageCard } from "@/components/journal/welcome-message-card";
@@ -16,9 +16,7 @@ import { isISODate, todayISO } from "@/lib/journal-date";
  * today — so the day-navigation arrows never run shiftISODate on a non-date
  * string and mint a "NaN-NaN-NaN" slug.
  */
-function parseHash(): { kind: string; slug: string } {
-  if (typeof window === "undefined") return { kind: "daily", slug: todayISO() };
-  const hash = window.location.hash.slice(1);
+function parseHash(hash: string): { kind: string; slug: string } {
   const parts = hash ? hash.split("/") : [];
   const kind = parts[0] || "daily";
   let slug = parts.length >= 2 ? parts.slice(1).join("/") : "";
@@ -30,12 +28,26 @@ function parseHash(): { kind: string; slug: string } {
   return { kind, slug };
 }
 
+function subscribeHash(callback: () => void) {
+  window.addEventListener("hashchange", callback);
+  window.addEventListener("popstate", callback);
+  return () => {
+    window.removeEventListener("hashchange", callback);
+    window.removeEventListener("popstate", callback);
+  };
+}
+const hashSnapshot = () => window.location.hash.slice(1);
+const serverHashSnapshot = (): string | null => null;
+
 export default function JournalPage() {
-  const [activeKind, setActiveKind] = useState(() => parseHash().kind);
-  const [activeSlug, setActiveSlug] = useState(() => parseHash().slug);
+  // Wait for the browser URL before mounting document/sidebar queries.
+  // Cross-page document links and browser Back must select the requested note.
+  const hash = useSyncExternalStore(subscribeHash, hashSnapshot, serverHashSnapshot);
+  const { kind: activeKind, slug: activeSlug } = parseHash(hash ?? "");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [viewKey, setViewKey] = useState(0);
+  const [revealLatestOnLoad, setRevealLatestOnLoad] = useState(false);
 
   // Recent entries from sidebar tree
   const { data: tree } = useSidebarTreeQuery();
@@ -52,16 +64,17 @@ export default function JournalPage() {
     [queryClient],
   );
 
-  const handleNavigate = (kind: string, slug: string) => {
+  const handleNavigate = (kind: string, slug: string, revealLatest = false) => {
     setMobileSidebarOpen(false);
     // If already on this document, do not increment viewKey — that would
     // force-remount DocumentView and silently discard any in-progress draft.
     if (kind === activeKind && slug === activeSlug) return;
-    setActiveKind(kind);
-    setActiveSlug(slug);
+    setRevealLatestOnLoad(revealLatest);
     window.location.hash = `${kind}/${slug}`;
     setViewKey((k) => k + 1);
   };
+
+  if (hash === null) return null;
 
   return (
     <div className="flex h-full">
@@ -128,6 +141,7 @@ export default function JournalPage() {
           className="view-transition-enter min-h-0 flex-1"
         >
           <DocumentView
+            revealLatestOnLoad={revealLatestOnLoad}
             kind={activeKind}
             slug={activeSlug}
             onNavigate={handleNavigate}

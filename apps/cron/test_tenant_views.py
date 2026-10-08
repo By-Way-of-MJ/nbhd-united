@@ -1333,7 +1333,12 @@ class RegenerateTenantCronsTest(TestCase):
         self.user, self.tenant = _create_user_and_tenant()
         self.tenant.postgres_cron_canonical = True
         self.tenant.container_fqdn = "oc-test.example.com"
-        self.tenant.save(update_fields=["postgres_cron_canonical", "container_fqdn"])
+        # This suite exercises the 2026.5.28 gateway reconcile path (cron.add/
+        # list/remove, caps, at-reaping). 2026.9.4 tenants take the signed-file
+        # path instead (apps/cron/share_cron_sync.py, tested in
+        # test_share_cron_sync.py), so pin the version — the default is 2026.9.4.
+        self.tenant.openclaw_version = "2026.5.28"
+        self.tenant.save(update_fields=["postgres_cron_canonical", "container_fqdn", "openclaw_version"])
 
     def test_skips_when_flag_off(self):
         from apps.orchestrator.cron_reconcile import regenerate_tenant_crons
@@ -1429,7 +1434,7 @@ class RegenerateTenantCronsTest(TestCase):
 
         # No CronJob rows = empty desired. Container has one job that we
         # consider managed (no underscore prefix).
-        mock_invoke.side_effect = lambda tenant, tool, args: (
+        mock_invoke.side_effect = lambda tenant, tool, args, **kwargs: (
             {"details": {"jobs": [{"name": "Old Task", "id": "j1"}]}} if tool == "cron.list" else None
         )
         result = regenerate_tenant_crons(self.tenant)
@@ -1503,7 +1508,7 @@ class RegenerateTenantCronsTest(TestCase):
         stale_ms = int(time.time() * 1000) - 2 * 60 * 60 * 1000  # 2h ago
         calls: list[tuple[str, dict]] = []
 
-        def _stub(tenant, tool, args):
+        def _stub(tenant, tool, args, **kwargs):
             calls.append((tool, args))
             if tool == "cron.list":
                 return {
@@ -1643,7 +1648,7 @@ class RegenerateTenantCronsTest(TestCase):
         ]
         remove_calls: list[str] = []
 
-        def _stub(tenant, tool, args):
+        def _stub(tenant, tool, args, **kwargs):
             if tool == "cron.list":
                 return {"details": {"jobs": jobs}}
             if tool == "cron.remove":

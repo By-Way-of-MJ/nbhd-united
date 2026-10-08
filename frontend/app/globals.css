@@ -570,3 +570,528 @@ body {
     display: none !important;
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Web app — Open Sky (web redesign, gated per tenant by `web_redesign`)
+   The iPhone Open Sky language on a big screen: content on the night sky,
+   grouped by space + hairlines + small uppercase labels (no boxes), one serif
+   title per page, one pale-violet accent, teal only for done, outline/ghost
+   buttons, no gradients / glows / blur washes. See DESIGN.md §"Web app — Open
+   Sky". Everything below is scoped to `html.open-sky`, which the shell sets
+   only for tenants with `web_redesign` — everyone else keeps the old skin.
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --os-sky: #07090c;
+  --os-ink: #e2e8f0;
+  --os-muted: rgba(226, 232, 240, 0.8);
+  --os-faint: rgba(226, 232, 240, 0.62);
+  --os-label: rgba(226, 232, 240, 0.78);
+  --os-hairline: rgba(226, 232, 240, 0.12);
+  --os-ring: rgba(226, 232, 240, 0.35);
+  --os-surface: rgba(22, 27, 34, 0.55);
+  --os-surface-solid: #11151b;
+  --os-accent: #c4bbff;
+  --os-accent-line: rgba(196, 187, 255, 0.5);
+  --os-accent-soft: rgba(196, 187, 255, 0.12);
+  --os-done: #4ecdc4;
+  --os-attn: #f2c66d;
+  --os-danger: #e8b4b8;
+  --os-bar: rgba(18, 22, 28, 0.86);
+}
+
+/* Re-skin legacy sections through their tokens (no feature changes). */
+html.open-sky {
+  --bg: var(--os-sky);
+  --mist: #0c1015;
+  --ink-muted: var(--os-muted);
+  --ink-faint: var(--os-faint);
+  --card: var(--os-surface);
+  --surface: #11151b;
+  --surface-elevated: #161b22;
+  --border: var(--os-hairline);
+  --bg-gradient: var(--os-sky);
+  --grid-opacity: 0;
+  --shadow-panel: none;
+  --focus-ring: 0 0 0 2px var(--os-accent);
+  --focus-ring-offset: 0 0 0 2px var(--os-sky), 0 0 0 4px var(--os-accent);
+  background: var(--os-sky);
+}
+/* Transparent body so the fixed -z starfield paints above it (html holds the sky). */
+html.open-sky body { background: transparent; }
+html.open-sky .glass-card,
+html.open-sky .glass-card-horizons {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-radius: 0;
+}
+html.open-sky .glow-signal,
+html.open-sky .glow-purple,
+html.open-sky .glow-purple-hover:hover { box-shadow: none; }
+
+/* Open Sky primitives */
+.os-page-title {
+  font-family: var(--font-serif), Georgia, serif;
+  font-style: normal;
+  font-weight: 400;
+  font-size: clamp(2.25rem, 3vw + 1rem, 2.75rem);
+  line-height: 1.02;
+  color: #fff;
+  letter-spacing: -0.005em;
+}
+.os-serif {
+  font-family: var(--font-serif), Georgia, serif;
+  font-style: normal;
+  font-weight: 400;
+}
+.os-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--os-label);
+}
+.os-hairline-top { border-top: 1px solid var(--os-hairline); }
+.os-hairline-bottom { border-bottom: 1px solid var(--os-hairline); }
+.os-num { font-variant-numeric: tabular-nums; }
+.os-focus:focus-visible {
+  outline: 2px solid var(--os-accent);
+  outline-offset: 2px;
+}
+/* Outline capsule — the primary action (never filled). */
+.os-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  padding: 0 1.125rem;
+  border-radius: 999px;
+  border: 1px solid var(--os-accent-line);
+  color: var(--os-accent);
+  font-weight: 600;
+  font-size: 0.9375rem;
+  background: transparent;
+  transition: background-color 150ms ease, opacity 150ms ease;
+}
+.os-btn:hover { background: var(--os-accent-soft); }
+.os-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.os-btn-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 44px;
+  color: var(--os-muted);
+  font-weight: 500;
+  font-size: 0.9375rem;
+}
+.os-btn-text:hover { color: var(--os-ink); }
+
+@media (prefers-reduced-motion: reduce) {
+  .os-twinkle { animation: none !important; }
+}
+@keyframes os-twinkle {
+  0%, 100% { opacity: var(--os-a, 0.3); }
+  50% { opacity: calc(var(--os-a, 0.3) * 0.35); }
+}
+.os-twinkle { animation: os-twinkle 6s ease-in-out infinite; }
+/* A new line of text settling in (the constellation's chosen lesson). */
+@keyframes os-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.os-fade-in { animation: os-fade-in 700ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .os-fade-in { animation: none; }
+}
+/* Right-side panels (Neighborhood): slide in from the edge over a dark shade.
+   The panel's own sky is the same faint static starfield as the page. */
+@keyframes os-panel-in {
+  from { transform: translateX(28px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes os-shade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.os-panel-in { animation: os-panel-in 280ms cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.os-shade-in { animation: os-shade-in 220ms ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .os-panel-in, .os-shade-in { animation: none; }
+}
+.os-panel-sky {
+  background-color: var(--os-sky);
+  background-image:
+    radial-gradient(1px 1px at 23px 41px, rgba(255, 255, 255, 0.5), transparent 60%),
+    radial-gradient(1px 1px at 131px 97px, rgba(255, 255, 255, 0.3), transparent 60%),
+    radial-gradient(1.2px 1.2px at 77px 173px, rgba(255, 255, 255, 0.42), transparent 60%);
+  background-size: 230px 250px;
+}
+
+/* Open Sky: legacy filled-accent buttons (`bg-accent text-white`, 41 sites) become
+   the outline capsule — class-level, no per-page edits. Non-button accent fills
+   (dots, bars) never carry text-white and are untouched. */
+html.open-sky .bg-accent.text-white {
+  background-color: transparent !important;
+  color: var(--os-accent) !important;
+  box-shadow: inset 0 0 0 1px var(--os-accent-line) !important;
+  filter: none !important;
+}
+html.open-sky .bg-accent.text-white:hover { background-color: var(--os-accent-soft) !important; }
+/* Legacy page-level titles are replaced by the shell's serif header. */
+html.open-sky [data-os-legacy-title] { display: none !important; }
+html.open-sky [data-os-journal] {
+  margin: 0 !important;
+  height: calc(100dvh - 11rem);
+  border-top: 1px solid var(--os-hairline);
+}
+html.open-sky nav[aria-label="Journal sidebar"] { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+/* Open Sky: legacy display-serif italics become the upright page serif. */
+html.open-sky main .font-display { font-family: var(--font-serif), Georgia, serif; font-style: normal; }
+/* Art canvases fade into the page sky instead of showing their box edge. */
+.os-art-fade {
+  -webkit-mask-image: radial-gradient(closest-side, #000 72%, transparent 100%);
+  mask-image: radial-gradient(closest-side, #000 72%, transparent 100%);
+}
+@media (min-width: 768px) {
+  .os-band-fade {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent), linear-gradient(to bottom, transparent, #000 18%);
+    -webkit-mask-composite: source-in;
+    mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent), linear-gradient(to bottom, transparent, #000 18%);
+    mask-composite: intersect;
+  }
+}
+
+
+/* Fuel, Neighborhood management and Journal: finish the legacy component skin.
+   Hooks are inert outside this gate; dialogs/menus retain their object surfaces. */
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) {
+  --accent: var(--os-accent);
+  --accent-hi: var(--os-accent);
+  --accent-hover: var(--os-accent);
+  --amber-text: var(--os-muted);
+  --amber-bg: transparent;
+  --amber-border: var(--os-hairline);
+  --rose-text: var(--os-ink);
+  --rose-bg: transparent;
+  --rose-border: var(--os-ring);
+  --emerald-text: var(--os-done);
+  --emerald-bg: transparent;
+  --status-amber-text: var(--os-muted);
+  --status-amber-bg: transparent;
+  --status-emerald-text: var(--os-done);
+  --status-emerald-bg: transparent;
+  --font-headline: var(--font-body);
+  --font-mono: var(--font-body);
+  font-variant-numeric: tabular-nums;
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) :is(button, a, input, select, textarea):focus-visible {
+  outline: 2px solid var(--os-accent);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+/* Same outline capsule as os-btn; row and icon buttons stay plain. */
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) button.rounded-full:not([data-os-row]),
+html.open-sky [data-os-new-entry] button {
+  min-height: 44px;
+  border: 1px solid var(--os-accent-line);
+  border-radius: 999px;
+  background: transparent;
+  background-image: none;
+  color: var(--os-accent);
+  box-shadow: none;
+  filter: none;
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) button.rounded-full:hover,
+html.open-sky [data-os-new-entry] button:hover {
+  background: var(--os-accent-soft);
+  box-shadow: none;
+}
+html.open-sky [data-os-fuel] {
+  /* Category metadata uses these variables, including inside SVG charts. */
+  --color-violet-400: var(--os-muted);
+  --color-amber-400: var(--os-muted);
+  --color-pink-400: var(--os-muted);
+  --color-teal-400: var(--os-muted);
+  --color-slate-400: var(--os-muted);
+  --color-blue-400: var(--os-muted);
+  --color-purple-400: var(--os-muted);
+}
+html.open-sky [data-os-fuel] :is([data-os-surface], [data-os-day]),
+html.open-sky [data-os-neighborhood] > section {
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-left-width: 0 !important; /* Legacy inline category stripe. */
+  border-radius: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  padding: 1.25rem 0;
+}
+html.open-sky [data-os-fuel] [data-os-day] { min-width: 0; }
+html.open-sky [data-os-fuel] :is([data-os-row], [data-os-session], [data-os-rest]),
+html.open-sky [data-os-neighborhood] [data-os-row] {
+  min-width: 0;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0.875rem 0;
+}
+html.open-sky [data-os-fuel] [data-os-session]:first-child { border-top: 0; }
+html.open-sky [data-os-fuel] [data-os-session] button > div {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+html.open-sky [data-os-fuel] [data-os-category-mark] { display: none; }
+html.open-sky [data-os-fuel] [data-os-field] {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-hairline);
+  border-radius: 0;
+  padding-inline: 0;
+}
+html.open-sky [data-os-fuel] [data-os-calendar-day] {
+  background: transparent;
+  border: 0;
+  border-top: 1px solid var(--os-hairline);
+  border-radius: 0;
+}
+html.open-sky [data-os-fuel] :is(.uppercase, [data-os-label]),
+html.open-sky [data-os-neighborhood] > section > header > h2,
+html.open-sky [data-os-journal] .uppercase {
+  font-family: var(--font-body), sans-serif;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--os-label);
+}
+html.open-sky [data-os-fuel] .uppercase.text-accent { color: var(--os-accent); }
+html.open-sky [data-os-fuel] .uppercase.text-emerald-text { color: var(--os-done); }
+html.open-sky [data-os-fuel] [data-os-surface] h3 {
+  font-family: var(--font-serif), Georgia, serif;
+  font-size: 1.75rem;
+  font-weight: 400;
+}
+html.open-sky [data-os-neighborhood] { margin-top: 2.5rem; }
+html.open-sky [data-os-neighborhood] > section > p {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+}
+html.open-sky [data-os-neighborhood] [data-os-avatar] {
+  display: grid;
+  place-items: center;
+  background: transparent !important; /* User hue remains intact in the old skin. */
+  border: 1px solid var(--os-ring);
+  color: var(--os-muted);
+  font-size: 0.8125rem;
+}
+html.open-sky [data-os-neighborhood] [data-os-avatar]::after { content: attr(data-initial); }
+html.open-sky [data-os-neighborhood] [data-os-row] > .min-w-0 > .flex { flex-wrap: wrap; gap: 0 0.5rem; }
+
+/* Journal: an unboxed text rail, upright serif date, and hairline writing field. */
+html.open-sky [data-os-journal-rail] {
+  background: transparent;
+  border-color: var(--os-hairline);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.open-sky [data-os-journal-rail] [data-os-nav-item] {
+  position: relative;
+  min-height: 44px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--os-muted);
+}
+html.open-sky [data-os-journal-rail] [data-os-nav-item][data-active="true"] { color: var(--os-ink); }
+html.open-sky [data-os-journal-rail] .active-glow-left::before,
+html.open-sky [data-os-journal-rail] [data-os-nav-item][data-active="true"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.875rem;
+  bottom: 0.875rem;
+  width: 1px;
+  background: var(--os-accent);
+  box-shadow: none;
+}
+html.open-sky [data-os-nav-item] > svg,
+html.open-sky [data-os-new-entry] svg,
+html.open-sky [data-os-current-orbit] svg { display: none; }
+html.open-sky [data-os-journal-rail] [class*="text-ink-faint/"] { color: var(--os-faint); }
+html.open-sky [data-os-journal-rail] .border-b,
+html.open-sky [data-os-journal-rail] .border-t { border-color: var(--os-hairline); }
+html.open-sky [data-os-document-header] { border-color: var(--os-hairline); }
+html.open-sky [data-os-document-header] .font-display {
+  font-family: var(--font-serif), Georgia, serif;
+  font-weight: 400;
+  font-size: clamp(1.5rem, 2.1vw, 2rem);
+  line-height: 1.15;
+  letter-spacing: 0;
+}
+html.open-sky [data-os-document-header] button.rounded-xl {
+  background: transparent;
+  border-color: transparent;
+  border-radius: 999px;
+  color: var(--os-accent);
+}
+html.open-sky [data-os-document-header] label:focus-within {
+  outline: 2px solid var(--os-accent);
+  outline-offset: 3px;
+}
+html.open-sky [data-os-current-orbit] { color: var(--os-accent) !important; }
+html.open-sky [data-os-document-header] span.rounded-full { border: 0; background: transparent; }
+html.open-sky :is([data-os-current-status], [data-os-document-body]) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding-inline: 0;
+}
+html.open-sky [data-os-current-status] { margin-bottom: 1.5rem; }
+html.open-sky [data-os-current-status] .normal-case { color: var(--os-faint); }
+html.open-sky [data-os-current-status] li { border-bottom: 1px solid var(--os-hairline); min-height: 44px; }
+html.open-sky [data-os-current-status] .truncate { white-space: normal; overflow-wrap: anywhere; }
+html.open-sky [data-os-current-status] button:not([aria-pressed="true"]):hover > span { border-color: var(--os-accent); }
+html.open-sky [data-os-quick-log] input {
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-ring);
+  border-radius: 0;
+  padding-inline: 0;
+}
+@media (max-width: 639px) {
+  html.open-sky [data-os-neighborhood] [data-os-approval] { flex-wrap: wrap; }
+  html.open-sky [data-os-neighborhood] [data-os-approval] > .min-w-0 { flex-basis: 100%; }
+  html.open-sky [data-os-document-header] { padding-inline: 0; }
+  html.open-sky [data-os-document-header] > .flex:first-child { flex-basis: 100%; }
+  html.open-sky [data-os-document-header] > .flex:first-child > .flex { min-width: 0; gap: 0; flex-wrap: wrap; }
+  html.open-sky [data-os-journal] { height: calc(100dvh - 15rem); }
+}
+html.open-sky :is([data-os-fuel], [data-os-neighborhood], [data-os-journal]) .bg-accent.text-white {
+  box-shadow: none !important;
+  border: 1px solid var(--os-accent-line);
+}
+html.open-sky [data-os-fuel] button.rounded-full:has(> svg:only-child) { min-width: 44px; }
+html.open-sky [data-os-fuel] [data-os-filter] {
+  background: transparent !important;
+  border-color: var(--os-hairline) !important;
+  color: var(--os-muted);
+}
+html.open-sky [data-os-fuel] [data-os-filter][data-active="true"] {
+  border-color: var(--os-accent-line) !important;
+  color: var(--os-accent);
+}
+/* Trend direction is information, not a completed action. */
+html.open-sky [data-os-fuel] [data-os-surface] .text-emerald-text:not(.uppercase) { color: var(--os-muted); }
+html.open-sky [data-os-fuel] svg path[fill^="url("] { fill: none; }
+html.open-sky [data-os-fuel] svg path[stroke^="var(--color-"] { stroke: var(--os-ink); }
+html.open-sky [data-os-fuel] svg circle[fill^="var(--color-"] { fill: var(--os-accent); }
+html.open-sky [data-os-welcome] {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--os-hairline);
+  border-radius: 0;
+  padding-left: 0;
+  padding-top: 0;
+  padding-bottom: 1.25rem;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.open-sky [data-os-welcome] h2 { color: var(--os-label); font-weight: 600; }
+html.open-sky [data-os-welcome] > button { top: -0.5rem; right: 0; }
+html.open-sky [data-os-journal-rail] button:has(> span) > svg { display: none; }
+
+/* Keep edge labels inside the phone viewport without clipping names. */
+@media (max-width: 639px) {
+  html.open-sky [data-os-map-label="right"] {
+    left: auto;
+    right: 100%;
+    padding: 0 0.25rem 0 0;
+    align-items: flex-end;
+    text-align: right;
+  }
+  html.open-sky [data-os-map-label="left"] {
+    right: auto;
+    left: 100%;
+    padding: 0 0 0 0.25rem;
+    align-items: flex-start;
+    text-align: left;
+  }
+}
+
+html.open-sky [data-os-fuel] [data-os-day] header button { margin-right: 0; }
+html.open-sky [data-os-fuel] [data-os-tab][data-active="true"] { color: var(--os-accent); }
+html.open-sky [data-os-fuel] [data-os-tab] > .absolute { background: var(--os-accent); }
+html.open-sky [data-os-fuel] [data-os-surface] > button.absolute:focus-visible { outline-offset: -2px; }
+html.open-sky [data-os-journal] input[type="checkbox"]:checked { accent-color: var(--os-done); }
+
+/* Daily blocks remain unboxed; only the active textarea is an edit surface. */
+html.open-sky .os-journal-block + .os-journal-block { border-top: 1px solid var(--os-hairline); }
+html.open-sky .os-journal-block-content .prose { color: var(--os-muted); font-size: 0.9375rem; line-height: 1.85; }
+html.open-sky .os-journal-block-content .os-label { color: var(--os-accent); }
+html.open-sky .os-journal-block-content .contains-task-list { list-style-type: disc; padding-left: 1.5em; }
+html.open-sky .os-journal-block a { cursor: pointer; }
+html.open-sky .os-journal-block-content[data-block-kind="entry"] .prose { color: var(--os-ink); }
+html.open-sky .os-journal-blocks .os-btn-text:disabled { opacity: 0.45; cursor: not-allowed; }
+@media (max-width: 639px) {
+  html.open-sky [data-os-block-header] > .flex:first-child { flex-basis: auto; }
+}
+
+
+/* A real checkbox with quiet Open Sky chrome; its label supplies the 44px target. */
+html.open-sky .os-task-checkbox {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  border: 1px solid color-mix(in srgb, var(--os-ink) 50%, transparent);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+html.open-sky .os-task-checkbox:checked { border-color: var(--os-done); }
+html.open-sky .os-task-check { color: var(--os-done); opacity: 0; }
+html.open-sky .os-task-checkbox:checked + .os-task-check { opacity: 1; }
+html.open-sky .os-task-checkbox:focus-visible { outline: 2px solid var(--os-accent); outline-offset: 3px; }
+html.open-sky .os-task-checkbox:disabled { cursor: wait; }
+html.open-sky .os-journal-blocks [role="alert"] > .os-label { color: var(--os-accent); }
+html.open-sky .os-write-input {
+  border: 0;
+  border-bottom: 1px solid var(--os-ring);
+  border-radius: 0;
+  background: transparent;
+  max-height: 8rem;
+  overflow-y: auto;
+}
+html.open-sky [data-os-block-scroll] { scroll-padding-block: 1rem; }
+@media (max-width: 767px) {
+  /* Keep enough trailing scroll space for the measured composer plus the
+     floating phone nav (70px tall, 12px inset, and a little breathing room). */
+  html.open-sky [data-os-block-scroll] {
+    padding-bottom: calc(var(--os-write-bar-height, 96px) + 96px + env(safe-area-inset-bottom));
+    scroll-padding-bottom: calc(var(--os-write-bar-height, 96px) + 96px + env(safe-area-inset-bottom));
+  }
+}
+@media (forced-colors: active) {
+  html.open-sky .os-task-checkbox { border-color: ButtonText; }
+  html.open-sky .os-task-checkbox:checked { border-color: Highlight; }
+  html.open-sky .os-task-check { color: Highlight; }
+}
+
+/* Overview notes use the same Markdown renderer as Journal, at reading size. */
+html.open-sky .os-assistant-prose .prose { font-size: 1.125rem; line-height: 1.65; color: var(--os-ink); max-width: none; }
+html.open-sky .os-assistant-prose .prose > :first-child { margin-top: 0; }
+html.open-sky .os-assistant-prose .prose > :last-child { margin-bottom: 0; }
+html.open-sky :is(#sleep, #weight, #week, #training, #north-star) { scroll-margin-top: 24px; }

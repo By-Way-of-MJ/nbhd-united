@@ -1,13 +1,14 @@
 """Idle hibernation service — scale-to-zero for inactive tenants.
 
-Tenants whose containers have been idle for 2+ hours get their revisions
-deactivated (0 replicas, 0 cost). When a message arrives, the container
-wakes and buffered messages are auto-forwarded via QStash.
+Tenants whose containers pass the configured idle cutoff get their
+revisions deactivated (0 replicas, 0 cost). When a message arrives, the
+container wakes and buffered messages are auto-forwarded via QStash.
 
 Cron-aware wake: before hibernating, we capture the tenant's cron
 schedules and schedule a QStash task to wake the container just before
-the next cron fires. After 30 minutes, if no user messages arrived, the
-container is re-hibernated (and the next cron wake is scheduled again).
+the next cron fires. After the configured cron-wake idle window, if no user
+messages arrived, the container is re-hibernated (and the next cron wake is
+scheduled again).
 
 This is distinct from billing-based SUSPENDED status — hibernated tenants
 remain status=ACTIVE with a non-null ``hibernated_at`` timestamp.
@@ -20,7 +21,8 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from django.db import models
+from django.conf import settings
+from django.db import InterfaceError, OperationalError, models
 from django.utils import timezone
 
 from apps.common.eval_sink import suppresses_real_transport
@@ -42,27 +44,29 @@ logger = logging.getLogger(__name__)
 # user-visible.
 _CRON_WAKE_LEAD_SECONDS = 240
 
-# How long (seconds) to keep a cron-woken container alive before
-# re-hibernating if no user messages arrive.
-_CRON_WAKE_IDLE_SECONDS = 1800  # 30 minutes
-
 # Look-ahead window used by ``check_cron_wake_idle_task`` to decide whether
 # to defer re-hibernation. If another cron is due to fire within this
 # window from "now" (i.e. when the idle check fires), keep the container
 # awake instead of re-hibernating just to cold-start again for the next
-# fire. 90 min covers typical morning patterns (e.g. 7 AM Morning
-# Briefing + 8:30 AM Project Check-in) without holding tenants awake
-# unnecessarily for sparse cron schedules.
-_CRON_LOOKAHEAD_WINDOW_SECONDS = 5400  # 90 minutes
+# fire. The window is configured by ``TENANT_CRON_HOLD_MINUTES``.
 
-# Defer-window used by ``_cron_active_or_imminent`` for hourly sweeps
+# Defer-window used by ``_cron_active_or_imminent`` for periodic sweeps
 # (hibernate-idle, image-bump). Catches the common "sweep fires at :00,
 # user cron fires at :00" race. Wider than the gateway's worst-case
 # response time so a slow cron.list call doesn't accidentally race past
-# the deferral. Smaller than the 90 min look-ahead because that one is
-# about keeping a warm container warm; this one is about not killing
-# a cron mid-fire.
+# the deferral. This fixed five-minute safety guard is distinct from the
+# configurable cron hold window: it prevents killing a cron mid-fire.
 _CRON_DEFER_WINDOW_SECONDS = 300  # 5 minutes
+
+
+def _cron_hold_seconds() -> int:
+    """Configured warm-container hold after a cron wake, in seconds."""
+    return settings.TENANT_CRON_HOLD_MINUTES * 60
+
+
+def _cron_wake_idle_seconds() -> int:
+    """Configured idle re-check delay after a cron-triggered wake, in seconds."""
+    return settings.TENANT_CRON_WAKE_IDLE_MINUTES * 60
 
 
 def hibernate_idle_tenant(tenant: Tenant) -> bool:
@@ -138,9 +142,9 @@ def _capture_tenant_cron_schedules(tenant: Tenant) -> list[dict]:
         return []
 
     try:
-        from apps.cron.gateway_client import invoke_gateway_tool
+        from apps.cron.gateway_client import list_tenant_crons
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        result = list_tenant_crons(tenant, {"includeDisabled": False})
         data = result.get("details", result) if isinstance(result, dict) else result
         jobs = data.get("jobs", []) if isinstance(data, dict) else data if isinstance(data, list) else []
 
@@ -306,7 +310,7 @@ def _next_run_from_expr(expr: str, tz_name: str) -> int | None:
 def _next_cron_within_window(
     tenant: Tenant,
     *,
-    window_seconds: int = _CRON_LOOKAHEAD_WINDOW_SECONDS,
+    window_seconds: int | None = None,
 ) -> int | None:
     """Return ``state.nextRunAtMs`` of the earliest enabled cron firing within
     ``[now, now + window_seconds]``, or ``None`` if no qualifying cron exists.
@@ -316,16 +320,8 @@ def _next_cron_within_window(
     back-to-back crons through cold-start cycles when ``last_message_at``
     can't be used to keep the container awake (cron output never moves it).
 
-    Source order, mirroring ``_capture_tenant_cron_schedules``:
-
-    1. Live ``cron.list`` against the gateway. The tenant is awake at this
-       point (the idle check only runs after a successful cron wake), so
-       the gateway should respond. This catches schedule changes that
-       happened during the wake window — the snapshot would miss them.
-    2. ``tenant.cron_jobs_snapshot`` if the live call raises. Stale by
-       design (point-in-time at the last hibernation), but better than
-       nothing if the gateway is briefly unreachable.
-    3. ``None`` if both fail. Caller hibernates conservatively.
+    Requires a live ``cron.list``. A snapshot cannot prove that no cron is
+    due now, so gateway failures propagate to the caller to defer this cycle.
 
     Reads ``state.nextRunAtMs`` directly (the gateway's actual field
     location — see plugin-sdk's ``Cron.JobState``) rather than calling
@@ -336,26 +332,14 @@ def _next_cron_within_window(
     to fire from our perspective", which is the right conservative
     answer here.
     """
-    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.gateway_client import list_tenant_crons
     from apps.orchestrator.services import _extract_cron_jobs
 
-    jobs: list | None = None
+    if window_seconds is None:
+        window_seconds = _cron_hold_seconds()
 
-    try:
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
-        jobs = _extract_cron_jobs(result)
-    except GatewayError:
-        logger.warning(
-            "lookahead: live cron.list failed for tenant %s — falling back to snapshot",
-            str(tenant.id)[:8],
-            exc_info=True,
-        )
-
-    if not jobs:
-        snapshot = tenant.cron_jobs_snapshot or {}
-        snapshot_jobs = snapshot.get("jobs") if isinstance(snapshot, dict) else None
-        if isinstance(snapshot_jobs, list):
-            jobs = snapshot_jobs
+    result = list_tenant_crons(tenant, {"includeDisabled": False})
+    jobs = _extract_cron_jobs(result)
 
     if not jobs:
         return None
@@ -386,7 +370,7 @@ def _cron_active_or_imminent(
     """Return a skip reason if ``tenant`` has a cron mid-flight or about to
     fire within ``window_seconds`` — else ``None``.
 
-    Used by the hourly sweeps (``hibernate_idle_tenants_task``,
+    Used by the periodic sweeps (``hibernate_idle_tenants_task``,
     ``apply_pending_configs``'s image batch) to defer a tenant when killing
     the container right now would interrupt a user-visible cron run. The
     existing backward-looking ``cron_wake_at`` guard only catches tenants
@@ -402,23 +386,24 @@ def _cron_active_or_imminent(
        the in-process cron dispatch.
 
     Single live ``cron.list`` services both checks. Conservative on
-    failure: returns ``None`` (don't block the sweep) if the gateway is
-    unreachable — the 2h idle cutoff and ``cron_wake_at`` still act as
-    backstops, and the next sweep will retry.
+    failure: returns ``cron_state_unknown`` if the gateway cannot be read.
+    Both hibernation and image replacement must defer for this cycle;
+    unknown cron state is not permission to stop the container.
     """
-    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.orchestrator.services import _extract_cron_jobs
 
     try:
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": False})
+        result = list_tenant_crons(tenant, {"includeDisabled": False})
         jobs = _extract_cron_jobs(result)
     except GatewayError:
         logger.warning(
-            "defer-for-cron: live cron.list failed for tenant %s — proceeding without deferral",
-            str(tenant.id)[:8],
+            "defer-for-cron: live cron.list failed for tenant %s — deferring hibernation/image replacement "
+            "(cron_state_unknown)",
+            tenant.id,
             exc_info=True,
         )
-        return None
+        return "cron_state_unknown"
 
     if not jobs:
         return None
@@ -450,10 +435,30 @@ def _cron_active_or_imminent(
     return None
 
 
-def wake_hibernated_tenant(tenant: Tenant) -> bool:
+def _update_tenant_after_azure(tenant_id, *, filters=None, **updates) -> int:
+    """Persist wake status after a long Azure call, retrying one stale connection."""
+    filters = filters or {}
+    try:
+        return Tenant.objects.filter(pk=tenant_id, **filters).update(**updates)
+    except (OperationalError, InterfaceError):
+        from django.db import connection
+
+        from apps.tenants.middleware import set_rls_context
+
+        logger.warning(
+            "idle_wake: DB connection died during Azure wake — reconnecting + retrying status update for %s",
+            str(tenant_id)[:8],
+        )
+        connection.close()
+        set_rls_context(service_role=True)
+        return Tenant.objects.filter(pk=tenant_id, **filters).update(**updates)
+
+
+def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
     """Wake a hibernated tenant's container and schedule follow-up tasks.
 
-    Returns True on success.
+    Returns True on success. A cron wake stamps ``cron_wake_at`` in the
+    conditional update that claims the hibernated row, before Azure starts.
 
     Image refresh on wake: if the latest image tag (``OPENCLAW_IMAGE_TAG``)
     differs from the tenant's stored ``container_image_tag``, push the new
@@ -463,6 +468,23 @@ def wake_hibernated_tenant(tenant: Tenant) -> bool:
     tenants come back stale because fleet rollouts skip them.
     """
     tid = str(tenant.id)[:8]
+    original_hibernated_at = tenant.hibernated_at
+    original_cron_wake_at = tenant.cron_wake_at
+
+    wake_updates = {"hibernated_at": None}
+    if cron_wake:
+        wake_updates["cron_wake_at"] = timezone.now()
+    try:
+        claimed = Tenant.objects.filter(pk=tenant.pk, hibernated_at__isnull=False).update(**wake_updates)
+    except Exception:
+        logger.exception("idle_wake: failed to claim hibernated tenant %s", tid)
+        return False
+
+    if cron_wake and not claimed:
+        Tenant.objects.filter(pk=tenant.pk).update(cron_wake_at=timezone.now())
+
+    if not claimed:
+        logger.info("idle_wake: tenant %s already claimed; waiting on the existing wake", tid)
 
     # Tracks whether the image refresh below moved openclaw_version (the field
     # that drives config SCHEMA generation). When it does, step 3 must force a
@@ -470,66 +492,117 @@ def wake_hibernated_tenant(tenant: Tenant) -> bool:
     # container reads it — otherwise the just-deployed image boots against a
     # stale-schema config and crash-loops on "agents.defaults: Invalid input".
     version_synced = False
+    # Set when step 1 swapped the image; step 6 schedules its health check.
+    refreshed_from_image = None
 
-    # 1. Wake the container — image-refresh path takes priority over plain wake
-    try:
-        from django.conf import settings as django_settings
+    # 1. The claimant wakes the container. A concurrent caller skips Azure and
+    # joins the same follow-up path below.
+    if claimed:
+        try:
+            status_updates = {"last_wake_at": timezone.now()}
 
-        from apps.orchestrator.azure_client import (
-            ensure_plugin_runtime_deps_mount,
-            update_container_image,
-            wake_container_app,
-        )
-        from apps.orchestrator.tool_policy import openclaw_version_for_image_tag
+            # Image-refresh path takes priority over plain wake.
+            from django.conf import settings as django_settings
 
-        desired_tag = getattr(django_settings, "OPENCLAW_IMAGE_TAG", "latest") or "latest"
-        current_tag = tenant.container_image_tag or ""
-        needs_image_refresh = desired_tag != "latest" and current_tag != desired_tag
-
-        if needs_image_refresh:
-            # update_container_image bakes the EmptyDir mount into the same
-            # revision as the image bump, so a single restart lands both.
-            registry = getattr(django_settings, "AZURE_ACR_SERVER", "nbhdunited.azurecr.io")
-            desired_image = f"{registry}/nbhd-openclaw:{desired_tag}"
-            update_container_image(tenant.container_id, desired_image)
-
-            # Keep openclaw_version (config SCHEMA) in lockstep with the image
-            # we just deployed. Fleet version bumps skip hibernated tenants, so
-            # a tenant can wake onto a much newer image while its
-            # openclaw_version is stale; the next config it gets is then the
-            # wrong schema for the running image → crash loop. Mirror
-            # bump_openclaw_version_for_tenant (incident 2026-06-17: 44aaee8d
-            # woke onto 2026.5.28 with openclaw_version stuck at 2026.4.25).
-            new_version = openclaw_version_for_image_tag(desired_tag)
-            image_updates = {"container_image_tag": desired_tag}
-            if new_version and (tenant.openclaw_version or "") != new_version:
-                image_updates["openclaw_version"] = new_version
-                tenant.openclaw_version = new_version  # in-memory sync for step 3
-                version_synced = True
-            Tenant.objects.filter(id=tenant.id).update(**image_updates)
-            tenant.container_image_tag = desired_tag
-            logger.info(
-                "idle_wake: refreshed image for %s (%s -> %s, version -> %s)",
-                tid,
-                current_tag[:10] if current_tag else "?",
-                desired_tag[:10],
-                new_version,
+            from apps.orchestrator.azure_client import (
+                ensure_plugin_runtime_deps_mount,
+                update_container_image,
+                wake_container_app,
             )
-        elif ensure_plugin_runtime_deps_mount(tenant.container_id):
-            # In single-revision mode, adding the mount creates a new revision
-            # which auto-activates — that wakes the container too. No separate
-            # wake call needed.
-            logger.info("idle_wake: added plugin-runtime-deps mount and woke %s", tid)
-        else:
-            wake_container_app(tenant.container_id)
-    except Exception:
-        logger.exception("idle_wake: failed to wake container for %s", tid)
-        return False
+            from apps.orchestrator.image_rollout import image_rollout_allowed
+            from apps.orchestrator.runtime_guard import image_only_update_allowed
+            from apps.orchestrator.tool_policy import openclaw_version_for_image_tag
 
-    # 2. Clear hibernation flag; stamp the wake so the message drain can
-    # tell "still booting after a wake" (retry soon, keep delivery
-    # attempts) apart from a genuinely down container.
-    Tenant.objects.filter(id=tenant.id).update(hibernated_at=None, last_wake_at=timezone.now())
+            desired_tag = getattr(django_settings, "OPENCLAW_IMAGE_TAG", "latest") or "latest"
+            current_tag = tenant.container_image_tag or ""
+            # Gate the wake-time image refresh with the same per-tenant rollout
+            # allowlist as apply_pending_configs: a deploy bumps OPENCLAW_IMAGE_TAG,
+            # and a hibernated tenant waking must NOT auto-jump onto a not-yet-
+            # verified image (e.g. 2026.9.4, which bricks without the mount/oc-state
+            # retrofit) unless it's explicitly opted in. Default allows nobody.
+            #
+            # Two more guards: never retry a tag whose refresh already failed its
+            # health check here (``image_refresh_blocked_tag``), and only swap
+            # within the same OpenClaw family, checked against the LIVE Azure
+            # image (``image_only_update_allowed``) — a family jump is a
+            # migration, not a refresh.
+            #
+            # Only on a CRON wake: it runs ~4 min ahead of the cron, so nobody is
+            # waiting on the image pull + first boot. A wake for a person's
+            # message stays a plain wake (MJ 2026-09-29); that tenant upgrades at
+            # its next cron wake.
+            needs_image_refresh = (
+                cron_wake
+                and desired_tag != "latest"
+                and current_tag != desired_tag
+                and desired_tag != (tenant.image_refresh_blocked_tag or "")
+                and image_rollout_allowed(tenant.id)
+                and image_only_update_allowed(tenant, desired_tag)
+            )
+
+            if needs_image_refresh:
+                # Remember what is running now, so the post-wake health check can
+                # put it back if the new image never becomes ready.
+                previous_image = _live_openclaw_image(tenant.container_id)
+                # update_container_image bakes the EmptyDir mount into the same
+                # revision as the image bump, so a single restart lands both.
+                registry = getattr(django_settings, "AZURE_ACR_SERVER", "nbhdunited.azurecr.io")
+                desired_image = f"{registry}/nbhd-openclaw:{desired_tag}"
+                update_container_image(tenant.container_id, desired_image)
+                refreshed_from_image = previous_image
+
+                # Keep openclaw_version (config SCHEMA) in lockstep with the image
+                # we just deployed. Fleet version bumps skip hibernated tenants, so
+                # a tenant can wake onto a much newer image while its
+                # openclaw_version is stale; the next config it gets is then the
+                # wrong schema for the running image → crash loop. Mirror
+                # bump_openclaw_version_for_tenant (incident 2026-06-17: 44aaee8d
+                # woke onto 2026.5.28 with openclaw_version stuck at 2026.4.25).
+                new_version = openclaw_version_for_image_tag(desired_tag)
+                status_updates["container_image_tag"] = desired_tag
+                if new_version and (tenant.openclaw_version or "") != new_version:
+                    status_updates["openclaw_version"] = new_version
+                    tenant.openclaw_version = new_version  # in-memory sync for step 3
+                    version_synced = True
+                tenant.container_image_tag = desired_tag
+                logger.info(
+                    "idle_wake: refreshed image for %s (%s -> %s, version -> %s)",
+                    tid,
+                    current_tag[:10] if current_tag else "?",
+                    desired_tag[:10],
+                    new_version,
+                )
+            elif ensure_plugin_runtime_deps_mount(tenant.container_id):
+                # In single-revision mode, adding the mount creates a new revision
+                # which auto-activates — that wakes the container too. No separate
+                # wake call needed.
+                logger.info("idle_wake: added plugin-runtime-deps mount and woke %s", tid)
+            else:
+                wake_container_app(tenant.container_id)
+
+            # Azure LROs can leave the pooled DB connection idle long enough for
+            # the server to reap it. Reconnect, restore RLS, and retry once on the
+            # specific connection failures before continuing to config writes.
+            _update_tenant_after_azure(tenant.pk, **status_updates)
+        except Exception:
+            logger.exception("idle_wake: failed to wake container for %s", tid)
+            rollback_updates = {"hibernated_at": original_hibernated_at}
+            if cron_wake:
+                rollback_updates["cron_wake_at"] = original_cron_wake_at
+            try:
+                rolled_back = _update_tenant_after_azure(
+                    tenant.pk,
+                    filters={"hibernated_at__isnull": True},
+                    **rollback_updates,
+                )
+                logger.info("idle_wake: rolled back failed wake claim for %s (rows=%d)", tid, rolled_back)
+            except Exception:
+                logger.exception("idle_wake: failed to roll back wake claim for %s", tid)
+            return False
+
+    # 2. The hibernation flag (and cron stamp, when applicable) was committed
+    # together by the conditional claim before Azure. That closes the window in
+    # which the idle sweep could see an awake tenant with no cron activity.
 
     # 3. Apply pending config (writes to file share before container finishes
     # booting). Normally gated on pending>config, but two states need a forced
@@ -598,8 +671,100 @@ def wake_hibernated_tenant(tenant: Tenant) -> bool:
     except Exception:
         logger.exception("idle_wake: failed to schedule cron resume for %s", tid)
 
+    # 6. A refreshed image must prove it boots. The entrypoint gives the gateway
+    # up to 3 minutes; check after that and put the old image back if it never
+    # became ready (the 2026-09-28 Kiho case: a new revision that could not
+    # start while the user's traffic pointed at it).
+    if refreshed_from_image:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task(
+                "verify_wake_image_refresh",
+                str(tenant.id),
+                tenant.container_image_tag,
+                refreshed_from_image,
+                1,
+                delay_seconds=WAKE_IMAGE_VERIFY_DELAY_SECONDS,
+            )
+        except Exception:
+            logger.exception("idle_wake: failed to schedule image health check for %s", tid)
+
     logger.info("idle_wake: tenant %s wake initiated", tid)
     return True
+
+
+# Entrypoint gateway budget is 3 min after `doctor --fix`; allow boot + probe.
+WAKE_IMAGE_VERIFY_DELAY_SECONDS = 240
+WAKE_IMAGE_VERIFY_RETRY_SECONDS = 180
+WAKE_IMAGE_VERIFY_ATTEMPTS = 2
+
+
+def _live_openclaw_image(container_id: str) -> str | None:
+    """The ``openclaw`` container image Azure is actually serving (not the DB tag)."""
+    from django.conf import settings as django_settings
+
+    from apps.orchestrator.azure_client import get_container_client
+
+    app = get_container_client().container_apps.get(django_settings.AZURE_RESOURCE_GROUP, container_id)
+    for container in app.template.containers:
+        if container.name == "openclaw":
+            return container.image
+    return None
+
+
+def verify_wake_image_refresh_task(tenant_id: str, refreshed_tag: str, previous_image: str, attempt: int = 1) -> dict:
+    """Health check for a wake-time image refresh; reverts a refresh that never boots.
+
+    Ready means Azure's latest revision is also its latest READY revision. Not
+    ready after ``WAKE_IMAGE_VERIFY_ATTEMPTS`` checks ⇒ push ``previous_image``
+    back, record ``refreshed_tag`` in ``image_refresh_blocked_tag`` so no later
+    wake retries it, and log an error for the operator.
+    """
+    import re
+
+    from django.conf import settings as django_settings
+
+    from apps.orchestrator.azure_client import get_container_client, is_mock, update_container_image
+
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if tenant is None or not tenant.container_id or is_mock():
+        return {"status": "skipped"}
+    tid = str(tenant.id)[:8]
+    if tenant.container_image_tag != refreshed_tag:
+        return {"status": "superseded"}
+
+    app = get_container_client().container_apps.get(django_settings.AZURE_RESOURCE_GROUP, tenant.container_id)
+    if app.latest_revision_name and app.latest_revision_name == app.latest_ready_revision_name:
+        logger.info("wake_image_verify: %s ready on %s", tid, refreshed_tag[:18])
+        return {"status": "ready"}
+
+    if attempt < WAKE_IMAGE_VERIFY_ATTEMPTS:
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "verify_wake_image_refresh",
+            str(tenant.id),
+            refreshed_tag,
+            previous_image,
+            attempt + 1,
+            delay_seconds=WAKE_IMAGE_VERIFY_RETRY_SECONDS,
+        )
+        logger.warning("wake_image_verify: %s not ready on %s (attempt %d)", tid, refreshed_tag[:18], attempt)
+        return {"status": "retry"}
+
+    update_container_image(tenant.container_id, previous_image)
+    match = re.fullmatch(r"[^/]+/nbhd-openclaw:([^/@]+)(?:@sha256:[0-9a-f]{64})?", previous_image or "")
+    Tenant.objects.filter(pk=tenant.pk).update(
+        container_image_tag=match[1] if match else "",
+        image_refresh_blocked_tag=refreshed_tag,
+    )
+    logger.error(
+        "wake_image_verify: %s never became ready on %s — reverted to previous image and blocked the tag",
+        tid,
+        refreshed_tag[:18],
+    )
+    return {"status": "reverted"}
 
 
 # ---------------------------------------------------------------------------
@@ -697,9 +862,9 @@ def _write_deferred_state(tenant: Tenant, *, label: str) -> None:
 def wake_for_cron_task(tenant_id: str) -> dict:
     """Wake a hibernated tenant's container for a scheduled cron job.
 
-    Called by QStash ~2 minutes before the tenant's next cron is due.
-    After 30 minutes, if no user messages arrived, the container is
-    re-hibernated via ``check_cron_wake_idle_task``.
+    Called by QStash about four minutes before the tenant's next cron is due.
+    After the configured cron-wake idle window, if no user messages arrived,
+    the container is re-hibernated via ``check_cron_wake_idle_task``.
     """
     tenant = Tenant.objects.filter(id=tenant_id).first()
     if not tenant:
@@ -738,20 +903,17 @@ def wake_for_cron_task(tenant_id: str) -> dict:
         return {"status": "not_active"}
 
     # Wake the container (clears hibernated_at, resumes crons, delivers buffers)
-    if not wake_hibernated_tenant(tenant):
+    if not wake_hibernated_tenant(tenant, cron_wake=True):
         return {"status": "wake_failed"}
 
-    # Mark this as a cron-triggered wake
-    Tenant.objects.filter(id=tenant.id).update(cron_wake_at=timezone.now())
-
-    # Schedule idle check — if no user messages in 30 min, re-hibernate
+    # Schedule the configured idle check; re-hibernate if no user messages arrive.
     try:
         from apps.cron.publish import publish_task
 
         publish_task(
             "check_cron_wake_idle",
             str(tenant.id),
-            delay_seconds=_CRON_WAKE_IDLE_SECONDS,
+            delay_seconds=_cron_wake_idle_seconds(),
         )
     except Exception:
         logger.exception(
@@ -766,10 +928,10 @@ def wake_for_cron_task(tenant_id: str) -> dict:
 def check_cron_wake_idle_task(tenant_id: str) -> dict:
     """Check if a cron-woken tenant should be re-hibernated.
 
-    Called 30 minutes after a cron wake. If no user messages were sent
-    during the wake window, hibernate immediately (which also schedules
-    the next cron wake). If the user messaged, clear ``cron_wake_at``
-    and let normal idle detection handle it.
+    Called after the configured cron-wake idle window. If no user messages
+    were sent during the wake window, hibernate immediately (which also
+    schedules the next cron wake). If the user messaged, clear
+    ``cron_wake_at`` and let normal idle detection handle it.
     """
     tenant = Tenant.objects.filter(id=tenant_id).first()
     if not tenant:
@@ -789,11 +951,19 @@ def check_cron_wake_idle_task(tenant_id: str) -> dict:
         )
         return {"status": "already_hibernated"}
 
+    # An OpenClaw auto-upgrade holds this tenant awake and hibernates it
+    # itself once the run is safe; a mid-run hibernate would strand it.
+    from apps.orchestrator.openclaw_auto_upgrade import in_flight
+
+    if in_flight(tenant.id):
+        logger.info("check_cron_wake_idle: tenant %s is auto-upgrading, skipping", tenant_id[:8])
+        return {"status": "auto_upgrade_in_flight"}
+
     # Did the user send any messages since the cron wake?
     user_messaged = tenant.last_message_at and tenant.last_message_at > tenant.cron_wake_at
 
     if user_messaged:
-        # User is active — hand off to normal idle detection (2h threshold)
+        # User is active — hand off to normal configured idle detection.
         Tenant.objects.filter(id=tenant.id).update(cron_wake_at=None)
         logger.info(
             "check_cron_wake_idle: tenant %s has user activity, staying awake",
@@ -806,13 +976,32 @@ def check_cron_wake_idle_task(tenant_id: str) -> dict:
     # cold-start cycle. ``last_message_at`` doesn't move on cron output, so
     # without this check a back-to-back pattern (e.g. 7am + 8:30am) always
     # paid two cold-starts.
-    upcoming_cron_ms = _next_cron_within_window(tenant)
+    from apps.cron.gateway_client import GatewayError
+
+    try:
+        upcoming_cron_ms = _next_cron_within_window(tenant)
+    except GatewayError:
+        logger.warning(
+            "check_cron_wake_idle: cron state unknown for tenant %s — deferring re-hibernation",
+            tenant_id,
+            exc_info=True,
+        )
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task("check_cron_wake_idle", tenant_id, delay_seconds=_cron_wake_idle_seconds())
+        except Exception:
+            logger.warning(
+                "check_cron_wake_idle: failed to schedule deferred check for %s — leaving tenant awake",
+                tenant_id,
+                exc_info=True,
+            )
+        return {"status": "deferred_for_unknown_cron_state"}
     if upcoming_cron_ms is not None:
         now_ms = int(timezone.now().timestamp() * 1000)
-        # Re-check 30 min after the upcoming cron fires. If by then no
-        # further cron is due and the user hasn't messaged, we'll
-        # re-hibernate then.
-        delay_seconds = (upcoming_cron_ms - now_ms) // 1000 + _CRON_WAKE_IDLE_SECONDS
+        # Re-check one configured idle window after the upcoming cron fires.
+        # If no further cron is due and the user hasn't messaged, re-hibernate.
+        delay_seconds = (upcoming_cron_ms - now_ms) // 1000 + _cron_wake_idle_seconds()
         try:
             from apps.cron.publish import publish_task
 
@@ -826,8 +1015,9 @@ def check_cron_wake_idle_task(tenant_id: str) -> dict:
                 "check_cron_wake_idle: failed to schedule deferred check for %s",
                 tenant_id[:8],
             )
-            # Fall through to re-hibernate so we don't end up in a state
-            # with no future check pending.
+            # A publish failure is not permission to interrupt the upcoming
+            # cron. The periodic idle sweep will check this tenant again.
+            return {"status": "deferred_for_upcoming_cron"}
         else:
             logger.info(
                 "check_cron_wake_idle: tenant %s — upcoming cron in %ds, deferring re-hibernation (next check in %ds)",
@@ -837,7 +1027,30 @@ def check_cron_wake_idle_task(tenant_id: str) -> dict:
             )
             return {"status": "deferred_for_upcoming_cron"}
 
-    # No user activity, no upcoming cron — re-hibernate (this also
+    # A cron still mid-run (``runningAtMs`` set) must not be cut off: a long
+    # briefing can outlast the idle window, and hibernating now SIGTERMs it
+    # before the reply reaches the user (prod 2026-09-12, ~12 tenants/day at a
+    # 10-min window). Re-check shortly instead of waiting a full idle window.
+    defer_reason = _cron_active_or_imminent(tenant)
+    if defer_reason:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task("check_cron_wake_idle", str(tenant.id), delay_seconds=_CRON_DEFER_WINDOW_SECONDS)
+        except Exception:
+            logger.exception(
+                "check_cron_wake_idle: failed to schedule recheck for %s — idle sweep is the fallback",
+                tenant_id[:8],
+            )
+        logger.info(
+            "check_cron_wake_idle: tenant %s — %s, deferring re-hibernation %ds",
+            tenant_id[:8],
+            defer_reason,
+            _CRON_DEFER_WINDOW_SECONDS,
+        )
+        return {"status": f"deferred_{defer_reason}"}
+
+    # No user activity, no upcoming or running cron — re-hibernate (this also
     # schedules the next cron wake).
     logger.info(
         "check_cron_wake_idle: tenant %s idle after cron wake, re-hibernating",

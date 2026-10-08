@@ -91,6 +91,111 @@ class CronNameConflictError(TypedCronError):
         self.name = name
 
 
+def _is_cancellable_user_cron(cron: CronJob) -> bool:
+    from apps.cron.postgres_canonical import _classify_source
+    from apps.orchestrator.cron_reconcile import _is_unmanaged_cron
+
+    return (
+        cron.source in (CronJobSource.USER, CronJobSource.AGENT)
+        and cron.creation_path != CronCreationPath.INTERNAL
+        and _classify_source(cron.name) == CronJobSource.USER
+        # Pass the name: user-owned one-shots are deliberately unmanaged.
+        and not _is_unmanaged_cron(cron.name)
+        and cron.name != TASK_HYGIENE_CRON_NAME
+        and cron.pattern not in (CronPattern.DAILY_BRIEFING, CronPattern.WORKOUT_CONGRATS, CronPattern.TASK_HYGIENE)
+    )
+
+
+def reminder_summary(cron: CronJob) -> dict[str, Any]:
+    from apps.cron.gate import _humanize_schedule
+
+    schedule = (cron.data or {}).get("schedule") or {}
+    try:
+        human_schedule = _humanize_schedule(schedule)
+    except (TypeError, ValueError, AttributeError):
+        human_schedule = "Scheduled time"
+    return {"id": cron.pk, "name": cron.name, "schedule": human_schedule, "enabled": cron.enabled}
+
+
+def list_user_crons(tenant: Tenant, *, include_disabled: bool = False) -> list[dict[str, Any]]:
+    rows = CronJob.objects.filter(tenant=tenant, source__in=(CronJobSource.USER, CronJobSource.AGENT))
+    if not include_disabled:
+        rows = rows.filter(enabled=True)
+    return [reminder_summary(row) for row in rows.order_by("name", "id") if _is_cancellable_user_cron(row)]
+
+
+def cancel_user_cron(tenant: Tenant, cron_id: int, *, origin_stamp=None) -> dict[str, Any]:
+    """Persist reversible cancellation, then publish it through the tenant's cron path.
+
+    A failed publication leaves the row disabled. Retrying a cancellation always
+    republishes, including for already-disabled rows, so failure can converge.
+    """
+    from django.utils import timezone
+
+    from apps.actions.models import ActionAuditOutcome, CronDispatch
+    from apps.actions.services import record_action_audit
+    from apps.cron.gateway_client import GatewayError, cron_remove
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+    from apps.cron.signals import _enqueue_regen, suppress_cronjob_reconcile
+    from apps.orchestrator.migration_cron_fence import cron_edits_fenced
+
+    if cron_edits_fenced(tenant):
+        raise TypedCronError("Your assistant is updating. Try again in one minute.", code="assistant_updating")
+    if type(cron_id) is not int or cron_id <= 0:
+        raise TypedCronError("cron_id must be a positive integer", code="invalid_cron_id")
+
+    with transaction.atomic(), suppress_cronjob_reconcile():
+        cron = CronJob.objects.select_for_update().filter(tenant=tenant, pk=cron_id).first()
+        if cron is None or not _is_cancellable_user_cron(cron):
+            raise CronJob.DoesNotExist
+        already_cancelled = not cron.enabled
+        if not already_cancelled:
+            cron.enabled = False
+            cron.save(update_fields=["enabled", "updated_at"])
+            # Gated creates have an immutable action history. Append to that
+            # history; ungated/legacy creates use tool telemetry instead.
+            dispatch = CronDispatch.objects.select_related("action").filter(cron=cron).first()
+            if dispatch is not None:
+                record_action_audit(dispatch.action, ActionAuditOutcome.CANCELLED, responded_at=timezone.now())
+
+    try:
+        if tenant_uses_file_cron_sync(tenant):
+            write_tenant_crons_file(tenant)
+        elif tenant.postgres_cron_canonical and cron.managed and not _is_at_schedule((cron.data or {}).get("schedule")):
+            # Same debounced reconcile as a dashboard enabled=False edit.
+            # Explicit enqueue lets us surface publication failures and retry.
+            if not _enqueue_regen(str(tenant.id)):
+                raise GatewayError("Could not enqueue reminder cancellation")
+        elif cron.gateway_job_id:
+            cron_remove(tenant, job_id=cron.gateway_job_id)
+        else:
+            cron_remove(tenant, cron_name=cron.name)
+    except Exception as exc:
+        emit_tool_event(
+            tool_name="cron-cancel-reminder",
+            outcome="error",
+            namespace="cron",
+            tenant_id=tenant.id,
+            reason_code="propagation_failed",
+            detail={"cron_id": cron.pk},
+        )
+        raise GatewayError("Reminder cancellation could not be propagated; retry the cancel call.") from exc
+
+    emit_tool_event(
+        tool_name="cron-cancel-reminder",
+        outcome="accepted",
+        namespace="cron",
+        tenant_id=tenant.id,
+        detail={
+            "cron_id": cron.pk,
+            "already_cancelled": already_cancelled,
+            "origin_kind": getattr(origin_stamp, "kind", "unknown"),
+            "origin_run_id": getattr(origin_stamp, "run_id", ""),
+        },
+    )
+    return {**reminder_summary(cron), "cancelled": True, "already_cancelled": already_cancelled}
+
+
 def _is_at_schedule(schedule: dict[str, Any]) -> bool:
     return isinstance(schedule, dict) and schedule.get("kind") == "at"
 
@@ -313,6 +418,22 @@ def _push_at_cron_immediately(tenant: Tenant, cron: CronJob) -> None:
     and our ``cron_changed`` hook learns of the fire/delete.
     """
     from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    # 9.4 gates the gateway cron.add; publish the signed crons file (which
+    # includes this committed row) for the in-container helper, as gate.py does.
+    # A failed write raises GatewayError so callers keep their rollback contract.
+    if tenant_uses_file_cron_sync(tenant):
+        try:
+            write_tenant_crons_file(tenant)
+        except Exception as exc:
+            logger.exception(
+                "Immediate at-cron file publish failed (tenant=%s cron=%s)",
+                str(tenant.id)[:8],
+                cron.name,
+            )
+            raise GatewayError(f"crons file publish failed for tenant {tenant.id}") from exc
+        return
 
     try:
         result = invoke_gateway_tool(tenant, "cron.add", {"job": cron.data})

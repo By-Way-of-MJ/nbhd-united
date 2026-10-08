@@ -49,7 +49,20 @@ logger = logging.getLogger(__name__)
 #     this reconciler owned them, they'd be absent from ``desired_by_name``
 #     and get removed on every pass — a destructive flapping race against
 #     the fuel reconciler that just added them.
-_UNMANAGED_PREFIXES: tuple[str, ...] = ("_sync:", "_fuel:")
+_UNMANAGED_PREFIXES: tuple[str, ...] = (
+    "_sync:",
+    "_fuel:",
+    # OpenClaw 2026.9.4's gateway auto-provisions its own system-owned monitor
+    # crons — heartbeat-<agentId>, heartbeat-monitor-*, heartbeat-task:*, and
+    # skill-collection-review-<agentId> (usually disabled rows). Cron clients
+    # cannot remove them ("system-owned monitor jobs cannot be removed by cron
+    # clients"), so the reconciler MUST treat them as unmanaged or it errors on
+    # every pass and burns its per-pass removal budget. Our own heartbeat cron
+    # is "Heartbeat Check-in" (capitalized, spaced) — no collision with these
+    # lowercase-hyphen system names.
+    "heartbeat-",
+    "skill-collection-review-",
+)
 
 # Schedule kinds that the reconciler treats as unmanaged. ``kind:"at"`` is
 # a one-shot whose gateway-side default is ``deleteAfterRun=true`` — the
@@ -81,6 +94,132 @@ _AT_CRON_CATASTROPHIC_CAP = 200
 # tighter removal budget because they include the destructive half.
 MAX_OPS_PER_PASS = 25
 MAX_REMOVES_PER_PASS = 10
+
+
+def _complete_cron_observation(result: object) -> list[dict] | None:
+    """Return jobs only when the public tool's first page proves completeness.
+
+    The public cron tool ignores limit/offset and caps lists at 200 (see
+    post_reconcile.py). A full page is conservatively unknown, even if its
+    metadata claims completeness. Older unpaginated envelopes are accepted
+    below that limit. Never discard malformed entries when proving absence.
+
+    OpenClaw v2026.5.28 defaults limit to the job count (50 when empty):
+    https://github.com/openclaw/openclaw/blob/v2026.5.28/src/cron/service/ops.ts#L388-L400
+    Thus limit == len(jobs) is normal; total, offset, hasMore and nextOffset
+    provide completeness evidence at every envelope level present.
+    """
+    from .services import _extract_cron_jobs
+
+    jobs = _extract_cron_jobs(result)
+    if jobs is None or len(jobs) >= 200:
+        return None
+    if any(
+        not isinstance(job, dict)
+        or not isinstance(job.get("id") or job.get("jobId"), str)
+        or not (job.get("id") or job.get("jobId"))
+        or not isinstance(job.get("name"), str)
+        or not job["name"]
+        for job in jobs
+    ):
+        return None
+
+    # Check both envelope levels so wrapping cannot hide pagination hints.
+    envelopes = [result]
+    if isinstance(result, dict) and "details" in result:
+        envelopes.append(result["details"])
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            continue
+        if "total" in envelope and (type(envelope["total"]) is not int or envelope["total"] != len(jobs)):
+            return None
+        if "hasMore" in envelope and envelope["hasMore"] is not False:
+            return None
+        if "offset" in envelope and (type(envelope["offset"]) is not int or envelope["offset"] != 0):
+            return None
+        if envelope.get("nextOffset") is not None:
+            return None
+    return jobs
+
+
+def _remove_cron_or_verify(tenant: Tenant, job_id: str, *, replacement: dict | None = None) -> bool:
+    """Remove a job; return False only if a failed mutation already converged.
+
+    For recreation, convergence also requires exactly one current replacement
+    without drift. An absent old ID alone does not authorize another add: the
+    winning worker may still be between remove and add. Unresolved outcomes
+    raise GatewayError for the caller's error accounting and recovery.
+    """
+    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+
+    from .cron_drift import job_drift
+
+    try:
+        invoke_gateway_tool(tenant, "cron.remove", {"jobId": job_id}, error_log_level=logging.WARNING)
+        return True
+    except GatewayError as remove_exc:
+        if remove_exc.unavailable:
+            raise
+        verify_result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
+        jobs = _complete_cron_observation(verify_result)
+        unresolved = ""
+        if jobs is None:
+            unresolved = "verification list is invalid or incomplete"
+        elif str(job_id) in {job.get("id") or job.get("jobId") for job in jobs}:
+            unresolved = "job remains live after verification"
+        elif replacement is not None:
+            matches = [job for job in jobs if job["name"] == replacement["name"]]
+            if (
+                len(matches) != 1
+                or not isinstance(matches[0].get("schedule"), dict)
+                or not isinstance(matches[0].get("payload"), dict)
+                or job_drift(matches[0], replacement)
+            ):
+                unresolved = "old ID absent but replacement is missing, duplicated, or drifted/invalid"
+        if unresolved:
+            logger.error(
+                "regenerate_tenant_crons: cron.remove for %s on tenant %s unresolved: %s",
+                str(job_id)[:12],
+                tenant.id,
+                unresolved,
+            )
+            raise GatewayError(f"cron.remove unresolved: {unresolved}") from remove_exc
+        logger.info(
+            "regenerate_tenant_crons: cron.remove for %s on tenant %s converged after live verification%s",
+            str(job_id)[:12],
+            tenant.id,
+            " (replacement already present)" if replacement is not None else "",
+        )
+        return False
+
+
+def _schedule_remove_recovery(tenant: Tenant) -> None:
+    """Request one fresh pass after unresolved recreation removals."""
+    from django.conf import settings
+
+    from apps.cron.publish import publish_task
+
+    # publish_task executes synchronously without QStash; recursive retries
+    # would never let a persistent failure return. Leave that failure visible.
+    if not settings.QSTASH_TOKEN or not settings.API_BASE_URL:
+        logger.error(
+            "regenerate_tenant_crons: cannot schedule removal recovery for tenant %s: QStash is not configured",
+            tenant.id,
+        )
+        return
+    try:
+        # Coalesce concurrent losers independently of the signal debounce.
+        # The marker bounds recovery to one generation; QStash must not retry it.
+        publish_task(
+            "regenerate_tenant_crons",
+            str(tenant.id),
+            recovery=True,
+            idempotency_key=f"regen-cron-recovery-{tenant.id}",
+            delay_seconds=30,
+            retries=0,
+        )
+    except Exception:
+        logger.exception("regenerate_tenant_crons: failed to schedule removal recovery for tenant %s", tenant.id)
 
 
 def _is_unmanaged_cron(job: dict | str) -> bool:
@@ -286,7 +425,7 @@ def _row_to_cron_dict(row) -> dict:
     return job
 
 
-def regenerate_tenant_crons(tenant: Tenant) -> dict:
+def regenerate_tenant_crons(tenant: Tenant, *, recovery: bool = False) -> dict:
     """Reconcile container managed crons against the Postgres CronJob table.
 
     Postgres rows where ``managed=True`` are the desired set. The container's
@@ -303,6 +442,7 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
     Returns a dict with ``{added, removed, unchanged, errors, capped}`` for telemetry.
     No-op if the tenant is not on the Postgres-canonical flow (returns
     zeros without touching the gateway).
+    Recovery passes still count unresolved removals but never enqueue recovery.
     """
     from django.utils import timezone as django_tz
 
@@ -330,6 +470,27 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
             "regenerate_tenant_crons: tenant %s not on new flow — skipping",
             tenant.id,
         )
+        return summary
+
+    # OpenClaw 2026.9.4 gates the agent-tool gateway cron.* RPC path, so Django
+    # can no longer push crons over HTTP /tools/invoke. Deliver the desired set
+    # via a signed share file that the in-container helper applies with the
+    # ungated operator CLI. See apps/cron/share_cron_sync.py and
+    # CONTINUITY_openclaw_9_4_cron_sync.md.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
+    if tenant_uses_file_cron_sync(tenant):
+        from apps.cron.share_cron_sync import write_tenant_crons_file
+
+        try:
+            summary["file_synced"] = write_tenant_crons_file(tenant)
+        except Exception:
+            logger.warning(
+                "regenerate_tenant_crons: signed cron-file write failed for tenant %s",
+                tenant.id,
+                exc_info=True,
+            )
+            summary["errors"] = 1
         return summary
 
     all_desired_rows = list(CronJob.objects.filter(tenant=tenant, managed=True))
@@ -572,7 +733,7 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
         if not job_id:
             continue
         try:
-            invoke_gateway_tool(tenant, "cron.remove", {"jobId": job_id})
+            _remove_cron_or_verify(tenant, job_id)
             summary["removed"] += 1
         except GatewayError:
             logger.warning(
@@ -583,12 +744,28 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
             )
             summary["errors"] += 1
 
+    retry_recreation = False
     for name, existing, desired in to_recreate:
         gateway_job_id = existing.get("id") or existing.get("jobId") or ""
+        if gateway_job_id:
+            try:
+                removed_here = _remove_cron_or_verify(tenant, gateway_job_id, replacement=desired)
+            except GatewayError as exc:
+                logger.warning(
+                    "regenerate_tenant_crons: recreate removal unresolved for '%s' on tenant %s (recovery=%s)",
+                    name,
+                    tenant.id,
+                    recovery,
+                    exc_info=True,
+                )
+                summary["errors"] += 1
+                retry_recreation = retry_recreation or not exc.unavailable
+                continue
+        else:
+            removed_here = True
         try:
-            if gateway_job_id:
-                invoke_gateway_tool(tenant, "cron.remove", {"jobId": gateway_job_id})
-            invoke_gateway_tool(tenant, "cron.add", {"job": desired})
+            if removed_here:
+                invoke_gateway_tool(tenant, "cron.add", {"job": desired})
             summary["recreated"] += 1
             row = desired_rows_by_name.get(name)
             if row is not None:
@@ -602,13 +779,16 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
             )
             summary["errors"] += 1
 
+    if retry_recreation and not recovery:
+        _schedule_remove_recovery(tenant)
+
     reaped_ids: set[str] = set()
     for job in stuck_at_jobs:
         job_id = job.get("id") or job.get("jobId", "")
         if not job_id:
             continue
         try:
-            invoke_gateway_tool(tenant, "cron.remove", {"jobId": job_id})
+            _remove_cron_or_verify(tenant, job_id)
             summary["stuck_reaped"] += 1
             reaped_ids.add(str(job_id))
         except GatewayError:
@@ -633,7 +813,7 @@ def regenerate_tenant_crons(tenant: Tenant) -> dict:
             if not job_id:
                 continue
             try:
-                invoke_gateway_tool(tenant, "cron.remove", {"jobId": job_id})
+                _remove_cron_or_verify(tenant, job_id)
                 summary["cap_reaped"] += 1
                 reaped_ids.add(str(job_id))
             except GatewayError:

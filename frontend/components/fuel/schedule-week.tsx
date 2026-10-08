@@ -8,8 +8,8 @@ import {
   useScheduleWindowQuery,
   useSkipWorkoutMutation,
 } from "@/lib/queries";
+import { dayLabel, formatNextUpLabel, isOverdueLabel } from "@/lib/fuel-relative";
 import type { FuelWorkout, WorkoutCategory } from "@/lib/types";
-import { StatusPill } from "@/components/status-pill";
 import { SkelBar } from "@/components/ui/skeleton";
 import { CATEGORIES } from "./category-meta";
 
@@ -17,9 +17,6 @@ interface ScheduleWeekProps {
   onAddSession: (date: string) => void;
   onOpenWorkout: (id: string) => void;
 }
-
-const DAY_LABEL_LONG = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const DAY_LABEL_SHORT = ["M", "T", "W", "T", "F", "S", "S"];
 
 function isoDate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -47,7 +44,6 @@ export function ScheduleWeek({ onAddSession, onOpenWorkout }: ScheduleWeekProps)
   const { data, isLoading, isPending } = useScheduleWindowQuery("7d");
 
   const days = useMemo(() => nextSevenDays(), []);
-  const todayIso = days[0].iso;
 
   const byDate = useMemo(() => {
     const m: Record<string, FuelWorkout[]> = {};
@@ -87,217 +83,90 @@ export function ScheduleWeek({ onAddSession, onOpenWorkout }: ScheduleWeekProps)
       ) : null}
 
       <div className="flex items-center justify-between gap-3">
-        <h2 className="font-headline text-base sm:text-lg font-semibold text-ink">Next 7 days</h2>
+        <h2 data-os-label className="font-headline text-base sm:text-lg font-semibold text-ink">Next 7 days</h2>
         {isLoading && data && (
           <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink-faint">syncing…</span>
         )}
       </div>
 
-      {/* Mobile: today card + compact rows for the rest of the week. All 7 days visible at once. */}
-      <div className="space-y-2 sm:hidden">
-        <DayCard
-          iso={days[0].iso}
-          date={days[0].date}
-          sessions={byDate[days[0].iso] || []}
-          isToday
-          onAddSession={onAddSession}
-          onOpenWorkout={onOpenWorkout}
-        />
-        {days.slice(1).map(({ iso, date }) => (
+      {/* One agenda list, top to bottom in date order, one row per day. */}
+      <ol className="border-t border-border">
+        {days.map(({ iso, date }, i) => (
           <DayRow
             key={iso}
             iso={iso}
             date={date}
+            isToday={i === 0}
             sessions={byDate[iso] || []}
             onAddSession={onAddSession}
             onOpenWorkout={onOpenWorkout}
           />
         ))}
-      </div>
-
-      {/* sm: 2-up; lg: 3-up; xl+: 4-up. All 7 days visible in 2 rows at xl. */}
-      <div className="hidden sm:grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-        {days.map(({ iso, date }) => (
-          <DayCard
-            key={iso}
-            iso={iso}
-            date={date}
-            sessions={byDate[iso] || []}
-            isToday={iso === todayIso}
-            onAddSession={onAddSession}
-            onOpenWorkout={onOpenWorkout}
-          />
-        ))}
-      </div>
+      </ol>
     </div>
-  );
-}
-
-interface DayCardProps {
-  iso: string;
-  date: Date;
-  sessions: FuelWorkout[];
-  isToday: boolean;
-  onAddSession: (iso: string) => void;
-  onOpenWorkout: (id: string) => void;
-}
-
-function DayCard({ iso, date, sessions, isToday, onAddSession, onOpenWorkout }: DayCardProps) {
-  const dow = (date.getDay() + 6) % 7; // Mon = 0
-  return (
-    <article
-      className={`rounded-panel border border-border bg-card/95 backdrop-blur-md p-4 shadow-panel ${
-        isToday ? "ring-1 ring-accent/30" : ""
-      }`}
-    >
-      <header className="flex items-baseline justify-between gap-2 mb-3">
-        <div className="flex items-baseline gap-2 min-w-0">
-          <span
-            className={`font-mono text-[10px] uppercase tracking-[0.2em] ${
-              isToday ? "text-accent" : "text-ink-faint"
-            }`}
-          >
-            <span>{DAY_LABEL_LONG[dow]}</span>
-          </span>
-          <span className="font-headline text-base font-semibold text-ink">{date.getDate()}</span>
-          {isToday && (
-            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-accent">today</span>
-          )}
-        </div>
-        <button
-          type="button"
-          aria-label={`Add a session on ${date.toDateString()}`}
-          onClick={() => onAddSession(iso)}
-          className="-mr-1.5 inline-flex h-8 w-8 items-center justify-center rounded-full text-ink-faint transition hover:bg-surface-hover hover:text-ink active:scale-95"
-        >
-          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M12 5v14M5 12h14" strokeLinecap="round" />
-          </svg>
-        </button>
-      </header>
-
-      <div className="space-y-2">
-        {sessions.length === 0 ? (
-          <button
-            type="button"
-            onClick={() => onAddSession(iso)}
-            className="block w-full rounded-lg border border-dashed border-border px-3 py-3 text-xs text-ink-faint transition hover:bg-surface-hover hover:text-ink"
-          >
-            Rest day · tap to add
-          </button>
-        ) : (
-          sessions.map((s, i) => (
-            <SessionCard
-              key={s.id}
-              workout={s}
-              onOpen={() => onOpenWorkout(s.id)}
-              autoFocus={isToday && i === 0}
-            />
-          ))
-        )}
-      </div>
-    </article>
   );
 }
 
 interface DayRowProps {
   iso: string;
   date: Date;
+  isToday: boolean;
   sessions: FuelWorkout[];
   onAddSession: (iso: string) => void;
   onOpenWorkout: (id: string) => void;
 }
 
-function DayRow({ iso, date, sessions, onAddSession, onOpenWorkout }: DayRowProps) {
-  const dow = (date.getDay() + 6) % 7;
-  const first = sessions[0];
-  const empty = !first;
-  const cat = first ? CATEGORIES[first.category as WorkoutCategory] ?? CATEGORIES.other : null;
-  const time = first?.scheduled_at ? formatTime(first.scheduled_at) : null;
-  const isDone = first?.status === "done";
-
-  const handleClick = () => {
-    if (empty) onAddSession(iso);
-    else onOpenWorkout(first.id);
-  };
-
-  return (
+function DayRow({ iso, date, isToday, sessions, onAddSession, onOpenWorkout }: DayRowProps) {
+  const label = dayLabel(date, new Date());
+  const showDate = label === "Today" || label === "Tomorrow";
+  const addButton = (
     <button
       type="button"
-      onClick={handleClick}
-      aria-label={
-        empty
-          ? `Add a session on ${date.toDateString()}`
-          : `Open ${first.activity} on ${date.toDateString()}`
-      }
-      className="group w-full flex items-center gap-3 rounded-lg border border-border bg-surface-elevated/70 px-3 py-2.5 text-left transition hover:border-border-strong hover:bg-surface-hover min-h-[56px]"
+      aria-label={`Add a session on ${date.toDateString()}`}
+      onClick={() => onAddSession(iso)}
+      className="relative inline-flex items-center gap-1 rounded-md px-1 py-0.5 text-xs text-ink-faint transition hover:text-ink before:absolute before:-inset-x-2 before:-inset-y-3 before:content-[''] [@media(hover:hover)]:opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
     >
-      <div className="flex flex-col items-center justify-center w-10 shrink-0 leading-none">
-        <span className="font-mono text-[9px] uppercase tracking-[0.15em] text-ink-faint">
-          {DAY_LABEL_LONG[dow]}
-        </span>
-        <span className="mt-1 font-headline text-base font-semibold text-ink">
-          {date.getDate()}
-        </span>
+      <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+        <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+      </svg>
+      Add
+    </button>
+  );
+
+  return (
+    <li className="group grid grid-cols-[84px_minmax(0,1fr)] sm:grid-cols-[120px_minmax(0,1fr)] gap-x-4 border-b border-border py-4">
+      <div className="min-w-0 pt-0.5">
+        <div className={`text-sm font-semibold ${isToday ? "text-accent" : "text-ink"}`}>{label}</div>
+        {showDate && (
+          <div className="mt-0.5 text-xs text-ink-faint">
+            {date.toLocaleDateString(undefined, { weekday: "short" })} {date.getDate()}
+          </div>
+        )}
       </div>
-      {cat && (
-        <span
-          className="h-9 w-0.5 rounded-full shrink-0"
-          style={{ background: cat.accent, opacity: 0.7 }}
-          aria-hidden="true"
-        />
-      )}
-      <div className={`flex-1 min-w-0 ${isDone ? "opacity-60" : ""}`}>
-        {empty ? (
-          <span className="text-sm text-ink-faint">Rest day</span>
+      <div className="min-w-0">
+        {sessions.length === 0 ? (
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm text-ink-faint">Rest day</span>
+            {addButton}
+          </div>
         ) : (
           <>
-            <div className="flex items-center gap-2 min-w-0">
-              {time && (
-                <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-ink-faint shrink-0">
-                  {time}
-                </span>
-              )}
-              <span className="truncate text-sm font-medium text-ink">{first.activity}</span>
+            <div className="space-y-1">
+              {sessions.map((s) => (
+                <SessionItem key={s.id} workout={s} onOpen={() => onOpenWorkout(s.id)} />
+              ))}
             </div>
-            <div className="text-[11px] text-ink-muted mt-0.5 flex items-center gap-1.5 flex-wrap">
-              <span className="capitalize">{first.category}</span>
-              {first.duration_minutes && <span>· {first.duration_minutes}m</span>}
-              {sessions.length > 1 && <span>· +{sessions.length - 1} more</span>}
-            </div>
+            <div className="mt-1">{addButton}</div>
           </>
         )}
       </div>
-      {empty ? (
-        <svg
-          viewBox="0 0 24 24"
-          className="shrink-0 h-4 w-4 text-ink-faint group-hover:text-ink"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          aria-hidden="true"
-        >
-          <path d="M12 5v14M5 12h14" strokeLinecap="round" />
-        </svg>
-      ) : (
-        <svg
-          viewBox="0 0 24 24"
-          className="shrink-0 h-3.5 w-3.5 text-ink-faint group-hover:text-ink"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.8"
-          aria-hidden="true"
-        >
-          <path d="m9 18 6-6-6-6" />
-        </svg>
-      )}
-    </button>
+    </li>
   );
 }
 
 function NextUpSkeleton() {
   return (
-    <section
+    <section data-os-surface
       aria-busy="true"
       role="status"
       aria-label="Loading next workout"
@@ -331,44 +200,6 @@ interface NextUpBannerProps {
   onOpen: () => void;
 }
 
-function formatRelative(scheduledAt: string | null, fallbackDate: string, now: number): string {
-  const target = scheduledAt
-    ? new Date(scheduledAt).getTime()
-    : new Date(fallbackDate + "T00:00:00").getTime();
-  const diffMs = target - now;
-  const diffMin = Math.round(diffMs / 60_000);
-  if (diffMin < -120) {
-    const d = new Date(target);
-    return `was ${d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
-  }
-  if (diffMin < 0) return "overdue";
-  if (diffMin < 5) return "starting soon";
-  if (diffMin < 60) return `in ${diffMin} min`;
-  const target_d = new Date(target);
-  const today = new Date(now);
-  const isToday =
-    target_d.getFullYear() === today.getFullYear() &&
-    target_d.getMonth() === today.getMonth() &&
-    target_d.getDate() === today.getDate();
-  if (isToday) {
-    return `today at ${target_d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
-  }
-  const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const isTomorrow =
-    target_d.getFullYear() === tomorrow.getFullYear() &&
-    target_d.getMonth() === tomorrow.getMonth() &&
-    target_d.getDate() === tomorrow.getDate();
-  if (isTomorrow) {
-    return `tomorrow at ${target_d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
-  }
-  return target_d.toLocaleString(undefined, {
-    weekday: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
 function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -392,8 +223,8 @@ function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
 
   const display = justCompleted ?? workout;
   const cat = CATEGORIES[display.category as WorkoutCategory] ?? CATEGORIES.other;
-  const relative = formatRelative(display.scheduled_at, display.date, now);
-  const isOverdue = relative === "overdue" || relative.startsWith("was ");
+  const relative = formatNextUpLabel(display.scheduled_at, display.date, now);
+  const isOverdue = isOverdueLabel(relative);
 
   const onComplete = () => {
     const target = workout;
@@ -406,7 +237,7 @@ function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
   };
 
   return (
-    <section
+    <section data-os-surface
       aria-label="Next workout"
       className="
         rounded-panel border border-border bg-card/95 p-4 sm:p-5 shadow-panel backdrop-blur-md
@@ -500,40 +331,31 @@ function NextUpBanner({ workout, onOpen }: NextUpBannerProps) {
   );
 }
 
-interface SessionCardProps {
-  workout: FuelWorkout;
-  onOpen: () => void;
-  autoFocus?: boolean;
-}
-
-function SessionCard({ workout, onOpen }: SessionCardProps) {
+function SessionItem({ workout, onOpen }: { workout: FuelWorkout; onOpen: () => void }) {
   const time = formatTime(workout.scheduled_at);
   const cat = CATEGORIES[workout.category as WorkoutCategory] ?? CATEGORIES.other;
-  const accentBorder = { borderLeftColor: cat.accent };
+  const isDone = workout.status === "done";
+  const meta = [
+    time,
+    cat.label,
+    workout.duration_minutes ? `${workout.duration_minutes}m` : null,
+  ].filter(Boolean);
 
   return (
-    <div
-      className="group relative flex items-center gap-2.5 rounded-lg border border-border border-l-2 bg-surface/60 pl-3 pr-1 py-2 transition hover:bg-surface-hover"
-      style={accentBorder}
-    >
+    <div className="flex items-start gap-2">
       <button
         type="button"
         onClick={onOpen}
-        className="flex flex-1 min-w-0 flex-col items-start text-left min-h-[44px]"
+        className="min-w-0 flex-1 py-1 text-left"
       >
-        <div className="flex items-baseline gap-2 min-w-0">
-          {time && (
-            <span className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink-faint shrink-0">
-              {time}
-            </span>
-          )}
-          <span className="truncate text-sm font-medium text-ink">{workout.activity}</span>
-        </div>
-        <div className="mt-0.5 flex items-center gap-2 text-[11px] text-ink-muted">
-          <span className="capitalize">{workout.category}</span>
-          {workout.duration_minutes && <span>· {workout.duration_minutes}m</span>}
-          {workout.status !== "planned" && <StatusPill status={workout.status} size="sm" />}
-        </div>
+        <span className={`block text-sm font-medium ${isDone ? "text-ink-muted" : "text-ink"}`}>
+          {workout.activity}
+        </span>
+        <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-xs text-ink-muted">
+          <span>{meta.join(" · ")}</span>
+          {isDone && <span className="font-medium text-emerald-text">Done</span>}
+          {workout.status === "skipped" && <span className="text-ink-faint">Skipped</span>}
+        </span>
       </button>
       <SessionMenu workout={workout} />
     </div>
@@ -562,7 +384,7 @@ function SessionMenu({ workout }: { workout: FuelWorkout }) {
         aria-label="Session actions"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-ink-faint transition hover:bg-surface-hover hover:text-ink"
+        className="relative inline-flex h-8 w-8 items-center justify-center rounded-md text-ink-faint transition before:absolute before:-inset-1.5 before:content-[''] hover:bg-surface-hover hover:text-ink"
       >
         <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden="true">
           <circle cx="5" cy="12" r="1.5" />

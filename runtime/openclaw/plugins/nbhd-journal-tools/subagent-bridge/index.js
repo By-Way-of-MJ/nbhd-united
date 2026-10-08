@@ -283,7 +283,7 @@ export default function register(api) {
   const runtime = getRuntimeConfig(api);
   const markedRuns = new Map();
   const successfulSendRuns = new Set();
-  safeLog(api, "info", "nbhd-subagent-bridge: registered");
+  safeLog(api, "warn", "nbhd-subagent-bridge: registered");
 
   api.on("before_tool_call", (event, ctx) => {
     let realToolId = "";
@@ -326,7 +326,11 @@ export default function register(api) {
     return undefined;
   });
 
-  api.on("before_agent_start", (event, ctx) => {
+  // OpenClaw 2026.9.4 removed the before_agent_start hook. before_prompt_build is
+  // the 2026.9.4 prompt hook that fires before the run, receives the current
+  // prompt (event.prompt) + ctx.runId/ctx.sessionKey, and (unlike the gate-only
+  // before_agent_run) supports returning appendContext for prompt injection.
+  api.on("before_prompt_build", (event, ctx) => {
     try {
       const runId = asTrimmedString(ctx?.runId || event?.runId);
       const parsed = parseAnnounceTurn(event?.prompt, ctx?.sessionKey);

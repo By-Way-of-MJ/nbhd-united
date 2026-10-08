@@ -32,6 +32,7 @@ import {
   ProvisioningStatus,
   WeeklyReview,
   Lesson,
+  LessonSearchResult,
   ConstellationData,
   CreditsResponse,
 } from "@/lib/types";
@@ -199,6 +200,14 @@ async function apiFetch<T>(
   options: ApiFetchOptions = {},
 ): Promise<T> {
   const { anonymous = false, timeoutMs } = options;
+  // DEV-ONLY fixture API for local screenshots (see lib/dev-fixtures.ts). Both
+  // conditions are inlined at build time, so production drops this branch and
+  // never bundles the fixture module.
+  if (process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_WEB_FIXTURES === "1") {
+    const { fixtureResponse } = await import("./dev-fixtures");
+    const hit = fixtureResponse(path, init);
+    if (hit !== undefined) return hit as T;
+  }
   const timeoutController = timeoutMs === undefined
     ? undefined
     : new AbortController();
@@ -437,10 +446,16 @@ export async function signup(
   email: string,
   password: string,
   displayName?: string,
+  source?: "web" | "ios_handoff",
 ): Promise<{ access: string; refresh: string }> {
   return apiFetch<{ access: string; refresh: string }>("/api/v1/auth/signup/", {
     method: "POST",
-    body: JSON.stringify({ email, password, display_name: displayName }),
+    body: JSON.stringify({
+      email,
+      password,
+      display_name: displayName,
+      ...(source === undefined ? {} : { source }),
+    }),
   });
 }
 
@@ -520,7 +535,11 @@ export function fetchUsageSummary(): Promise<UsageSummary> {
 }
 
 export function fetchHorizons(): Promise<import("@/lib/types").HorizonsData> {
-  return apiFetch<import("@/lib/types").HorizonsData>("/api/v1/dashboard/horizons/");
+  // Mutations invalidate React Query and the server tag; bypass the browser's
+  // max-age cache too so a refetch immediately shows the saved checklist.
+  return apiFetch<import("@/lib/types").HorizonsData>("/api/v1/dashboard/horizons/", {
+    cache: "no-store",
+  });
 }
 
 // First page of the existing cross-channel chat feed. Keep the response
@@ -528,6 +547,56 @@ export function fetchHorizons(): Promise<import("@/lib/types").HorizonsData> {
 // wire shape changes or a field is absent.
 export function fetchChatMessagesFirstPage(): Promise<unknown> {
   return apiFetch<unknown>("/api/v1/chat/messages/");
+}
+
+// Assistant cards for the web Overview (read-only). The since-feed is
+// ascending from an opaque (created_at, id) keyset cursor; to read only the
+// recent window we start from a watermark `days` ago (same encoding the server
+// emits: base64url(JSON [iso, ""])) and page forward a bounded number of
+// times, keeping assistant rows that carry live panel references.
+export interface AssistantPanelRef {
+  kind: string;
+  params?: Record<string, unknown>;
+  title?: string;
+}
+
+export interface AssistantCardRow {
+  id: string;
+  text: string;
+  created_at: string;
+  source: string;
+  panels: AssistantPanelRef[];
+}
+
+function sinceCursor(daysAgo: number): string {
+  const at = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
+  const raw = JSON.stringify([at, ""]);
+  return btoa(raw).replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+export async function fetchRecentAssistantCards(days = 7, maxPages = 5): Promise<AssistantCardRow[]> {
+  let cursor: string | null = sinceCursor(days);
+  const cards: AssistantCardRow[] = [];
+  for (let page = 0; page < maxPages && cursor; page += 1) {
+    const qs: string = `?since=${encodeURIComponent(cursor)}&limit=100`;
+    const res: { messages?: unknown[]; cursor?: string | null } = await apiFetch(`/api/v1/chat/messages/${qs}`);
+    const rows = Array.isArray(res?.messages) ? res.messages : [];
+    for (const r of rows) {
+      const row = r as Partial<AssistantCardRow> & { role?: string };
+      if (row.role !== "assistant" || !Array.isArray(row.panels) || row.panels.length === 0) continue;
+      cards.push({
+        id: String(row.id ?? ""),
+        text: typeof row.text === "string" ? row.text : "",
+        created_at: String(row.created_at ?? ""),
+        source: String(row.source ?? ""),
+        panels: row.panels.filter((p): p is AssistantPanelRef => !!p && typeof (p as AssistantPanelRef).kind === "string"),
+      });
+    }
+    if (rows.length === 0 || !res?.cursor || res.cursor === cursor) break;
+    cursor = res.cursor;
+  }
+  // Newest first for display.
+  return cards.sort((a, b) => b.created_at.localeCompare(a.created_at));
 }
 
 // Journal current-status projection — live state derived from typed models
@@ -554,6 +623,24 @@ export function completeTask(taskId: string): Promise<unknown> {
 
 export function reopenTask(taskId: string): Promise<unknown> {
   return apiFetch<unknown>(`/api/v1/journal/tasks/${taskId}/reopen/`, { method: "POST" });
+}
+
+export function createGoalTask(data: { title: string; parent_goal_id: string }): Promise<unknown> {
+  return apiFetch<unknown>("/api/v1/journal/tasks/", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function updateGoalNotes(id: string, description: string): Promise<unknown> {
+  return apiFetch<unknown>(`/api/v1/journal/goals/${id}/`, {
+    method: "PATCH",
+    body: JSON.stringify({ description }),
+  });
+}
+
+export function achieveGoal(id: string): Promise<unknown> {
+  return apiFetch<unknown>(`/api/v1/journal/goals/${id}/achieve/`, { method: "POST" });
 }
 
 export function approveExtraction(id: string): Promise<{ id: string; status: string }> {
@@ -1228,6 +1315,11 @@ export function dismissLesson(id: number): Promise<Lesson> {
 
 export function deleteLesson(id: number): Promise<void> {
   return apiFetch<void>(`/api/v1/lessons/${id}/`, { method: "DELETE" });
+}
+
+/** GET /api/v1/lessons/search/?q=… — approved lessons ranked by meaning (embeddings). */
+export function searchLessons(q: string, limit = 20): Promise<LessonSearchResult[]> {
+  return apiFetch<LessonSearchResult[]>(`/api/v1/lessons/search/?q=${encodeURIComponent(q)}&limit=${limit}`);
 }
 
 export function fetchConstellation(): Promise<ConstellationData> {
@@ -2079,6 +2171,16 @@ export function fetchNeighborhood(): Promise<import("@/lib/types").NeighborhoodD
   return apiFetch<import("@/lib/types").NeighborhoodData>("/api/v1/friends/");
 }
 
+/** GET /api/v1/friends/home/ — neighbors with bond/sky/friends_since + waves. */
+export function fetchNeighborhoodHome(): Promise<import("@/lib/types").NeighborhoodHome> {
+  return apiFetch<import("@/lib/types").NeighborhoodHome>("/api/v1/friends/home/");
+}
+
+/** POST / DELETE /api/v1/friends/<id>/sky/ — add to / take out of MY sky (cap from the server). */
+export function setInMySky(friendshipId: string, inSky: boolean): Promise<unknown> {
+  return apiFetch(`/api/v1/friends/${friendshipId}/sky/`, { method: inSky ? "POST" : "DELETE" });
+}
+
 export function sendWave(data: {
   handle: string;
   note?: string;
@@ -2135,6 +2237,19 @@ export function createFriendInvite(
   return apiFetch<import("@/lib/types").FriendInvite>("/api/v1/friends/invites/", {
     method: "POST",
     body: JSON.stringify(data),
+  });
+}
+
+export function fetchFriendInvite(token: string): Promise<import("@/lib/types").FriendInvitePreview> {
+  return apiFetch(`/api/v1/friends/invites/${encodeURIComponent(token)}/`, undefined, {
+    anonymous: true,
+    timeoutMs: 15_000,
+  });
+}
+
+export function claimFriendInvite(token: string): Promise<import("@/lib/types").WaveResult> {
+  return apiFetch(`/api/v1/friends/invites/${encodeURIComponent(token)}/claim/`, {
+    method: "POST",
   });
 }
 
@@ -2441,9 +2556,17 @@ export function fetchMissions(): Promise<import("@/lib/types").MissionSummary[]>
   return apiFetch<import("@/lib/types").MissionSummary[]>("/api/v1/friends/missions/");
 }
 
+/** GET /api/v1/friends/missions/?include_invited=1 — joined missions plus open invitations. */
+export function fetchMissionAsks(): Promise<import("@/lib/types").MissionAsk[]> {
+  return apiFetch<import("@/lib/types").MissionAsk[]>("/api/v1/friends/missions/?include_invited=1");
+}
+
 /** POST /api/v1/friends/missions/ — create a 1:1 mission on an accepted friendship. */
 export function createMission(data: {
-  friendship_id: string;
+  // The legacy single neighbor, or (Projects v2) `member_friendship_ids` —
+  // any number of neighbors, an empty list for a solo project.
+  friendship_id?: string;
+  member_friendship_ids?: string[];
   title: string;
   description?: string;
   target?: import("@/lib/types").MissionTarget;
@@ -2511,6 +2634,13 @@ export function joinMission(
   });
 }
 
+/** POST /api/v1/friends/missions/<id>/decline/ — turn an invitation down. */
+export function declineMission(id: string): Promise<{ mission_id: string; status: string }> {
+  return apiFetch<{ mission_id: string; status: string }>(`/api/v1/friends/missions/${id}/decline/`, {
+    method: "POST",
+  });
+}
+
 export function leaveMission(id: string): Promise<{ mission_id: string; status: string }> {
   return apiFetch<{ mission_id: string; status: string }>(`/api/v1/friends/missions/${id}/leave/`, {
     method: "POST",
@@ -2573,6 +2703,9 @@ export function createCircle(data: {
   name: string;
   description?: string;
   hue?: number;
+  // Whether my assistant may learn from the conversation. The server's default
+  // is on, so the form always sends the person's explicit choice.
+  agent_absorb_enabled?: boolean;
 }): Promise<{ circle_id: string }> {
   return apiFetch<{ circle_id: string }>("/api/v1/friends/circles/", {
     method: "POST",
@@ -2582,10 +2715,10 @@ export function createCircle(data: {
 
 /** POST /api/v1/friends/circles/join/ {invite_code} — join via a code shared
  * by a neighbor already in the circle. */
-export function joinCircle(inviteCode: string): Promise<import("@/lib/types").CircleJoinResult> {
+export function joinCircle(inviteCode: string, agentAbsorbEnabled?: boolean): Promise<import("@/lib/types").CircleJoinResult> {
   return apiFetch<import("@/lib/types").CircleJoinResult>("/api/v1/friends/circles/join/", {
     method: "POST",
-    body: JSON.stringify({ invite_code: inviteCode }),
+    body: JSON.stringify(agentAbsorbEnabled === undefined ? { invite_code: inviteCode } : { invite_code: inviteCode, agent_absorb_enabled: agentAbsorbEnabled }),
   });
 }
 
@@ -2637,4 +2770,200 @@ export function regenerateInviteCode(circleId: string): Promise<{ circle_id: str
     `/api/v1/friends/circles/${circleId}/invite-code/`,
     { method: "POST" },
   );
+}
+
+/** GET /api/v1/datebook/agenda/?days=N — the owner's calendar projection (read-only). */
+export function fetchDatebookAgenda(days = 7): Promise<import("@/lib/types").DatebookAgenda> {
+  return apiFetch<import("@/lib/types").DatebookAgenda>(`/api/v1/datebook/agenda/?days=${days}`);
+}
+
+export interface TaskFilters {
+  status?: "open" | "done";
+  completed_after?: string;
+}
+
+export function fetchTasks(filters: TaskFilters = {}): Promise<import("./types").JournalTask[]> {
+  return apiFetch(`/api/v1/journal/tasks/?${new URLSearchParams({ ...filters })}`, { cache: "no-store" });
+}
+
+export function createTask(data: { title: string; due_date?: string | null; parent_goal_id?: string | null }): Promise<import("./types").JournalTask> {
+  return apiFetch("/api/v1/journal/tasks/", { method: "POST", body: JSON.stringify(data) });
+}
+
+export interface BlockReplacement { index: number; original: string; replacement: string }
+
+export class JournalBlockConflict extends Error {
+  readonly status = 409;
+  constructor(public document: DocumentResponse) {
+    super("This part changed while you were editing");
+    this.name = "JournalBlockConflict";
+  }
+}
+
+export async function replaceDocumentBlock(kind: string, slug: string, data: BlockReplacement): Promise<DocumentResponse> {
+  try {
+    return await apiFetch(`/api/v1/journal/documents/${kind}/${slug}/blocks/replace/`, { method: "POST", body: JSON.stringify(data) });
+  } catch (error) {
+    // apiFetch preserves the HTTP status and raw response body in Error.message.
+    if (error instanceof Error && (error as Error & { status?: number }).status === 409) {
+      let body;
+      try { body = JSON.parse(error.message); } catch { /* Other 409 guards are ordinary errors. */ }
+      if (body?.error === "block_changed" && typeof body.document?.markdown === "string") throw new JournalBlockConflict(body.document);
+    }
+    throw error;
+  }
+}
+
+/** Goal labels for tasks, including goals outside the active Horizons list. */
+export function fetchTaskGoals(): Promise<Array<{ id: string; title: string }>> {
+  return apiFetch("/api/v1/journal/goals/");
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// The shared plan and every write the project page makes to it. Every path is
+// under /api/v1/friends/ and 404s when the tenant isn't on the v2 allowlist.
+// The server is authoritative: each write is followed by a fresh plan read.
+
+const missionBase = (id: string) => `/api/v1/friends/missions/${id}/`;
+
+/** GET missions/<id>/plan/ — milestones, steps, who has what, what waits on what. */
+export function fetchProjectPlan(id: string): Promise<import("@/lib/types").ProjectPlanData> {
+  return apiFetch<import("@/lib/types").ProjectPlanData>(`${missionBase(id)}plan/`);
+}
+
+export interface StepBody {
+  title?: string;
+  description?: string;
+  start_date?: string | null;
+  due_date?: string | null;
+  milestone_id?: string | null;
+  order?: number;
+}
+
+export function createProjectStep(id: string, body: StepBody): Promise<{ step_id: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/`, { method: "POST", body: JSON.stringify(body) });
+}
+
+/** PATCH needs the step's current `version`; a stale one is a 409. */
+export function patchProjectStep(id: string, stepId: string, body: StepBody & { version: number }): Promise<{ step_id: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function deleteProjectStep(id: string, stepId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/`, { method: "DELETE" });
+}
+
+/** Ask members to take a step. Nothing reaches their journal until they say yes. */
+export function askProjectStep(id: string, stepId: string, membershipIds: string[]): Promise<{ step_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/ask/`, { method: "POST", body: JSON.stringify({ membership_ids: membershipIds }) });
+}
+
+export type StepAnswer =
+  | { answer: "yes" }
+  | { answer: "no" }
+  | { answer: "dates"; start?: string; due?: string }
+  | { answer: "smaller"; note: string };
+
+export function respondProjectStep(id: string, stepId: string, answer: StepAnswer): Promise<{ assignment_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/respond/`, { method: "POST", body: JSON.stringify(answer) });
+}
+
+export function setProjectStepDone(id: string, stepId: string, done: boolean): Promise<{ step_id: string; status: string; version: number }> {
+  return apiFetch(`${missionBase(id)}steps/${stepId}/${done ? "complete" : "reopen"}/`, { method: "POST", body: "{}" });
+}
+
+export interface MilestoneBody {
+  title: string;
+  target_date: string | null;
+  order?: number;
+}
+
+export function createProjectMilestone(id: string, body: MilestoneBody): Promise<{ milestone_id: string }> {
+  return apiFetch(`${missionBase(id)}milestones/`, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function patchProjectMilestone(id: string, milestoneId: string, body: MilestoneBody): Promise<{ milestone_id: string }> {
+  return apiFetch(`${missionBase(id)}milestones/${milestoneId}/`, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+/** Its steps stay in the project, under "Other steps". */
+export function deleteProjectMilestone(id: string, milestoneId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}milestones/${milestoneId}/`, { method: "DELETE" });
+}
+
+export function createProjectDependency(id: string, blockerId: string, blockedId: string): Promise<{ dependency_id: string }> {
+  return apiFetch(`${missionBase(id)}dependencies/`, { method: "POST", body: JSON.stringify({ blocker_id: blockerId, blocked_id: blockedId }) });
+}
+
+export function deleteProjectDependency(id: string, dependencyId: string): Promise<void> {
+  return apiFetch(`${missionBase(id)}dependencies/${dependencyId}/`, { method: "DELETE" });
+}
+
+/** PATCH missions/<id>/ {title, version} — rename (owners; 409 if someone got there first). */
+export function renameProject(id: string, title: string, version: number): Promise<{ mission_id: string; version: number; title: string }> {
+  return apiFetch(missionBase(id), { method: "PATCH", body: JSON.stringify({ title, version }) });
+}
+
+/** Invite more of my neighbors into a project I started; each still decides. */
+export function addProjectMembers(id: string, friendshipIds: string[]): Promise<{ invited: number }> {
+  return apiFetch(`${missionBase(id)}members/`, { method: "POST", body: JSON.stringify({ member_friendship_ids: friendshipIds }) });
+}
+
+/** An owner deletes the project for everyone. */
+export function deleteProject(id: string): Promise<{ mission_id: string; status: string }> {
+  return apiFetch(`${missionBase(id)}delete/`, { method: "POST", body: "{}" });
+}
+
+/** Link this project to one of my own Horizons goals (null clears). Only I ever see it. */
+export function setProjectLinkedGoal(id: string, goalId: string | null): Promise<{ linked_goal_id: string | null }> {
+  return apiFetch(`${missionBase(id)}membership/`, { method: "PATCH", body: JSON.stringify({ linked_goal_id: goalId }) });
+}
+
+/** My active Horizons goals, for "Part of my goal". */
+export async function fetchActiveGoals(): Promise<{ id: string; title: string }[]> {
+  const body = await apiFetch<unknown>("/api/v1/journal/goals/?status=active");
+  const rows = Array.isArray(body) ? body : ((body as { results?: unknown[] } | null)?.results ?? []);
+  return rows
+    .map((r) => r as { id?: unknown; title?: unknown })
+    .filter((r) => r.id !== undefined && r.id !== null)
+    .map((r) => ({ id: String(r.id), title: typeof r.title === "string" && r.title ? r.title : "Goal" }));
+}
+
+/** My assistant's pending suggestions (optionally for one project). */
+export function fetchProjectProposals(missionId?: string): Promise<import("@/lib/types").ProjectProposal[]> {
+  const qs = missionId ? `?mission_id=${encodeURIComponent(missionId)}` : "";
+  return apiFetch<import("@/lib/types").ProjectProposal[]>(`/api/v1/friends/project-proposals/${qs}`);
+}
+
+/** The human decides. Approving applies what the normal rules allow and reports the rest. */
+export function decideProjectProposal(proposalId: string, approve: boolean): Promise<{ status?: string; changes?: { outcome?: string }[] }> {
+  return apiFetch(`/api/v1/friends/project-proposals/${proposalId}/${approve ? "approve" : "reject"}/`, { method: "POST", body: "{}" });
+}
+
+export function fetchProjectDrafts(): Promise<import("@/lib/types").ProjectDraftSummary[]> {
+  return apiFetch<import("@/lib/types").ProjectDraftSummary[]>("/api/v1/friends/project-drafts/");
+}
+
+export function fetchProjectDraft(draftId: string): Promise<import("@/lib/types").ProjectDraftDetail> {
+  return apiFetch<import("@/lib/types").ProjectDraftDetail>(`/api/v1/friends/project-drafts/${draftId}/`);
+}
+
+/** Start the drafted project: the people it suggests are then asked, and they decide. */
+export function publishProjectDraft(draftId: string): Promise<{ mission_id?: string }> {
+  return apiFetch(`/api/v1/friends/project-drafts/${draftId}/publish/`, { method: "POST", body: "{}" });
+}
+
+export function discardProjectDraft(draftId: string): Promise<void> {
+  return apiFetch(`/api/v1/friends/project-drafts/${draftId}/`, { method: "DELETE" });
+}
+
+/**
+ * POST /api/v1/friends/report/ — report a cluster message. The server hides it
+ * for the reporter straight away and records it for review.
+ */
+export function reportFriendMessage(publicId: string, reason: string, detail: string): Promise<{ report_id: string; hidden: boolean }> {
+  return apiFetch("/api/v1/friends/report/", {
+    method: "POST",
+    body: JSON.stringify({ target_kind: "friend_message", target_id: publicId, reason, detail }),
+  });
 }

@@ -292,37 +292,55 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
         )
         return
 
-    # Phase 1: Snapshot current cron state before the restart wipes SQLite.
-    try:
-        from apps.cron.gateway_client import invoke_gateway_tool
-        from apps.orchestrator.services import _extract_cron_jobs
+    # A tag whose refresh already failed its boot health check (and was
+    # reverted) is not retried automatically; see verify_wake_image_refresh_task.
+    if desired_tag == (tenant.image_refresh_blocked_tag or ""):
+        logger.info("apply_single_tenant_image: %s is blocked for tenant %s — skipping", desired_tag, tenant_id[:8])
+        return
 
-        result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
-        jobs = _extract_cron_jobs(result)
-        if jobs is not None:
-            Tenant.objects.filter(id=tenant_id).update(
-                cron_jobs_snapshot={
-                    "jobs": jobs,
-                    "snapshot_at": timezone.now().isoformat(),
-                    "trigger": "pre-image-update",
-                    "image_tag": desired_tag,
-                },
-            )
-            logger.info(
-                "Pre-image cron snapshot saved for tenant %s (%d jobs)",
+    # Phase 1: Snapshot current cron state before the restart wipes SQLite.
+    # 9.4 skips it: the gateway list is gated and the post-image restore
+    # republishes the signed file instead of replaying a snapshot.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
+    if not tenant_uses_file_cron_sync(tenant):
+        try:
+            from apps.cron.gateway_client import invoke_gateway_tool
+            from apps.orchestrator.services import _extract_cron_jobs
+
+            result = invoke_gateway_tool(tenant, "cron.list", {"includeDisabled": True})
+            jobs = _extract_cron_jobs(result)
+            if jobs is not None:
+                Tenant.objects.filter(id=tenant_id).update(
+                    cron_jobs_snapshot={
+                        "jobs": jobs,
+                        "snapshot_at": timezone.now().isoformat(),
+                        "trigger": "pre-image-update",
+                        "image_tag": desired_tag,
+                    },
+                )
+                logger.info(
+                    "Pre-image cron snapshot saved for tenant %s (%d jobs)",
+                    tenant_id[:8],
+                    len(jobs),
+                )
+        except Exception:
+            logger.warning(
+                "Pre-image cron snapshot failed for tenant %s (proceeding — will fall back to seed)",
                 tenant_id[:8],
-                len(jobs),
+                exc_info=True,
             )
-    except Exception:
-        logger.warning(
-            "Pre-image cron snapshot failed for tenant %s (proceeding — will fall back to seed)",
-            tenant_id[:8],
-            exc_info=True,
-        )
 
     # Phase 2: Update the container image.
     desired_image = f"{django_settings.AZURE_ACR_SERVER}/nbhd-openclaw:{desired_tag}"
     version_changed = False
+    # The image Azure is serving now, for the boot health check's revert.
+    try:
+        from apps.orchestrator.hibernation import _live_openclaw_image
+
+        previous_image = _live_openclaw_image(tenant.container_id)
+    except Exception:
+        previous_image = None
     try:
         update_container_image(tenant.container_id, desired_image)
         # Keep openclaw_version (config SCHEMA) in lockstep with the image we
@@ -373,6 +391,24 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
 
     # Phase 3: Schedule post-restart cron restore (90s for container startup).
     from apps.cron.publish import publish_task as publish_qstash_task
+
+    # Same-family bumps must prove the new revision boots, or go back to the
+    # previous image (2026-09-28: Kiho's traffic moved to a revision that never
+    # started). A family change is a migration with its own rollback.
+    if previous_image and not version_changed:
+        from apps.orchestrator.hibernation import WAKE_IMAGE_VERIFY_DELAY_SECONDS
+
+        try:
+            publish_qstash_task(
+                "verify_wake_image_refresh",
+                tenant_id,
+                desired_tag,
+                previous_image,
+                1,
+                delay_seconds=WAKE_IMAGE_VERIFY_DELAY_SECONDS,
+            )
+        except Exception:
+            logger.warning("Failed to schedule image health check for %s", tenant_id[:8], exc_info=True)
 
     try:
         publish_qstash_task(
@@ -603,6 +639,17 @@ def restore_crons_after_image_update_task(tenant_id: str) -> None:
     if not tenant or not tenant.container_id:
         return
 
+    # 9.4 gates every gateway cron.* call below. The new container rebuilds its
+    # crons at boot from the signed file (Postgres rows + the Fuel set), so
+    # republish it once. Not covered: firing crons missed while the container
+    # was down — 9.4 has no Django-reachable run-now (see CONTINUITY_oc94_*).
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    if tenant_uses_file_cron_sync(tenant):
+        count = write_tenant_crons_file(tenant)
+        logger.info("Post-image cron restore for tenant %s: republished %d crons (9.4)", tenant_id[:8], count)
+        return
+
     snapshot = getattr(tenant, "cron_jobs_snapshot", None)
     if not snapshot or not isinstance(snapshot, dict) or not snapshot.get("jobs"):
         logger.warning(
@@ -805,9 +852,9 @@ def broadcast_single_tenant_task(tenant_id: str, message: str) -> None:
 
 
 def hibernate_idle_tenants_task() -> dict:
-    """Find active tenants idle >2h and hibernate their containers.
+    """Find active tenants past the configured idle cutoff and hibernate them.
 
-    Excludes tenants with a recent ``cron_wake_at`` so this hourly sweep
+    Excludes tenants with a recent ``cron_wake_at`` so this ten-minute sweep
     doesn't race with ``wake_for_cron_task`` and kill a container right
     when its scheduled cron is about to fire. Without this guard, a
     morning briefing scheduled at the top of the hour was silently killed
@@ -816,12 +863,13 @@ def hibernate_idle_tenants_task() -> dict:
     at :00:47, briefing never delivered). Cron-wake re-hibernation belongs
     to ``check_cron_wake_idle_task``, which knows about upcoming crons and
     decides correctly. If ``cron_wake_at`` ever gets stuck (QStash drop,
-    etc.), the same 2h cutoff still lets us reclaim the container — we
-    just defer to the cron-aware path while it's fresh.
+    etc.), the configured idle cutoff still lets us reclaim the container
+    — we just defer to the cron-aware path while it's fresh.
     """
     import logging
     from datetime import timedelta
 
+    from django.conf import settings
     from django.db.models import Q
     from django.utils import timezone
 
@@ -832,7 +880,7 @@ def hibernate_idle_tenants_task() -> dict:
 
     from django.db import transaction
 
-    cutoff = timezone.now() - timedelta(hours=2)
+    cutoff = timezone.now() - timedelta(minutes=settings.TENANT_IDLE_HIBERNATE_MINUTES)
 
     hibernated = 0
     failed = 0
@@ -861,7 +909,14 @@ def hibernate_idle_tenants_task() -> dict:
             .select_for_update(skip_locked=True)
         )
 
+    from apps.orchestrator import openclaw_auto_upgrade
     from apps.orchestrator.hibernation import _cron_active_or_imminent
+
+    auto_upgrading = 0
+    try:
+        openclaw_auto_upgrade.reap_stale_run()
+    except Exception:
+        logger.exception("hibernate_idle_tenants: auto-upgrade recovery check failed")
 
     for tenant in idle_tenants:
         # Re-check last_message_at + cron_wake_at to avoid TOCTOU race
@@ -893,24 +948,105 @@ def hibernate_idle_tenants_task() -> dict:
             )
             continue
 
+        # An idle 5.28 tenant upgrades to 9.4 first; the upgrade task
+        # hibernates it when done. A tenant mid-upgrade is never hibernated.
+        try:
+            intercepted = openclaw_auto_upgrade.intercept_idle_tenant(tenant)
+        except Exception:
+            logger.exception("hibernate_idle_tenants: auto-upgrade check failed for %s", str(tenant.id)[:8])
+            intercepted = openclaw_auto_upgrade.in_flight(tenant.id)
+        if intercepted:
+            auto_upgrading += 1
+            continue
+
         if hibernate_idle_tenant(tenant):
             hibernated += 1
         else:
             failed += 1
 
+    suspended_hibernated, suspended_failed = _hibernate_idle_suspended_tenants(cutoff)
+
     logger.info(
-        "hibernate_idle_tenants: hibernated=%d failed=%d skipped_cron_wake=%d skipped_imminent_cron=%d",
+        "hibernate_idle_tenants: hibernated=%d failed=%d skipped_cron_wake=%d skipped_imminent_cron=%d "
+        "auto_upgrading=%d suspended_hibernated=%d suspended_failed=%d",
         hibernated,
         failed,
         skipped_cron_wake,
         skipped_imminent_cron,
+        auto_upgrading,
+        suspended_hibernated,
+        suspended_failed,
     )
     return {
         "hibernated": hibernated,
         "failed": failed,
         "skipped_cron_wake": skipped_cron_wake,
         "skipped_imminent_cron": skipped_imminent_cron,
+        "auto_upgrading": auto_upgrading,
+        "suspended_hibernated": suspended_hibernated,
+        "suspended_failed": suspended_failed,
     }
+
+
+def _hibernate_idle_suspended_tenants(cutoff) -> tuple[int, int]:
+    """Put idle, awake SUSPENDED tenants' containers back to sleep.
+
+    Suspension deactivates revisions once but leaves ``hibernated_at`` NULL,
+    so any later wake (e.g. a message from the suspended user) left the box
+    running forever — the active-only pass above never looks at it. Seen in
+    prod 2026-09-29: four suspended tenants up 168/168h, some since July.
+
+    No cron capture, gateway call, or cron-aware wake here: suspension
+    already disabled the tenant's crons, and ``wake_for_cron_task`` refuses
+    non-ACTIVE tenants anyway. Stamping ``hibernated_at`` puts the tenant on
+    the normal wake-on-message path; reactivation clears it.
+    """
+    import logging
+
+    from django.db import transaction
+    from django.db.models import Q
+    from django.utils import timezone
+
+    from apps.orchestrator.azure_client import hibernate_container_app
+    from apps.tenants.models import Tenant
+
+    logger = logging.getLogger(__name__)
+
+    with transaction.atomic():
+        candidates = list(
+            Tenant.objects.filter(
+                status=Tenant.Status.SUSPENDED,
+                container_id__gt="",
+                hibernated_at__isnull=True,
+            )
+            .filter(Q(last_message_at__lt=cutoff) | Q(last_message_at__isnull=True, provisioned_at__lt=cutoff))
+            .select_for_update(skip_locked=True)
+        )
+
+    hibernated = failed = 0
+    for tenant in candidates:
+        tid = str(tenant.id)[:8]
+        # Re-check after the lock is released: a reactivation or fresh message
+        # may have landed since the claim.
+        tenant.refresh_from_db(fields=["status", "hibernated_at", "last_message_at"])
+        if tenant.status != Tenant.Status.SUSPENDED or tenant.hibernated_at:
+            continue
+        if tenant.last_message_at and tenant.last_message_at >= cutoff:
+            continue
+        try:
+            hibernate_container_app(tenant.container_id)
+        except Exception:
+            logger.exception("hibernate_idle_tenants: failed to hibernate suspended tenant %s", tid)
+            failed += 1
+            continue
+        # Compare-and-set so a concurrent reactivation (status → ACTIVE) wins.
+        Tenant.objects.filter(pk=tenant.pk, status=Tenant.Status.SUSPENDED, hibernated_at__isnull=True).update(
+            hibernated_at=timezone.now(),
+            cron_wake_at=None,
+        )
+        logger.info("hibernate_idle_tenants: hibernated suspended tenant %s", tid)
+        hibernated += 1
+    return hibernated, failed
 
 
 def refresh_user_md_fleet_task() -> dict:
@@ -936,31 +1072,47 @@ def refresh_user_md_fleet_task() -> dict:
     """
     import logging
 
-    from apps.orchestrator.workspace_envelope import push_user_md
+    from apps.orchestrator.workspace_envelope import TRIGGER_FLEET_SWEEP, push_user_md
     from apps.tenants.models import Tenant
 
     logger = logging.getLogger(__name__)
 
     tenants = Tenant.objects.filter(status=Tenant.Status.ACTIVE).exclude(container_id="").select_related("user")
 
-    pushed = 0
-    failed = 0
+    attempted = returned_true = returned_false = raised = 0
     for tenant in tenants:
+        attempted += 1
         try:
             # Keep the sweep on the public single-flight seam so it coalesces
             # safely with signal-driven pushes for the same tenant.
-            push_user_md(tenant, force=True, debounce_seconds=0)
-            pushed += 1
+            result = push_user_md(tenant, force=True, debounce_seconds=0, trigger=TRIGGER_FLEET_SWEEP)
+            if result:
+                returned_true += 1
+            else:
+                returned_false += 1
         except Exception:
             logger.warning(
                 "refresh_user_md_fleet: USER.md push failed for tenant %s",
                 str(tenant.id)[:8],
                 exc_info=True,
             )
-            failed += 1
+            raised += 1
 
-    logger.info("refresh_user_md_fleet: pushed=%d failed=%d", pushed, failed)
-    return {"pushed": pushed, "failed": failed}
+    logger.info(
+        "refresh_user_md_fleet: attempted=%d returned_true=%d returned_false=%d raised=%d",
+        attempted,
+        returned_true,
+        returned_false,
+        raised,
+    )
+    return {
+        "attempted": attempted,
+        "returned_true": returned_true,
+        "returned_false": returned_false,
+        "raised": raised,
+        "pushed": returned_true,
+        "failed": raised,
+    }
 
 
 NIGHTLY_EXTRACTION_LOCAL_HOUR = 21
@@ -1218,7 +1370,7 @@ def complete_elapsed_plans_task() -> dict:
     return totals
 
 
-def regenerate_tenant_crons_task(tenant_id: str) -> dict:
+def regenerate_tenant_crons_task(tenant_id: str, *, recovery: bool = False) -> dict:
     """Reconcile a tenant's managed crons against the Postgres CronJob table.
 
     Enqueued (debounced 30s) by ``apps/cron/signals.py`` on CronJob writes
@@ -1237,7 +1389,7 @@ def regenerate_tenant_crons_task(tenant_id: str) -> dict:
     tenant = Tenant.objects.filter(id=tenant_id).select_related("user").first()
     if not tenant or not tenant.container_fqdn:
         return {"added": 0, "removed": 0, "unchanged": 0, "errors": 0}
-    return regenerate_tenant_crons(tenant)
+    return regenerate_tenant_crons(tenant, recovery=recovery)
 
 
 def reconcile_tenant_crons_task() -> dict:
@@ -1420,7 +1572,7 @@ def ensure_at_cron_wakes_task() -> dict:
     Background: Django only schedules ``wake_for_cron`` tasks via
     ``hibernate_idle_tenants`` — i.e. when it cleanly hibernates a tenant.
     For an ``at`` cron created mid-conversation, that path doesn't run
-    until the next hourly idle sweep, and even then only if the tenant is
+    until the next ten-minute idle sweep, and even then only if the tenant is
     actually idle. If the container goes down out-of-band (Azure replica
     recycle, OOM, crash) between cron creation and fire time, the fire
     is missed because nothing wakes the tenant.
@@ -1440,7 +1592,7 @@ def ensure_at_cron_wakes_task() -> dict:
     import logging
     import time as _time
 
-    from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
+    from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.cron.pending_at_views import _at_fires_at_ms
     from apps.cron.publish import publish_task
     from apps.orchestrator.hibernation import _CRON_WAKE_LEAD_SECONDS
@@ -1462,7 +1614,7 @@ def ensure_at_cron_wakes_task() -> dict:
     for tenant in tenants:
         totals["tenants"] += 1
         try:
-            list_result = invoke_gateway_tool(tenant, "cron.list", {})
+            list_result = list_tenant_crons(tenant)
         except GatewayError:
             totals["skipped"] += 1
             continue

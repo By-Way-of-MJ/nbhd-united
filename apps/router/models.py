@@ -377,6 +377,10 @@ class ProactiveOutbound(models.Model):
     # ``apps.router.quick_replies.extract_quick_replies``). Stored in
     # PII-placeholder space and rehydrated only at the owner-facing ``?since=``
     # feed. null/absent means the send carried no valid marker.
+    panels = models.JSONField(
+        null=True, blank=True, help_text="Live panel references attached to the assistant message."
+    )
+
     quick_replies = models.JSONField(null=True, blank=True, default=None)
 
     class Meta:
@@ -670,6 +674,47 @@ class RuntimeWriteActivity(models.Model):
         db_table = "runtime_write_activity"
 
 
+class RuntimeWriteEvent(models.Model):
+    """One assistant (runtime) write to an item the app can open — metadata only.
+
+    Feeds the iOS "Since you were last here" links. ``ref`` carries only the ids /
+    slug / date needed to open the item, never user text; titles are resolved
+    at read time from the live row through the owner-read path. Rows older than
+    ``RUNTIME_WRITE_EVENT_RETENTION`` are purged daily.
+    """
+
+    class Kind(models.TextChoices):
+        JOURNAL_DOC = "journal_doc"
+        FUEL = "fuel"
+        HORIZONS_GOAL = "horizons_goal"
+        CALENDAR = "calendar"
+
+    class Verb(models.TextChoices):
+        CREATED = "created"
+        UPDATED = "updated"
+
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="runtime_write_events",
+    )
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    ref = models.JSONField(default=dict)
+    verb = models.CharField(max_length=12, choices=Verb.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "runtime_write_events"
+        indexes = [
+            models.Index(fields=["tenant", "-created_at"], name="rwe_tenant_created_idx"),
+            models.Index(fields=["created_at"], name="rwe_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"RuntimeWriteEvent({self.kind}/{self.verb}, tenant={self.tenant_id})"
+
+
 class AppChatMessage(models.Model):
     """A single rich-client (iOS/web) chat turn: the user's message and the
     assistant's reply, persisted so the client can POLL for the reply.
@@ -836,6 +881,12 @@ class AppChatMessage(models.Model):
     # mirroring where ``reply_text`` lands.
     user_redactions = models.JSONField(null=True, blank=True, default=None)
     reply_redactions = models.JSONField(null=True, blank=True, default=None)
+    # Content-free receipt for the inbound redaction attempt. ``null`` / ``""``
+    # means the row predates receipt persistence (or never entered the tenant
+    # redaction path, such as an on-device turn). The reason is a machine code,
+    # never source text or detector output.
+    redaction_confirmed = models.BooleanField(null=True)
+    redaction_reason = models.CharField(max_length=32, blank=True, default="")
     # Up to 3 short tappable choice labels parsed from a trailing
     # ``[[quick-replies: A | B | C]]`` marker on the assistant reply (see
     # ``apps.router.quick_replies.extract_quick_replies``). Rides the SAME
@@ -843,6 +894,10 @@ class AppChatMessage(models.Model):
     # means the turn carried no marker (or predates the feature) — the two
     # are indistinguishable and both mean "show no buttons". iOS-only for
     # now; Telegram/LINE strip the marker but never populate this field.
+    panels = models.JSONField(
+        null=True, blank=True, help_text="Live panel references attached to the assistant message."
+    )
+
     quick_replies = models.JSONField(null=True, blank=True, default=None)
     # A tappable "View in Journal" deep-link parsed from a trailing
     # ``[[journal-link: kind|slug|title]]`` marker on the assistant reply (see

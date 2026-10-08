@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 from apps.actions.models import ActionType, PendingAction
 from apps.integrations.internal_auth import InternalAuthError, validate_internal_runtime_request
 from apps.pii.egress import KnownValueResponseGuardMixin
-from apps.router.document_write_guard import record_runtime_write_activity
+from apps.router.document_write_guard import record_runtime_write_activity, record_runtime_write_event
 from apps.tenants.middleware import set_rls_context
 from apps.tenants.models import Tenant
 
@@ -369,6 +369,11 @@ class RuntimeRequestCreateView(_DatebookRuntimeView):
             response_status = status.HTTP_409_CONFLICT
         elif result["state"] == "stale_review":
             response_status = status.HTTP_410_GONE
+        if command_type == DeviceCommand.CommandType.CALENDAR_CREATE and response_status < 300:
+            # The feed shows this only once the device has actually created it.
+            record_runtime_write_event(
+                tenant, kind="calendar", ref={"command_id": result.get("command_id")}, verb="created"
+            )
         return Response(result, status=response_status)
 
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { isLoggedIn } from "@/lib/auth";
 import { getLiveQueryClient } from "@/lib/query-persist";
@@ -27,6 +27,7 @@ import {
 } from "@/lib/types";
 import {
   appendToDocument,
+  fetchTaskGoals, fetchTasks, createTask, replaceDocumentBlock, type TaskFilters, type BlockReplacement,
   bulkDeleteCronJobs,
   bulkUpdateForeground,
   cancelPendingReminder,
@@ -63,6 +64,7 @@ import {
   fetchRefreshConfigStatus,
   fetchSidebarTree,
   fetchTenant,
+  fetchRecentAssistantCards,
   fetchTemplates,
   fetchTelegramStatus,
   fetchLineStatus,
@@ -77,6 +79,9 @@ import {
   updatePurpose,
   completeTask,
   reopenTask,
+  createGoalTask,
+  updateGoalNotes,
+  achieveGoal,
   fetchHorizons,
   fetchJournalStatus,
   fetchUsageHistory,
@@ -170,10 +175,14 @@ import {
   fetchConstellation,
   fetchGalaxy,
   fetchPendingLessons,
+  searchLessons,
   approveLesson,
   dismissLesson,
   deleteLesson,
   fetchNeighborhood,
+  fetchNeighborhoodHome,
+  setInMySky,
+  fetchDatebookAgenda,
   sendWave,
   acceptWave,
   declineWave,
@@ -182,6 +191,8 @@ import {
   fetchNeighborProfile,
   updateNeighborProfile,
   createFriendInvite,
+  fetchFriendInvite,
+  claimFriendInvite,
   fetchLessons,
   fetchPendingShares,
   shareLesson,
@@ -199,6 +210,7 @@ import {
   markThreadRead,
   patchThreadMembership,
   fetchMissions,
+  fetchMissionAsks,
   createMission,
   fetchMissionDetail,
   patchMission,
@@ -217,6 +229,13 @@ import {
   leaveCircle,
   removeCircleMember,
   regenerateInviteCode,
+  declineMission,
+  fetchProjectPlan,
+  fetchProjectProposals,
+  fetchProjectDrafts,
+  fetchProjectDraft,
+  fetchActiveGoals,
+  reportFriendMessage,
 } from "@/lib/api";
 import { selectGreeting } from "@/lib/welcome-message";
 
@@ -240,12 +259,12 @@ export function useUpdateProfileMutation() {
   });
 }
 
-export function useTenantQuery() {
+export function useTenantQuery(enabled = true) {
   return useQuery({
     queryKey: ["tenant"],
     queryFn: fetchTenant,
     staleTime: 5 * 60_000,
-    enabled: isLoggedIn(),
+    enabled: enabled && isLoggedIn(),
     // Poll while a picker change is in flight so the AI provider page can
     // transition the "Switching…" badge to "Active" once the container
     // adopts the change. `applied_model` is stamped only after a successful
@@ -324,6 +343,7 @@ export function useCompleteTaskMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (taskId: string) => completeTask(taskId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["horizons"] }),
     // CurrentStatusCard shows an inline "couldn't save — retry" on failure, so
     // opt out of the global mutation error toast (avoid a double signal).
     meta: { skipErrorToast: true },
@@ -335,6 +355,7 @@ export function useCompleteTaskMutation() {
     // reappearing from the stale `max-age=10` browser cache.
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
   });
 }
@@ -343,9 +364,42 @@ export function useReopenTaskMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (taskId: string) => reopenTask(taskId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["horizons"] }),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
+  });
+}
+
+export function useCreateGoalTaskMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: createGoalTask,
+    meta: { skipErrorToast: true },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["journal-tasks"] });
+      return queryClient.invalidateQueries({ queryKey: ["horizons"] });
+    },
+  });
+}
+
+export function useUpdateGoalNotesMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, description }: { id: string; description: string }) =>
+      updateGoalNotes(id, description),
+    meta: { skipErrorToast: true },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
+  });
+}
+
+export function useAchieveGoalMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: achieveGoal,
+    meta: { skipErrorToast: true },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["horizons"] }),
   });
 }
 
@@ -355,6 +409,7 @@ export function useApproveExtractionMutation() {
     mutationFn: approveExtraction,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["horizons"] });
+      void queryClient.invalidateQueries({ queryKey: ["journal-tasks"] });
     },
   });
 }
@@ -1777,6 +1832,25 @@ export function useDeleteRestingHRMutation() {
   });
 }
 
+// Web Overview — recent assistant cards (read-only; hides when none).
+export function useAssistantCardsQuery(enabled: boolean) {
+  return useQuery({
+    queryKey: ["web-assistant-cards"],
+    queryFn: () => fetchRecentAssistantCards(7),
+    staleTime: 60_000,
+    enabled: enabled && isLoggedIn(),
+  });
+}
+
+export function useDatebookAgendaQuery(enabled: boolean, days = 7) {
+  return useQuery({
+    queryKey: ["datebook-agenda", days],
+    queryFn: () => fetchDatebookAgenda(days),
+    staleTime: 60_000,
+    enabled: enabled && isLoggedIn(),
+  });
+}
+
 // Sleep
 export function useSleepQuery() {
   return useQuery({
@@ -1954,6 +2028,19 @@ export function useConstellationQuery() {
   });
 }
 
+/** Search lessons by meaning. Pass an already-debounced query; empty = idle. */
+export function useLessonSearchQuery(q: string) {
+  const query = q.trim();
+  return useQuery({
+    queryKey: ["lesson-search", query],
+    queryFn: () => searchLessons(query),
+    enabled: isLoggedIn() && query.length > 0,
+    staleTime: 5 * 60_000,
+    retry: 1,
+    placeholderData: keepPreviousData,
+  });
+}
+
 export function usePendingLessonsQuery() {
   return useQuery({
     queryKey: ["pending-lessons"],
@@ -2003,7 +2090,7 @@ export function useNeighborhoodQuery() {
     queryKey: ["neighborhood"],
     queryFn: fetchNeighborhood,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2013,7 +2100,7 @@ export function useNeighborProfileQuery() {
     queryKey: ["neighbor-profile"],
     queryFn: fetchNeighborProfile,
     staleTime: 10 * 60_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2026,7 +2113,7 @@ export function useWormholesQuery() {
     queryKey: ["wormholes"],
     queryFn: fetchWormholes,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2204,6 +2291,30 @@ export function useCreateInviteMutation() {
   });
 }
 
+export function useFriendInviteQuery(token: string | null) {
+  return useQuery({
+    queryKey: ["friend-invite", token],
+    queryFn: () => fetchFriendInvite(token!),
+    enabled: !!token,
+    retry: false,
+    staleTime: 0,
+  });
+}
+
+export function useClaimFriendInviteMutation(token: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => {
+      if (!isLoggedIn()) throw new Error("Please sign in to accept this invite.");
+      return claimFriendInvite(token);
+    },
+    meta: { skipErrorToast: true },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["neighborhood"] });
+    },
+  });
+}
+
 // ── Neighborhood shares (PR2) ────────────────────────────────────────────────
 // propose → scrub → preview → approve → publish. See lib/api.ts for the
 // discriminated 200/202/409 result shapes the preview + approve endpoints
@@ -2216,7 +2327,7 @@ export function usePendingSharesQuery() {
     queryKey: ["pending-shares"],
     queryFn: fetchPendingShares,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2228,7 +2339,7 @@ export function useApprovedLessonsQuery() {
     queryKey: ["lessons-approved"],
     queryFn: () => fetchLessons("approved"),
     staleTime: 60_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2301,7 +2412,7 @@ export function useAbsorbedQuery() {
     queryKey: ["absorbed"],
     queryFn: fetchAbsorbed,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2340,7 +2451,7 @@ export function useThreadsQuery() {
     queryKey: ["friend-threads"],
     queryFn: fetchThreads,
     staleTime: 15_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2452,7 +2563,7 @@ export function useMissionsQuery() {
     queryKey: ["missions"],
     queryFn: fetchMissions,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2462,8 +2573,29 @@ export function useMissionDetailQuery(id: string | null) {
     queryKey: ["mission", id],
     queryFn: () => fetchMissionDetail(id as string),
     staleTime: 15_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled && !!id,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled && !!id,
   });
+}
+
+/** Several missions' crew projections at once (same cache as useMissionDetailQuery). */
+export function useMissionDetailsQueries(ids: string[]) {
+  const { data: tenant } = useTenantQuery();
+  const on = isLoggedIn() && !!tenant?.neighborhood_enabled;
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["mission", id],
+      queryFn: () => fetchMissionDetail(id),
+      staleTime: 15_000,
+      enabled: on,
+    })),
+    combine: dataOnly,
+  });
+}
+
+// Module-level so useQueries keeps the combined array referentially stable
+// while the underlying data is unchanged.
+function dataOnly<T>(results: { data?: T }[]): (T | undefined)[] {
+  return results.map((r) => r.data);
 }
 
 export function useGoalActionsQuery() {
@@ -2472,7 +2604,7 @@ export function useGoalActionsQuery() {
     queryKey: ["goal-actions"],
     queryFn: fetchGoalActions,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2486,6 +2618,41 @@ export function useCreateMissionMutation() {
   });
 }
 
+// Keyed under "neighborhood" so wave accept/decline/unfriend invalidations
+// (prefix match) refresh the Open Sky home too.
+export function useNeighborhoodHomeQuery(enabled = true) {
+  const { data: tenant } = useTenantQuery();
+  return useQuery({
+    queryKey: ["neighborhood", "home"],
+    queryFn: fetchNeighborhoodHome,
+    staleTime: 30_000,
+    enabled: enabled && isLoggedIn() && !!tenant?.neighborhood_enabled,
+  });
+}
+
+export function useSkyMembershipMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ friendshipId, inSky }: { friendshipId: string; inSky: boolean }) => setInMySky(friendshipId, inSky),
+    // The server owns the cap; its 409 message is shown inline by the caller.
+    meta: { skipErrorToast: true },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ["neighborhood"] });
+    },
+  });
+}
+
+// Keyed under "missions" so join/leave invalidations refresh the asks list.
+export function useMissionAsksQuery(enabled = true) {
+  const { data: tenant } = useTenantQuery();
+  return useQuery({
+    queryKey: ["missions", "asks"],
+    queryFn: fetchMissionAsks,
+    staleTime: 30_000,
+    enabled: enabled && isLoggedIn() && !!tenant?.neighborhood_enabled,
+  });
+}
+
 export function useJoinMissionMutation() {
   const qc = useQueryClient();
   return useMutation({
@@ -2493,6 +2660,18 @@ export function useJoinMissionMutation() {
     onSettled: (_data, _err, variables) => {
       void qc.invalidateQueries({ queryKey: ["missions"] });
       void qc.invalidateQueries({ queryKey: ["mission", variables.id] });
+    },
+  });
+}
+
+/** Turn a project invitation down ("Not this time"). */
+export function useDeclineMissionMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => declineMission(id),
+    onSettled: (_data, _err, id) => {
+      void qc.invalidateQueries({ queryKey: ["missions"] });
+      void qc.invalidateQueries({ queryKey: ["mission", id] });
     },
   });
 }
@@ -2631,7 +2810,7 @@ export function useCirclesQuery() {
     queryKey: ["circles"],
     queryFn: fetchCircles,
     staleTime: 30_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled,
   });
 }
 
@@ -2641,7 +2820,22 @@ export function useCircleDetailQuery(id: string | null) {
     queryKey: ["circle", id],
     queryFn: () => fetchCircleDetail(id as string),
     staleTime: 15_000,
-    enabled: isLoggedIn() && !!tenant?.friends_enabled && !!id,
+    enabled: isLoggedIn() && !!tenant?.neighborhood_enabled && !!id,
+  });
+}
+
+/** Several circles' details at once (same cache entries as useCircleDetailQuery). */
+export function useCircleDetailsQueries(ids: string[]) {
+  const { data: tenant } = useTenantQuery();
+  const on = isLoggedIn() && !!tenant?.neighborhood_enabled;
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["circle", id],
+      queryFn: () => fetchCircleDetail(id),
+      staleTime: 15_000,
+      enabled: on,
+    })),
+    combine: dataOnly,
   });
 }
 
@@ -2661,7 +2855,10 @@ export function useCreateCircleMutation() {
 export function useJoinCircleMutation() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (inviteCode: string) => joinCircle(inviteCode),
+    // A bare code keeps the server's default; the form passes the person's
+    // explicit choice about their assistant learning from the conversation.
+    mutationFn: (input: string | { code: string; assistantLearning: boolean }) =>
+      typeof input === "string" ? joinCircle(input) : joinCircle(input.code, input.assistantLearning),
     meta: { skipErrorToast: true },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["circles"] });
@@ -2728,5 +2925,110 @@ export function useRegenerateInviteCodeMutation() {
       );
       void qc.invalidateQueries({ queryKey: ["circles"] });
     },
+  });
+}
+
+export function useTasksQuery(filters: TaskFilters = {}, enabled = true) {
+  return useQuery({ queryKey: ["journal-tasks", filters], queryFn: () => fetchTasks(filters), enabled: enabled && isLoggedIn(), staleTime: 30_000 });
+}
+
+export function useCreateTaskMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createTask,
+    meta: { skipErrorToast: true },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["journal-tasks"] });
+      void qc.invalidateQueries({ queryKey: ["journal-status"] });
+      void qc.invalidateQueries({ queryKey: ["horizons"] });
+    },
+  });
+}
+
+export function useReplaceDocumentBlockMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ kind, slug, data }: { kind: string; slug: string; data: BlockReplacement }) => replaceDocumentBlock(kind, slug, data),
+    meta: { skipErrorToast: true },
+    onSuccess: (document, { kind, slug }) => {
+      qc.setQueryData(["document", kind, slug], document);
+      void qc.invalidateQueries({ queryKey: ["sidebar-tree"] });
+    },
+  });
+}
+
+export function useTaskGoalsQuery() {
+  return useQuery({ queryKey: ["task-goals"], queryFn: fetchTaskGoals, enabled: isLoggedIn(), staleTime: 60_000 });
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// The shared plan behind the project page. Gated on the tenant's
+// `projects_v2_enabled` (the endpoints 404 otherwise). Not persisted to
+// localStorage: a plan is other people's live work, never replayed stale.
+
+export function useProjectsV2Enabled(): boolean {
+  const { data: tenant } = useTenantQuery();
+  return !!tenant?.neighborhood_enabled && !!tenant?.projects_v2_enabled;
+}
+
+export function useProjectPlanQuery(id: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({
+    queryKey: ["project-plan", id],
+    queryFn: () => fetchProjectPlan(id as string),
+    staleTime: 15_000,
+    retry: false,
+    enabled: isLoggedIn() && on && !!id,
+  });
+}
+
+/** Several plans at once, for the Neighborhood's project rows (same cache as the page). */
+export function useProjectPlansQueries(ids: string[]) {
+  const on = useProjectsV2Enabled();
+  return useQueries({
+    queries: ids.map((id) => ({
+      queryKey: ["project-plan", id],
+      queryFn: () => fetchProjectPlan(id),
+      staleTime: 15_000,
+      retry: false,
+      enabled: isLoggedIn() && on,
+    })),
+    combine: dataOnly,
+  });
+}
+
+/** My assistant's pending suggestions for one project. */
+export function useProjectProposalsQuery(missionId: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({
+    queryKey: ["project-proposals", missionId],
+    queryFn: () => fetchProjectProposals(missionId as string),
+    staleTime: 15_000,
+    retry: false,
+    enabled: isLoggedIn() && on && !!missionId,
+  });
+}
+
+/** Private starter plans my assistant drafted. */
+export function useProjectDraftsQuery() {
+  const on = useProjectsV2Enabled();
+  return useQuery({ queryKey: ["project-drafts"], queryFn: fetchProjectDrafts, staleTime: 30_000, retry: false, enabled: isLoggedIn() && on });
+}
+
+export function useProjectDraftQuery(draftId: string | null) {
+  const on = useProjectsV2Enabled();
+  return useQuery({ queryKey: ["project-draft", draftId], queryFn: () => fetchProjectDraft(draftId as string), retry: false, enabled: isLoggedIn() && on && !!draftId });
+}
+
+/** My active Horizons goals — loaded only while the "Part of my goal" picker is open. */
+export function useActiveGoalsQuery(enabled: boolean) {
+  return useQuery({ queryKey: ["active-goals"], queryFn: fetchActiveGoals, staleTime: 60_000, enabled: enabled && isLoggedIn() });
+}
+
+/** Report a message in a cluster conversation; the form shows a failure inline. */
+export function useReportMessageMutation() {
+  return useMutation({
+    mutationFn: ({ publicId, reason, detail }: { publicId: string; reason: string; detail: string }) => reportFriendMessage(publicId, reason, detail),
+    meta: { skipErrorToast: true },
   });
 }

@@ -24,7 +24,7 @@ stateDiagram-v2
     [*] --> PROVISIONING: provision_tenant_task
     PROVISIONING --> ACTIVE: identity+share+container up, status=ACTIVE
     PROVISIONING --> PENDING: any error (retryable, no teardown)
-    ACTIVE --> hibernated: idle >=2h sweep (hibernated_at set, still ACTIVE)
+    ACTIVE --> hibernated: idle >=30m sweep (hibernated_at set, still ACTIVE)
     hibernated --> ACTIVE: drain/cron/API wake (self-heals image)
     ACTIVE --> SUSPENDED: billing lapse
     SUSPENDED --> ACTIVE: invoice.paid reactivation
@@ -106,7 +106,9 @@ Single input `tenant`; tier and version are derived from tenant fields (`config_
 | `>= 2026.5.0` | `plugins.bundledDiscovery:"compat"`; per-provider `timeoutSeconds` **replaces** the retired `agents.defaults.llm` idle key (pre-5.0 emits `llm`, `:2293`; post emits provider timeout) | `:2216`, `:2285` |
 | `>= 2026.5.28` | `tools.toolSearch`, and `agents.defaults.params`/`contextPruning` | `:1744`, `:2330` |
 
-**Bootstrap budget.** `agents.defaults.bootstrapMaxChars: 18000` / `bootstrapTotalMaxChars: 80000` (`config_generator.py:2059–2060`) cap how much AGENTS.md/USER.md/SOUL.md is injected per turn (raised above the OC 12k/60k default for the Phase-2 insights prompt).
+**Bootstrap budget.** The runtime cap is 26,000 characters (`BOOTSTRAP_MAX_CHARS`, emitted as `agents.defaults.bootstrapMaxChars`), and OpenClaw silently truncates each bootstrap file's tail past it. The CI ceiling is 25,950 characters, a truncation alarm fixed 50 characters below the runtime cap. The separate 22,759-character content pin (`MaximalTenantBudgetTest.test_rules_delivery_r0_all_gates_budget`) enforces that an addition is funded by a trim; `bootstrapTotalMaxChars` remains 80,000.
+
+P5 **Size policy:** fund every addition with a trim; if headroom < 1,500 after R0, raise `BOOTSTRAP_MAX_CHARS` and the CI ceiling TOGETHER by a fixed margin (e.g. 26,000 / 25,950) — never the ceiling alone.
 
 **Plugins (config_generator.py:1852–2219).** A `(plugin_id, path)` list built from settings — unconditional (Google, Journal, Usage, ImageGen, Settings, RoutingContext, ActivityStream, StreamProgress) plus per-tenant-flag-gated (Reddit, Finance, Fuel, Site-publishing, Neighborhood/Friends, Insights, typed-crons). `_active_plugins` drops any entry whose ID is `""` (`config_generator.py:2018`) — this empty-ID convention is the **smoke-disable** mechanism (a bad plugin path wedges boot to last-good). `plugins.allow` and `plugins.entries` are kept consistent (`config_validator` flags orphans).
 
@@ -133,7 +135,7 @@ Two apply paths, chosen by the fleet router `apply_pending_configs` (referenced,
 
 **Fleet bumps.** `bump_openclaw_atomic_per_tenant_task` (`tasks.py:33`) is the QStash fan-out target for a version+image+DB bump; it delegates to `services.bump_openclaw_version_for_tenant(tenant, target_version, image_tag, registry)` (`services.py:466`), which: snapshots current config bytes for restore (`services.py:516`) → sets `openclaw_version` → `update_tenant_config` (regenerates+pushes config, `services.py:545`) → `update_container_image` (`services.py:549`); **on image-push failure it restores the snapshotted config** so the still-running old image doesn't crash-loop on the new schema (`services.py:560`), then re-raises. `container_image_tag` and any `hibernated_at` clear are set on success (`services.py:573–578`). `image_tag`↔`openclaw_version` lockstep is the single most repeated safety theme in this subsystem.
 
-**Idle sweep entrypoint.** `hibernate_idle_tenants_task` (`tasks.py:807`) is the hourly QStash task; it delegates the decision/action to `hibernation.py` (`hibernate_idle_tenant`, `_cron_active_or_imminent`). USER.md staleness is bounded by the hourly `refresh_user_md_fleet_task` (`tasks.py:916`, `force=True`, includes hibernated tenants since the share is always mounted).
+**Idle sweep entrypoint.** `hibernate_idle_tenants_task` (`tasks.py:807`) is the every-10-minute QStash task; its cutoff comes from `TENANT_IDLE_HIBERNATE_MINUTES` (default 30), and it delegates the decision/action to `hibernation.py` (`hibernate_idle_tenant`, `_cron_active_or_imminent`). USER.md staleness is bounded by the hourly `refresh_user_md_fleet_task` (`tasks.py:916`, `force=True`, includes hibernated tenants since the share is always mounted).
 
 ## Hibernation & wake
 
@@ -147,7 +149,7 @@ Two apply paths, chosen by the fleet router `apply_pending_configs` (referenced,
 
 Then it clears `hibernated_at`, stamps `last_wake_at` (`hibernation.py:530`), forces a config regen if the version synced or `config_version==0` (`hibernation.py:544–563`), and schedules buffered-message delivery (+45s) and cron resume (+60s). **A hibernated tenant is never assumed to be on the fleet image** — it self-heals at wake.
 
-**Cron-wake lookahead.** Constants (`hibernation.py:41–63`): wake lead 240s, post-wake idle 1800s, lookahead window 5400s, sweep-defer window 300s. `wake_for_cron_task` (`hibernation.py:695`) wakes ~2 min before a cron; if already awake it re-arms idempotently and returns `already_awake`. `check_cron_wake_idle_task` (`hibernation.py:764`) 30 min later decides re-hibernate vs. defer (if another cron is imminent). The idle sweep also defers via `_cron_active_or_imminent` (`hibernation.py:379`) if a cron is in-flight or fires within 5 min. This is how a hibernated (zero-cost) tenant still runs scheduled crons.
+**Cron-wake lookahead.** `hibernation.py` wakes 240s before a cron, runs its idle re-check after `TENANT_CRON_WAKE_IDLE_MINUTES` (default 10), and holds a warm container only when another cron is due within `TENANT_CRON_HOLD_MINUTES` (default 20). `wake_for_cron_task` re-arms idempotently when the tenant is already awake. The idle sweep separately defers via `_cron_active_or_imminent` if a cron is in-flight or fires within the fixed 5-minute safety window. This is how a hibernated (zero-cost) tenant still runs scheduled crons without letting sparse schedules hold it awake.
 
 **Idempotency (invariant #5).** `activate_revision`/`deactivate_revision` raise `ResourceExistsError` when a stale `list_revisions` read races a no-op; `_is_already_in_requested_state` (`azure_client.py:1429`) matches only `RevisionAlreadyInRequestedState`/"already active|inactive" and treats it as success — other 409s still propagate. Caller-side guards (`hibernation.py:707`, `:783`) short-circuit double-wake/double-hibernate before any Azure call.
 
@@ -168,6 +170,8 @@ Then it clears `hibernated_at`, stamps `last_wake_at` (`hibernation.py:530`), fo
 | `SOUL.md` / `IDENTITY.md` | `personas.render_soul_managed` / `render_identity_managed` (`personas.py:249/300`) | begin/end markers (`identity_merge.py:39`) | `download` → `splice_identity_file` → `upload` (`services.py:655–699`); **fail-closed** (skip on read failure to protect the agent's growth region); `reassert_identity_files` each boot (`services.py:795`) |
 
 The sentinel/marker design lets Django own a managed block while the agent grows the rest of the file. All writes go through the sanitize chokepoint.
+
+Chat turns never read workspace files: filesystem `read` is absent from their tool policy. Rules reach chat only through always-loaded prompt text, tool descriptions, tool responses, or server 400 responses that carry the correction. The `rules/*.md` files are for cron/background turns only and their on-demand index is injected into every cron preamble.
 
 ## Action gating (apps/actions)
 

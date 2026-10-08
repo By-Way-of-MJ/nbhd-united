@@ -103,3 +103,70 @@ class ReconcileWelcomesTaskTests(TestCase):
 
         self.assertEqual(totals["fuel"], {"replaced_stale": 1})
         self.assertEqual(totals["finance"], {"skipped_already_delivered": 1})
+
+
+class Oc94WelcomeRowTests(TestCase):
+    """9.4 gates the gateway cron.*: a welcome is a one-shot ``at`` CronJob row
+    published in the signed crons file."""
+
+    def setUp(self):
+        from apps.tenants.models import Tenant
+
+        self.tenant = create_tenant(display_name="Welcome94", telegram_chat_id=901994)
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_fqdn = "oc-w94.example.com"
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save(update_fields=["status", "container_fqdn", "openclaw_version"])
+
+    def _schedule(self):
+        from apps.orchestrator.welcome_scheduler import schedule_welcome
+
+        return schedule_welcome(
+            self.tenant, feature="fuel", cron_name="_fuel:welcome", prompt_template="Hi {tenant_id}"
+        )
+
+    @mock.patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @mock.patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=1)
+    def test_creates_at_row_publishes_and_stamps(self, mock_write, mock_invoke):
+        from apps.cron.models import CronJob
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        self.assertEqual(self._schedule(), WelcomeStatus.SCHEDULED)
+        row = CronJob.objects.get(tenant=self.tenant, name="_fuel:welcome")
+        self.assertEqual(row.data["schedule"]["kind"], "at")
+        self.assertEqual(row.data["payload"]["message"], f"Hi {self.tenant.id}")
+        self.assertFalse(row.managed)
+        mock_write.assert_called_once_with(self.tenant)
+        mock_invoke.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertIn("fuel", self.tenant.welcomes_sent)
+
+    @mock.patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=1)
+    def test_pending_row_skips_and_stale_row_is_replaced(self, _mock_write):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from apps.cron.models import CronJob
+        from apps.orchestrator.welcome_scheduler import WelcomeStatus
+
+        self._schedule()
+        self.tenant.welcomes_sent = {}
+        self.tenant.save(update_fields=["welcomes_sent"])
+        self.assertEqual(self._schedule(), WelcomeStatus.SKIPPED_PENDING)
+
+        row = CronJob.objects.get(tenant=self.tenant, name="_fuel:welcome")
+        row.data["schedule"]["at"] = (timezone.now() - timedelta(hours=1)).isoformat()
+        row.save(update_fields=["data"])
+        self.assertEqual(self._schedule(), WelcomeStatus.REPLACED_STALE)
+        self.assertEqual(CronJob.objects.filter(tenant=self.tenant, name="_fuel:welcome").count(), 1)
+
+    @mock.patch("apps.cron.share_cron_sync.write_tenant_crons_file", side_effect=RuntimeError("share down"))
+    def test_publish_failure_leaves_no_row_and_no_stamp(self, _mock_write):
+        from apps.cron.models import CronJob
+
+        with self.assertRaises(RuntimeError):
+            self._schedule()
+        self.assertFalse(CronJob.objects.filter(tenant=self.tenant, name="_fuel:welcome").exists())
+        self.tenant.refresh_from_db()
+        self.assertNotIn("fuel", self.tenant.welcomes_sent or {})

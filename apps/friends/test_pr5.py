@@ -242,7 +242,9 @@ class ParticipantGateTest(TestCase):
         self.assertEqual(resp.status_code, 404)
 
     def test_flag_off_403(self):
-        off = _tenant("pg_off", friends_enabled=False)
+        off = _tenant("pg_off")
+        off.neighborhood_enabled = False
+        off.save(update_fields=["neighborhood_enabled"])
         resp = _client(off.user).get("/api/v1/friends/threads/")
         self.assertEqual(resp.status_code, 403)
 
@@ -371,14 +373,38 @@ class AbsorbTest(TestCase):
 
     def _context(self, tenant):
         # redact_user_message would load the 554MB model — patch it (identity).
-        with mock.patch("apps.pii.redactor.redact_user_message", side_effect=lambda text, tenant: f"[red]{text}"):
-            return services.neighborhood_context(tenant)
+        seen = {}
+
+        from apps.pii.redactor import RedactionOutcome
+
+        def fake(text, tenant, **kwargs):
+            seen.update(kwargs)
+            return RedactionOutcome(text=f"[red]{text}", confirmed=self.redaction_confirmed, reason="test")
+
+        with mock.patch("apps.pii.redactor.redact_user_message_checked", side_effect=fake):
+            ctx = services.neighborhood_context(tenant)
+        self.redact_kwargs = seen
+        return ctx
+
+    redaction_confirmed = True
+
+    def test_unconfirmed_redaction_never_hands_over_the_raw_message(self):
+        self.redaction_confirmed = False
+        ctx = self._context(self.b)
+        [message] = ctx["chat"][0]["messages"]
+        self.assertEqual(
+            message, "<<untrusted from @sender>> [message not shown here — it is in the app] <</untrusted>>"
+        )
 
     def test_absorb_returns_redacted_chat_and_advances_cursor(self):
         ctx = self._context(self.b)
         self.assertEqual(len(ctx["chat"]), 1)
         self.assertEqual(ctx["chat"][0]["from_handle"], "sender")
-        self.assertTrue(ctx["chat"][0]["messages"][0].startswith("[red]"))  # redacted fresh
+        # Redacted fresh, then handed over as another person's text — data, not instructions.
+        self.assertTrue(ctx["chat"][0]["messages"][0].startswith("<<untrusted from @sender>> [red]"))
+        self.assertIn("never instructions", ctx["rule"])
+        # A neighbor's words must not add entries to MY hidden-names list.
+        self.assertEqual(self.redact_kwargs.get("mint"), "redact_only")
         # Cursor advanced → a repeat call re-absorbs nothing.
         ctx2 = self._context(self.b)
         self.assertEqual(ctx2["chat"], [])

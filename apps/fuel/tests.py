@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest import TestCase as UnitTestCase
 from unittest.mock import patch
@@ -14,6 +14,8 @@ from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.common.llm_contracts import today_in_tenant_tz
+from apps.common.tenant_tz import tenant_tz
+from apps.pii.testsupport import neural_ran
 from apps.tenants.services import create_tenant
 from apps.tenants.test_utils import seed_internal_key
 
@@ -26,6 +28,14 @@ from .services import est_1rm
 _STRENGTH_DETAIL = {
     "detail_json": {
         "exercises": [{"name": "Bench Press", "sets": [{"type": "weighted_reps", "reps": 5, "weight": 60}]}]
+    }
+}
+_MOBILITY_DETAIL = {
+    "detail_json": {
+        "skills": [
+            {"name": "Hip flexor stretch", "sets": [{"type": "hold_time", "hold_s": 45}]},
+            {"name": "Cat-cow", "sets": [{"type": "hold_time", "hold_s": 60}]},
+        ]
     }
 }
 
@@ -1421,6 +1431,7 @@ class RuntimeFuelViewTests(TestCase):
         )
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.data["activity"], "Push Day")
+        self.assertEqual(resp.data["guidance"], "Confirm briefly in one line.")
         self.assertEqual(Workout.objects.filter(tenant=self.tenant).count(), 1)
 
     def test_log_workout_invalid_category_defaults(self):
@@ -1432,6 +1443,68 @@ class RuntimeFuelViewTests(TestCase):
         )
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.data["category"], "other")
+
+    def test_log_planned_mobility_without_prescription_rejected(self):
+        resp = self.client.post(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/log/",
+            {
+                "date": "2026-04-21",
+                "status": "planned",
+                "category": "mobility",
+                "activity": "Mobility",
+                "detail_json": {},
+            },
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["details"][0]["type"], "missing_prescription")
+        self.assertEqual(resp.data["details"][0]["loc"], ["detail_json", "skills"])
+        self.assertFalse(Workout.objects.filter(tenant=self.tenant).exists())
+
+    def test_patch_planned_mobility_without_prescription_rejected(self):
+        workout = Workout.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 21),
+            status="planned",
+            category="mobility",
+            activity="Mobility",
+            detail_json=_MOBILITY_DETAIL["detail_json"],
+        )
+
+        resp = self.client.patch(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/workouts/{workout.id}/",
+            {"detail_json": {}},
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["details"][0]["type"], "missing_prescription")
+        workout.refresh_from_db()
+        self.assertEqual(workout.detail_json, _MOBILITY_DETAIL["detail_json"])
+
+    def test_patch_done_mobility_without_prescription_allowed(self):
+        workout = Workout.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 21),
+            status="done",
+            category="mobility",
+            activity="Mobility",
+            detail_json=_MOBILITY_DETAIL["detail_json"],
+        )
+
+        resp = self.client.patch(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/workouts/{workout.id}/",
+            {"detail_json": {}},
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        workout.refresh_from_db()
+        self.assertEqual(workout.detail_json, {})
 
     def test_auth_required(self):
         resp = self.client.post(
@@ -1535,6 +1608,7 @@ class RuntimeFuelViewTests(TestCase):
                 "calories": 430,
                 "detail_json": detail_json,
                 "status": "done",
+                "completed_at": None,
                 "scheduled_at": scheduled_at.isoformat(),
                 "plan_id": str(plan.id),
                 "slot_id": str(slot.id),
@@ -1591,6 +1665,7 @@ class RuntimeFuelViewTests(TestCase):
         )
         self.assertEqual(resp.status_code, 201)
         self.assertIn("82.5", resp.data["weight_kg"])
+        self.assertEqual(resp.data["guidance"], "Confirm briefly in one line.")
 
     def test_log_body_weight_default_date_uses_tenant_timezone(self):
         """Bug #3 regression: an early-morning Eastern entry lands today, not yesterday.
@@ -1783,6 +1858,24 @@ class RuntimeFuelAuditTests(TestCase):
         self.assertEqual(body["conflicts"]["duplicate_fires"], [])
         self.assertIn("Safe to propose", body["guidance"])
         self.assertEqual(body["active_plans"], [])  # none yet → no plan-state note
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_audit_guidance_carries_coaching_rules(self, mock_invoke):
+        mock_invoke.return_value = {"details": {"jobs": []}}
+
+        resp = self.client.get(f"/api/v1/fuel/runtime/{self.tenant.id}/audit/", **self.headers)
+
+        self.assertEqual(resp.status_code, 200)
+        guidance = resp.data["guidance"]
+        for phrase in (
+            "rest days count as adherence, not gaps",
+            "never invent a workout on a rest day",
+            "acknowledge completed sessions",
+            "handle misses without guilt",
+            "Injury, poor sleep, or inactivity",
+            "at least 75% complete or in its final week",
+        ):
+            self.assertIn(phrase, guidance)
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
     def test_audit_surfaces_active_plan_and_intent_guidance(self, mock_invoke):
@@ -2219,6 +2312,52 @@ class RuntimeFuelSummaryWithProfileTests(TestCase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertIsNone(resp.data["profile"])
+        self.assertIn("profile is empty", resp.data["guidance"])
+        self.assertIn("conservative general-population advice", resp.data["guidance"])
+
+    def test_summary_guidance_carries_reasoning_and_pending_onboarding(self):
+        FuelProfile.objects.create(tenant=self.tenant, onboarding_status="pending")
+
+        resp = self.client.get(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/summary/",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        guidance = resp.data["guidance"]
+        for phrase in (
+            "source healthkit is measured device data",
+            "user is user-entered",
+            "assistant is assistant-logged",
+            "template is plan-generated",
+            "Prefer measured metrics over guesses",
+            "server-computed four-week trends",
+            "monthly_volume_12mo",
+            "estimated 1RM",
+            "never as weight actually lifted",
+            "Program toward open_goals",
+            "Use latest_sleep to temper recovery recommendations",
+            "Onboarding is optional",
+            "fitness level, goals, injuries or limitations",
+            "preferred training frequency, days, and time",
+            "one or two questions at a time",
+            "set onboarding_status to declined and stop asking",
+        ):
+            self.assertIn(phrase, guidance)
+
+    def test_summary_guidance_respects_declined_onboarding(self):
+        FuelProfile.objects.create(tenant=self.tenant, onboarding_status="declined")
+
+        resp = self.client.get(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/summary/",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        guidance = resp.data["guidance"]
+        self.assertIn("declined onboarding", guidance)
+        self.assertIn("conservative general advice", guidance)
+        self.assertIn("do not ask again", guidance)
 
     def test_summary_echoes_rpe_and_objective(self):
         # Read-back: a later session must be able to see the intensity (target_rpe)
@@ -2369,6 +2508,20 @@ class WeeklyVolumeTests(TestCase):
     def test_weekly_summary_empty(self):
         resp = self.client.get("/api/v1/fuel/weekly-summary/")
         self.assertEqual(resp.data["totals"]["sessions"], 0)
+
+    def test_weekly_summary_uses_tenant_local_day(self):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+        frozen = datetime(2026, 8, 31, 22, 30, tzinfo=UTC)
+        tenant_day = frozen.astimezone(tenant_tz(self.tenant)).date()
+
+        with patch("apps.common.llm_contracts.dj_tz.now", return_value=frozen) as mock_now:
+            resp = self.client.get("/api/v1/fuel/weekly-summary/")
+
+        self.assertEqual(resp.status_code, 200)
+        mock_now.assert_called_once_with()
+        expected_week_start = tenant_day - timedelta(days=tenant_day.weekday())
+        self.assertEqual(resp.data["week_start"], expected_week_start.isoformat())
 
 
 class PRDetectionTests(TestCase):
@@ -2617,6 +2770,43 @@ class RuntimeWorkoutPlanTests(TestCase):
         }
 
     def test_create_plan(self):
+        base_detail = {
+            "detail_json": {
+                "exercises": [
+                    {
+                        "name": "Bench Press",
+                        "role": "primary",
+                        "sets": [{"type": "weighted_reps", "reps": 5, "weight": 60}],
+                    },
+                    {
+                        "name": "Hammer Curl",
+                        "role": "accessory",
+                        "sets": [{"type": "weighted_reps", "reps": 10, "weight": 10}],
+                    },
+                ]
+            }
+        }
+        rotated_detail = {
+            "detail_json": {
+                "exercises": [
+                    {
+                        "name": "Bench Press",
+                        "role": "primary",
+                        "sets": [{"type": "weighted_reps", "reps": 5, "weight": 60}],
+                    },
+                    {
+                        "name": "Front Raise",
+                        "role": "accessory",
+                        "sets": [{"type": "weighted_reps", "reps": 10, "weight": 10}],
+                    },
+                ]
+            }
+        }
+        rotated_week = {
+            "0": {"activity": "Push", "category": "strength", "duration_minutes": 60, **rotated_detail},
+            "2": {"activity": "Pull", "category": "strength", "duration_minutes": 60, **rotated_detail},
+            "4": {"activity": "Legs", "category": "strength", "duration_minutes": 55, **rotated_detail},
+        }
         resp = self.client.post(
             f"/api/v1/fuel/runtime/{self.tenant.id}/plans/",
             {
@@ -2625,10 +2815,11 @@ class RuntimeWorkoutPlanTests(TestCase):
                 "weeks": 4,
                 "days_per_week": 3,
                 "schedule_json": {
-                    "0": {"activity": "Push", "category": "strength", "duration_minutes": 60, **_STRENGTH_DETAIL},
-                    "2": {"activity": "Pull", "category": "strength", "duration_minutes": 60, **_STRENGTH_DETAIL},
-                    "4": {"activity": "Legs", "category": "strength", "duration_minutes": 55, **_STRENGTH_DETAIL},
+                    "0": {"activity": "Push", "category": "strength", "duration_minutes": 60, **base_detail},
+                    "2": {"activity": "Pull", "category": "strength", "duration_minutes": 60, **base_detail},
+                    "4": {"activity": "Legs", "category": "strength", "duration_minutes": 55, **base_detail},
                 },
+                "week_overrides": {"2": rotated_week, "3": rotated_week},
                 "notes": "Linear progression: add 2.5kg each week.",
             },
             format="json",
@@ -2652,7 +2843,7 @@ class RuntimeWorkoutPlanTests(TestCase):
                 "days_per_week": 2,
                 "schedule_json": {
                     "0": {"activity": "Mon Workout", "category": "strength", **_STRENGTH_DETAIL},
-                    "4": {"activity": "Fri Workout", "category": "cardio"},
+                    "4": {"activity": "Fri Workout", "category": "cardio", "duration_minutes": 30},
                 },
             },
             format="json",
@@ -2909,8 +3100,17 @@ class RuntimeWorkoutPlanTests(TestCase):
             activity="Push",
         )
 
+        preview = self.client.delete(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/plans/{plan.id}/",
+            {},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(preview.status_code, 200)
         resp = self.client.delete(
             f"/api/v1/fuel/runtime/{self.tenant.id}/plans/{plan.id}/",
+            {"confirm_token": preview.data["confirm_token"]},
+            format="json",
             **self.headers,
         )
         self.assertEqual(resp.status_code, 204)
@@ -2973,7 +3173,7 @@ class RuntimeWorkoutPlanTests(TestCase):
 
 @override_settings(NBHD_INTERNAL_API_KEY="test-internal-key")
 class RequirePrescriptionOnStrengthDaysTests(TestCase):
-    """A strength/calisthenics plan day must carry an exercise prescription.
+    """Every prescribed plan category must carry category-appropriate detail.
 
     The production bug: an assistant created a plan with ``detail_json: {}`` on
     every strength day, so all 35 expanded planned workouts had zero exercises
@@ -3050,6 +3250,51 @@ class RequirePrescriptionOnStrengthDaysTests(TestCase):
         resp = self._post({"0": {"activity": "Run", "category": "cardio", "duration_minutes": 30}})
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(Workout.objects.filter(tenant=self.tenant, category="cardio").count(), 1)
+
+    def test_create_mobility_empty_detail_400_with_weekday_and_example(self):
+        resp = self._post({"monday": {"activity": "Mobility", "category": "mobility", "detail_json": {}}})
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["weekday"], 0)
+        self.assertEqual(resp.data["weekday_name"], "monday")
+        self.assertEqual(
+            resp.data["details"][0]["loc"],
+            ["schedule_json", "monday", "detail_json", "skills"],
+        )
+        self.assertEqual(resp.data["details"][0]["example"], _MOBILITY_DETAIL["detail_json"])
+
+    def test_update_omitted_mobility_detail_leaves_existing_prescription(self):
+        create = self._post({"monday": {"activity": "Mobility", "category": "mobility", **_MOBILITY_DETAIL}})
+        self.assertEqual(create.status_code, 201, create.data)
+        plan_id = create.data["id"]
+        detail_before = WorkoutPlan.objects.get(id=plan_id).schedule_json["0"]["detail_json"]
+
+        resp = self.client.patch(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/plans/{plan_id}/",
+            {"schedule_json": {"monday": {"activity": "Recovery Mobility"}}},
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        plan = WorkoutPlan.objects.get(id=plan_id)
+        self.assertEqual(plan.schedule_json["0"]["detail_json"], detail_before)
+
+    def test_update_explicit_empty_mobility_detail_rejected(self):
+        create = self._post({"monday": {"activity": "Mobility", "category": "mobility", **_MOBILITY_DETAIL}})
+        self.assertEqual(create.status_code, 201, create.data)
+        plan_id = create.data["id"]
+
+        resp = self.client.patch(
+            f"/api/v1/fuel/runtime/{self.tenant.id}/plans/{plan_id}/",
+            {"schedule_json": {"monday": {"detail_json": {}}}},
+            format="json",
+            **self.headers,
+        )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["weekday_name"], "monday")
+        self.assertEqual(resp.data["details"][0]["type"], "missing_prescription")
 
     def test_week_override_empty_strength_400_persists_nothing(self):
         resp = self._post(
@@ -3405,6 +3650,52 @@ class ConsumerWorkoutPlanTests(TestCase):
         self.assertEqual(len(resp.data), 1)
         self.assertEqual(resp.data[0]["name"], "Plan A")
 
+    def test_list_plans_query_count_is_constant(self):
+        plan = WorkoutPlan.objects.create(
+            tenant=self.tenant,
+            name="Plan 1",
+            start_date=date(2026, 8, 31),
+            weeks=1,
+            days_per_week=1,
+        )
+        Workout.objects.create(
+            tenant=self.tenant,
+            plan=plan,
+            date=date(2026, 8, 31),
+            status="done",
+            category="strength",
+            activity="Session 1",
+        )
+
+        with self.assertNumQueries(4):
+            one_plan = self.client.get("/api/v1/fuel/plans/")
+
+        for index in range(2, 6):
+            extra_plan = WorkoutPlan.objects.create(
+                tenant=self.tenant,
+                name=f"Plan {index}",
+                start_date=date(2026, 8, 31),
+                weeks=1,
+                days_per_week=1,
+            )
+            Workout.objects.create(
+                tenant=self.tenant,
+                plan=extra_plan,
+                date=date(2026, 8, 31),
+                status="planned",
+                category="strength",
+                activity=f"Session {index}",
+            )
+
+        with self.assertNumQueries(4):
+            five_plans = self.client.get("/api/v1/fuel/plans/")
+
+        self.assertEqual(one_plan.status_code, 200)
+        self.assertEqual(one_plan.data[0]["workout_count"], 1)
+        self.assertEqual(one_plan.data[0]["completed_count"], 1)
+        self.assertEqual(five_plans.status_code, 200)
+        self.assertEqual(len(five_plans.data), 5)
+
     def test_create_plan(self):
         resp = self.client.post(
             "/api/v1/fuel/plans/",
@@ -3617,6 +3908,71 @@ class ConsumerPlanPatchPrescriptionTests(TestCase):
 # ═════════════════════════════════════════════════════════════════════
 
 
+class HasPrescriptionTests(UnitTestCase):
+    """Pure category matrix for planned-workout content."""
+
+    def test_strength_and_calisthenics_require_exercises_or_skills(self):
+        from .set_contract import has_prescription
+
+        for category in ("strength", "calisthenics"):
+            with self.subTest(category=category, shape="exercises"):
+                self.assertTrue(has_prescription({"exercises": [{"name": "Squat"}]}, category))
+            with self.subTest(category=category, shape="skills"):
+                self.assertTrue(has_prescription({"skills": [{"name": "Plank"}]}, category))
+            with self.subTest(category=category, shape="empty"):
+                self.assertFalse(has_prescription({"exercises": [], "skills": []}, category))
+
+    def test_cardio_accepts_each_target_or_duration(self):
+        from .set_contract import has_prescription
+
+        for field, value in {
+            "distance_km": 5,
+            "pace": "5:30",
+            "structure": "5 x 3 min tempo",
+            "avg_hr": 145,
+            "elevation": 120,
+            "avg_power": 240,
+        }.items():
+            with self.subTest(field=field):
+                self.assertTrue(has_prescription({field: value}, "cardio"))
+        self.assertTrue(has_prescription({}, "cardio", duration_minutes=30))
+        self.assertFalse(has_prescription({}, "cardio"))
+        self.assertFalse(has_prescription({"distance_km": 0, "pace": ""}, "cardio"))
+
+    def test_hiit_accepts_rounds_work_structure_or_movements(self):
+        from .set_contract import has_prescription
+
+        self.assertTrue(has_prescription({"rounds": 8, "work_s": 30}, "hiit"))
+        self.assertFalse(has_prescription({"rounds": 8}, "hiit"))
+        self.assertFalse(has_prescription({"work_s": 30}, "hiit"))
+        self.assertTrue(has_prescription({"structure": "EMOM 10"}, "hiit"))
+        self.assertTrue(has_prescription({"exercises": [{"name": "Burpee"}]}, "hiit"))
+        self.assertTrue(has_prescription({"skills": [{"name": "Sprint"}]}, "hiit"))
+        self.assertFalse(has_prescription({}, "hiit"))
+
+    def test_mobility_accepts_blocks_skills_or_exercises(self):
+        from .set_contract import has_prescription
+
+        for field in ("blocks", "skills", "exercises"):
+            with self.subTest(field=field):
+                self.assertTrue(has_prescription({field: [{"name": "Cat-cow"}]}, "mobility"))
+        self.assertFalse(has_prescription({}, "mobility"))
+
+    def test_unregulated_categories_have_no_requirement(self):
+        from .set_contract import has_prescription
+
+        for category in ("other", "sport", "rest", "future-category"):
+            with self.subTest(category=category):
+                self.assertTrue(has_prescription(None, category))
+
+    def test_required_categories_reject_non_dict_detail(self):
+        from .set_contract import has_prescription
+
+        for category in ("strength", "calisthenics", "cardio", "hiit", "mobility"):
+            with self.subTest(category=category):
+                self.assertFalse(has_prescription([], category))
+
+
 class SetMetricTests(UnitTestCase):
     """`set_metric` / `coerce_set` — pure, no DB."""
 
@@ -3745,9 +4101,9 @@ class NormalizeDetailTests(UnitTestCase):
             "strength",
         )
         self.assertEqual(cat, "calisthenics")
-        self.assertEqual(detail["exercises"][0]["sets"][0]["type"], "hold_time")
+        self.assertEqual(detail["skills"][0]["sets"][0]["type"], "hold_time")
         kinds = {o.get("field") for o in ov}
-        self.assertEqual(kinds, {"set.type", "category"})
+        self.assertEqual(kinds, {"set.type", "category", "exercise_key"})
         self.assertIn("_normalized", detail)
 
     def test_weighted_pullups_promoted_to_strength(self):
@@ -3777,6 +4133,38 @@ class NormalizeDetailTests(UnitTestCase):
         self.assertEqual(cat, "calisthenics")
         self.assertEqual(detail["skills"][0]["sets"][0]["type"], "hold_time")
         self.assertEqual(ov, [])  # already correct → no override note
+
+    def test_calisthenics_exercises_move_to_skills_with_override(self):
+        from .set_contract import normalize_detail
+
+        detail, category, overrides = normalize_detail(
+            {"exercises": [{"name": "Custom Hold", "sets": [{"hold_s": 30}]}]},
+            "calisthenics",
+        )
+
+        self.assertEqual(category, "calisthenics")
+        self.assertNotIn("exercises", detail)
+        self.assertEqual(detail["skills"][0]["name"], "Custom Hold")
+        self.assertIn(
+            {"field": "exercise_key", "from": "exercises", "to": "skills"},
+            overrides,
+        )
+
+    def test_strength_skills_move_to_exercises(self):
+        from .set_contract import normalize_detail
+
+        detail, category, overrides = normalize_detail(
+            {"skills": [{"name": "Custom Press", "sets": [{"reps": 8, "weight": 20}]}]},
+            "strength",
+        )
+
+        self.assertEqual(category, "strength")
+        self.assertNotIn("skills", detail)
+        self.assertEqual(detail["exercises"][0]["name"], "Custom Press")
+        self.assertIn(
+            {"field": "exercise_key", "from": "skills", "to": "exercises"},
+            overrides,
+        )
 
     def test_cardio_category_never_touched(self):
         from .set_contract import normalize_detail
@@ -3858,7 +4246,7 @@ class RuntimeNormalizeTests(TestCase):
         self.assertEqual(resp.status_code, 201)
         w = Workout.objects.get(tenant=self.tenant)
         self.assertEqual(w.category, "calisthenics")
-        self.assertEqual(w.detail_json["exercises"][0]["sets"][0]["type"], "hold_time")
+        self.assertEqual(w.detail_json["skills"][0]["sets"][0]["type"], "hold_time")
         self.assertIn("_normalized", w.detail_json)
 
     def test_runtime_correct_data_not_falsely_flipped(self):
@@ -3896,7 +4284,7 @@ class RuntimeNormalizeTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         w.refresh_from_db()
         self.assertEqual(w.category, "calisthenics")
-        self.assertEqual(w.detail_json["exercises"][0]["sets"][0]["type"], "hold_time")
+        self.assertEqual(w.detail_json["skills"][0]["sets"][0]["type"], "hold_time")
 
     def test_runtime_date_patch_cascades_to_linked_prs(self):
         from .models import PersonalRecord
@@ -4264,7 +4652,7 @@ class PoisonedDetailPatchTests(TestCase):
         self.assertEqual(resp.status_code, 200, resp.data)
         self.workout.refresh_from_db()
         self.assertEqual(self.workout.status, "done")
-        sets0 = self.workout.detail_json["exercises"][0]["sets"]
+        sets0 = self.workout.detail_json["skills"][0]["sets"]
         self.assertEqual(sets0[0], {"type": "hold_time", "reps": 5})  # reps preserved, type restamped
         self.assertEqual(sets0[1], {"type": "hold_time", "reps": 5, "weight": 61.5})  # values preserved
         self.assertEqual(sets0[2], {"type": "hold_time", "hold_s": 45})  # the new valid set persisted
@@ -4936,8 +5324,8 @@ class HealthKitSyncTests(TestCase):
         planned = self._planned()
 
         with (
-            patch("apps.pii.redactor._detect_pii", return_value=[]),
-            patch("apps.pii.authoring._detect_pii", return_value=[]),
+            patch("apps.pii.redactor._detect_pii", side_effect=neural_ran([])),
+            patch("apps.pii.authoring._detect_pii", side_effect=neural_ran([])),
         ):
             resp = self._post({"workouts": [self._workout_item(activity="Outdoor Run with Alice")]})
 
@@ -4966,8 +5354,8 @@ class HealthKitSyncTests(TestCase):
         )
 
         with (
-            patch("apps.pii.redactor._detect_pii", return_value=[]),
-            patch("apps.pii.authoring._detect_pii", return_value=[]),
+            patch("apps.pii.redactor._detect_pii", side_effect=neural_ran([])),
+            patch("apps.pii.authoring._detect_pii", side_effect=neural_ran([])),
         ):
             resp = self._post({"workouts": [self._workout_item(activity="Outdoor Run with Alice")]})
 
@@ -6009,14 +6397,15 @@ class FuelOverviewViewTests(TestCase):
         self.assertEqual(self._as_json(overview["workouts"]), self._as_json(workouts))
         self.assertEqual(self._as_json(overview["calendar"]), self._as_json(cal))
 
-    def test_etag_repeat_returns_304(self):
+    def test_etag_repeat_still_returns_the_body(self):
+        """No 304s: a client cache must never stand in for live data (cache_middleware)."""
         FuelProfile.objects.create(tenant=self.tenant)
         resp = self.client.get("/api/v1/fuel/overview/")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("ETag", resp)
-        etag = resp["ETag"]
-        resp2 = self.client.get("/api/v1/fuel/overview/", HTTP_IF_NONE_MATCH=etag)
-        self.assertEqual(resp2.status_code, 304)
+        resp2 = self.client.get("/api/v1/fuel/overview/", HTTP_IF_NONE_MATCH=resp["ETag"])
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.content, resp.content)
 
     def test_tenant_isolation(self):
         other = create_tenant(display_name="Other Overview", telegram_chat_id=800078)
@@ -6038,7 +6427,8 @@ class ManageFuelCronGateTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Cron Gate", telegram_chat_id=800777)
         self.tenant.fuel_enabled = True
-        self.tenant.save(update_fields=["fuel_enabled"])
+        self.tenant.openclaw_version = "2026.5.28"  # gateway path; see test_9_4_publishes_signed_file
+        self.tenant.save(update_fields=["fuel_enabled", "openclaw_version"])
         self.plan = WorkoutPlan.objects.create(
             tenant=self.tenant,
             name="My Plan",
@@ -6072,6 +6462,20 @@ class ManageFuelCronGateTests(TestCase):
         self.assertIn("cron.add", tools)
         add_call = next(c for c in mock_invoke.call_args_list if c.args[1] == "cron.add")
         self.assertEqual(add_call.args[2], {"job": {"name": "_fuel:My Plan"}})
+
+    @patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=1)
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_9_4_publishes_signed_file(self, mock_invoke, mock_write):
+        """9.4 gates the gateway cron.*; the signed file carries the Fuel set."""
+        from apps.fuel.runtime_views import _manage_fuel_cron
+
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save(update_fields=["openclaw_version"])
+        FuelProfile.objects.create(tenant=self.tenant, use_session_scheduling=False)
+        for action in ("create", "update", "remove"):
+            _manage_fuel_cron(self.tenant, self.plan, action=action)
+        self.assertEqual(mock_write.call_count, 3)
+        mock_invoke.assert_not_called()
 
     @patch("apps.orchestrator.config_generator.build_fuel_workout_cron", return_value={"name": "_fuel:My Plan"})
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
@@ -6198,7 +6602,7 @@ class RuntimePlanSingleActiveTests(TestCase):
             "start_date": "2026-06-15",
             "schedule_json": {
                 "0": {"category": "strength", "activity": "Push", **_STRENGTH_DETAIL},
-                "2": {"category": "cardio", "activity": "Run"},
+                "2": {"category": "cardio", "activity": "Run", "duration_minutes": 30},
             },
         }
         body.update(extra)
@@ -6593,6 +6997,7 @@ class RestDaysRuntimeTests(TestCase):
         rest_entries = [w for w in resp.data["next_14d_workouts"] if w.get("status") == "rest"]
         self.assertTrue(rest_entries)
         self.assertEqual(rest_entries[0]["activity"], "Rest day")
+        self.assertIsNone(rest_entries[0]["has_prescription"])
         # today is a programmed rest day → the rest entry flows into today_plan.workouts.
         self.assertIn("rest", [w.get("status") for w in resp.data["today_plan"]["workouts"]])
         # active_plans carry the progress fields too.
@@ -6839,7 +7244,7 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "start_date": "2026-06-15",  # Monday
                 "schedule_json": {
                     "monday": {"category": "strength", "activity": "Upper Pull", **_STRENGTH_DETAIL},
-                    "Wednesday": {"category": "cardio", "activity": "Tempo Run"},
+                    "Wednesday": {"category": "cardio", "activity": "Tempo Run", "duration_minutes": 30},
                     "FRIDAY": {"category": "strength", "activity": "Lower Power", **_STRENGTH_DETAIL},
                 },
             }
@@ -6862,8 +7267,8 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "days_per_week": 2,
                 "start_date": "2026-06-15",
                 "schedule_json": {
-                    "tue": {"category": "cardio", "activity": "Easy Run"},
-                    "thurs": {"category": "cardio", "activity": "Intervals"},
+                    "tue": {"category": "cardio", "activity": "Easy Run", "duration_minutes": 30},
+                    "thurs": {"category": "cardio", "activity": "Intervals", "duration_minutes": 30},
                 },
             }
         )
@@ -6880,7 +7285,7 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "start_date": "2026-06-15",
                 "schedule_json": {
                     "0": {"category": "strength", "activity": "Squat", **_STRENGTH_DETAIL},
-                    "thursday": {"category": "cardio", "activity": "Row"},
+                    "thursday": {"category": "cardio", "activity": "Row", "duration_minutes": 30},
                 },
             }
         )
@@ -6896,8 +7301,8 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "days_per_week": 1,
                 "start_date": "2026-06-15",
                 "schedule_json": {
-                    "2": {"category": "cardio", "activity": "Run A"},
-                    "wednesday": {"category": "cardio", "activity": "Run B"},
+                    "2": {"category": "cardio", "activity": "Run A", "duration_minutes": 30},
+                    "wednesday": {"category": "cardio", "activity": "Run B", "duration_minutes": 30},
                 },
             }
         )
@@ -6913,7 +7318,7 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "weeks": 1,
                 "days_per_week": 1,
                 "start_date": "2026-06-15",
-                "schedule_json": {"wodensday": {"category": "cardio", "activity": "Run"}},
+                "schedule_json": {"wodensday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
             }
         )
         self.assertEqual(resp.status_code, 400, resp.data)
@@ -6928,7 +7333,7 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "weeks": 1,
                 "days_per_week": 1,
                 "start_date": "2026-06-15",
-                "schedule_json": {"7": {"category": "cardio", "activity": "Run"}},
+                "schedule_json": {"7": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
             }
         )
         self.assertEqual(resp.status_code, 400, resp.data)
@@ -6995,9 +7400,10 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "weeks": 4,
                 "days_per_week": 2,
                 "start_date": "2026-06-15",
+                "variation_policy": "progression_only",
                 "schedule_json": {
                     "monday": {"category": "strength", "activity": "Push", **_STRENGTH_DETAIL},
-                    "wednesday": {"category": "cardio", "activity": "Run"},
+                    "wednesday": {"category": "cardio", "activity": "Run", "duration_minutes": 30},
                 },
                 "week_overrides": {
                     "3": {
@@ -7023,8 +7429,13 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "weeks": 2,
                 "days_per_week": 1,
                 "start_date": "2026-06-15",
-                "schedule_json": {"monday": {"category": "cardio", "activity": "Run"}},
-                "week_overrides": {"1": {"monday": None, "0": {"category": "cardio", "activity": "Row"}}},
+                "schedule_json": {"monday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
+                "week_overrides": {
+                    "1": {
+                        "monday": None,
+                        "0": {"category": "cardio", "activity": "Row", "duration_minutes": 30},
+                    }
+                },
             }
         )
         self.assertEqual(resp.status_code, 400, resp.data)
@@ -7072,7 +7483,7 @@ class WeekdayNameScheduleKeyTests(TestCase):
                 "weeks": 2,
                 "days_per_week": 1,
                 "start_date": "2026-06-15",
-                "schedule_json": {"monday": {"category": "cardio", "activity": "Run"}},
+                "schedule_json": {"monday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
             }
         )
         self.assertEqual(created.status_code, 201, created.data)
@@ -7080,8 +7491,8 @@ class WeekdayNameScheduleKeyTests(TestCase):
             f"/api/v1/fuel/runtime/{self.tenant.id}/plans/{created.data['id']}/",
             data={
                 "schedule_json": {
-                    "1": {"category": "cardio", "activity": "Run A"},
-                    "tuesday": {"category": "cardio", "activity": "Run B"},
+                    "1": {"category": "cardio", "activity": "Run A", "duration_minutes": 30},
+                    "tuesday": {"category": "cardio", "activity": "Run B", "duration_minutes": 30},
                 }
             },
             format="json",
@@ -7181,7 +7592,7 @@ class PlanStartsTodayEnforcementTests(TestCase):
                     "weeks": 1,
                     "days_per_week": 1,
                     "start_date": "2026-08-24",  # Monday, five days out
-                    "schedule_json": {"thursday": {"category": "cardio", "activity": "Run"}},
+                    "schedule_json": {"thursday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
                 }
             )
         self.assertEqual(resp.status_code, 201, resp.data)
@@ -7197,8 +7608,16 @@ class PlanStartsTodayEnforcementTests(TestCase):
                     "weeks": 2,
                     "days_per_week": 1,
                     "start_date": "2026-08-19",
-                    "schedule_json": {"friday": {"category": "cardio", "activity": "Run"}},
-                    "week_overrides": {"0": {"wednesday": {"category": "cardio", "activity": "Opener"}}},
+                    "schedule_json": {"friday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
+                    "week_overrides": {
+                        "0": {
+                            "wednesday": {
+                                "category": "cardio",
+                                "activity": "Opener",
+                                "duration_minutes": 20,
+                            }
+                        }
+                    },
                 }
             )
         self.assertEqual(ok.status_code, 201, ok.data)
@@ -7212,7 +7631,7 @@ class PlanStartsTodayEnforcementTests(TestCase):
                     "days_per_week": 1,
                     "concurrent": True,
                     "start_date": "2026-08-19",
-                    "schedule_json": {"wednesday": {"category": "cardio", "activity": "Run"}},
+                    "schedule_json": {"wednesday": {"category": "cardio", "activity": "Run", "duration_minutes": 30}},
                     "week_overrides": {"0": {"wednesday": None}},
                 }
             )

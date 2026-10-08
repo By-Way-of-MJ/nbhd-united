@@ -50,6 +50,7 @@ create_snapshot() {
       --exclude='*/.env' \
       --exclude='*/.env.*' \
       --exclude='./.venv' \
+      --exclude='./deploy/local-test/.state' \
       --exclude='./venv' \
       --exclude='./env' \
       --exclude='./frontend/node_modules' \
@@ -259,15 +260,18 @@ else
 fi
 cleanup_backend
 
-echo
-echo "=== FRONTEND LEG: node:22 ==="
-if run_frontend; then
-  echo "=== FRONTEND LEG: PASS ==="
-else
-  echo "=== FRONTEND LEG: FAIL ===" >&2
-  status=1
+# CI runs only the backend leg (the frontend has its own job): DOCKER_GATE_LEGS=backend.
+if [[ "${DOCKER_GATE_LEGS:-backend frontend}" == *frontend* ]]; then
+  echo
+  echo "=== FRONTEND LEG: node:22 ==="
+  if run_frontend; then
+    echo "=== FRONTEND LEG: PASS ==="
+  else
+    echo "=== FRONTEND LEG: FAIL ===" >&2
+    status=1
+  fi
+  FRONTEND_CONTAINER=""
 fi
-FRONTEND_CONTAINER=""
 
 if [[ "$status" -eq 0 ]]; then
   echo
