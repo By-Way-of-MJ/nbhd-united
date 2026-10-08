@@ -12,9 +12,18 @@ canary images diverge from the stored tag). On 2026-10-08 opening
 ``PROJECTS_V2_TENANT_IDS`` to ``*`` crash-looped every woken tenant on an image
 without ``nbhd-project-tools``.
 
-Fail closed: an image that predates the report never sends one, so its list is
-empty and it is never handed a plugin gated here. A report recorded under a
-different image tag is ignored until the new image reports for itself.
+Fail closed: an image that predates the report never sends one, so nothing is
+ever recorded for it and it is never handed a plugin gated here. A report
+recorded under a different image tag is ignored until the new image reports for
+itself.
+
+A hook WITHOUT a report changes nothing. During an image roll the outgoing
+revision's replica can boot alongside the new one and fire its hook last; if
+that empty hook cleared the list, it would withdraw what the new image just
+reported (seen on the first roll, 2026-10-08). Known limit: two REPORTING
+images racing the same way can leave the older one's list recorded until the
+next boot. That only ever withholds a newly added plugin; never remove a plugin
+dir from the image in the same release that still gates on it.
 
 Gate any plugin added after this module the same way.
 """
@@ -54,10 +63,11 @@ def image_has_plugin(tenant: object | None, plugin_id: str) -> bool:
 def record_image_plugins(tenant, reported: object) -> bool:
     """Store a boot report. Returns True when the trusted set changed.
 
-    ``reported`` is the hook body's ``plugins`` value; anything that is not a
-    list of plugin ids (including the empty body older images send) records an
-    empty list, so a tenant moved back to an old image stops being trusted.
+    ``reported`` is the hook body's ``plugins`` value. Anything that is not a
+    list (the empty body older images send) is not a report and is ignored.
     """
+    if not isinstance(reported, list):
+        return False
     before = image_plugin_ids(tenant)
     ids = _clean(reported)
     tag = getattr(tenant, "container_image_tag", "") or ""
