@@ -189,7 +189,14 @@ def render_projects(tenant: Tenant) -> str:
         memberships = list(access.my_active_project_memberships(tenant)[:3])
         if not memberships:
             return ""
-        lines = ["Call nbhd_project_context for details before answering about a project."]
+        # Only name the tool when this tenant's image actually ships it.
+        from .project_flags import project_tools_ready
+
+        lines = (
+            ["Call nbhd_project_context for details before answering about a project."]
+            if project_tools_ready(tenant)
+            else []
+        )
         for membership in memberships:
             goal = membership.shared_goal
             plan = project_services.get_plan(tenant, goal.id)

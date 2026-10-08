@@ -47,6 +47,7 @@ All scheduling goes through QStash (`apps/cron/publish.py`). Never add `django_c
 - Env var names in `config/settings/production.py` must match the Azure Container App env vars on `nbhd-django-westus2` — renaming in code alone breaks prod at next deploy (a hook reminds you on edit).
 - Key Vault `identityref:` uses the `mi-nbhd-` identity name, NOT the `oc-` container name.
 - Image before config: never push an OpenClaw config that requires a newer image than what's deployed (live-reload → last-good rollback wedge).
+- A plugin dir that older images lack is loaded only after the image reported it: gate it in `config_generator` with `apps/orchestrator/image_plugins.image_has_plugin` (the container-started hook records each image's dirs). A rollout flag alone is not proof — 2026.9.4 never starts its gateway on a config naming a missing plugin dir (2026-10-08: `PROJECTS_V2_TENANT_IDS=*` crash-looped every woken tenant on an image without `nbhd-project-tools`).
 
 ## 11. Secrets discipline
 

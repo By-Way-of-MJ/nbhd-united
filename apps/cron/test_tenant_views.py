@@ -1796,3 +1796,89 @@ class RuntimeContainerStartedTest(TestCase):
     def test_hook_unauthorized(self):
         resp = self.client.post(f"/api/cron/runtime/{self.tenant.id}/container-started/")
         self.assertEqual(resp.status_code, 401)
+
+    def _boot(self, body=None):
+        url = f"/api/cron/runtime/{self.tenant.id}/container-started/"
+        with patch("apps.orchestrator.cron_reconcile.regenerate_tenant_crons", return_value={}):
+            if body is None:
+                return self.client.post(url, **self.headers)
+            return self.client.post(url, body, format="json", **self.headers)
+
+    def _projects_tenant(self, image_tag="2026.9.4-aaaaaaa"):
+        self.tenant.neighborhood_enabled = True
+        self.tenant.container_image_tag = image_tag
+        self.tenant.save(update_fields=["neighborhood_enabled", "container_image_tag"])
+
+    @patch("apps.cron.publish.publish_task")
+    def test_plugin_report_turns_project_tools_on_and_refreshes_config(self, mock_publish):
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        pending = self.tenant.pending_config_version
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertFalse(project_tools_ready(self.tenant))
+            resp = self._boot({"plugins": ["nbhd-journal-tools", "nbhd-project-tools"]})
+            self.assertEqual(resp.status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugin_ids, ["nbhd-journal-tools", "nbhd-project-tools"])
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+        self.assertEqual(self.tenant.pending_config_version, pending + 1)
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+
+    @patch("apps.cron.publish.publish_task")
+    def test_image_without_a_report_never_gets_project_tools(self, mock_publish):
+        """Older images POST an empty body: the 2026-10-08 crash-loop case."""
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+        from apps.orchestrator.config_generator import generate_openclaw_config
+
+        self._projects_tenant()
+        pending = self.tenant.pending_config_version
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertEqual(self._boot().status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertFalse(project_tools_ready(self.tenant))
+            paths = generate_openclaw_config(self.tenant).get("plugins", {}).get("load", {}).get("paths", [])
+        self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", paths)
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        self.assertEqual(self.tenant.pending_config_version, pending)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_report_from_another_image_tag_is_not_trusted(self, mock_publish):
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self._boot({"plugins": ["nbhd-project-tools"]})
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+            # The tenant moves to another image: unknown until that image reports.
+            self.tenant.container_image_tag = "2026.9.4-bbbbbbb"
+            self.tenant.save(update_fields=["container_image_tag"])
+            self.assertFalse(project_tools_ready(self.tenant))
+            # An old image boots (no report) and stays without the tools.
+            mock_publish.reset_mock()
+            self._boot()
+            self.tenant.refresh_from_db()
+            self.assertFalse(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-bbbbbbb")
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_malformed_plugin_report_is_ignored(self, mock_publish):
+        self._projects_tenant()
+        resp = self._boot({"plugins": ["../etc", 7, "NBHD-Project-Tools", {"a": 1}]})
+        self.assertEqual(resp.status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        self.assertEqual(self._boot({"plugins": "nbhd-project-tools"}).status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        mock_publish.assert_not_called()
