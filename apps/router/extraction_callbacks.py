@@ -341,7 +341,10 @@ def _approve_purpose(pending: PendingExtraction) -> tuple[str, None]:
 def _undo_lesson(pending: PendingExtraction) -> None:
     """Delete the Lesson created by this extraction."""
     if pending.lesson_id:
-        Lesson.objects.filter(id=pending.lesson_id, tenant=pending.tenant).delete()
+        from apps.friends.access import backstop_service_context
+
+        with backstop_service_context():
+            Lesson.objects.filter(id=pending.lesson_id, tenant=pending.tenant).delete()
 
 
 def _undo_goal(pending: PendingExtraction) -> None:
@@ -369,9 +372,11 @@ def _undo_task(pending: PendingExtraction) -> None:
     """Reverse the task approval — delete the typed row when present,
     otherwise scrub the legacy markdown line."""
     if pending.task_id:
+        from apps.friends.access import backstop_service_context
         from apps.journal.models import Task
 
-        Task.objects.filter(id=pending.task_id, tenant=pending.tenant).delete()
+        with backstop_service_context():
+            Task.objects.filter(id=pending.task_id, tenant=pending.tenant).delete()
         return
 
     doc = Document.objects.filter(tenant=pending.tenant, kind=Document.Kind.TASKS, slug="tasks").first()

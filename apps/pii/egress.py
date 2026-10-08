@@ -251,15 +251,18 @@ class KnownValueResponseGuardMixin:
         tenant_id = kwargs.get("tenant_id") or getattr(self, "kwargs", {}).get("tenant_id")
         if tenant_id and hasattr(response, "data"):
             try:
+                from django.db import transaction
+
                 from apps.tenants.models import Tenant
 
-                tenant = Tenant.objects.filter(pk=tenant_id).only("id", "pii_entity_map").first()
-                response.data = redact_known_value_fields(
-                    tenant,
-                    response.data,
-                    seam=self.pii_egress_seam,
-                    text_fields=self.pii_egress_text_fields,
-                )
+                with transaction.atomic():
+                    tenant = Tenant.objects.filter(pk=tenant_id).only("id", "pii_entity_map").first()
+                    response.data = redact_known_value_fields(
+                        tenant,
+                        response.data,
+                        seam=self.pii_egress_seam,
+                        text_fields=self.pii_egress_text_fields,
+                    )
             except Exception:
                 logger.warning(
                     "pii_egress_guard_error tenant=%s seam=%s",

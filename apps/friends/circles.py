@@ -207,13 +207,17 @@ def add_circle_member(tenant, user, circle_id, handle) -> dict:
     return {"circle_id": str(circle.id), "added": profile.handle}
 
 
+@transaction.atomic
 def _depart(circle, tenant, membership, *, purge, new_status):
     membership.status = new_status
     membership.left_at = timezone.now()
     membership.save(update_fields=["status", "left_at"])
     _sync_circle_thread_membership(circle, tenant, tenant.user, active=False)
     # My circle-scoped shares leave the circle instantly (zero residue).
-    access.revoke_owner_circle_grants(tenant, circle)
+    # Membership is already inactive, so tenant RLS can no longer see these
+    # grants. The accessor restricts revocation to this owner and circle.
+    with access.backstop_service_context():
+        access.revoke_owner_circle_grants(tenant, circle)
     if purge:
         # Default: purge what my agent absorbed FROM this circle. Keep = my choice.
         AbsorbedItem.objects.filter(tenant=tenant, circle=circle, purged_at__isnull=True).update(

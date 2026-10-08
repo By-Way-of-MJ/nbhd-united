@@ -710,8 +710,10 @@ def _do_hard_delete(user) -> None:
                 tenant.id,
                 exc_info=True,
             )
+    from apps.friends.access import backstop_service_context
+
     user_id, user_email = user.id, user.email
-    with transaction.atomic():
+    with transaction.atomic(), backstop_service_context():
         # Serialize deletion against a concurrent link (FK insert) and against
         # existing-identity token rotation. The outbox copy and cascade delete
         # then commit together, so the newest revocation credential cannot be

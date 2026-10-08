@@ -414,8 +414,9 @@ class ShareIntentTest(TestCase):
     def test_enqueue_scrub_dedup_id_uses_content_hash_without_colon(self):
         shared_lesson, _ = access.ensure_shared_lesson(self.lesson, self.a)
         content_hash = "abcdef12" + "0" * 56
-        with mock.patch("apps.cron.publish.publish_task") as publish:
+        with mock.patch("apps.cron.publish.publish_task") as publish, self.captureOnCommitCallbacks(execute=True):
             services._enqueue_scrub(shared_lesson, content_hash)
+            publish.assert_not_called()
 
         publish.assert_called_once_with(
             "scrub_shared_lesson",

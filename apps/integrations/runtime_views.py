@@ -63,6 +63,7 @@ from apps.router.document_write_guard import (
     record_runtime_write_event,
 )
 from apps.tenants.models import Tenant
+from apps.tenants.rls import RLSRequestTransactionMixin
 
 from .apple_maps import search_places
 from .google_api import (
@@ -1607,7 +1608,10 @@ class RuntimeTaskDetailView(APIView):
                 return Response(payload, status=status.HTTP_409_CONFLICT)
 
             deleted_id = str(task.id)
-            task.delete()
+            from apps.friends.access import backstop_service_context
+
+            with backstop_service_context():
+                task.delete()
 
         logger.info(
             "journal_task_delete tenant=%s subtasks=%s pending_actions=%s",
@@ -5980,7 +5984,7 @@ class RuntimeCronCreateDomainSummaryView(_RuntimeCronCreateBase):
 # Lesson load below are per-tenant, not the confined cross-tenant managers).
 
 
-class RuntimeProposeShareView(APIView):
+class RuntimeProposeShareView(RLSRequestTransactionMixin, APIView):
     """POST runtime/<tid>/lessons/<lesson_id>/propose-share/
 
     The agent proposes sharing an EXISTING star to a neighbor. Body:
@@ -6066,13 +6070,15 @@ class RuntimeNeighborhoodContextView(APIView):
     authentication_classes = []
 
     def get(self, request, tenant_id):
-        auth_failure = _internal_auth_or_401(request, tenant_id)
-        if auth_failure is not None:
-            return auth_failure
-        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
-        if tenant_failure is not None or tenant is None:
-            return tenant_failure
-
+        # Authenticate on the same backend as the context SET. Absorb owns its
+        # short DB phases; neural redaction must run outside request atomic.
+        with transaction.atomic():
+            auth_failure = _internal_auth_or_401(request, tenant_id)
+            if auth_failure is not None:
+                return auth_failure
+            tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+            if tenant_failure is not None or tenant is None:
+                return tenant_failure
         from django.utils.dateparse import parse_datetime
 
         from apps.friends import services as friends_services
@@ -6082,7 +6088,7 @@ class RuntimeNeighborhoodContextView(APIView):
         return Response(friends_services.neighborhood_context(tenant, since=since))
 
 
-class RuntimeMissionsView(KnownValueResponseGuardMixin, APIView):
+class RuntimeMissionsView(RLSRequestTransactionMixin, KnownValueResponseGuardMixin, APIView):
     """GET runtime/<tid>/missions/ — the tid's own Missions + crew projection, so
     the agent can nudge ITS OWN human toward showing up."""
 
@@ -6104,7 +6110,7 @@ class RuntimeMissionsView(KnownValueResponseGuardMixin, APIView):
         return Response({"missions": friends_services.runtime_missions(tenant)})
 
 
-class RuntimeProposeMissionTaskView(APIView):
+class RuntimeProposeMissionTaskView(RLSRequestTransactionMixin, APIView):
     """POST runtime/<tid>/missions/<mission_id>/propose-task/ {title, description?,
     due_date?} — the agent proposes ONE Mission task for ITS OWN human →
     PendingGoalAction (human-gated). Never writes another human's task: the
@@ -6154,7 +6160,7 @@ class RuntimeProposeMissionTaskView(APIView):
 _PROJECT_EGRESS_TEXT_FIELDS = frozenset({"title", "goal", "name", "owner", "my_linked_goal"})
 
 
-class RuntimeProjectsContextView(KnownValueResponseGuardMixin, APIView):
+class RuntimeProjectsContextView(RLSRequestTransactionMixin, KnownValueResponseGuardMixin, APIView):
     """GET runtime/<tid>/projects/ — the tid's OWN shared projects (Projects v2).
 
     Other members' text arrives fenced as untrusted data; their notes never arrive.
@@ -6178,7 +6184,7 @@ class RuntimeProjectsContextView(KnownValueResponseGuardMixin, APIView):
         return Response(project_assistant.runtime_context(tenant))
 
 
-class RuntimeProjectDraftView(APIView):
+class RuntimeProjectDraftView(RLSRequestTransactionMixin, APIView):
     """POST runtime/<tid>/project-drafts/ — the assistant saves a PRIVATE starter plan
     for its own human. Shares nothing; the human publishes (or not) from the app."""
 
@@ -6199,7 +6205,7 @@ class RuntimeProjectDraftView(APIView):
         return Response(project_assistant.create_draft(tenant, request.data), status=status.HTTP_201_CREATED)
 
 
-class RuntimeProjectProposeView(APIView):
+class RuntimeProjectProposeView(RLSRequestTransactionMixin, APIView):
     """POST runtime/<tid>/projects/<mission_id>/propose/ — the assistant SUGGESTS
     changes. A proposal only: the human approves in the app; the assistant cannot."""
 
