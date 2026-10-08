@@ -100,124 +100,27 @@ jobs:
   # Backend: Django checks and tests
   # ==========================================================================
   backend-test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    # Runs the backend leg of scripts/docker-gate.sh: python:3.12 + pgvector/pg16
+    # containers with the same steps as before (deps, ruff, secret scan, migrations
+    # check, Django tests, config validator). Same Linux containers wherever it runs.
+    #
+    # Where (MJ 2026-10-08): basecamp's self-hosted runner for MJ's own work — pushes
+    # to main and PRs from branches in THIS repo. This repo is public, so a PR from a
+    # fork (a stranger's code) and Dependabot's package bumps stay on GitHub-hosted
+    # runners and never execute on basecamp. Fallback: set repo variable
+    # BACKEND_RUNS_ON to "ubuntu-latest" (a JSON string, with the quotes).
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]')) && '"ubuntu-latest"' || vars.BACKEND_RUNS_ON || '["self-hosted","basecamp"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # Pin Ruff so formatter output matches the version used to format this repo; an
-          # unpinned release broke main with zero code changes on 2026-07-25. Bump the pin
-          # and reformat the repo together in the same deliberate-chore PR.
-          pip install "ruff==0.15.21"
-          pip install --no-deps https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl || python -m spacy download en_core_web_sm
-
-      - name: Run ruff lint
-        run: ruff check .
-
-      - name: Run ruff format check
-        run: ruff format --check .
-
-      - name: Secret scan
-        run: |
-          HITS=$(grep -rPn '(sk-ant-[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|AAAAAAAAAAAAA|tvly-dev-[A-Za-z0-9_-]{20,})' \
-            --include='*.py' --include='*.ts' --include='*.tsx' --include='*.js' \
-            --include='*.json' --include='*.yaml' --include='*.yml' \
-            --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.venv \
-            --exclude='*.lock' \
-            --exclude='config_validator.py' \
-            --exclude='config_security.py' \
-            --exclude='test_config_security.py' \
-            --exclude='harness-check' \
-            --exclude='ci-cd.yml' \
-            . 2>/dev/null || true)
-          if [ -n "$HITS" ]; then
-            echo "Secret patterns detected in source files:"
-            echo "$HITS"
-            exit 1
-          fi
-          echo "No secret patterns found"
-
-      - name: Run Django checks and tests
+      - name: Backend leg (Linux containers)
         env:
-          DJANGO_SETTINGS_MODULE: config.settings.development
-          SECRET_KEY: test-secret-key-not-for-production
-          DEBUG: "True"
-          DATABASE_URL: postgres://test_user:test_password@localhost:5432/test_db
-          ALLOWED_HOSTS: "*"
-          # Force on_commit callbacks to run synchronously in tests so
-          # daemon-thread USER.md pushes (envelope registry) and QStash
-          # publishes (journal post_save) don't outlive the test runner
-          # and hold DB connections open during teardown.
-          NBHD_DISABLE_BACKGROUND_THREADS: "True"
-          # Tests trigger model post_save → registry → push_user_md, which
-          # would otherwise call real Azure storage. Mock keeps tests fast
-          # (otherwise each save burns ~30s on DefaultAzureCredential
-          # timeouts).
-          AZURE_MOCK: "true"
-        run: |
-          python manage.py makemigrations --check --dry-run
-          python manage.py migrate --noinput
-          python manage.py check
-          python manage.py test apps/
-
-      - name: Config validator check
-        env:
-          DJANGO_SETTINGS_MODULE: config.settings.development
-          SECRET_KEY: test-secret-key-not-for-production
-          DEBUG: "True"
-          DATABASE_URL: postgres://test_user:test_password@localhost:5432/test_db
-          ALLOWED_HOSTS: "*"
-          AZURE_MOCK: "true"
-          OPENCLAW_USAGE_PLUGIN_ID: ""
-        run: |
-          python manage.py shell -c "
-          from apps.tenants.services import create_tenant
-          from apps.orchestrator.config_generator import generate_openclaw_config
-          from apps.orchestrator.config_validator import validate_openclaw_config
-          from apps.orchestrator.config_security import audit_config_security
-
-          tenant = create_tenant(display_name='CI Validator', telegram_chat_id=999999)
-          config = generate_openclaw_config(tenant)
-
-          issues = validate_openclaw_config(config)
-          errors = [i for i in issues if i.severity == 'error']
-          if errors:
-              for e in errors:
-                  print(f'ERROR: {e.path} — {e.message}')
-              raise SystemExit(1)
-
-          findings = audit_config_security(config)
-          sec_errors = [f for f in findings if f.severity == 'error']
-          if sec_errors:
-              for f in sec_errors:
-                  print(f'SECURITY: {f.check} — {f.message}')
-              raise SystemExit(1)
-
-          print('Config validator: PASS')
-          print('Security audit: PASS')
-          "
+          DOCKER_GATE_LEGS: backend
+          # basecamp's Docker (colima) only sees the home folder; the runner's temp
+          # dir is inside it (the macOS default /var/folders is not).
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/docker-gate.sh
 
   # ==========================================================================
   # OpenClaw config conformance smoke
