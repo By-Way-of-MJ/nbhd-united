@@ -17,7 +17,7 @@ from typing import Any
 # Bump this constant + Dockerfile.openclaw ARG when rolling out a new
 # OpenClaw release.  Everything else (model default, config fallback,
 # function defaults, tests) imports this value.
-OPENCLAW_CURRENT_VERSION = "2026.5.28"
+OPENCLAW_CURRENT_VERSION = "2026.9.4"
 
 
 def _parse_version(v: str) -> tuple[int, ...]:
@@ -131,9 +131,11 @@ _STARTER_ALLOW_2026_5_7: tuple[str, ...] = _STARTER_ALLOW_2026_4_15
 # with tenant data in the query string to an attacker-controlled URL —
 # wrapping the tool's *response* via ``wrapExternalContent`` does nothing to
 # stop the outbound request itself. The only production dependency was the
-# morning-briefing weather step, rerouted to ``web_search`` (already
-# allowed, already wrapped) in ``config_generator._MORNING_BRIEFING_PROMPT_TEMPLATE``
-# — see that template for the graceful-degradation handling.
+# morning-briefing weather step, which no longer fetches anything from the
+# agent side at all: Django calls Open-Meteo itself and hands the model a
+# verbatim line via the ``nbhd_weather_briefing`` plugin tool (see
+# ``apps.orchestrator.briefing_weather`` and
+# ``config_generator._MORNING_BRIEFING_WEATHER_STEP``).
 
 _DENIED_TOOLS_2026_5_28: tuple[str, ...] = _DENIED_TOOLS_2026_5_7 + ("web_fetch",)
 

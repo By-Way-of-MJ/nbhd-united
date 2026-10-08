@@ -27,6 +27,7 @@ a party (IDOR defeated by construction, design §4.5).
 from __future__ import annotations
 
 import contextlib
+from datetime import timedelta
 
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -44,8 +45,10 @@ from .models import (
     FriendThread,
     FriendThreadMembership,
     LessonShareGrant,
+    NeighborPhoto,
     NeighborProfile,
     SharedGoal,
+    SharedGoalMembership,
     SharedLesson,
     SkyMembership,
     WormholeVisit,
@@ -68,7 +71,7 @@ def backstop_service_context():
     a background read would see zero rows and the feature would break.
 
     A no-op when ``FRIENDS_DB_BACKSTOP`` is off, and harmless (inert) while the
-    app role bypasses RLS. On exit it clears ONLY ``app.service_role`` — never
+    app role bypasses RLS. On exit it restores ONLY ``app.service_role`` (including a nested service context) — never
     ``app.tenant_id`` / ``app.user_id`` — so a middleware-set tenant GUC on an
     in-request caller survives untouched."""
     if not getattr(settings, "FRIENDS_DB_BACKSTOP", True):
@@ -76,13 +79,16 @@ def backstop_service_context():
         return
     from apps.tenants.middleware import set_rls_context
 
+    with connection.cursor() as cur:
+        cur.execute("SELECT current_setting('app.service_role', true)")
+        previous = cur.fetchone()[0] or ""
     set_rls_context(service_role=True)
     try:
         yield
     finally:
         if connection.connection is not None:
             with connection.cursor() as cur:
-                cur.execute("SELECT set_config('app.service_role', '', false)")
+                cur.execute("SELECT set_config('app.service_role', %s, false)", [previous])
 
 
 def are_neighbors(a: Tenant, b: Tenant) -> bool:
@@ -120,7 +126,7 @@ def assert_neighbors(viewer_tenant, friendship_id) -> Friendship:
     viewer_id = _tenant_id(viewer_tenant)
     try:
         edge = Friendship.objects.get(id=friendship_id)
-    except Friendship.DoesNotExist as exc:
+    except (Friendship.DoesNotExist, ValueError, ValidationError) as exc:
         raise PermissionDenied("No such friendship") from exc
     if viewer_id not in (edge.requester_id, edge.addressee_id):
         raise PermissionDenied("Not a party to this friendship")
@@ -912,10 +918,9 @@ def absorb_pending_chat(viewer_tenant) -> list[dict]:
 
 # ── Missions (SharedGoal) data layer — SharedGoal.objects confined here ──────
 #
-# Only ``SharedGoal`` is chokepoint-confined (SharedGoalMembership /
-# SharedGoalUpdate / PendingGoalAction are ordinary friends models used freely
-# by services + projection). So the mission's create / read / list / locked-edit
-# funnel here; membership + the append-only update stream do not.
+# SharedGoal and all related project managers are confined here, including
+# memberships, updates, pending legacy actions, and Projects v2 plan rows.
+# Services enforce membership before loading a plan or mutating its rows.
 
 
 def create_mission(creator_tenant, friendship, *, title, description="", pillar="", target=None, target_date=None):
@@ -931,20 +936,26 @@ def create_mission(creator_tenant, friendship, *, title, description="", pillar=
     )
 
 
-def get_mission(mission_id):
+def get_mission(mission_id, *, lock=False):
     try:
-        return SharedGoal.objects.select_related("friendship").get(id=mission_id)
+        qs = SharedGoal.objects.select_related("friendship")
+        if lock:
+            qs = qs.select_for_update(of=("self",))
+        return qs.get(id=mission_id)
     except (SharedGoal.DoesNotExist, ValueError, ValidationError):
         return None
 
 
-def missions_for(tenant):
-    """Active missions the tenant is an active member of, newest first."""
-    return (
-        SharedGoal.objects.filter(memberships__tenant=tenant, memberships__status="active")
-        .distinct()
-        .order_by("-created_at")
-    )
+def missions_for(tenant, *, include_invited=False):
+    """Active participation plus optional invitations on still-accepted edges."""
+    states = Q(memberships__status="active")
+    if include_invited:
+        neighbor_ids = Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status="accepted")
+        counterparts = [e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in neighbor_ids]
+        states |= Q(memberships__status="invited") & (
+            Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts)
+        )
+    return SharedGoal.objects.filter(states, memberships__tenant=tenant).distinct().order_by("-created_at")
 
 
 def update_mission(mission, *, expected_version, editor_owner, fields):
@@ -1101,3 +1112,587 @@ def sky_roster(viewer_tenant) -> list[dict]:
         return out
 
     return _run_sky_with_rls_context(viewer_tenant, roster)
+
+
+# ── Shared-activity bond (web Neighborhood line thickness) ───────────────────
+#
+# A qualitative bucket per accepted neighbor — never a count, score, rank or
+# timestamp on the wire. Inputs are only things BOTH people already see: their
+# shared 1:1 thread, missions they are both active in, circles they are both
+# active in, and sparks granted on THEIR edge. Third-party activity never
+# counts (circle-granted sparks and group threads are excluded), the other
+# person's sky choice is never read, and every input is capped so message
+# volume can't dominate. An accepted edge is never below "light".
+
+BOND_WINDOW_DAYS = 180
+BOND_LIGHT, BOND_STEADY, BOND_STRONG = "light", "steady", "strong"
+_BOND_MESSAGE_CAP = 40  # → up to 4 points
+_BOND_MISSION_CAP = 2  # → up to 3 points
+_BOND_CIRCLE_CAP = 2  # → up to 2 points
+_BOND_SPARK_CAP = 6  # → up to 3 points
+_BOND_STEADY_AT = 2.0
+_BOND_STRONG_AT = 5.0
+
+
+def bond_points(*, messages: int, missions: int, circles: int, sparks: int) -> float:
+    """Capped, weighted evidence → points (pure; unit-tested directly)."""
+    return (
+        min(messages, _BOND_MESSAGE_CAP) / 10
+        + min(missions, _BOND_MISSION_CAP) * 1.5
+        + min(circles, _BOND_CIRCLE_CAP) * 1.0
+        + min(sparks, _BOND_SPARK_CAP) / 2
+    )
+
+
+def bond_bucket(points: float) -> str:
+    if points >= _BOND_STRONG_AT:
+        return BOND_STRONG
+    if points >= _BOND_STEADY_AT:
+        return BOND_STEADY
+    return BOND_LIGHT
+
+
+def bond_by_counterpart(viewer_tenant, edges) -> dict:
+    """``{counterpart_tenant_id: "light"|"steady"|"strong"}`` for the viewer's
+    ACCEPTED ``edges`` in a fixed number of grouped queries (no per-neighbor N+1).
+    Unknown/extra edges are ignored; non-accepted edges never get a bucket."""
+    viewer_id = _tenant_id(viewer_tenant)
+    accepted = [e for e in edges if e.status == Friendship.Status.ACCEPTED]
+    if not accepted:
+        return {}
+    by_edge = {e.id: (e.addressee_id if e.requester_id == viewer_id else e.requester_id) for e in accepted}
+    counterparts = set(by_edge.values())
+    since = timezone.now() - timedelta(days=BOND_WINDOW_DAYS)
+
+    # 1. Messages in THEIR 1:1 thread (either author), live, within the window.
+    messages: dict = {}
+    for row in (
+        FriendMessage.objects.filter(
+            thread__kind=FriendThread.Kind.DIRECT,
+            thread__friendship_id__in=list(by_edge),
+            deleted_at__isnull=True,
+            created_at__gte=since,
+        )
+        .values("thread__friendship_id")
+        .annotate(n=Count("seq"))
+    ):
+        messages[by_edge[row["thread__friendship_id"]]] = row["n"]
+
+    # 2. Missions both are ACTIVE in (goal still live or touched in the window).
+    my_goal_ids = list(
+        SharedGoalMembership.objects.filter(tenant_id=viewer_id, status="active")
+        .filter(Q(shared_goal__status=SharedGoal.Status.ACTIVE) | Q(shared_goal__created_at__gte=since))
+        .values_list("shared_goal_id", flat=True)
+    )
+    missions: dict = {}
+    if my_goal_ids:
+        for row in (
+            SharedGoalMembership.objects.filter(
+                shared_goal_id__in=my_goal_ids, status="active", tenant_id__in=counterparts
+            )
+            .values("tenant_id")
+            .annotate(n=Count("shared_goal_id", distinct=True))
+        ):
+            missions[row["tenant_id"]] = row["n"]
+
+    # 3. Circles both are ACTIVE members of.
+    my_circle_ids = my_active_circle_ids(viewer_id)
+    circles: dict = {}
+    if my_circle_ids:
+        for row in (
+            CircleMembership.objects.filter(circle_id__in=my_circle_ids, status="active", tenant_id__in=counterparts)
+            .values("tenant_id")
+            .annotate(n=Count("circle_id", distinct=True))
+        ):
+            circles[row["tenant_id"]] = row["n"]
+
+    # 4. Sparks granted on THEIR edge (either owner), ready + active, in window.
+    sparks: dict = {}
+    for row in (
+        LessonShareGrant.objects.filter(
+            friendship_id__in=list(by_edge),
+            status=LessonShareGrant.Status.ACTIVE,
+            shared_lesson__scrub_status=SharedLesson.ScrubStatus.READY,
+            created_at__gte=since,
+        )
+        .values("friendship_id")
+        .annotate(n=Count("shared_lesson_id", distinct=True))
+    ):
+        sparks[by_edge[row["friendship_id"]]] = row["n"]
+
+    return {
+        cid: bond_bucket(
+            bond_points(
+                messages=messages.get(cid, 0),
+                missions=missions.get(cid, 0),
+                circles=circles.get(cid, 0),
+                sparks=sparks.get(cid, 0),
+            )
+        )
+        for cid in counterparts
+    }
+
+
+# ── Reach: friends-of-friends as nameless COUNTS (web Neighborhood glimmers) ──
+# "N people you don't know are one step away through Kiho". The accessor returns
+# ONLY coarse buckets — never ids, names or exact counts — so a small network
+# can't be pinpointed. Below the smallest bucket the answer is null.
+
+REACH_BUCKETS = (100, 50, 25, 10, 5, 3)
+_REACH_GONE_STATUSES = (Tenant.Status.SUSPENDED, Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED)
+
+
+def reach_bucket(count: int) -> str | None:
+    """Largest threshold ≤ ``count`` as ``"<n>+"``; ``None`` for 0-2."""
+    for threshold in REACH_BUCKETS:
+        if count >= threshold:
+            return f"{threshold}+"
+    return None
+
+
+def _reach_visible(status, user_is_active, neighborhood_enabled) -> bool:
+    return status not in _REACH_GONE_STATUSES and bool(user_is_active) and bool(neighborhood_enabled)
+
+
+def reach_by_counterpart(viewer_tenant, edges) -> tuple[dict, str | None]:
+    """``({counterpart_tenant_id: bucket|None}, total_bucket|None)`` for the
+    viewer's ACCEPTED ``edges``, in two queries (blocks + one edge scan).
+
+    Reach through a friend = that friend's accepted neighbors, minus the viewer,
+    the viewer's own accepted neighbors, anyone in a blocked edge with the
+    viewer, and suspended/deleted/deactivated or Neighborhood-off accounts. A
+    friend who is themselves gone or has the Neighborhood off hides their
+    network: ``None``, and they add nothing to the total. The total buckets the
+    DEDUPED union across friends."""
+    viewer_id = _tenant_id(viewer_tenant)
+    counterparts = {
+        (e.addressee_id if e.requester_id == viewer_id else e.requester_id)
+        for e in edges
+        if e.status == Friendship.Status.ACCEPTED
+    }
+    if not counterparts:
+        return {}, None
+    excluded = counterparts | blocked_counterpart_ids(viewer_id) | {viewer_id}
+
+    # One scan: every accepted edge touching a counterpart — including the
+    # viewer↔counterpart edge itself, which carries the counterpart's own
+    # visibility — with both parties' account state joined in.
+    rows = Friendship.objects.filter(
+        Q(requester_id__in=counterparts) | Q(addressee_id__in=counterparts),
+        status=Friendship.Status.ACCEPTED,
+    ).values_list(
+        "requester_id",
+        "requester__status",
+        "requester__user__is_active",
+        "requester__neighborhood_enabled",
+        "addressee_id",
+        "addressee__status",
+        "addressee__user__is_active",
+        "addressee__neighborhood_enabled",
+    )
+    hidden: set = set()
+    through: dict = {cid: set() for cid in counterparts}
+    for r_id, r_status, r_active, r_nbhd, a_id, a_status, a_active, a_nbhd in rows:
+        parties = (
+            (r_id, _reach_visible(r_status, r_active, r_nbhd)),
+            (a_id, _reach_visible(a_status, a_active, a_nbhd)),
+        )
+        for (side, side_visible), (other, other_visible) in (parties, parties[::-1]):
+            if side not in counterparts:
+                continue
+            if not side_visible:
+                hidden.add(side)
+            elif other not in excluded and other_visible:
+                through[side].add(other)
+
+    union: set = set()
+    out: dict = {}
+    for cid in counterparts:
+        if cid in hidden:
+            out[cid] = None
+            continue
+        union |= through[cid]
+        out[cid] = reach_bucket(len(through[cid]))
+    return out, reach_bucket(len(union))
+
+
+# Projects v2. Callers authenticate membership before loading a plan. Every write
+# takes the goal lock before changing the plan. Existing Task mirrors lock the
+# caller's Task before the goal, matching the journal completion receiver.
+def mission_memberships():
+    return SharedGoalMembership.objects.all()
+
+
+def mission_updates():
+    from .models import SharedGoalUpdate
+
+    return SharedGoalUpdate.objects.all()
+
+
+def pending_goal_actions():
+    from .models import PendingGoalAction
+
+    return PendingGoalAction.objects.all()
+
+
+def assert_project_invitee(tenant, mission):
+    if mission.friendship_id:
+        return assert_neighbors(tenant, mission.friendship_id)
+    if _tenant_id(tenant) == mission.created_by_id:
+        return  # The creator can rejoin their own friendship-less/solo project.
+    if not are_neighbors(tenant, mission.created_by_id):
+        raise PermissionDenied("Friendship is not active")
+
+
+def lock_project(tenant, mission_id):
+    from rest_framework.exceptions import NotFound
+
+    goal = SharedGoal.objects.select_for_update().filter(id=mission_id).first()
+    member = mission_memberships().filter(shared_goal=goal, tenant=tenant, status="active").first() if goal else None
+    if member is None:
+        raise NotFound("No such mission.")
+    return goal, member
+
+
+def project_steps(goal):
+    from .models import SharedGoalStep
+
+    return SharedGoalStep.objects.filter(shared_goal=goal)
+
+
+def project_milestones(goal):
+    from .models import SharedGoalMilestone
+
+    return SharedGoalMilestone.objects.filter(shared_goal=goal)
+
+
+def project_assignments(goal):
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(step__shared_goal=goal, membership__shared_goal=goal)
+
+
+def my_open_project_asks(tenant):
+    """Unanswered asks addressed to ``tenant`` on open steps of active projects it has
+    joined (an invitee answers the invitation first)."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(
+        membership__tenant_id=_tenant_id(tenant),
+        membership__status="active",
+        status="asked",
+        step__status__in=["open", "in_progress"],
+        step__shared_goal__status="active",
+    )
+
+
+def due_nudge_candidates():
+    """Accepted owners of open, dated steps in active projects (the hourly
+    "due tomorrow" sweep narrows by each owner's local time)."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(
+        status="accepted",
+        membership__status="active",
+        membership__muted=False,
+        step__status__in=["open", "in_progress"],
+        step__due_date__isnull=False,
+        step__shared_goal__status="active",
+    ).select_related("step", "step__shared_goal", "membership", "membership__user", "membership__tenant")
+
+
+def claim_due_nudge(assignment_id, due) -> bool:
+    """Compare-and-set: True only for the one run that records this due date."""
+    from .models import SharedGoalStepAssignment
+
+    return bool(
+        SharedGoalStepAssignment.objects.filter(id=assignment_id).exclude(due_nudged_for=due).update(due_nudged_for=due)
+    )
+
+
+def still_yours_candidates(now):
+    """Owners of open steps 2–16 days past due who haven't been asked "still yours?"
+    for that due date (the sweep narrows to 3–14 days in each owner's local time)."""
+    from datetime import timedelta
+
+    from django.db.models import F
+
+    today = now.date()
+    return (
+        due_nudge_candidates()
+        .filter(step__due_date__lte=today - timedelta(days=2), step__due_date__gte=today - timedelta(days=16))
+        .exclude(still_yours_nudged_for=F("step__due_date"))
+        .order_by("step__due_date", "id")
+    )
+
+
+def claim_still_yours_nudge(assignment_id, due) -> bool:
+    """Compare-and-set: True only for the one run that records this overdue date."""
+    from .models import SharedGoalStepAssignment
+
+    return bool(
+        SharedGoalStepAssignment.objects.filter(id=assignment_id)
+        .exclude(still_yours_nudged_for=due)
+        .update(still_yours_nudged_for=due)
+    )
+
+
+def my_linked_step_tasks(membership):
+    """This member's own accepted step assignments that carry a private journal Task."""
+    from .models import SharedGoalStepAssignment
+
+    return SharedGoalStepAssignment.objects.filter(membership=membership, status="accepted", task__isnull=False)
+
+
+def project_dependencies(goal):
+    from .models import SharedGoalStepDependency
+
+    return SharedGoalStepDependency.objects.filter(blocker__shared_goal=goal, blocked__shared_goal=goal)
+
+
+def _own_goal_title(viewer, goal_id):
+    """Title of the VIEWER's own journal Goal (never another tenant's)."""
+    if not goal_id:
+        return None
+    from apps.journal.models import Goal
+
+    return Goal.objects.filter(id=goal_id, tenant_id=_tenant_id(viewer)).values_list("title", flat=True).first()
+
+
+_STEP_TENANT_FIELDS = {"completed_by_id", "reviewed_by_id", "review_set_by_id"}
+
+
+def project_snapshot(goal, *, viewer):
+    """Eager control-plane data; mute preferences are private to the viewer.
+
+    Pure projection cannot lazily read a Task. The caller has checked membership.
+    """
+    members = list(
+        mission_memberships()
+        .filter(shared_goal=goal)
+        .values("id", "tenant_id", "role", "status", "muted", "linked_goal_id")
+    )
+    profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
+    membership_by_tenant = {m["tenant_id"]: m["id"] for m in members}
+    for member in members:
+        if member["tenant_id"] != _tenant_id(viewer):
+            member.pop("muted")
+            member.pop("linked_goal_id")
+        else:
+            member["linked_goal_title"] = _own_goal_title(viewer, member["linked_goal_id"])
+        profile = profiles.get(member.pop("tenant_id"))
+        member.update(
+            handle=profile.handle if profile else None,
+            display_name=profile.display_name if profile else "Neighbor",
+            hue=profile.avatar_hue if profile else 210,
+            photo_url=photo_url(profile),
+        )
+    return {
+        "mission_id": goal.id,
+        "title": goal.title,
+        "description": goal.description,
+        "status": goal.status,
+        "version": goal.version,
+        "target_date": goal.target_date,
+        "members": members,
+        "milestones": list(project_milestones(goal).values("id", "title", "target_date", "order", "reached_at")),
+        # Tenant ids never leave the server: who completed a step is reported as their
+        # membership id in this project.
+        "steps": [
+            {
+                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS},
+                "completed_by_membership_id": membership_by_tenant.get(row["completed_by_id"]),
+                "reviewed_by_membership_id": membership_by_tenant.get(row["reviewed_by_id"]),
+                "review_set_by_membership_id": membership_by_tenant.get(row["review_set_by_id"]),
+            }
+            for row in project_steps(goal).values(
+                "id",
+                "milestone_id",
+                "title",
+                "description",
+                "start_date",
+                "due_date",
+                "status",
+                "completed_at",
+                "completed_by_id",
+                "done_note",
+                "done_link",
+                "needs_review",
+                "review_set_by_id",
+                "reviewed_at",
+                "reviewed_by_id",
+                "order",
+                "version",
+            )
+        ],
+        "assignments": list(
+            project_assignments(goal).values(
+                "id",
+                "step_id",
+                "membership_id",
+                "status",
+                "counter_start",
+                "counter_due",
+                "note",
+                "responded_at",
+                "released_at",
+                "kept_at",
+                "suggested_membership_id",
+            )
+        ),
+        "edges": list(project_dependencies(goal).order_by("id").values("id", "blocker_id", "blocked_id")),
+    }
+
+
+def assignment_for_task(task):
+    """Trusted receiver lookup: exact task link AND accepted active tenant owner."""
+    from .models import SharedGoalStepAssignment
+
+    return (
+        SharedGoalStepAssignment.objects.filter(
+            task_id=task.id,
+            membership__tenant_id=task.tenant_id,
+            membership__status="active",
+            status="accepted",
+        )
+        .select_related("step", "membership")
+        .first()
+    )
+
+
+def milestone_completion_rows(goal):
+    """One aggregate read for all milestone completion counts (bounded at eight)."""
+    return project_milestones(goal).annotate(
+        step_count=Count("steps"),
+        open_count=Count("steps", filter=~Q(steps__status__in=["done", "skipped"])),
+    )
+
+
+# ── Projects v2 assistant (P1c): the user's PRIVATE drafts + proposals ──────────
+
+
+def my_project_drafts(tenant):
+    from django.utils import timezone
+
+    from .models import ProjectDraft
+
+    return ProjectDraft.objects.filter(
+        tenant_id=_tenant_id(tenant), published_goal__isnull=True, expires_at__gt=timezone.now()
+    )
+
+
+def my_project_proposals(tenant):
+    from .models import PendingProjectAction
+
+    return PendingProjectAction.objects.filter(tenant_id=_tenant_id(tenant))
+
+
+def expire_project_proposals(goal):
+    """A deleted project's pending assistant suggestions (every member's) expire."""
+    from .models import PendingProjectAction
+
+    PendingProjectAction.objects.filter(shared_goal=goal, status="pending").update(
+        status="expired", resolved_at=timezone.now()
+    )
+
+
+def create_project_draft(tenant, **fields):
+    from .models import ProjectDraft
+
+    return ProjectDraft.objects.create(tenant_id=_tenant_id(tenant), **fields)
+
+
+def create_project_proposal(tenant, goal, **fields):
+    from .models import PendingProjectAction
+
+    return PendingProjectAction.objects.create(tenant_id=_tenant_id(tenant), shared_goal=goal, **fields)
+
+
+def my_active_project_memberships(tenant):
+    """Projects I have joined that are still active (for the assistant's context)."""
+    return (
+        mission_memberships()
+        .filter(tenant_id=_tenant_id(tenant), status="active", shared_goal__status="active")
+        .select_related("shared_goal")
+    )
+
+
+def my_neighbor_edges_by_handle(tenant) -> dict:
+    """``{lowercase @handle: accepted Friendship}`` for the tenant's neighbors."""
+    from django.db.models import Q
+
+    viewer = _tenant_id(tenant)
+    edges = list(
+        Friendship.objects.filter(Q(requester_id=viewer) | Q(addressee_id=viewer), status=Friendship.Status.ACCEPTED)
+    )
+    other = {str(e.addressee_id if str(e.requester_id) == str(viewer) else e.requester_id): e for e in edges}
+    out = {}
+    for profile in NeighborProfile.objects.filter(tenant_id__in=list(other)):
+        if profile.handle:
+            out[profile.handle.lower()] = other[str(profile.tenant_id)]
+    return out
+
+
+# ── Profile photos — NeighborPhoto.objects confined here ────────────────────
+
+
+def photo_url(profile) -> str | None:
+    """The versioned URL clients fetch a person's photo from, or None (no photo).
+    A new photo is a new version, so each URL is safe to cache forever."""
+    version = getattr(profile, "photo_version", None)
+    if not profile or not version:
+        return None
+    return f"/api/v1/friends/photos/{profile.id}/?v={version}"
+
+
+def save_photo(profile, jpeg: bytes) -> int:
+    """Store (or replace) my photo and bump the version. Returns the new version."""
+    with transaction.atomic():
+        NeighborPhoto.objects.update_or_create(profile=profile, defaults={"image": jpeg, "content_type": "image/jpeg"})
+        profile.photo_version = (profile.photo_version or 0) + 1
+        profile.save(update_fields=["photo_version", "updated_at"])
+    return profile.photo_version
+
+
+def delete_photo(profile) -> None:
+    """Remove my photo (the bytes too, not just the pointer)."""
+    with transaction.atomic():
+        NeighborPhoto.objects.filter(profile=profile).delete()
+        profile.photo_version = None
+        profile.save(update_fields=["photo_version", "updated_at"])
+
+
+def photo_bytes(profile_id):
+    return NeighborPhoto.objects.filter(profile_id=profile_id).values_list("image", "content_type").first()
+
+
+def _blocked_between(a_id, b_id) -> bool:
+    return Friendship.objects.filter(pair_key=compute_pair_key(a_id, b_id), status=Friendship.Status.BLOCKED).exists()
+
+
+def can_view_photo(viewer, profile) -> bool:
+    """Who sees a person's photo: themselves; an accepted neighbor; or someone who
+    shares an active circle or project with them. Never after a block (either way)
+    and never once the viewer has reported that person's photo."""
+    viewer_id, owner_id = _tenant_id(viewer), profile.tenant_id
+    if viewer_id == owner_id:
+        return True
+    if _blocked_between(viewer_id, owner_id):
+        return False
+    if ContentReport.objects.filter(
+        reporter_tenant_id=viewer_id, target_kind="profile_photo", photo_profile=profile
+    ).exists():
+        return False
+    if are_neighbors(viewer_id, owner_id):
+        return True
+    my_circles = CircleMembership.objects.filter(tenant_id=viewer_id, status="active").values_list(
+        "circle_id", flat=True
+    )
+    if CircleMembership.objects.filter(tenant_id=owner_id, status="active", circle_id__in=my_circles).exists():
+        return True
+    my_projects = SharedGoalMembership.objects.filter(
+        tenant_id=viewer_id, status="active", shared_goal__status="active"
+    ).values_list("shared_goal_id", flat=True)
+    return SharedGoalMembership.objects.filter(
+        tenant_id=owner_id, status__in=["active", "invited"], shared_goal_id__in=my_projects
+    ).exists()

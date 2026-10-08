@@ -1,5 +1,6 @@
 """Stripe webhook handler and billing views."""
 
+import json
 import logging
 
 import stripe
@@ -445,3 +446,74 @@ class CreditBalanceView(APIView):
         except Tenant.DoesNotExist:
             return Response({"detail": "No tenant found."}, status=http_status.HTTP_404_NOT_FOUND)
         return Response(credits_state(tenant))
+
+
+# ── Apple in-app subscriptions ───────────────────────────────────────────────
+
+_APPLE_NOTIFICATION_MAX_BYTES = 256 * 1024
+
+
+@csrf_exempt
+@require_POST
+def apple_notifications(request):
+    """App Store Server Notifications V2. 200 for anything verified and recorded
+    (unknown types, TEST, unknown accounts); non-200 only when Apple should retry."""
+    from apps.tenants.middleware import set_rls_context
+
+    from . import apple_iap
+
+    if len(request.body) > _APPLE_NOTIFICATION_MAX_BYTES:
+        return HttpResponse(status=413)
+    if not apple_iap.is_configured():
+        return HttpResponse(status=503)
+    try:
+        signed_payload = json.loads(request.body or b"{}").get("signedPayload") or ""
+    except (ValueError, AttributeError):
+        return HttpResponseBadRequest("Invalid body")
+    if not signed_payload:
+        return HttpResponseBadRequest("Missing signedPayload")
+
+    # Unauthenticated like the Stripe webhook: the signature is the authentication.
+    set_rls_context(service_role=True)
+    try:
+        apple_iap.handle_notification(signed_payload)
+    except apple_iap.AppleVerificationError:
+        logger.warning("Apple notification failed verification")
+        return HttpResponseBadRequest("Invalid signature")
+    except apple_iap.TransientAppleError:
+        logger.warning("Apple notification deferred (transient)", exc_info=True)
+        return HttpResponse(status=503)
+    return HttpResponse(status=200)
+
+
+class AppleSyncView(APIView):
+    """POST {"signed_transaction": "<JWS>"} from the signed-in app right after a
+    purchase or restore. Always records a real Apple purchase (Apple has already
+    charged); refuses only to bind it to the wrong NBHD account."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from . import apple_iap
+
+        tenant = getattr(request.user, "tenant", None)
+        if tenant is None:
+            return Response({"detail": "No account found."}, status=http_status.HTTP_404_NOT_FOUND)
+        signed = (request.data or {}).get("signed_transaction") or ""
+        if not signed:
+            return Response({"detail": "signed_transaction is required."}, status=http_status.HTTP_400_BAD_REQUEST)
+        if not apple_iap.is_configured():
+            return Response({"detail": "In-app purchase is not available yet."}, status=503)
+        try:
+            apple_iap.sync_from_app(tenant, signed)
+        except apple_iap.AccountMismatch as exc:
+            return Response({"detail": str(exc), "error": "other_account"}, status=http_status.HTTP_409_CONFLICT)
+        except apple_iap.AppleVerificationError:
+            return Response({"detail": "That purchase couldn't be verified."}, status=http_status.HTTP_400_BAD_REQUEST)
+        except apple_iap.TransientAppleError:
+            return Response({"detail": "The App Store didn't answer. Try again in a moment."}, status=503)
+        except apple_iap.AppleIAPError:
+            logger.warning("Apple sync failed for tenant %s", tenant.id, exc_info=True)
+            return Response({"detail": "That purchase couldn't be applied."}, status=http_status.HTTP_400_BAD_REQUEST)
+        tenant.refresh_from_db()
+        return Response({"subscription": apple_iap.subscription_summary(tenant)})

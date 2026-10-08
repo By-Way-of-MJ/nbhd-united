@@ -197,7 +197,8 @@ class BackfillWelcomesTransitionRegressionTest(TestCase):
         self.client = APIClient()
         self.tenant = _create_tenant_with_config_state(suffix=20)
         self.tenant.fuel_enabled = True
-        self.tenant.save(update_fields=["fuel_enabled"])
+        self.tenant.openclaw_version = "2026.5.28"  # gateway welcome path
+        self.tenant.save(update_fields=["fuel_enabled", "openclaw_version"])
 
     def _post(self):
         return self.client.post(

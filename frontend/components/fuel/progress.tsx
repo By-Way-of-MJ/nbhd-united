@@ -25,6 +25,8 @@ export function Progress() {
             return (
               <button
                 key={c}
+                data-os-filter
+                data-active={on}
                 onClick={() => setCat(c)}
                 className={`rounded-full min-h-[44px] px-3 py-2 text-[11px] font-bold uppercase tracking-wider transition border flex items-center gap-1.5 whitespace-nowrap ${
                   on ? "text-ink" : "text-ink-muted"
@@ -208,7 +210,7 @@ function StrengthProgress({ data }: { data: Record<string, unknown> }) {
   );
 
   if (lifts.length === 0) {
-    return <div className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">No strength sessions logged yet.</div>;
+    return <div data-os-surface className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">No strength sessions logged yet.</div>;
   }
 
   const HERO = 4;
@@ -260,7 +262,7 @@ function StrengthProgress({ data }: { data: Record<string, unknown> }) {
             </button>
           )}
           {restVisible && (
-            <div className="rounded-panel border border-border bg-surface-elevated/40 overflow-hidden">
+            <div data-os-surface className="rounded-panel border border-border bg-surface-elevated/40 overflow-hidden">
               {rest.map(([lift, pts], i) => (
                 <CompactStrengthRow
                   key={lift}
@@ -278,7 +280,7 @@ function StrengthProgress({ data }: { data: Record<string, unknown> }) {
       )}
 
       {filtered.length === 0 && query && (
-        <div className="rounded-panel border border-border p-4 text-center text-sm text-ink-faint">
+        <div data-os-surface className="rounded-panel border border-border p-4 text-center text-sm text-ink-faint">
           No lifts match &ldquo;{query}&rdquo;.
         </div>
       )}
@@ -305,7 +307,7 @@ function StrengthCard({
   const delta = +(latest - first).toFixed(1);
   const hasTrend = displayPts.length >= 2;
   return (
-    <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+    <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint truncate">{lift.toUpperCase()}</div>
@@ -398,7 +400,7 @@ function CardioProgress({ data }: { data: Record<string, unknown> }) {
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">PACE TREND</div>
         <div className="mt-1.5 text-2xl sm:text-3xl font-semibold italic" style={{ color: accent }}>
           {pace.length > 0 ? fmtPace(Math.min(...pace.map((p) => p.value))) : "\u2014"}
@@ -406,7 +408,7 @@ function CardioProgress({ data }: { data: Record<string, unknown> }) {
         </div>
         <Sparkline pts={pace} color={accent} invert format={(v) => `${fmtPace(v)} /km`} />
       </div>
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">DISTANCE PER SESSION</div>
         <div className="mt-1.5 text-2xl sm:text-3xl font-semibold italic" style={{ color: accent }}>
           {totalKm.toFixed(1)}<span className="text-xs text-ink-faint ml-1">km total</span>
@@ -426,14 +428,14 @@ function HiitProgress({ data }: { data: Record<string, unknown> }) {
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">PEAK HR</div>
         <div className="mt-1.5 text-2xl sm:text-3xl font-semibold italic" style={{ color: accent }}>
           {hrPts.length ? Math.max(...hrPts.map((p) => p.value)) : "\u2014"}<span className="text-xs text-ink-faint ml-1">bpm</span>
         </div>
         <Sparkline pts={hrPts} color={accent} format={(v) => `${Math.round(v)} bpm`} />
       </div>
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">TOTALS</div>
         <div className="mt-1.5 grid grid-cols-2 gap-4">
           <div>
@@ -477,7 +479,7 @@ function CalisProgress({ data }: { data: Record<string, unknown> }) {
   );
 
   if (skills.length === 0) {
-    return <div className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">No calisthenics sessions logged yet.</div>;
+    return <div data-os-surface className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">No calisthenics sessions logged yet.</div>;
   }
 
   const HERO = 4;
@@ -502,7 +504,7 @@ function CalisProgress({ data }: { data: Record<string, unknown> }) {
       {heroes.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
           {heroes.map(([name, { points, is_hold }]) => (
-            <div key={name} className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+            <div data-os-surface key={name} className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
               <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">{name.toUpperCase()}</div>
               <div className="mt-1.5 text-2xl sm:text-3xl font-semibold italic" style={{ color: accent }}>
                 {points.at(-1)?.value ?? 0}
@@ -529,7 +531,7 @@ function CalisProgress({ data }: { data: Record<string, unknown> }) {
             </button>
           )}
           {restVisible && (
-            <div className="rounded-panel border border-border bg-surface-elevated/40 overflow-hidden">
+            <div data-os-surface className="rounded-panel border border-border bg-surface-elevated/40 overflow-hidden">
               {rest.map(([name, { points, is_hold }], i) => (
                 <CompactCalisRow
                   key={name}
@@ -546,7 +548,7 @@ function CalisProgress({ data }: { data: Record<string, unknown> }) {
       )}
 
       {filtered.length === 0 && query && (
-        <div className="rounded-panel border border-border p-4 text-center text-sm text-ink-faint">
+        <div data-os-surface className="rounded-panel border border-border p-4 text-center text-sm text-ink-faint">
           No skills match &ldquo;{query}&rdquo;.
         </div>
       )}
@@ -670,7 +672,7 @@ function CountProgress({ data, accent }: { data: Record<string, unknown>; accent
   const sessions = (data.sessions as { date: string; activity: string; duration_minutes: number | null }[]) || [];
 
   return (
-    <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+    <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
       <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">SESSIONS</div>
       <div className="mt-1.5 text-2xl sm:text-3xl font-semibold italic" style={{ color: accent }}>{count}</div>
       <div className="mt-4 space-y-1.5">

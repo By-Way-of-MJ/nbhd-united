@@ -597,7 +597,9 @@ class ShareHttpTest(TestCase):
         self.assertEqual(resp.json()[0]["audience"], "HBee")
 
     def test_preview_endpoint_flag_off_403(self):
-        off = _tenant("http_off", friends_enabled=False)
+        off = _tenant("http_off")
+        off.neighborhood_enabled = False
+        off.save(update_fields=["neighborhood_enabled"])
         resp = _client(off.user).get("/api/v1/friends/shares/preview/?lesson_id=1&friendship_id=x")
         self.assertEqual(resp.status_code, 403)
 
@@ -674,19 +676,24 @@ class PendingShareDedupeMigrationTest(TransactionTestCase):
     migrate_from = ("friends", "0011_sky_rls_backstop")
     migrate_to = ("friends", "0012_dedupe_pending_shares")
 
-    def setUp(self):
-        super().setUp()
-        MigrationExecutor(connection).migrate([self.migrate_from])
-
     def tearDown(self):
-        MigrationExecutor(connection).migrate([self.migrate_to])
+        # Back to the LATEST of every app, not just friends 0012: rolling friends
+        # back also unapplies later migrations that depend on it (e.g. the tenants
+        # relocks and anything after them), and stopping at migrate_to would
+        # strand those columns for every later TransactionTestCase.
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
         super().tearDown()
 
     def test_migration_keeps_newest_pending_share(self):
+        # Rows that use today's Tenant model are created BEFORE the rollback:
+        # at friends 0011 later tenants columns are unapplied.
         owner = _tenant("dedupe_migration_owner")
         neighbor = _tenant("dedupe_migration_neighbor")
         edge = _accepted_edge(owner, neighbor)
         lesson = _lesson(owner)
+        MigrationExecutor(connection).migrate([self.migrate_from])
         expires_at = timezone.now() + timedelta(days=7)
         older = PendingShare.objects.create(
             tenant=owner,

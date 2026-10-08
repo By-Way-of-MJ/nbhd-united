@@ -22,6 +22,12 @@ _ENTITY_LEGEND_MAX_ENTRIES = 20
 _ENTITY_LEGEND_MAX_LINE_CHARS = 140
 
 
+# Spans the substitution never touches: existing placeholders, and the fence
+# markers around other people's text (a hidden name equal to "untrusted", or to a
+# neighbor's handle, must not rewrite the marker the assistant's rule refers to).
+_PROTECTED_RE = re.compile(_PLACEHOLDER_RE.pattern + r"|<<untrusted(?: from @[a-z0-9_]{3,30})?>>|<</untrusted>>")
+
+
 @dataclass(frozen=True)
 class _KnownValueMatcher:
     pattern: re.Pattern[str]
@@ -96,7 +102,7 @@ def _redact_known_values(tenant: Tenant | None, text: str) -> str:
 
     parts: list[str] = []
     last = 0
-    for placeholder_match in _PLACEHOLDER_RE.finditer(text):
+    for placeholder_match in _PROTECTED_RE.finditer(text):
         parts.append(matcher.pattern.sub(replace, text[last : placeholder_match.start()]))
         parts.append(placeholder_match.group(0))
         last = placeholder_match.end()
@@ -208,14 +214,20 @@ def redact_known_value_fields(
 ) -> Any:
     """Recursively guard allowlisted human-text fields in a JSON-like payload."""
     try:
+        from apps.pii.store_registry import is_cardio_machine_path
 
-        def walk(value: Any, redact_strings: bool = False) -> Any:
+        def walk(value: Any, redact_strings: bool = False, path: tuple = ()) -> Any:
+            if is_cardio_machine_path(path, value):
+                return value
             if isinstance(value, str):
                 return _redact_known_values(tenant, value) if redact_strings else value
             if isinstance(value, list):
-                return [walk(item, redact_strings) for item in value]
+                return [walk(item, redact_strings, (*path, index)) for index, item in enumerate(value)]
             if isinstance(value, dict):
-                return {key: walk(item, redact_strings or str(key) in text_fields) for key, item in value.items()}
+                return {
+                    key: walk(item, redact_strings or str(key) in text_fields, (*path, key))
+                    for key, item in value.items()
+                }
             return value
 
         return walk(payload)

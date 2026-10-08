@@ -247,7 +247,7 @@ def _clean_workout(item) -> tuple[dict | None, str | None]:
         "raw_type": raw_type,
         "source_bundle": source_bundle,
         "started_at": started_at,
-        "ended_at": ended_at,
+        "ended_at": ended_at or started_at + timedelta(seconds=duration_seconds or duration * 60),
         "duration_minutes": duration,
         "duration_seconds": duration_seconds,
         "metrics": metrics,
@@ -293,8 +293,23 @@ def _find_candidate(tenant, clean: dict, tz, consumed: set) -> Workout | None:
             continue
         if low_signal and not any(k in (c.activity or "").lower() for k in ("walk", "hike")):
             continue
-        if c.duration_minutes and clean["duration_minutes"] < _MIN_DURATION_RATIO * c.duration_minutes:
-            continue
+        detail = c.detail_json if isinstance(c.detail_json, dict) else {}
+        has_segments = c.category == "cardio" and bool(detail.get("segments"))
+        planned = detail.get("planned") if has_segments and isinstance(detail.get("planned"), dict) else {}
+        planned_seconds = _safe_float(planned.get("duration_s"))
+        planned_duration = planned_seconds / 60 if planned_seconds else c.duration_minutes
+        if planned_duration:
+            if clean["duration_minutes"] < _MIN_DURATION_RATIO * planned_duration:
+                continue
+        elif has_segments:
+            planned_distance = _safe_float(planned.get("distance_km"))
+            measured_distance = _safe_float(clean.get("metrics", {}).get("distance_km"))
+            if (
+                not planned_distance
+                or measured_distance is None
+                or measured_distance < _MIN_DURATION_RATIO * planned_distance
+            ):
+                continue
         if c.scheduled_at:
             window_start = c.window_start_at or (c.scheduled_at - timedelta(hours=2))
             window_end = c.window_end_at or (c.scheduled_at + timedelta(hours=2))
@@ -319,7 +334,11 @@ def _complete_planned(locked: Workout, clean: dict, authored_input: dict, input_
     Planned exercises/detail are preserved; measured metric keys win.
     """
     merged = dict(locked.detail_json or {})
-    healthkit_detail = dict(authored_input["detail_json"])
+    healthkit_detail = {
+        key: value
+        for key, value in authored_input["detail_json"].items()
+        if key not in {"planned", "segments", "terrain", "structure"}
+    }
     healthkit_detail["_healthkit"] = {**(healthkit_detail.get("_healthkit") or {}), "matched": True}
     merged.update(healthkit_detail)
 
@@ -360,7 +379,7 @@ def _complete_planned(locked: Workout, clean: dict, authored_input: dict, input_
             stored_text=stored_thread,
         )
 
-    locked.status = WorkoutStatus.DONE
+    locked.set_status(WorkoutStatus.DONE, completed_at=clean["ended_at"])
     locked.duration_minutes = clean["duration_minutes"]
     locked.duration_seconds = clean["duration_seconds"]
     locked.detail_json = merged
@@ -371,6 +390,7 @@ def _complete_planned(locked: Workout, clean: dict, authored_input: dict, input_
     locked.save(
         update_fields=[
             "status",
+            "completed_at",
             "duration_minutes",
             "duration_seconds",
             "detail_json",
@@ -511,12 +531,23 @@ def _adopt_existing_log(locked: Workout, clean: dict, authored_input: dict, inpu
             stored_text=stored_thread,
         )
 
+    locked.completed_at = clean["ended_at"]
     locked.external_id = clean["external_id"]
     locked.detail_json = merged
     locked.notes_thread = thread
     locked.pii_receipts = receipts
     locked.version += 1
-    locked.save(update_fields=["external_id", "detail_json", "notes_thread", "pii_receipts", "version", "updated_at"])
+    locked.save(
+        update_fields=[
+            "completed_at",
+            "external_id",
+            "detail_json",
+            "notes_thread",
+            "pii_receipts",
+            "version",
+            "updated_at",
+        ]
+    )
 
     return {
         "external_id": clean["external_id"],
@@ -573,6 +604,7 @@ def _ingest_workout(tenant, clean: dict, tz, consumed: set) -> dict:
                         tenant=tenant,
                         date=clean["started_at"].astimezone(tz).date(),
                         status=WorkoutStatus.DONE,
+                        completed_at=clean["ended_at"],
                         source=WorkoutSource.HEALTHKIT,
                         external_id=eid,
                         category=clean["category"],
@@ -694,7 +726,8 @@ def ingest_healthkit_payload(tenant, payload: dict) -> dict:
     tz = tenant_tz(tenant)
 
     profile = FuelProfile.objects.filter(tenant=tenant).first()
-    tombstones = set(profile.healthkit_tombstones or []) if profile else set()
+    ordered_tombstones = list(profile.healthkit_tombstones or []) if profile else []
+    tombstones = set(ordered_tombstones)
 
     # Deletions first: per-instance deletes so post_delete receivers fire
     # (tombstone capture + fuel_version). Bounded by MAX_DELETED.
@@ -707,7 +740,10 @@ def ingest_healthkit_payload(tenant, payload: dict) -> dict:
         for row in Workout.objects.filter(tenant=tenant, source=WorkoutSource.HEALTHKIT, external_id__in=deleted_ids):
             row.delete()
             deleted_count += 1
-        tombstones.update(deleted_ids)
+        for deleted_id in deleted_ids:
+            if deleted_id not in tombstones:
+                ordered_tombstones.append(deleted_id)
+                tombstones.add(deleted_id)
         # Persist the full tombstone set regardless of whether any rows were
         # actually deleted.  The post_delete signal only fires when a row
         # exists; when the HK sample was deleted before it ever synced, or was
@@ -715,7 +751,7 @@ def ingest_healthkit_payload(tenant, payload: dict) -> dict:
         # Without this, an anchor reset / app reinstall can resurrect the
         # sample — the same resurrection class as PR #847.
         if profile is not None:
-            profile.healthkit_tombstones = list(tombstones)[-_TOMBSTONE_CAP:]
+            profile.healthkit_tombstones = ordered_tombstones[-_TOMBSTONE_CAP:]
             profile.save(update_fields=["healthkit_tombstones", "updated_at"])
 
     raw_workouts = payload.get("workouts") or []
@@ -791,9 +827,9 @@ def push_visibility_refresh(tenant_id: str) -> None:
 
     def _run() -> None:
         try:
-            from apps.orchestrator.workspace_envelope import push_user_md
+            from apps.orchestrator.workspace_envelope import TRIGGER_HEALTHKIT, push_user_md
 
-            push_user_md(tenant_id, debounce_seconds=0)
+            push_user_md(tenant_id, debounce_seconds=0, trigger=TRIGGER_HEALTHKIT)
         except Exception:
             logger.warning("Post-sync USER.md push failed for tenant %s", str(tenant_id)[:8], exc_info=True)
 

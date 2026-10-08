@@ -708,12 +708,13 @@ class FuelMealsTodayView(APIView):
         # The Fuel surface is linked-account only. sautai_identity's email
         # fallback remains valid for assistant plan generation, but must not
         # auto-create or reveal a meal surface for an unlinked console user.
-        identity, integration = sautai_client.sautai_identity(tenant)
-        if integration is None or not integration.sautai_user_id:
-            return Response({"meals": [], "linked": False})
-
         today = tenant_today(tenant)
         week_start = today - timedelta(days=today.weekday())
+        metadata = {"week_start": week_start.isoformat()}
+        identity, integration = sautai_client.sautai_identity(tenant)
+        if integration is None or not integration.sautai_user_id:
+            return Response({"meals": [], "linked": False, "empty_reason": "not_linked", **metadata})
+
         try:
             result = sautai_client.fetch_sautai_current_plan(
                 identity=identity,
@@ -724,11 +725,22 @@ class FuelMealsTodayView(APIView):
             # Partner failures are expected degradation. Do not include the
             # exception or response content: either may contain user content.
             _logger.warning("fuel meals: Sautai read failed for tenant %s", str(tenant.id)[:8])
-            return Response({"meals": [], "linked": True})
+            return Response({"meals": [], "linked": True, "empty_reason": "plan_unavailable", **metadata})
 
         if not isinstance(result, dict) or result.get("outcome") != "ok":
-            return Response({"meals": [], "linked": True})
-        return Response({"meals": _today_meals_from_sautai_plan(result.get("plan"), today), "linked": True})
+            return Response({"meals": [], "linked": True, "empty_reason": "plan_unavailable", **metadata})
+        plan = result.get("plan")
+        meals = _today_meals_from_sautai_plan(plan, today)
+        payload = {"meals": meals, "linked": True, **metadata}
+        if not meals:
+            valid_plan = (
+                isinstance(plan, dict)
+                and plan.get("week_start") == week_start.isoformat()
+                and isinstance(plan.get("days"), list)
+                and all(isinstance(day, dict) and isinstance(day.get("meals"), list) for day in plan["days"])
+            )
+            payload["empty_reason"] = "no_meal_today" if valid_plan else "plan_unavailable"
+        return Response(payload)
 
 
 class WorkoutProgressView(APIView):
@@ -1025,10 +1037,10 @@ class WorkoutSkipView(APIView):
             writer="owner",
             receipts=workout.pii_receipts,
         )
-        workout.status = WorkoutStatus.SKIPPED
+        workout.set_status(WorkoutStatus.SKIPPED)
         workout.skip_reason = authored["skip_reason"]
         workout.pii_receipts = receipts
-        workout.save(update_fields=["status", "skip_reason", "pii_receipts", "updated_at"])
+        workout.save(update_fields=["status", "completed_at", "skip_reason", "pii_receipts", "updated_at"])
         return Response(WorkoutSerializer(workout, context={"tenant": tenant, "rehydrate": True}).data)
 
 
@@ -1045,7 +1057,7 @@ class WorkoutCompleteView(APIView):
             workout = Workout.objects.get(id=workout_id, tenant=tenant)
         except Workout.DoesNotExist:
             return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
-        workout.status = WorkoutStatus.DONE
+        workout.set_status(WorkoutStatus.DONE)
         if "notes" in request.data:
             from apps.pii.store_authoring import author_store_fields
 
@@ -1153,7 +1165,7 @@ class WeeklyVolumeSummaryView(APIView):
             except ValueError:
                 return Response({"error": "invalid week_start"}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            today = date_cls.today()
+            today = today_in_tenant_tz(tenant)
             week_start = today - timedelta(days=today.weekday())  # Monday
 
         week_end = week_start + timedelta(days=6)
@@ -1488,6 +1500,11 @@ class WorkoutPlanListView(APIView):
         if status_filter:
             qs = qs.filter(status=status_filter)
 
+        qs = qs.annotate(
+            workout_count=Count("workouts"),
+            completed_count=Count("workouts", filter=Q(workouts__status=WorkoutStatus.DONE)),
+        )
+
         # Compute the tenant-local today once and thread it into every
         # serializer so the derived program-progress fields don't fire a
         # per-plan tenant lookup (N+1) resolving "today".
@@ -1498,8 +1515,6 @@ class WorkoutPlanListView(APIView):
                 plan,
                 context={"today": today, "tenant": tenant, "rehydrate": True},
             ).data
-            data["workout_count"] = Workout.objects.filter(plan=plan).count()
-            data["completed_count"] = Workout.objects.filter(plan=plan, status=WorkoutStatus.DONE).count()
             result.append(data)
 
         return Response(result)
@@ -1557,7 +1572,7 @@ class WorkoutPlanListView(APIView):
                 data["deduped"] = True
                 return Response(data, status=status.HTTP_200_OK)
 
-        from apps.pii.store_authoring import author_store_fields
+        from .authoring import author_store_fields
 
         authored_plan, plan_receipts = author_store_fields(
             tenant,
@@ -1677,7 +1692,7 @@ class WorkoutPlanDetailView(APIView):
                 return sched_err
             serializer.validated_data["schedule_json"] = normalized_schedule
 
-        from apps.pii.store_authoring import author_store_fields
+        from .authoring import author_store_fields
 
         authored_plan, plan_receipts = author_store_fields(
             tenant,

@@ -74,8 +74,8 @@ SYSTEM_CRONS = [
     # :00 so it doesn't collide with hibernate-idle-tenants or
     # apply-pending-configs (both at :00).
     ("refresh-user-md-fleet", "25 * * * *", "/api/cron/trigger/refresh_user_md_fleet/"),
-    # Every hour — hibernate idle tenants (no messages in 2h)
-    ("hibernate-idle-tenants", "0 * * * *", "/api/cron/trigger/hibernate_idle_tenants/"),
+    # Every 10 min — hibernate tenants past the configured idle cutoff
+    ("hibernate-idle-tenants", "*/10 * * * *", "/api/cron/trigger/hibernate_idle_tenants/"),
     # Daily at 07:00 UTC — clean up delivered message buffers older than 7 days
     # (residual sweeper; delivered/undelivered BufferedMessage rows). Also
     # deletes undelivered raw webhooks older than 30 days (dead-tenant buffers).
@@ -123,6 +123,12 @@ SYSTEM_CRONS = [
     # Every 5 min — delete disabled internal at-cron rows once their 24-hour
     # forensic buffer has elapsed. User one-shots remain retained for audit.
     ("cleanup-internal-crons", "*/5 * * * *", "/api/cron/trigger/cleanup_internal_crons/"),
+    # Daily at 05:40 UTC — delete "since you were last here" write events older
+    # than 30 days. Metadata only; the feed never looks further back.
+    ("purge-runtime-write-events", "40 5 * * *", "/api/cron/trigger/purge_runtime_write_events/"),
+    # Daily at 05:50 UTC — purge diagnostic tool events older than 90 days.
+    # Offset from the 05:40 runtime-write purge and all other daily entries.
+    ("purge-tool-events", "50 5 * * *", "/api/cron/trigger/purge_tool_events/"),
     # Daily at 01:30 UTC — watchdog for orphaned Fuel/Gravity welcome crons.
     # Re-invokes the self-healing schedulers so a tenant whose welcome was
     # missed (gateway hiccup, agent crash mid-turn) gets retried within 24h.
@@ -145,6 +151,9 @@ SYSTEM_CRONS = [
     # compare-and-set on SharedGoalMembership.last_digest_window so a re-run
     # never double-nudges. Delivered through each member's own send-to-user seam.
     ("mission-weekly-digest", "0 6 * * 0", "/api/cron/trigger/mission_weekly_digest/"),
+    # Hourly at :07 — Projects v2 "due tomorrow" reminder, sent at 09:00 in each
+    # owner's own time zone; one per (owner, step, due date) via a CAS claim.
+    ("project-due-nudges", "7 * * * *", "/api/cron/trigger/project_due_nudges/"),
     # Monthly on 1st at 06:00 UTC — write FinanceSnapshot for every
     # finance-enabled active tenant. Idempotent per (tenant, date).
     # Powers the /api/v1/finance/snapshots/ endpoint (monthly debt/savings
@@ -162,6 +171,8 @@ SYSTEM_CRONS = [
     # RETIRED_CRON_PATHS below). Offset from cleanup-expired-telegram-tokens
     # (03:00) and poll-line-quota (03:15). See apps/pii/junk_sweep.py.
     ("pii-junk-sweep", "45 3 * * *", "/api/cron/trigger/pii_junk_sweep/"),
+    # Hourly provisional-binding expiry; creation and sweep have independent gates.
+    ("expire-provisional-bindings", "17 * * * *", "/api/cron/trigger/expire_provisional_bindings/"),
     # Hourly at :13 — bounded repair of Layer-1 fields whose authoring receipts
     # are unconfirmed/residual. The offset leaves top-of-hour tenant crons clear;
     # the task is retry/DLQ-backed through QStash.
@@ -178,6 +189,7 @@ SYSTEM_CRONS = [
     # the creation-before-enqueue crash window. Turns with any matching pending
     # queue row remain owned by the normal drain/reaper and are excluded.
     ("reap-stale-app-chat-messages", "*/5 * * * *", "/api/cron/trigger/reap_stale_app_chat_messages/"),
+    ("reap-meditations", "*/10 * * * *", "/api/cron/trigger/reap_meditations/"),
     # Daily at 03:15 UTC — poll LINE Messaging API for monthly Push usage,
     # update the fleet-wide quota state, and dispatch the user-facing
     # fan-out (90% pre-warn, exhaustion emails + channel flips, recovery
@@ -243,8 +255,12 @@ SYSTEM_CRONS = [
     #     reaper would leave them invisible for ~24h. At :50, a stranded row is
     #     reaped within ~2h worst-case. It only flips runs stuck >30min, so it never
     #     touches a live probe run.
-    # Every 30 min — chat round-trip journey canary.
-    ("eval-journey-chat", "*/30 * * * *", "/api/cron/trigger/eval_journey_chat/", 0),
+    # Daily at 04:30 UTC — chat round-trip journey canary. Was */30 until
+    # 2026-10-02: every fire bumps the synthetic tenant's last_message_at, so it
+    # never idled long enough to hibernate (~$55/mo of always-on container), and
+    # in ~4,000 runs it never saw more than 2 consecutive fails. Daily, ahead of
+    # the 05:xx probe block, keeps the end-to-end check at ~$1-2/mo.
+    ("eval-journey-chat", "30 4 * * *", "/api/cron/trigger/eval_journey_chat/", 0),
     # Daily at 05:05 UTC — journal write→FTS-search journey canary.
     ("eval-journey-journal", "5 5 * * *", "/api/cron/trigger/eval_journey_journal/", 0),
     # Daily at 05:12 UTC — hibernation-wake journey canary (force-hibernates the

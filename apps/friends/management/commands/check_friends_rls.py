@@ -4,7 +4,8 @@ PR8 of the Neighborhood layer adds a defence-in-depth DB backstop: FORCE ROW
 LEVEL SECURITY + tenant-scoped policies on the three highest-blast-radius
 cross-tenant tables (``shared_lessons``, ``lesson_share_grants``,
 ``friend_messages``); BN-PR6 extends it to the private "My sky" table
-(``friend_sky_memberships``). Those policies BIND only when the app's Postgres role is
+(``friend_sky_memberships``). Projects v2 extends this to milestones, steps,
+assignments and dependencies (friends.0015). Those policies BIND only when the app's Postgres role is
 NON-superuser and NON-BYPASSRLS. If Django connects as a BYPASSRLS role
 (``postgres``/``service_role``), the policies are inert belt-and-suspenders that
 start enforcing the moment the connection role is switched.
@@ -32,7 +33,16 @@ from __future__ import annotations
 from django.core.management.base import BaseCommand
 from django.db import connection
 
-FRIENDS_TABLES = ("shared_lessons", "lesson_share_grants", "friend_messages", "friend_sky_memberships")
+FRIENDS_TABLES = (
+    "shared_goal_milestones",
+    "shared_goal_steps",
+    "shared_goal_step_assignments",
+    "shared_goal_step_dependencies",
+    "shared_lessons",
+    "lesson_share_grants",
+    "friend_messages",
+    "friend_sky_memberships",
+)
 
 
 class Command(BaseCommand):

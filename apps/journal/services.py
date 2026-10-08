@@ -98,36 +98,63 @@ def upsert_markdown_section(md: str, heading: str, body: str) -> str:
     return md[:heading_end] + body + "\n" + md[boundary:]
 
 
-def resolve_daily_section_heading(*, tenant, markdown: str, section_slug: str) -> str:
-    """Choose a template-aware heading while honoring legacy derived headings."""
-    derived_heading = section_slug.replace("-", " ").title()
+def normalize_section_key(value: str) -> str:
+    """Punctuation-safe slug form: lowercase, apostrophes dropped, other symbols to hyphens."""
+    value = re.sub(r"['\u2019]", "", (value or "").lower())
+    return re.sub(r"[\W_]+", "-", value).strip("-")
+
+
+def title_case_slug(slug: str) -> str:
+    """Turn a slug into a heading by capitalising only the first letter of each word."""
+    words = slug.replace("-", " ").split()
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def _template_section_sources(template) -> list[list]:
+    return [getattr(template, "sections", None) or [], DEFAULT_TEMPLATE_SECTIONS]
+
+
+def _markdown_section_titles(markdown: str) -> list[str]:
+    titles = []
+    for match in re.finditer(r"(?m)^## (.+?)[ \t]*$", markdown or ""):
+        title = match.group(1).strip()
+        if title and not _ENTRY_SECTION_HEADER_RE.match(title):
+            titles.append(title)
+    return titles
+
+
+def resolve_daily_section_heading(*, tenant, markdown: str, section_slug: str, template=None) -> str:
+    """Choose a template-aware heading, reusing an existing heading whenever one matches."""
+    section_slug = section_slug.strip()
+    key = normalize_section_key(section_slug)
+    derived_heading = title_case_slug(section_slug)
+
+    if template is None:
+        template = get_default_template(tenant=tenant)
 
     canonical_heading = None
-    template = get_default_template(tenant=tenant)
-    section_sources = [
-        getattr(template, "sections", None) or [],
-        DEFAULT_TEMPLATE_SECTIONS,
-    ]
-    for sections in section_sources:
+    for sections in _template_section_sources(template):
         for section in sections:
             if not isinstance(section, dict):
                 continue
-            if str(section.get("slug") or "").strip() != section_slug:
-                continue
             title = str(section.get("title") or "").strip()
-            if title:
+            slug = str(section.get("slug") or "").strip()
+            if not title:
+                continue
+            if slug == section_slug or key in (normalize_section_key(slug), normalize_section_key(title)):
                 canonical_heading = title
                 break
         if canonical_heading is not None:
             break
 
-    if canonical_heading is None:
-        return derived_heading
-    if markdown_has_section(markdown, canonical_heading):
+    if canonical_heading is not None and markdown_has_section(markdown, canonical_heading):
         return canonical_heading
-    if markdown_has_section(markdown, derived_heading):
-        return derived_heading
-    return canonical_heading
+    for existing in _markdown_section_titles(markdown):
+        if normalize_section_key(existing) == key:
+            return existing
+    if canonical_heading is not None:
+        return canonical_heading
+    return derived_heading
 
 
 def _validate_template_sections(sections: list[dict], /) -> list[dict[str, str]]:
@@ -305,9 +332,25 @@ def ensure_daily_note_template(*, tenant, note):
     return template
 
 
-def parse_daily_sections(markdown: str | None) -> list[dict[str, str]]:
+def parse_daily_sections(markdown: str | None, *, template=None) -> list[dict[str, str]]:
+    """Split a daily note into ``##`` sections.
+
+    A section whose title matches a template section (the tenant's ``template``
+    first, then the defaults) reports that template's slug, so the slug a read
+    returns is the one a write resolves.
+    """
     if not markdown:
         return []
+
+    template_slugs: dict[str, str] = {}
+    for sections in reversed(_template_section_sources(template)):
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            title = str(section.get("title") or "").strip()
+            slug = str(section.get("slug") or "").strip()
+            if title and slug:
+                template_slugs[title.casefold()] = slug
 
     lines = markdown.splitlines()
     sections: list[dict[str, str]] = []
@@ -345,7 +388,9 @@ def parse_daily_sections(markdown: str | None) -> list[dict[str, str]]:
             if not current_title:
                 current_slug = "section"
             else:
-                current_slug = current_title.lower().replace(" ", "-")
+                current_slug = (
+                    template_slugs.get(current_title.casefold()) or normalize_section_key(current_title) or "section"
+                )
             current_lines = []
             current_is_entry = False
             continue
@@ -381,7 +426,7 @@ def get_or_seed_note_template(
     if template is None:
         template = seed_default_templates_for_tenant(tenant=tenant)["template"]
 
-    source_sections = parse_daily_sections(markdown or "")
+    source_sections = parse_daily_sections(markdown or "", template=template)
     if source_sections:
         return template, source_sections
 
@@ -434,7 +479,7 @@ def set_daily_note_section(
         # Auto-create the section at the end of the note.
         new_section = {
             "slug": section_slug,
-            "title": section_slug.replace("-", " ").title(),
+            "title": title_case_slug(section_slug),
             "content": content.strip(),
         }
         sections.append(new_section)
@@ -446,6 +491,10 @@ def set_daily_note_section(
         writer=writer,
         seam=seam,
     )
+    if section_slug == "energy-mood":
+        from .mood import bridge_daily_note_mood
+
+        bridge_daily_note_mood(tenant=note.tenant, note_date=note.date, content=content, writer=writer)
     return note, sections
 
 

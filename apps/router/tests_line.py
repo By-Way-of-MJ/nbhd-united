@@ -11,6 +11,7 @@ import time
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+from django.db import OperationalError
 from django.test import RequestFactory, TestCase, override_settings
 from django.utils import timezone
 
@@ -137,6 +138,36 @@ class LineWebhookEventTest(TestCase):
 
         user.refresh_from_db()
         self.assertIsNone(user.line_user_id)
+
+    @patch("apps.router.inbound_dedup.claim_inbound_event", return_value=True)
+    @patch("apps.router.line_webhook.LineWebhookView._handle_message")
+    def test_infra_message_error_logs_marker_and_is_swallowed(self, mock_handle, _claim):
+        from apps.router.line_webhook import LineWebhookView
+
+        mock_handle.side_effect = OperationalError("database unavailable")
+        event = {"webhookEventId": "line-infra-1", "type": "message"}
+
+        with self.assertLogs("apps.router.line_webhook", level="ERROR") as captured:
+            LineWebhookView()._handle_event(event)
+
+        self.assertTrue(
+            any("inbound_lost_infra channel=line event=line-infra-1 type=message" in line for line in captured.output)
+        )
+
+    @patch("apps.router.inbound_dedup.claim_inbound_event", return_value=True)
+    @patch("apps.router.line_webhook.LineWebhookView._handle_message")
+    def test_poison_message_error_logs_marker_and_is_swallowed(self, mock_handle, _claim):
+        from apps.router.line_webhook import LineWebhookView
+
+        mock_handle.side_effect = ValueError("bad event shape")
+        event = {"webhookEventId": "line-poison-1", "type": "message"}
+
+        with self.assertLogs("apps.router.line_webhook", level="ERROR") as captured:
+            LineWebhookView()._handle_event(event)
+
+        self.assertTrue(
+            any("inbound_lost_poison channel=line event=line-poison-1 type=message" in line for line in captured.output)
+        )
 
     @patch("apps.router.line_webhook._send_line_push")
     def test_follow_event_sends_welcome(self, mock_push):
@@ -457,12 +488,11 @@ class CronDeliveryChannelRoutingTest(TestCase):
         user, _ = self._user_tenant("routing_line", line_user_id="U_456")
         self.assertEqual(view._resolve_channel(user), "line")
 
-    def test_resolve_channel_none_when_unlinked(self):
-        # A genuinely unlinked user — no Telegram/LINE AND no registered iOS
-        # device — has no delivery surface, so the channel is None.
+    def test_resolve_channel_app_feed_when_unlinked(self):
+        # No linked transport is required for the app feed.
         view = self._get_view()
         user, _ = self._user_tenant("unlinked_routing")
-        self.assertIsNone(view._resolve_channel(user))
+        self.assertEqual(view._resolve_channel(user), "app")
 
 
 # ────────────────────────────────────────────────────────────────────────────

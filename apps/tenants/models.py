@@ -17,6 +17,7 @@ from .line_models import LineLinkToken  # noqa: F401
 
 # Import so Django discovers the models for migrations
 from .oauth_models import OAuthAuthorizationCode  # noqa: F401
+from .openclaw_upgrade_models import OpenClawAutoUpgrade, OpenClawAutoUpgradeLock  # noqa: F401
 from .pat_models import PersonalAccessToken  # noqa: F401
 from .promo_models import PromoCampaign, PromoRedemption  # noqa: F401
 from .telegram_models import TelegramLinkToken  # noqa: F401
@@ -205,6 +206,13 @@ class Tenant(models.Model):
         default="",
         help_text="Current OpenClaw container image tag (git SHA)",
     )
+    image_refresh_blocked_tag = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="OpenClaw image tag whose wake-time refresh failed its health check and was reverted; "
+        "the wake path will not try this tag again",
+    )
     openclaw_version = models.CharField(
         max_length=20,
         default=OPENCLAW_CURRENT_VERSION,
@@ -248,6 +256,10 @@ class Tenant(models.Model):
     # Stripe (dj-stripe handles subscription objects; this is a quick-lookup cache)
     stripe_customer_id = models.CharField(max_length=255, blank=True, default="")
     stripe_subscription_id = models.CharField(max_length=255, blank=True, default="")
+    # When the Stripe subscription last ended (cancelled or finally unpaid). The id
+    # above is now cleared at that point so "paying" means paying; win-back targeting
+    # uses this instead of a lingering id.
+    stripe_subscription_ended_at = models.DateTimeField(null=True, blank=True)
 
     # Scheduled deletion
     pending_deletion = models.BooleanField(
@@ -583,6 +595,10 @@ class Tenant(models.Model):
         ),
     )
     journal_shaping_enabled = models.BooleanField(default=False)
+    mood_context_enabled = models.BooleanField(
+        default=False,
+        help_text="Include the latest mood self-report in assistant context; canary opt-in.",
+    )
     digest_thread_attribution_enabled = models.BooleanField(
         default=False,
         help_text="Label non-main iOS chat content in the shared conversation digest with its source thread",
@@ -684,6 +700,14 @@ class Tenant(models.Model):
         default=dict,
         blank=True,
         help_text='Last-known cron job list from gateway. Format: {"jobs": [...], "snapshot_at": "ISO8601"}',
+    )
+
+    openclaw_migration_cron_fenced = models.BooleanField(default=False, db_index=True, editable=False)
+
+    openclaw_migration = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Private OpenClaw migration checkpoints, source snapshot and verification evidence.",
     )
 
     # Per-tenant flag for the Postgres-canonical cron rollout. The dashboard,
@@ -871,13 +895,38 @@ class Tenant(models.Model):
             "blobAccount, blobContainer, blobPathPrefix."
         ),
     )
+    site_editor_enabled = models.BooleanField(
+        default=False,
+        help_text="Enable guarded GitHub source editing for the subscriber's own website",
+    )
+    site_editor_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Per-tenant nbhd-site-editor config. Keys: owner, repo, branch, "
+            "allowPaths, denyPaths, maxTextBytes, maxImageBytes, maxFiles, "
+            "maxTotalBytes, deployMinutes, authorEmail."
+        ),
+    )
 
     # Neighborhood (Friends) module — cross-tenant sharing, wormholes, chat,
     # Missions. Dark by default; rolled out per-tenant like every other pillar.
     # Product surface is "Neighborhood"; the flag/app stay ``friends_*``.
+    # Whether the PERSON can use the Neighborhood surface (waves, neighbor chat,
+    # circles/communities, shared sparks). Standard-on for everyone — this is a
+    # human-to-human social feature with no dependency on the paid AI runtime.
+    # A per-tenant off switch remains for moderation.
+    neighborhood_enabled = models.BooleanField(
+        default=True,
+        help_text="Person can use the Neighborhood — waves, neighbor chat, circles, shared sparks",
+    )
+    # Whether the ASSISTANT participates in the Neighborhood (friends plugin +
+    # tools, the Neighborhood AGENTS.md section, neighbor persona). Opt-in and
+    # dark by default — kept separate from neighborhood_enabled so opening the
+    # human surface never changes anyone's AI config.
     friends_enabled = models.BooleanField(
         default=False,
-        help_text="Enable the Neighborhood (Friends) layer — waves, shared sparks, wormholes, chat",
+        help_text="Assistant participates in the Neighborhood (friends plugin, tools, AGENTS.md section)",
     )
     friends_agent_propose_enabled = models.BooleanField(
         default=False,
@@ -1029,6 +1078,18 @@ class Tenant(models.Model):
         help_text="Latest available config version; > config_version means update pending",
     )
     provisioned_at = models.DateTimeField(null=True, blank=True)
+    provision_lease_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Heartbeat stamped by the run that atomically claimed provisioning "
+            "for this tenant. A PROVISIONING row is only reclaimable once this "
+            "goes stale (see orchestrator.services._PROVISION_LEASE_STALE) — "
+            "without it, concurrent runs (QStash redelivery, Stripe retry "
+            "racing checkout) both mint an internal API key and the DB/KV "
+            "values diverge, bricking every authenticated container call."
+        ),
+    )
     config_refreshed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -1073,9 +1134,10 @@ class Tenant(models.Model):
         """
         from django.utils import timezone
 
-        has_subscription = bool(self.stripe_subscription_id)
+        from apps.billing.entitlement import is_paying
+
         on_valid_trial = bool(self.is_trial) and self.trial_ends_at and self.trial_ends_at > timezone.now()
-        return has_subscription or on_valid_trial or bool(self.is_budget_exempt)
+        return is_paying(self) or bool(on_valid_trial) or bool(self.is_budget_exempt)
 
     @classmethod
     def entitled_active(cls):
@@ -1091,14 +1153,14 @@ class Tenant(models.Model):
         """
         from django.utils import timezone
 
+        from apps.billing.entitlement import paying_q
+
         now = timezone.now()
         return cls.objects.filter(
             status=cls.Status.ACTIVE,
             container_id__gt="",
         ).filter(
-            models.Q(stripe_subscription_id__gt="")
-            | models.Q(is_trial=True, trial_ends_at__gt=now)
-            | models.Q(is_budget_exempt=True),
+            paying_q() | models.Q(is_trial=True, trial_ends_at__gt=now) | models.Q(is_budget_exempt=True),
         )
 
     @property

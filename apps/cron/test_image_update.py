@@ -54,10 +54,41 @@ def _batch_return_len(tasks, **kwargs):
     return len(tasks)
 
 
-@override_settings(OPENCLAW_IMAGE_TAG="abc123", AZURE_ACR_SERVER="nbhdunited.azurecr.io")
+# OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*" opts every tenant into the image
+# auto-roll — these tests exercise the roll mechanics, which are now gated by
+# that allowlist (default empty = nobody rolls; see image_rollout.py). The
+# gate's own default-off behavior is covered in test_image_rollout.py and
+# test_image_bump_skipped_when_not_allowlisted below.
+@override_settings(
+    OPENCLAW_IMAGE_TAG="abc123",
+    AZURE_ACR_SERVER="nbhdunited.azurecr.io",
+    OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*",
+)
 class ApplyPendingConfigsImageTests(TestCase):
     def setUp(self):
         self.client = APIClient()
+        self.enterContext(patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []}))
+        # Cron-state reads go through list_tenant_crons (gateway on 5.28, state file on 9.4).
+        self.gateway = self.enterContext(patch("apps.cron.gateway_client.list_tenant_crons", return_value={"jobs": []}))
+
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
+    def test_image_bump_deferred_when_cron_state_read_fails(self, mock_batch, _mock_verify):
+        from apps.cron.gateway_client import GatewayError
+
+        tenant = _create_tenant_with_state(
+            user_suffix=1,
+            last_message_at=timezone.now() - timedelta(minutes=20),
+            container_image_tag="oldtag",
+        )
+        self.gateway.side_effect = GatewayError("bad_gateway", status_code=502)
+        with self.assertLogs("apps.orchestrator.hibernation", level="WARNING") as logs:
+            response = self.client.post("/api/v1/cron/apply-pending-configs/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["image_enqueued"], 0)
+        self.assertEqual(response.json()["image_skipped_imminent_cron"], 1)
+        self.assertEqual(_extract_batch_tasks(mock_batch, "apply_single_tenant_image"), [])
+        self.assertIn(str(tenant.id), logs.output[0])
 
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
@@ -99,6 +130,28 @@ class ApplyPendingConfigsImageTests(TestCase):
         image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
         self.assertEqual(len(config_calls), 0)
         self.assertEqual(len(image_calls), 2)
+
+    @override_settings(OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="")
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
+    def test_image_bump_skipped_when_not_allowlisted(self, mock_batch, _mock_verify):
+        # The safety gate: with an empty allowlist (the default) NO tenant is
+        # rolled onto OPENCLAW_IMAGE_TAG even though it's stale — so a deploy
+        # that bumps the tag never moves the fleet on its own.
+        now = timezone.now()
+        _create_tenant_with_state(
+            user_suffix=1,
+            pending_config_version=1,
+            config_version=0,
+            last_message_at=now - timedelta(minutes=20),
+            container_image_tag="oldtag",
+        )
+
+        response = self.client.post("/api/v1/cron/apply-pending-configs/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["image_enqueued"], 0)
+        self.assertEqual(_extract_batch_tasks(mock_batch, "apply_single_tenant_image"), [])
 
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
@@ -210,9 +263,9 @@ class ApplyPendingConfigsImageTests(TestCase):
 
         response = self.client.post("/api/v1/cron/apply-pending-configs/")
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 503)
         body = response.json()
-        # Batch is all-or-nothing — on failure, all counts go to *_failed.
+        # A failed sweep must remain eligible for QStash delivery retries.
         self.assertEqual(body["config_enqueued"], 0)
         self.assertEqual(body["config_failed"], 1)
         self.assertEqual(body["image_enqueued"], 0)

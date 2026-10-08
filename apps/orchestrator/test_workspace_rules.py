@@ -9,10 +9,12 @@ file share under workspace/rules/<filename> on config refresh. This test ensures
 
 from __future__ import annotations
 
+from unittest.mock import call as mock_call
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
+from apps.orchestrator.config_generator import _prepare_cron_prompt
 from apps.orchestrator.personas import render_workspace_files, render_workspace_rules
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
@@ -39,9 +41,8 @@ class RenderWorkspaceRulesTest(TestCase):
         expected_rules = {
             "journal-capture.md",
             "lessons-constellation.md",
-            "memory.md",
             "messaging.md",
-            "onboarding.md",
+            "week-ahead.md",
         }
         # All expected rules should be present (may have more)
         self.assertTrue(expected_rules.issubset(set(rules.keys())))
@@ -51,18 +52,58 @@ class RenderWorkspaceRulesTest(TestCase):
         rules = render_workspace_rules()
         self.assertNotIn("workspaces.md", rules)
 
-    def test_memory_rule_carries_redacted_identity_honesty(self):
+    def test_retired_rules_are_absent(self):
         rules = render_workspace_rules()
-        memory = rules["memory.md"]
-        self.assertIn("## Redacted identities", memory)
-        self.assertIn("|unresolved", memory)
-        self.assertIn("Never assert familiarity, deny", memory)
+        self.assertNotIn("memory.md", rules)
+        self.assertNotIn("document-ingestion.md", rules)
+        self.assertNotIn("onboarding.md", rules)
+        self.assertNotIn("_principles.md", rules)
 
-    def test_memory_rule_requires_lookup_backed_check_claims(self):
-        memory = render_workspace_rules()["memory.md"]
-        self.assertIn("## Claims about checking", memory)
-        self.assertIn("only if you actually\ncalled a lookup tool THIS turn", memory)
-        self.assertIn("worst\nfailure mode", memory)
+    def test_fuel_rule_is_a_small_cron_only_stub(self):
+        fuel = render_workspace_rules()["fuel.md"]
+        self.assertTrue(fuel.startswith("<!-- CRON-ONLY:"))
+        self.assertLessEqual(len(fuel), 1_500)
+        self.assertIn("For Fuel plans/fill-ins, first use `tool_search`", fuel)
+        self.assertIn("background workout cron runs silently", fuel)
+        self.assertIn("Morning briefings", fuel)
+        self.assertIn("Evening check-ins", fuel)
+        self.assertIn("Week-ahead reviews", fuel)
+
+    def test_rendered_agents_has_always_loaded_fuel_search_gate(self):
+        agents = render_workspace_files("neighbor")["NBHD_AGENTS_MD"]
+        self.assertIn(
+            "For Fuel plans/fill-ins, first use `tool_search` for exact `nbhd_fuel_search_exercises`",
+            agents,
+        )
+
+    def test_messaging_rule_is_a_cron_only_stub(self):
+        messaging = render_workspace_rules()["messaging.md"]
+        self.assertTrue(messaging.startswith("<!-- CRON-ONLY:"))
+        self.assertIn("Only message if you have something genuinely useful to say.", messaging)
+        self.assertIn("Outside the window: respond to messages but don't proactively check in.", messaging)
+        self.assertIn(
+            "Read `docs/cron-management.md` before creating, editing, or disabling scheduled tasks.",
+            messaging,
+        )
+        self.assertNotIn("PATCH /api/v1/tenants/heartbeat/", messaging)
+        self.assertNotIn("Nightly Extraction", messaging)
+        self.assertNotIn("Project Check-in", messaging)
+
+    def test_week_ahead_rule_is_cron_only_and_excludes_reactive_chat_rules(self):
+        week_ahead = render_workspace_rules()["week-ahead.md"]
+        self.assertTrue(week_ahead.startswith("<!-- CRON-ONLY:"))
+        self.assertIn("Once a week, make yourself aware of the user's upcoming week", week_ahead)
+        self.assertIn("Current active cron jobs (`cron list`)", week_ahead)
+        self.assertIn("All decisions are logged", week_ahead)
+        self.assertNotIn("Reactive:", week_ahead)
+        self.assertNotIn("Any user plan change mid-week", week_ahead)
+        self.assertNotIn("immediately re-run the same check", week_ahead)
+
+    def test_cron_management_doc_does_not_copy_seed_schedules_or_nightly_extraction(self):
+        cron_doc = render_workspace_files("neighbor")["NBHD_DOC_CRON_MANAGEMENT"]
+        self.assertNotIn("Nightly Extraction", cron_doc)
+        self.assertNotIn("## System tasks (do NOT recreate, delete, or disable)", cron_doc)
+        self.assertNotIn("The 2:00 AM cron", cron_doc)
 
 
 class SubagentWorkspaceRulesTest(TestCase):
@@ -70,39 +111,38 @@ class SubagentWorkspaceRulesTest(TestCase):
         self.tenant = create_tenant(display_name="Subagent Rules", telegram_chat_id=606061)
 
     @override_settings(SUBAGENT_TENANT_IDS="")
-    def test_disabled_tenant_gets_exact_pre_feature_rule_set_and_agents_index(self):
+    def test_disabled_tenant_gets_exact_pre_feature_rule_set_and_no_chat_or_cron_index_row(self):
         rules = render_workspace_rules(tenant=self.tenant)
         self.assertEqual(
             set(rules),
             {
-                "_principles.md",
-                "document-ingestion.md",
                 "fuel.md",
                 "journal-capture.md",
                 "lessons-constellation.md",
-                "memory.md",
                 "messaging.md",
-                "onboarding.md",
-                "reply-markers.md",
-                "voice-journal.md",
                 "week-ahead.md",
             },
         )
         self.assertNotIn("rules/subagents.md", rules["messaging.md"])
         agents_md = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
+        cron_prompt = _prepare_cron_prompt("Task body", self.tenant)
         self.assertNotIn("| `rules/subagents.md` |", agents_md)
+        self.assertNotIn("| `rules/subagents.md` |", cron_prompt)
 
-    def test_enabled_tenant_gets_subagent_rule_messaging_exception_and_agents_index(self):
+    def test_enabled_tenant_gets_inline_chat_contract_without_cron_index(self):
         with override_settings(SUBAGENT_TENANT_IDS=str(self.tenant.id)):
             rules = render_workspace_rules(tenant=self.tenant)
             agents_md = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
+            cron_prompt = _prepare_cron_prompt("Task body", self.tenant)
 
         self.assertIn("subagents.md", rules)
         self.assertIn(
             "If `rules/subagents.md` is present in your workspace, follow it",
             rules["messaging.md"],
         )
-        self.assertIn("| `rules/subagents.md` |", agents_md)
+        self.assertNotIn("| `rules/subagents.md` |", agents_md)
+        self.assertNotIn("rules/subagents.md", cron_prompt)
+        self.assertIn("`sessions_spawn` BEFORE starting", agents_md)
 
 
 class UpdateTenantConfigUploadsRulesTest(TestCase):
@@ -125,7 +165,7 @@ class UpdateTenantConfigUploadsRulesTest(TestCase):
     )
     @patch("apps.orchestrator.azure_client.delete_workspace_file")
     @patch("apps.orchestrator.azure_client.upload_workspace_file")
-    def test_update_tenant_config_uploads_rules(
+    def test_update_tenant_config_uploads_rules_and_deletes_retired_rules(
         self,
         mock_upload_workspace_file,
         mock_delete_workspace_file,
@@ -152,22 +192,24 @@ class UpdateTenantConfigUploadsRulesTest(TestCase):
             0,
             f"No rules uploaded. All paths: {uploaded_paths}",
         )
-        self.assertTrue(
-            any("memory.md" in p for p in rules_paths),
-            f"memory.md not found in uploaded rules: {rules_paths}",
-        )
+        self.assertNotIn("workspace/rules/memory.md", rules_paths)
+        self.assertNotIn("workspace/rules/document-ingestion.md", rules_paths)
+        self.assertNotIn("workspace/rules/onboarding.md", rules_paths)
+        self.assertNotIn("workspace/rules/_principles.md", rules_paths)
         self.assertNotIn("workspace/rules/subagents.md", rules_paths)
-        mock_delete_workspace_file.assert_called_once_with(
-            str(self.tenant.id),
-            "workspace/rules/subagents.md",
+        mock_delete_workspace_file.assert_has_calls(
+            [
+                mock_call(str(self.tenant.id), "workspace/rules/voice-journal.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/reply-markers.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/memory.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/document-ingestion.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/onboarding.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/_principles.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/subagents.md"),
+            ],
+            any_order=True,
         )
-        memory_upload = next(
-            call for call in mock_upload_workspace_file.call_args_list if call.args[1] == "workspace/rules/memory.md"
-        )
-        self.assertIn("## Redacted identities", memory_upload.args[2])
-        self.assertIn("|unresolved", memory_upload.args[2])
-        self.assertIn("## Claims about checking", memory_upload.args[2])
-        self.assertIn("called a lookup tool THIS turn", memory_upload.args[2])
+        self.assertEqual(mock_delete_workspace_file.call_count, 7)
 
     @patch("apps.orchestrator.services.upload_config_to_file_share")
     @patch("apps.orchestrator.services.config_to_json", return_value="{}")
@@ -179,7 +221,7 @@ class UpdateTenantConfigUploadsRulesTest(TestCase):
     )
     @patch("apps.orchestrator.azure_client.delete_workspace_file")
     @patch("apps.orchestrator.azure_client.upload_workspace_file")
-    def test_enabled_tenant_does_not_delete_subagent_rule(
+    def test_enabled_tenant_keeps_subagent_rule_and_deletes_retired_rules(
         self,
         mock_upload_workspace_file,
         mock_delete_workspace_file,
@@ -194,7 +236,18 @@ class UpdateTenantConfigUploadsRulesTest(TestCase):
         with override_settings(SUBAGENT_TENANT_IDS=str(self.tenant.id)):
             update_tenant_config(str(self.tenant.id))
 
-        mock_delete_workspace_file.assert_not_called()
+        mock_delete_workspace_file.assert_has_calls(
+            [
+                mock_call(str(self.tenant.id), "workspace/rules/voice-journal.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/reply-markers.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/memory.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/document-ingestion.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/onboarding.md"),
+                mock_call(str(self.tenant.id), "workspace/rules/_principles.md"),
+            ],
+            any_order=True,
+        )
+        self.assertEqual(mock_delete_workspace_file.call_count, 6)
         uploaded_paths = [call.args[1] for call in mock_upload_workspace_file.call_args_list]
         self.assertIn("workspace/rules/subagents.md", uploaded_paths)
 

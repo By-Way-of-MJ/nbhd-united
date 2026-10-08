@@ -13,6 +13,7 @@ from typing import Any
 from apps.tenants.models import Tenant
 
 from .gateway_client import GatewayError, invoke_gateway_tool
+from .share_cron_sync import tenant_uses_file_cron_sync
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,14 @@ def suspend_tenant_crons(tenant: Tenant) -> dict[str, Any]:
     Jobs that are already disabled are left untouched.
     """
     result = {"disabled": 0, "already_disabled": 0, "errors": 0, "job_names": []}
+
+    # 9.4 gates the gateway cron.update. Nothing needs pausing there: a stopped
+    # container fires nothing, a non-active tenant is never woken for a cron
+    # (hibernation.wake_for_cron_task), and at boot the container rebuilds its
+    # crons from the signed file.
+    if tenant_uses_file_cron_sync(tenant):
+        result["skipped"] = "file_cron_sync"
+        return result
 
     if not tenant.container_fqdn:
         logger.warning("suspend_tenant_crons: tenant %s has no FQDN", tenant.id)
@@ -87,6 +96,12 @@ def resume_tenant_crons(tenant: Tenant) -> dict[str, Any]:
     Re-enables all disabled jobs — both system and user-created.
     """
     result = {"enabled": 0, "already_enabled": 0, "errors": 0, "job_names": []}
+
+    # 9.4: nothing was paused (see suspend_tenant_crons); the container runs
+    # the signed crons file from boot.
+    if tenant_uses_file_cron_sync(tenant):
+        result["skipped"] = "file_cron_sync"
+        return result
 
     if not tenant.container_fqdn:
         logger.warning("resume_tenant_crons: tenant %s has no FQDN", tenant.id)

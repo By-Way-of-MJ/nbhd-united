@@ -40,6 +40,7 @@ from collections.abc import Iterable
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 
 from apps.common.eval_sink import suppresses_real_transport
@@ -102,6 +103,7 @@ def record_proactive_outbound(
     job_name: str = "",
     journal_link: dict | None = None,
     quick_replies: list[str] | None = None,
+    panels: list[dict] | None = None,
     artifact_dedup_key: str | None = None,
     thread_id=None,
 ) -> ProactiveOutbound | None:
@@ -125,6 +127,9 @@ def record_proactive_outbound(
         from apps.pii.egress import redact_known_values
 
         message_text = redact_known_values(tenant, message_text, seam="proactive_outbound_storage")
+        from apps.router.panels import prepare_panels
+
+        panels = prepare_panels(tenant, panels, tool=True)
         transcript_redaction = None
         transcript_quarantine = None
         if getattr(tenant, "recall_capture_enabled", False):
@@ -185,6 +190,7 @@ def record_proactive_outbound(
                 # row across every delivery channel for the iOS feed and the
                 # deterministic model-facing offer set below.
                 quick_replies=quick_replies,
+                panels=panels or None,
             )
             if transcript_redaction is not None or transcript_quarantine is not None:
                 try:
@@ -258,6 +264,14 @@ def record_proactive_outbound(
     # the evidence row above, but never dispatch APNs from that stale channel.
     if suppresses_real_transport(tenant):
         return row
+
+    # The app feed does not depend on notifications. Avoid even scheduling a
+    # push worker when no eligible device exists; dispatch rechecks eligibility.
+    if channel == "app":
+        from apps.router.push_views import eligible_device_tokens
+
+        if not eligible_device_tokens(tenant.user).exists():
+            return row
 
     # Ping the user's iPhone(s) that a proactive / cron message just landed — the
     # missing leg that left crons silent on iOS (Telegram/LINE delivered, but the
@@ -354,6 +368,10 @@ def _format_block(rows: Iterable[ProactiveOutbound]) -> str:
             any_structured = True
             anchors = "\n".join(f"  [{i + 1}] {item}" for i, item in enumerate(row.parsed_items))
             body = f"{row.message_text}\n\n(numbered items you asked about:\n{anchors}\n)"
+        elif (row.job_name or "").startswith("_mission:"):
+            # The weekly mission digest names missions any member can rename: the
+            # person sees it; the assistant only learns that it was sent.
+            body = "(weekly mission digest sent to the user; its text is left out here)"
         else:
             body = row.message_text
         if row.journal_link:
@@ -449,7 +467,7 @@ def surface_proactive_context(
     follow_up_cutoff = now - timedelta(minutes=5)
 
     # Tenant-scoped — the (tenant, created_at) index (proactive_tenant_created_idx)
-    # backs both walks below. User-delivery channels are not distinguished: one
+    # backs the range scan below. User-delivery channels are not distinguished: one
     # tenant = one human, and switching transports must not break continuity.
     # Internal eval evidence and thread-targeted sub-agent results are excluded;
     # the latter already landed in their authoritative app thread.
@@ -459,26 +477,31 @@ def surface_proactive_context(
         .exclude(job_name="_subagent_result")
     )
 
-    # UNCONSUMED (never threaded) rows claim the limit first, newest-first,
-    # within the long window.
-    fresh = list(
-        base.filter(
-            consumed_at__isnull=True,
-            created_at__gte=unconsumed_cutoff,
-        ).order_by("-created_at")[:limit]
+    # ONE query over both consumption states (was two sequential SELECTs — a
+    # cross-region round-trip on every inbound turn). Selection is unchanged:
+    # UNCONSUMED (never threaded) rows within the long window claim the limit
+    # first, newest-first; only the slots left over go to consumed follow-up
+    # rows (created within 24h AND consumed within the 5-min follow-up window),
+    # newest-first. The priority sort key is the consumption STATE, not the
+    # ``consumed_at`` value — ordering consumed rows by when they were consumed
+    # would pick different fill rows than the old newest-created-first walk.
+    unconsumed = Q(consumed_at__isnull=True, created_at__gte=unconsumed_cutoff)
+    consumed_follow_up = Q(
+        consumed_at__isnull=False,
+        created_at__gte=consumed_cutoff,
+        consumed_at__gte=follow_up_cutoff,
     )
-
-    # Fill any remaining slots with consumed follow-up rows, newest-first:
-    # created within 24h AND consumed within the 5-min follow-up window.
-    fill = limit - len(fresh)
-    if fill > 0:
-        fresh += list(
-            base.filter(
-                consumed_at__isnull=False,
-                created_at__gte=consumed_cutoff,
-                consumed_at__gte=follow_up_cutoff,
-            ).order_by("-created_at")[:fill]
+    fresh = list(
+        base.filter(unconsumed | consumed_follow_up)
+        .annotate(
+            _consumed_rank=Case(
+                When(consumed_at__isnull=True, then=Value(0)),
+                default=Value(1),
+                output_field=IntegerField(),
+            )
         )
+        .order_by("_consumed_rank", "-created_at")[:limit]
+    )
 
     if not fresh:
         return ""

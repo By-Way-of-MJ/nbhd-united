@@ -45,6 +45,7 @@ def _make_tenant(username: str) -> Tenant:
         container_id="oc-test",
         container_fqdn="oc-test.internal.azurecontainerapps.io",
         postgres_cron_canonical=False,  # off → no QStash regen enqueue
+        openclaw_version="2026.5.28",  # gateway cron.add path; 9.4 publishes the signed file
     )
 
 

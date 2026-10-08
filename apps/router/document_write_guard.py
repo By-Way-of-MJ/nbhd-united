@@ -29,8 +29,23 @@ from rest_framework.response import Response
 logger = logging.getLogger(__name__)
 
 
-def record_runtime_write_activity(tenant) -> None:
-    """Upsert the tenant's latest runtime mutation without locking its hot row."""
+# ``RuntimeWriteEvent.ref`` keys per kind: ids only, never user text. Anything
+# else a caller passes is dropped before the insert.
+_EVENT_REF_KEYS = {
+    "journal_doc": frozenset({"document_id"}),
+    "fuel": frozenset({"workout_id", "plan_id"}),
+    "horizons_goal": frozenset({"goal_id"}),
+    "calendar": frozenset({"command_id"}),
+}
+_EVENT_REF_MAX_LEN = 64
+
+
+def record_runtime_write_activity(tenant, *, kind=None, ref=None, verb=None) -> None:
+    """Upsert the tenant's latest runtime mutation without locking its hot row.
+
+    With ``kind``, also record a metadata-only ``RuntimeWriteEvent`` (see
+    ``record_runtime_write_event``) for the "since you were last here" feed.
+    """
     from apps.router.models import RuntimeWriteActivity
 
     RuntimeWriteActivity.objects.bulk_create(
@@ -39,6 +54,39 @@ def record_runtime_write_activity(tenant) -> None:
         update_fields=["last_runtime_write_at"],
         unique_fields=["tenant"],
     )
+    if kind is not None:
+        record_runtime_write_event(tenant, kind=kind, ref=ref, verb=verb)
+
+
+def record_runtime_write_event(tenant, *, kind, ref=None, verb=None) -> None:
+    """Record which item an assistant write touched. Never raises.
+
+    Called after the write succeeded, so it needs the written row's id. One
+    INSERT inside a savepoint: a failure is logged (kind only, no ids) and the
+    write it observes carries on untouched.
+    """
+    from django.db import transaction
+
+    from apps.router.models import RuntimeWriteEvent
+
+    try:
+        allowed = _EVENT_REF_KEYS.get(kind)
+        if allowed is None:
+            raise ValueError("unknown kind")
+        verb = verb or RuntimeWriteEvent.Verb.UPDATED
+        if verb not in RuntimeWriteEvent.Verb.values:
+            raise ValueError("unknown verb")
+        clean_ref = {
+            key: str(value)
+            for key, value in (ref or {}).items()
+            if key in allowed and value is not None and len(str(value)) <= _EVENT_REF_MAX_LEN
+        }
+        if not clean_ref:
+            raise ValueError("empty ref")
+        with transaction.atomic():
+            RuntimeWriteEvent.objects.create(tenant_id=tenant.id, kind=kind, ref=clean_ref, verb=verb)
+    except Exception:  # noqa: BLE001 — the feed must never break the write it observes
+        logger.warning("runtime_write_event_failed kind=%s", kind if kind in _EVENT_REF_KEYS else "invalid")
 
 
 def assert_write_allowed_for_document_turn(tenant, thread=None) -> Response | None:

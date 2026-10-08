@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useRef, useEffect, useCallback } from "react";
 import clsx from "clsx";
 import { useQueryClient } from "@tanstack/react-query";
@@ -8,6 +9,7 @@ import { fetchDocument } from "@/lib/api";
 import { todayISO } from "@/lib/journal-date";
 import {
   useSidebarTreeQuery,
+  useTenantQuery,
   useDeleteDocumentMutation,
   useClearDocumentMutation,
   useCreateDocumentMutation,
@@ -74,6 +76,8 @@ function SectionIcon({ kind }: { kind: string }) {
 }
 
 export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggle, recentEntries }: SidebarProps) {
+  const { data: tenant } = useTenantQuery();
+  const openSky = !!tenant?.web_redesign;
   const queryClient = useQueryClient();
   const { data: tree, isLoading } = useSidebarTreeQuery();
   const [expandedSections, setExpandedSections] = useState<Set<string>>(
@@ -191,7 +195,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
 
   if (collapsed) {
     return (
-      <div className="flex flex-col items-center border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl py-4 w-12">
+      <div data-os-journal-rail className="flex flex-col items-center border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl py-4 w-12">
         <button
           type="button"
           onClick={onToggle}
@@ -220,10 +224,10 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
   });
 
   return (
-    <nav aria-label="Journal sidebar" className="flex h-full w-full lg:w-[15rem] flex-col border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl">
+    <nav data-os-journal-rail aria-label="Journal sidebar" className="flex h-full w-full lg:w-[15rem] flex-col border-r border-white/[0.03] bg-[#0B0F13]/80 backdrop-blur-2xl">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.04] px-4 py-4">
-        <div>
+        <div data-os-legacy-title>
           <h2 className="font-headline text-lg font-semibold text-ink tracking-tight">Journal</h2>
           <p className="text-[10px] uppercase tracking-[0.15em] text-ink-faint mt-0.5">Celestial Sanctuary</p>
         </div>
@@ -242,7 +246,7 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
       </div>
 
       {/* New Entry */}
-      <div className="px-3 py-3">
+      <div data-os-new-entry className="px-3 py-3">
         <button
           type="button"
           onClick={() => onNavigate("daily", todayISO())}
@@ -255,13 +259,15 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
 
       {/* Primary nav */}
       <div className="px-2 py-1 space-y-0.5">
-        {PRIMARY_NAV.map((item) => {
+        {PRIMARY_NAV.filter((item) => !openSky || item.kind !== "tasks").map((item) => {
           const isActive = activeKind === item.kind;
           const Icon = item.icon;
           const slug = item.kind === "daily" ? todayISO() : item.kind;
           return (
             <button
               key={item.kind}
+              data-os-nav-item
+              data-active={isActive}
               type="button"
               onMouseEnter={() => prefetchDocument(item.kind, slug)}
               onFocus={() => prefetchDocument(item.kind, slug)}
@@ -280,6 +286,8 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
         })}
       </div>
 
+      {openSky ? <Link href="/horizons" className="mx-5 mb-4 flex min-h-[44px] items-center text-xs leading-relaxed text-os-accent">Tasks and goals live in Horizons</Link> : null}
+
       {/* Scrollable content: Recent + user documents */}
       <div className="flex-1 overflow-y-auto px-2 py-2 border-t border-white/[0.03] mt-1.5 custom-scrollbar">
         {recentEntries && recentEntries.length > 0 && (
@@ -293,6 +301,8 @@ export function Sidebar({ activeKind, activeSlug, onNavigate, collapsed, onToggl
                 return (
                   <button
                     key={entry.slug}
+                    data-os-nav-item
+                    data-active={isActive}
                     type="button"
                     onClick={() => onNavigate("daily", entry.slug)}
                     onMouseEnter={() => prefetchDocument("daily", entry.slug)}

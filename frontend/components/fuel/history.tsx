@@ -39,6 +39,7 @@ export function History({ onOpenWorkout }: HistoryProps) {
           {[0, 1, 2, 3, 4, 5, 6].map((i) => (
             <div
               key={i}
+              data-os-surface
               className="rounded-panel border border-border bg-surface-elevated px-3 sm:px-4 py-3 flex items-center gap-2.5 sm:gap-3"
             >
               <SkelBar className="h-8 w-8 shrink-0" />
@@ -60,6 +61,8 @@ export function History({ onOpenWorkout }: HistoryProps) {
       <div className="flex flex-wrap items-center gap-1.5">
         <button
           onClick={() => setFilter("all")}
+          data-os-filter
+          data-active={filter === "all"}
           className={`rounded-full min-h-[44px] px-3 py-2 text-[11px] font-bold uppercase tracking-wider transition border whitespace-nowrap ${
             filter === "all" ? "bg-ink text-surface border-ink" : "border-border text-ink-muted hover:text-ink"
           }`}
@@ -73,6 +76,8 @@ export function History({ onOpenWorkout }: HistoryProps) {
           return (
             <button
               key={c}
+              data-os-filter
+              data-active={on}
               onClick={() => setFilter(c)}
               className={`rounded-full min-h-[44px] px-3 py-2 text-[11px] font-bold uppercase tracking-wider transition border flex items-center gap-1.5 whitespace-nowrap ${
                 on ? "text-ink" : "text-ink-muted"
@@ -93,7 +98,7 @@ export function History({ onOpenWorkout }: HistoryProps) {
           <WorkoutRow key={w.id} w={w} onClick={() => onOpenWorkout(w.id)} />
         ))}
         {filtered.length === 0 && (
-          <div className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">
+          <div data-os-surface className="rounded-panel border border-border p-4 sm:p-8 text-center text-sm text-ink-faint">
             No workouts logged yet.
           </div>
         )}
@@ -132,7 +137,7 @@ function WorkoutRow({ w, onClick }: { w: FuelWorkout; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
-      className="w-full rounded-panel border border-border bg-surface-elevated hover:border-border-strong hover:bg-surface-hover transition px-3 sm:px-4 py-3 text-left flex items-center gap-2.5 sm:gap-3 min-h-[44px]"
+      data-os-row className="w-full rounded-panel border border-border bg-surface-elevated hover:border-border-strong hover:bg-surface-hover transition px-3 sm:px-4 py-3 text-left flex items-center gap-2.5 sm:gap-3 min-h-[44px]"
     >
       <span
         className="shrink-0 h-8 w-8 rounded-lg flex items-center justify-center text-xs font-bold"

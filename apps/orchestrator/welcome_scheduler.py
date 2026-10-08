@@ -83,6 +83,20 @@ def schedule_welcome(
         )
         return WelcomeStatus.SKIPPED_ALREADY_DELIVERED
 
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
+    if tenant_uses_file_cron_sync(tenant):
+        status = _schedule_welcome_row(
+            tenant,
+            feature=feature,
+            cron_name=cron_name,
+            prompt_template=prompt_template,
+            fire_in_minutes=fire_in_minutes,
+        )
+        if status is not WelcomeStatus.SKIPPED_PENDING:
+            _stamp_welcome_sent(tenant, feature)
+        return status
+
     existing = cron_get(tenant, cron_name)
     has_stale = False
     if existing is not None:
@@ -144,6 +158,18 @@ def schedule_welcome(
         },
     )
 
+    _stamp_welcome_sent(tenant, feature)
+
+    logger.info(
+        "Scheduled and stamped %s welcome cron for tenant %s (fires at %s)",
+        feature,
+        tenant.id,
+        fire_at.isoformat(),
+    )
+    return WelcomeStatus.REPLACED_STALE if has_stale else WelcomeStatus.SCHEDULED
+
+
+def _stamp_welcome_sent(tenant: Tenant, feature: str) -> None:
     # Re-read under a row lock so concurrent feature activations cannot
     # overwrite one another's JSON keys with stale in-memory dictionaries.
     from apps.tenants.models import Tenant
@@ -156,10 +182,63 @@ def schedule_welcome(
         locked_tenant.save(update_fields=["welcomes_sent"])
     tenant.welcomes_sent = marks
 
-    logger.info(
-        "Scheduled and stamped %s welcome cron for tenant %s (fires at %s)",
-        feature,
-        tenant.id,
-        fire_at.isoformat(),
+
+def _schedule_welcome_row(
+    tenant: Tenant,
+    *,
+    feature: str,
+    cron_name: str,
+    prompt_template: str,
+    fire_in_minutes: int,
+) -> WelcomeStatus:
+    """OpenClaw 9.4: the welcome is a one-shot ``at`` CronJob row, published in
+    the signed crons file (9.4 gates the gateway ``cron.add``).
+
+    ``kind:"at"`` fires once and is retired by ``expire_finished_at_crons_task``,
+    so there is no annual re-fire and no "remove this cron" footer. An enabled
+    row still in the future is pending; a past one is stale and replaced.
+    Raises when the file publish fails, so the caller does not stamp the
+    welcome as sent.
+    """
+    from apps.cron.models import CronCreationPath, CronJob, CronJobSource
+    from apps.cron.share_cron_sync import write_tenant_crons_file
+
+    now = timezone.now()
+    has_stale = False
+    for row in CronJob.objects.filter(tenant=tenant, name=cron_name, enabled=True):
+        at_value = ((row.data or {}).get("schedule") or {}).get("at")
+        try:
+            fire = datetime.fromisoformat(str(at_value).replace("Z", "+00:00"))
+        except ValueError:
+            fire = None
+        if fire is not None and fire > now:
+            logger.info("%s welcome already pending for tenant %s — skipping (idempotent)", feature, tenant.id)
+            return WelcomeStatus.SKIPPED_PENDING
+        row.delete()
+        has_stale = True
+
+    fire_at = now + timedelta(minutes=fire_in_minutes)
+    row = CronJob.objects.create(
+        tenant=tenant,
+        name=cron_name,
+        source=CronJobSource.SYSTEM,
+        managed=False,  # one-shot: the container owns it once published
+        creation_path=CronCreationPath.INTERNAL,
+        data={
+            "name": cron_name,
+            "schedule": {"kind": "at", "at": fire_at.astimezone(UTC).isoformat().replace("+00:00", "Z")},
+            "sessionTarget": "isolated",
+            "payload": {"kind": "agentTurn", "message": prompt_template.format(tenant_id=tenant.id)},
+            "delivery": {"mode": "none"},
+            "enabled": True,
+        },
     )
+    try:
+        write_tenant_crons_file(tenant)
+    except Exception:
+        # Unstamped + no row: the next attempt starts clean instead of seeing a
+        # "pending" row that a later publish might deliver twice.
+        row.delete()
+        raise
+    logger.info("Scheduled %s welcome for tenant %s via signed crons file (fires at %s)", feature, tenant.id, fire_at)
     return WelcomeStatus.REPLACED_STALE if has_stale else WelcomeStatus.SCHEDULED

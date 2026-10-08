@@ -48,6 +48,7 @@ from apps.router.inbound_media import (
     store_inbound_image,
 )
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage
+from apps.router.panels import rehydrate_panels
 from apps.router.pending_queue import enqueue_message_for_tenant, placeholder_redactions
 from apps.router.reply_text import clamp_reply_text
 from apps.router.services import build_chat_context_marker, build_datetime_context
@@ -546,6 +547,10 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         # row predates the feature. Older iOS builds ignore the unknown keys.
         "user_redactions": msg.user_redactions,
         "reply_redactions": msg.reply_redactions,
+        # Content-free receipt for the inbound redaction attempt. Historical
+        # and on-device rows carry null / ""; no LLM-bound text is exposed.
+        "redaction_confirmed": msg.redaction_confirmed,
+        "redaction_reason": msg.redaction_reason,
         # Up to 3 tappable choice labels parsed from a trailing
         # [[quick-replies: A | B | C]] marker on the reply (iOS-only), REHYDRATED
         # to real values above. null when the turn carried no marker, or the
@@ -556,6 +561,7 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         # reply (iOS-only); title REHYDRATED above. null when the turn carried no
         # (valid) marker. Shared source of truth with the ?since= feed.
         "journal_link": journal_link,
+        "panels": rehydrate_panels(msg.panels, entity_map, tenant_id=msg.tenant_id),
     }
 
 
@@ -570,6 +576,9 @@ def enqueue_tenant_turn(
     image_ext: str = "jpg",
     document: bytes | None = None,
     document_ext: str = "pdf",
+    ingress_origin: str = "ios",
+    idempotency_prechecked: bool = False,
+    tenant_fresh: bool = False,
 ):
     """Create a PENDING ``AppChatMessage`` and enqueue a Tier-3 OpenClaw turn.
 
@@ -577,6 +586,18 @@ def enqueue_tenant_turn(
     both the normal ``ChatMessageView`` POST and the Tier-2 fast-responder
     escalation path (``apps.router.siri_views``). Idempotent on
     ``client_msg_id`` and budget-gated, exactly once.
+
+    ``idempotency_prechecked=True`` means the caller ALREADY ran the
+    ``(tenant, client_msg_id)`` replay read in this request and found nothing
+    (``ChatMessageView`` must, ahead of attachment validation), so the entry
+    read here is skipped — one cross-region round-trip. Idempotency does not
+    rest on either read: the ``(tenant, client_msg_id)`` unique constraint plus
+    the ``IntegrityError`` replay below is the guarantee.
+
+    ``tenant_fresh=True`` means ``tenant`` was loaded from the DB moments ago in
+    this same request (auth's ``select_related("tenant")``), so ``check_budget``
+    skips its budget-field re-read. The Siri escalation leaves it False: its
+    tenant row predates a multi-second fast-responder model call.
 
     ``image`` / ``document`` (optional, already-decoded+validated bytes; at most
     one per turn) are stored on the tenant share and referenced from the
@@ -602,9 +623,10 @@ def enqueue_tenant_turn(
     if image is not None and document is not None:
         raise ValueError("enqueue_tenant_turn: pass at most one of image/document per turn")
 
-    existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
-    if existing:
-        return existing, False
+    if not idempotency_prechecked:
+        existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
+        if existing:
+            return existing, False
 
     # Dual-write ciphertext (Phase 2, PR-2): the same `text` seals both the
     # budget-exhausted and the normal turn below, so compute it once. None when
@@ -613,16 +635,17 @@ def enqueue_tenant_turn(
 
     # Budget gate — don't enqueue work (or wake a container) for an over-budget
     # tenant. Recorded as an error so the client surfaces the reason.
-    budget_reason = check_budget(tenant)
+    budget_reason = check_budget(tenant, fresh=tenant_fresh)
     try:
         with transaction.atomic():
             # Serialize user-turn creation with the delayed dropped-turn retry.
             # The retry locks this same thread before its final newest-turn
             # check, closing the insert-between-check-and-requeue race.
+            # The lock orders inserts; it is NOT the idempotency gate. A duplicate
+            # client_msg_id that slipped past the replay read trips the
+            # (tenant, client_msg_id) unique constraint on the INSERT below and
+            # replays via the IntegrityError handler — no re-read under the lock.
             ChatThread.objects.select_for_update().only("id").get(id=thread.id, tenant=tenant)
-            existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
-            if existing:
-                return existing, False
 
             if budget_reason:
                 turn = AppChatMessage.objects.create(
@@ -711,9 +734,19 @@ def enqueue_tenant_turn(
     # Outbound rehydration is already wired in the drain path, so [PERSON_N]
     # placeholders round-trip. The checked wrapper preserves fail-open delivery
     # text while recording whether redaction genuinely completed for this row.
+    from apps.pii.provisional import PiiIngress, record_provisional_sightings
     from apps.pii.redactor import redact_user_message_checked
 
-    redaction = redact_user_message_checked(text, tenant)
+    if ingress_origin not in {"ios", "siri"}:
+        raise ValueError(f"unsupported ingress_origin: {ingress_origin}")
+    ingress = PiiIngress(
+        channel=ingress_origin,
+        provider_event_id=None if ingress_origin == "siri" else client_msg_id,
+        occurred_at=timezone.now(),
+    )
+    redaction = redact_user_message_checked(text, tenant, ingress=ingress)
+    if ingress.provider_event_id is not None:
+        record_provisional_sightings(tenant, text, ingress)
     redacted_text = redaction.text
     # Per-turn transparency metadata: which of the user's real values were
     # obfuscated behind placeholders before this turn reached the assistant.
@@ -721,12 +754,23 @@ def enqueue_tenant_turn(
     # tenant.pii_entity_map (in-memory too), so resolving the redacted text's
     # placeholders against it now finds even freshly-minted names. The row was
     # created above with verbatim user_text; attach the metadata to it. Skip the
-    # write when nothing was obfuscated so the column stays null (pre-feature /
-    # no-PII rows are indistinguishable and both mean "show nothing").
+    # user_redactions write when nothing was obfuscated so that column stays
+    # null (pre-feature / no-PII rows are indistinguishable and both mean "show
+    # nothing"). The content-free outcome receipt is always persisted for a
+    # turn that reached this redaction seam.
     user_redactions = placeholder_redactions(redacted_text, getattr(tenant, "pii_entity_map", None))
+    redaction_update = {
+        "redaction_confirmed": redaction.confirmed,
+        "redaction_reason": redaction.reason,
+    }
     if user_redactions:
-        AppChatMessage.objects.filter(pk=turn.pk).update(user_redactions=user_redactions)
+        redaction_update["user_redactions"] = user_redactions
         turn.user_redactions = user_redactions
+    # The row UPDATE itself runs AFTER the enqueue below: the drain reads the
+    # receipt from payload["redaction"], never from this row, so the write is
+    # display-only and must not sit in front of the QStash publish.
+    turn.redaction_confirmed = redaction.confirmed
+    turn.redaction_reason = redaction.reason
     # A bare attachment with no caption still needs SOMETHING for the agent to
     # act on.
     if redacted_text:
@@ -741,7 +785,11 @@ def enqueue_tenant_turn(
     # "this is a chat turn, don't pre-load workspace docs" marker + any
     # attachment marker, then the user's (redacted) text.
     message_text = (
-        build_datetime_context(user_tz) + build_chat_context_marker("ios") + image_marker + document_marker + llm_text
+        build_datetime_context(user_tz)
+        + build_chat_context_marker("ios", tenant=tenant)
+        + image_marker
+        + document_marker
+        + llm_text
     )
 
     payload = {
@@ -778,6 +826,10 @@ def enqueue_tenant_turn(
         # Telegram poller, which also stores a redacted excerpt.
         user_text_excerpt=redacted_text,
     )
+    # Deferred redaction receipt + transparency metadata (see above). A process
+    # death between the publish and this write leaves redaction_confirmed null —
+    # "unconfirmed", the fail-safe reading.
+    AppChatMessage.objects.filter(pk=turn.pk).update(**redaction_update)
     ChatThread.objects.filter(id=thread.id).update(last_active_at=timezone.now())
     # iOS is a first-class channel for the idle-hibernation freshness signal:
     # without this stamp the sweep sees an iOS-only tenant as permanently idle
@@ -1006,6 +1058,9 @@ class ChatMessageView(APIView):
             return Response({"error": "invalid_client_msg_id"}, status=status.HTTP_400_BAD_REQUEST)
         existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
         if existing:
+            # Filtering by tenant= does not fill the FK cache; without this the
+            # serializer's msg.tenant access refetches the whole Tenant row.
+            existing.tenant = tenant
             return Response(_serialize_message(existing), status=status.HTTP_200_OK)
 
         text = str(request.data.get("text") or "").strip()
@@ -1060,9 +1115,9 @@ class ChatMessageView(APIView):
                     "ios_chat",
                 )
             if situation_changed:
-                from apps.orchestrator.workspace_envelope import push_user_md_in_background
+                from apps.orchestrator.workspace_envelope import TRIGGER_PLACE_OBSERVATION, push_user_md_in_background
 
-                push_user_md_in_background(tenant)
+                push_user_md_in_background(tenant, trigger=TRIGGER_PLACE_OBSERVATION)
 
         turn, created = enqueue_tenant_turn(
             tenant=tenant,
@@ -1074,6 +1129,10 @@ class ChatMessageView(APIView):
             image_ext=image_ext or "jpg",
             document=document_bytes,
             document_ext=document_ext or "pdf",
+            # The replay read above already ran for this client_msg_id.
+            idempotency_prechecked=True,
+            # request.user.tenant was loaded by auth in this request.
+            tenant_fresh=True,
         )
         http = status.HTTP_201_CREATED if created else status.HTTP_200_OK
         return Response(_serialize_message(turn), status=http)
@@ -1264,6 +1323,9 @@ class ChatMessageDetailView(APIView):
         turn = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
         if not turn:
             return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+        # Filtering by tenant= does not fill the FK cache; without this every
+        # poll's serializer msg.tenant access refetches the whole Tenant row.
+        turn.tenant = tenant
         return _no_store(Response(_serialize_message(turn)))
 
 
@@ -1347,11 +1409,13 @@ def _parse_partial(data: dict) -> tuple[str | None, int | None]:
     if seq <= 0:
         return None, None
     from apps.router.journal_link import strip_streaming_journal_link_marker
+    from apps.router.panels import strip_streaming_panels
     from apps.router.quick_replies import strip_streaming_quick_reply_marker
 
-    # Both are no-ops unless their own opener is the trailing fragment, and only
-    # one marker can be the reply's final line, so chaining them is safe.
-    text = strip_streaming_journal_link_marker(strip_streaming_quick_reply_marker(raw_text[:_MAX_PARTIAL_TEXT_CHARS]))
+    # Remove panel fences first so trailing quick-reply / journal markers keep
+    # their existing placement contract. Partial JSON is normal during streaming.
+    text = strip_streaming_panels(raw_text[:_MAX_PARTIAL_TEXT_CHARS])
+    text = strip_streaming_journal_link_marker(strip_streaming_quick_reply_marker(text))
     return text, seq
 
 

@@ -29,7 +29,8 @@ Read before writing Django code. `docs/agents/invariants.md` holds the platform-
 
 ## Testing
 
-- `make test` = `python manage.py test apps/`. Prefer targeted runs (`python manage.py test apps.<app>.<module> --noinput`) while iterating.
+- Use `make test-local` for DB-backed tests from any worktree; narrow iteration with `make test-local TESTS=apps.cron`. Set `DATABASE_URL` in the environment or `~/.config/nbhd-united/test.env` (exported values win). The runner names its DB `test_nbhd_<sanitized, truncated basename>_<first 6 SHA-256 hex digits of the absolute worktree path>`, stable per worktree because Postgres may be shared. All names are capped at 58 characters to reserve Django parallel suffixes; `DJANGO_TEST_DB_NAME` overrides must match `^test_nbhd_[a-z0-9_]+$` and cannot be `test_nbhd_united_train`. Overrides require a successful existence check and refuse existing databases unless explicitly allowed with `NBHD_TEST_DB_REUSE=1`.
+- Pre-push CI parity still requires `make docker-gate` per [workflow.md](workflow.md). `make test` remains `python manage.py test apps/`.
 - Tests that patch gateway/network functions rely on the local re-import pattern above.
 - Query-count regressions: pin with `assertNumQueries` (see `apps/fuel/tests.py`, `apps/orchestrator/test_azure_client.py` for idempotency-shape examples).
 
@@ -42,6 +43,131 @@ Read before writing Django code. `docs/agents/invariants.md` holds the platform-
 - Dependabot major bumps for contracted SDKs stay ignored until a coordinated review updates contracts.
 - Reason: `azure-mgmt-storage` 25.x changed `.keys` into a method on 2026-08-24, breaking ~15 live paths while mocked CI stayed green.
 
+## Hidden-name management
+
+Under `/api/v1/tenants/settings/`, `entity-registry/` retains its legacy active
+`{"entries": [...]}` response unless any of `q`, `type`, `state`, `everyday`,
+`page_size`, `cursor`, or `select_all` is present. Extended reads filter by
+case-insensitive substring across name/relationship/notes/placeholder, placeholder
+type prefix, active/stopped state, and advisory everyday-word evidence. They sort
+by casefolded name then placeholder, return `total`, `next_cursor`, and unfiltered
+active/stopped `counts`, and default to 100 entries (maximum 200). Cursors belong
+to the tenant and filters; restart paging after changing filters. They track a
+sort position, not a frozen snapshot of concurrent edits.
+
+The advisory everyday-word flag also recognizes single alphabetic tokens in the
+lowercase entries (3–20 characters) of `/usr/share/dict/words`, installed by
+`wamerican` in the Django image. The immutable word set loads lazily once per
+process; a missing file silently leaves the existing predicates in effect.
+Unfiltered paging computes flags only for returned entries; unfiltered
+select-all computes none. This dictionary is never used by redaction.
+
+`select_all=true` returns all matching placeholders in that order (ignoring page
+size); more than 2000 matches returns 422 `{"detail":"too_many","total":N}`.
+`POST entity-registry/bulk-stop/` accepts 1..2000 placeholder strings, adds their
+canonical names to the denylist, and retires every active same-name binding in a
+single map pass under a tenant row lock. It preserves existing deny timestamps
+and returns each input's status plus the list of newly retired placeholders.
+`POST entity-registry/restore/` accepts that list for Undo: it clears retirement
+fields on those exact bindings and removes their canonical deny keys. Neither
+operation changes placeholder keys or type counters; historical rehydration
+continues throughout. Lifecycle and unknown fields survive both operations.
+Restoring an already-active binding preserves its exact stored value and skips
+the database update unless a corresponding deny key needs removal.
+
+PATCH and denylist POST/bulk names allow up to 256 characters. Existing bulk and
+denylist DELETE endpoints retain their semantics; deleting a deny key alone does
+not restore a retired binding. Use the restore endpoint for that action.
+
 ## LLM-adjacent judgment calls
 
 Backend computes evidence; the LLM judges. Don't encode fuzzy human judgments as arithmetic formulas in Python — pass structured evidence to the model and let it decide (established pattern across insights/fuel).
+
+## Completion evidence (Fuel and Core)
+
+Finishable rows use `status="done"` plus nullable `completed_at`; no backfill.
+Core practice counts/streaks use the tenant-local completion day, never compose
+`date`. `ready`/`delivered` audio is playable but uncompleted; `done` stays playable.
+Fuel writers preserve the first completion timestamp and clear it on reversal;
+HealthKit uses sample end (or start + duration for older clients).
+
+The send-to-user endpoint resolves `X-NBHD-Cron-Job-Id` within the tenant.
+Only a resolved `WORKOUT_CONGRATS` row requires the payload workout to remain
+`status="done"`; missing/reverted/deleted workouts skip with `workout_not_done`.
+Legacy congrats rows may use their `_congrats-<uuid>` name for the workout ID.
+Resolved non-congrats patterns deliver normally. Unknown IDs fall back to the
+legacy `job_name` check and deliver unless it identifies congratulations without
+current done evidence. Missing `gateway_job_id` mappings are normal before
+reconciliation and must never alone suppress heartbeat/briefing/evening sends.
+
+`POST /api/v1/core/sessions/<uuid>/complete/` is tenant-scoped, owner JWT only,
+with optional `{ "listened_seconds": 600 }` (logged, not persisted). From
+`ready`/`delivered`, stamp server time and mark done; repeated `done` returns
+unchanged. `pending`/`rendering`/`failed` returns 409 `{"error":"not_ready"}`;
+missing or foreign rows return 404. The 200 detail representation exposes
+read-only `status`, `completed_at`, and `lesson`. No runtime completion route:
+only the player reports completion; the server does not measure listening.
+
+## Compose lesson variety
+
+`apps/core/lesson.py` owns the tradition vocabulary and Pydantic lesson/manifest
+schemas. Compose requests `json_schema`, caching per-model schema rejection for
+process-lifetime `json_object` fallback; local lesson/render validation always
+applies. Lesson prose passes through the PII authoring registry before storage.
+Non-JSON schema answers also trigger JSON-mode fallback. Invalid manifests/lessons
+and variety clashes share one corrective retry per model, with redacted feedback.
+HTTP 200 empty/unusable choices are transient and get the existing backed-off retry.
+
+The latest 20 playable sits supply history (2,600 characters, whole entries).
+Reject normalized teaching-slug repeats, either of the two latest known
+traditions, and known intentions used in the last five sits (missing/`other` is
+unknown). A compact `AVOID INTENTIONS` line sits outside the history character
+budget. Planning and ambition alone are not evidence of distress; the prompt
+chooses one concrete aspect and one varied personal invitation.
+For each clash the corrective feedback identifies its reason; allow one corrective retry per model, then the next model. If no
+candidate succeeds but a structurally valid clash exists, accept the last one
+with a warning including `reason=intention` for an intention clash. `CORE_COMPOSE_STRICT_VARIETY=True` disables that fallback
+(default false). Logs expose `accepted_first`, `accepted_after_retry`, and
+`clash_accepted`. Legacy empty lessons contribute title/theme only; narration
+alignment with lesson metadata remains a prompt requirement.
+
+Meditation context uses at most eight owner excerpts from today and the prior two
+tenant-local days. Chat requires `recall_capture_enabled` and a non-null
+`recall_capture_birthday`, reads only post-birthday user text through the encrypted
+system-principal helper, and excludes on-device turns. Daily notes contribute only
+`### HH:MM — <owner display name>` quick-log entries, ending at the next heading;
+other daily-note prose is excluded. With recall capture OFF, chat is skipped and
+only owner quick logs can supply this section; when none qualify the section is
+omitted. App chat storage is verbatim, and quick-log writes can fail open: each
+selected excerpt therefore runs checked inbound detection with `MINT_REDACT_ONLY`
+and `allow_user_name=False` before truncation. Unknown detected PII becomes
+`[REDACTED]` without minting bindings or changing registry counters; unconfirmed
+or failed redaction drops the excerpt. Detection is bounded to eight candidates,
+so the section may contain fewer excerpts.
+
+At most one constellation star is offered per sit. IDs supplied to the last three
+READY/DELIVERED/DONE sits cool down before selection; services persist those IDs
+as `lesson.context_star_ids` without changing the LLM schema. An old pinned note
+is described as saved context, not recent activity. Prompt and retry templates
+are assembled after tenant/model content is scrubbed; never redact the assembled
+instructions with tenant bindings.
+
+Legacy sits need lesson backfilling to close the cold start: empty lessons cannot enforce tradition/teaching variety.
+Run `python manage.py backfill_meditation_lessons --tenant <uuid> --limit 40 --dry-run`, then repeat without `--dry-run`; dry-run makes no LLM calls or writes.
+Run per tenant, owner first; `--all` processes Core-enabled tenants with the limit applied per tenant.
+
+Add `--missing-intention` to also fill intention on existing lessons without that
+key, preserving their other fields (including service-owned `context_star_ids`,
+which is excluded from strict lesson validation). Existing missing intentions stay unknown until
+backfilled; new lessons require a Literal from the shared vocabulary in `lesson.py`.
+
+## Meditation TTS
+
+The default is `gemini-3.8-flash-lite-tts` with the Achernar (Soft) prebuilt voice.
+3.8 requests contain only the transcript in each text part; the calm-guide
+instruction and global/segment tones go in `speech_metadata.style`. The renderer
+and external-dependency smoke share the same request builder and normalize WAV
+or raw PCM responses to 24 kHz mono 16-bit WAV before processing.
+Set `GEMINI_TTS_MODEL=gemini-2.5-flash-preview-tts` (or a 3.1 TTS model) to roll
+back; those models retain the legacy inline instruction prefix. `google-genai`
+2.25.0 is required for the structured speech metadata fields.

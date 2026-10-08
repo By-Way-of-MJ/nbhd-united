@@ -7,8 +7,9 @@ from datetime import timedelta
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
-from apps.pii.config import resolve_detector_engine
+from apps.pii.config import resolve_detector_engine, resolve_detector_transport, resolve_positive_int
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -27,6 +28,25 @@ ALLOWED_HOSTS = env("ALLOWED_HOSTS")
 PII_DETECTOR_ENGINE = resolve_detector_engine(
     env("PII_DETECTOR_ENGINE", default="deberta"),
 )
+PII_DETECTOR_TRANSPORT = resolve_detector_transport(
+    env("PII_DETECTOR_TRANSPORT", default="local"),
+)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return resolve_positive_int(env(name, default=default), name=name)
+    except ValueError as exc:
+        raise ImproperlyConfigured(str(exc)) from exc
+
+
+# Creation and sweep gates are deliberately independent. Existing lifecycle
+# state is processed even after a tenant leaves the creation allowlist.
+PII_PROVISIONAL_TENANT_IDS = frozenset(
+    value.strip() for value in env("PII_PROVISIONAL_TENANT_IDS", default="").split(",") if value.strip()
+)
+PII_PROVISIONAL_SWEEP_ENABLED = env.bool("PII_PROVISIONAL_SWEEP_ENABLED", default=False)
+PII_PROVISIONAL_TTL_HOURS = _positive_int_env("PII_PROVISIONAL_TTL_HOURS", 72)
 
 # Django 6.1 enforces this cap on request.body reads, including DRF JSON
 # parsing. iOS base64 document uploads legitimately reach ~14.1 MB (a 10 MiB
@@ -223,6 +243,12 @@ QSTASH_CURRENT_SIGNING_KEY = env("QSTASH_CURRENT_SIGNING_KEY", default="")
 QSTASH_NEXT_SIGNING_KEY = env("QSTASH_NEXT_SIGNING_KEY", default="")
 QSTASH_TOKEN = env("QSTASH_TOKEN", default="")
 
+# Tenant runtime hibernation timing. All values are minutes so operators can
+# restore the previous behavior through environment variables without a deploy.
+TENANT_IDLE_HIBERNATE_MINUTES = env.int("TENANT_IDLE_HIBERNATE_MINUTES", default=30)
+TENANT_CRON_HOLD_MINUTES = env.int("TENANT_CRON_HOLD_MINUTES", default=20)
+TENANT_CRON_WAKE_IDLE_MINUTES = env.int("TENANT_CRON_WAKE_IDLE_MINUTES", default=10)
+
 # Steward Phase 1 — portfolio-scoped deterministic evidence ingestion,
 # direct urgent delivery, and the external dead-man. Every value is optional
 # at process boot; ingest fails closed with 503 while its secret is empty.
@@ -248,10 +274,65 @@ STEWARD_OPENROUTER_CANARY_TENANT_ID = env(
 # Fleet-go is a deliberate follow-up, not a side effect of deploying this code.
 TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 
+# Storage key cache canary gate. Container App env var names MUST match;
+# empty keeps the existing per-operation listKeys behavior.
+AZURE_STORAGE_KEY_CACHE_TENANT_IDS = env("AZURE_STORAGE_KEY_CACHE_TENANT_IDS", default="")
+AZURE_STORAGE_KEY_CACHE_TTL_SECONDS = env("AZURE_STORAGE_KEY_CACHE_TTL_SECONDS", default="300")
+# Which storage account key nbhd uses: "0" = key1, "1" = key2 (rotation 2026-10).
+AZURE_STORAGE_KEY_INDEX = env("AZURE_STORAGE_KEY_INDEX", default="1")
+
+# USER.md skip-unchanged canary gate; empty preserves all existing writes.
+USER_MD_SKIP_UNCHANGED_TENANT_IDS = env("USER_MD_SKIP_UNCHANGED_TENANT_IDS", default="")
+
+# OpenClaw image auto-roll allowlist. apply_pending_configs + wake refresh only
+# move a tenant onto OPENCLAW_IMAGE_TAG if it is listed here (comma-separated
+# UUIDs), or if this is "*". EMPTY MEANS NOBODY — so a deploy that bumps the
+# image tag (every merge rebuilds the OpenClaw image and points the tag at it)
+# never rolls the fleet on its own. Staged rollout for a schema/storage-crossing
+# image (e.g. 2026.9.4): canary UUID -> soak -> "*". Container App env var name
+# MUST match. See apps/orchestrator/image_rollout.py.
+OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS = env("OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS", default="")
+
+# Automatic 5.28 -> 9.4 upgrade at idle time (apps/orchestrator/openclaw_auto_upgrade.py).
+# OFF unless OPENCLAW_AUTO_UPGRADE_ENABLED is true. The allowlist works like the
+# image rollout one: EMPTY MEANS NOBODY, "*" means every 5.28 tenant. The tag
+# defaults to OPENCLAW_IMAGE_TAG and must be an immutable 2026.9.4-<sha>. Jev
+# only breaks ties on unrecognised failures, behind its own flag. Container App
+# env var names MUST match.
+OPENCLAW_AUTO_UPGRADE_ENABLED = env.bool("OPENCLAW_AUTO_UPGRADE_ENABLED", default=False)
+OPENCLAW_AUTO_UPGRADE_TENANT_IDS = env("OPENCLAW_AUTO_UPGRADE_TENANT_IDS", default="")
+OPENCLAW_AUTO_UPGRADE_TAG = env("OPENCLAW_AUTO_UPGRADE_TAG", default="")
+OPENCLAW_AUTO_UPGRADE_JEV_ENABLED = env.bool("OPENCLAW_AUTO_UPGRADE_JEV_ENABLED", default=False)
+
 # OpenClaw native sub-agent offload — canary rollout gate. Comma-separated
 # tenant UUIDs; EMPTY MEANS NOBODY. The generated config keeps sessions_spawn
 # and subagents denied unless a tenant is explicitly listed here.
 SUBAGENT_TENANT_IDS = env("SUBAGENT_TENANT_IDS", default="")
+
+# Image-independent Living Chat: explicit tenant UUID allowlist, no wildcard; dark by default.
+CHAT_SHAPE_TENANT_IDS = env("CHAT_SHAPE_TENANT_IDS", default="")
+# Tool/plugin panels: set ONLY after verifying the running image has the #1638
+# journal-tools manifest (panelsEnabled). Separate from Django-only shape panels.
+CHAT_PANELS_TOOL_TENANT_IDS = env("CHAT_PANELS_TOOL_TENANT_IDS", default="")
+CHAT_SHAPE_PANELS = env(
+    "CHAT_SHAPE_PANELS", default="sleep,schedule,training_week,workout,timer,log_table,journal_table,project"
+)
+
+# Talk routing: explicit tenant UUID allowlist, no wildcard; dark by default.
+TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
+
+# Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
+# (empty = nobody, exact "*" = everyone). Container App env var name MUST match.
+WEB_REDESIGN_TENANT_IDS = env("WEB_REDESIGN_TENANT_IDS", default="")
+
+# Morning Briefing weather via the `nbhd_weather_briefing` plugin tool (Django
+# calls Open-Meteo; the model relays a verbatim line). Comma-separated tenant
+# UUIDs open individual tenants; the literal "*" opens it fleet-wide. Empty or
+# unset means nobody: ungated tenants keep the web_search weather step. Open a
+# tenant ONLY once its RUNNING OpenClaw image ships the tool — the prompt
+# refresh is fleet-wide but the image rolls per tenant. Container App env var
+# name MUST match.
+BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
 
 # Human-review gate for agent-authored scheduled tasks. Comma-separated tenant
 # UUIDs open individual tenants; the literal "*" opens the gate fleet-wide.
@@ -371,6 +452,12 @@ ADMIN_OPENCLAW_GATEWAY_URL = env("ADMIN_OPENCLAW_GATEWAY_URL", default="")
 ADMIN_OPENCLAW_GATEWAY_TOKEN = env("ADMIN_OPENCLAW_GATEWAY_TOKEN", default="")
 CF_ACCESS_CLIENT_ID = env("CF_ACCESS_CLIENT_ID", default="")
 CF_ACCESS_CLIENT_SECRET = env("CF_ACCESS_CLIENT_SECRET", default="")
+
+# Pushover push notifications — the health-alert delivery channel (replaced the
+# personal-OpenClaw gateway route, which silently 530'd for 13 days after its
+# origin VPS was removed). A single HTTPS POST to Pushover; no tunnel/agent.
+PUSHOVER_API_TOKEN = env("PUSHOVER_API_TOKEN", default="")
+PUSHOVER_USER_KEY = env("PUSHOVER_USER_KEY", default="")
 ROUTER_RATE_LIMIT_PER_MINUTE = env.int("ROUTER_RATE_LIMIT_PER_MINUTE", default=30)
 # Shared internal API key for runtime auth between Django and tenant containers.
 # All containers use the same key (stored in Azure Key Vault). This is safe
@@ -410,13 +497,14 @@ BRAVE_API_KEY = env("BRAVE_API_KEY", default="")
 # Gemini TTS — Core pillar meditation render (server-side, key stays here).
 # Secret lives in Key Vault; set GEMINI_API_KEY on the Container App. Never echo it.
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
-GEMINI_TTS_MODEL = env("GEMINI_TTS_MODEL", default="gemini-2.5-flash-preview-tts")
+GEMINI_TTS_MODEL = env("GEMINI_TTS_MODEL", default="gemini-3.8-flash-lite-tts")
 # PRIMARY model that AUTHORS the meditation manifest (OpenRouter, JSON mode) — the
 # web orb's compose path. compose.py fronts a low-cost fallback chain with this id
 # (then DeepSeek V4 Flash, then Pro). Default is Gemma 4 31B: it's the cheap roster
 # model OpenRouter lists for structured outputs (English-native, non-reasoning), so
 # it steers reliably on this structured task; the DeepSeek reasoning models are the
 # fallbacks. See apps/core/compose.py.
+CORE_COMPOSE_STRICT_VARIETY = env.bool("CORE_COMPOSE_STRICT_VARIETY", default=False)
 CORE_COMPOSE_MODEL = env("CORE_COMPOSE_MODEL", default="openrouter/google/gemma-4-31b-it")
 # Bounded-parallel TTS calls per render — kept low to respect low-tier per-minute
 # rate caps (concurrent calls burst past the cap; the 429 backoff handles the rest).
@@ -613,6 +701,9 @@ AZURE_KV_SECRET_APPLE_MAPS_AUTHKEY = env(
 NBHD_APPLE_MAPS_KEY_ID = env("NBHD_APPLE_MAPS_KEY_ID", default="")
 NBHD_APPLE_MAPS_TEAM_ID = env("NBHD_APPLE_MAPS_TEAM_ID", default="")
 OPENROUTER_API_KEY = env("OPENROUTER_API_KEY", default="")
+# All OpenRouter endpoints for this slug were verified ZDR on 2026-08-26.
+# Run ``manage.py check_zdr_routes`` before changing it.
+OPENROUTER_STT_MODEL = env("OPENROUTER_STT_MODEL", default="openai/whisper-large-v3-turbo")
 AZURE_KV_SECRET_OPENROUTER_API_KEY = env(
     "AZURE_KV_SECRET_OPENROUTER_API_KEY",
     default="openrouter-api-key",
@@ -731,6 +822,18 @@ AZURE_STORAGE_ACCOUNT_NAME = env("AZURE_STORAGE_ACCOUNT_NAME", default="")
 # unwrap_dek and CONTINUITY_encryption-phase1.md.
 AZURE_KEK_VAULT_NAME = env("AZURE_KEK_VAULT_NAME", default="kv-nbhd-keks")
 AZURE_DECRYPT_BROKER_CLIENT_ID = env("AZURE_DECRYPT_BROKER_CLIENT_ID", default="")
+
+# Apple in-app subscriptions (DIRECTIVE_ios_in_app_purchase.md). The private key is an
+# App Store Connect "In-App Purchase" key (.p8), stored in Key Vault and injected as
+# env text; until all four of issuer/key id/key/bundle are set the endpoints answer 503.
+APPLE_IAP_ISSUER_ID = env("APPLE_IAP_ISSUER_ID", default="")
+APPLE_IAP_KEY_ID = env("APPLE_IAP_KEY_ID", default="")
+APPLE_IAP_PRIVATE_KEY = env("APPLE_IAP_PRIVATE_KEY", default="").replace("\\n", "\n")
+APPLE_IAP_BUNDLE_ID = env("APPLE_IAP_BUNDLE_ID", default="org.hoodunited.nbhd")
+APPLE_IAP_APP_APPLE_ID = env.int("APPLE_IAP_APP_APPLE_ID", default=6779158519)
+APPLE_IAP_PRODUCT_IDS = env.list("APPLE_IAP_PRODUCT_IDS", default=["org.hoodunited.nbhd.standard.monthly"])
+# Sandbox purchases (App Review, TestFlight) entitle only these user UUIDs.
+APPLE_IAP_SANDBOX_USER_IDS = env.list("APPLE_IAP_SANDBOX_USER_IDS", default=[])
 
 # Stripe pricing — single plan.
 # NOTE: the Django setting is STRIPE_PRICE_ID, but the env var it reads is
@@ -1002,3 +1105,5 @@ if SENTRY_DSN and not _SENTRY_RUNNING_TESTS:
 # accumulate DB connections + outbound HTTP attempts on every CronJob save.
 # See ``config/test_runner.py`` for the full rationale.
 TEST_RUNNER = "config.test_runner.QuietCronSignalRunner"
+
+PROJECTS_V2_TENANT_IDS = env("PROJECTS_V2_TENANT_IDS", default="")

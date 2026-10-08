@@ -119,10 +119,11 @@ DEFAULT_FROM_EMAIL = env(
 # to restore legacy per-run failure and reaper emails without a deploy.
 EVAL_EMAIL_ALERTS_ENABLED = env.bool("EVAL_EMAIL_ALERTS_ENABLED", default=False)
 
-# Steward Phase 1. These names intentionally mirror the Azure Container App
-# env vars verbatim (invariant §10). Empty ingest secret is fail-closed at the
-# endpoint; empty delivery/dead-man values safely disable that optional channel.
+# Steward smoke detector. These names intentionally mirror the Azure Container
+# App env vars verbatim (invariant §10). Empty ingest secret is fail-closed at
+# the endpoints; empty alert-email/dead-man values disable those optional paths.
 STEWARD_INGEST_SECRET = env("STEWARD_INGEST_SECRET", default="")
+# Legacy rollout settings; Steward no longer reads these Telegram values.
 STEWARD_TELEGRAM_BOT_TOKEN = env("STEWARD_TELEGRAM_BOT_TOKEN", default="")
 STEWARD_TELEGRAM_CHAT_ID = env("STEWARD_TELEGRAM_CHAT_ID", default="")
 STEWARD_ALERT_EMAIL = env("STEWARD_ALERT_EMAIL", default="")
@@ -142,6 +143,38 @@ STEWARD_OPENROUTER_CANARY_TENANT_ID = env(
 # UUIDs. UNSET (the state at deploy time) means the cron seeds for nobody;
 # add the canary's id to the Container App to open it for that tenant only.
 TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
+
+# Storage key cache canary gate. Container App env var names MUST match;
+# empty keeps the existing per-operation listKeys behavior.
+AZURE_STORAGE_KEY_CACHE_TENANT_IDS = env("AZURE_STORAGE_KEY_CACHE_TENANT_IDS", default="")
+AZURE_STORAGE_KEY_CACHE_TTL_SECONDS = env("AZURE_STORAGE_KEY_CACHE_TTL_SECONDS", default="300")
+# Which storage account key nbhd uses: "0" = key1, "1" = key2 (rotation 2026-10).
+AZURE_STORAGE_KEY_INDEX = env("AZURE_STORAGE_KEY_INDEX", default="1")
+
+# USER.md skip-unchanged canary gate. Container App env var name MUST match.
+USER_MD_SKIP_UNCHANGED_TENANT_IDS = env("USER_MD_SKIP_UNCHANGED_TENANT_IDS", default="")
+
+# Morning Briefing programmatic-weather canary gate (nbhd_weather_briefing
+# tool). Container App env var name MUST match. EMPTY MEANS NOBODY; open a
+# tenant only once its running OpenClaw image ships the tool.
+BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
+
+# OpenClaw image auto-roll allowlist. Container App env var name MUST match.
+# EMPTY MEANS NOBODY: a deploy bumps OPENCLAW_IMAGE_TAG but apply_pending_configs
+# + wake refresh only move a tenant onto it if listed here (comma-separated
+# UUIDs) or if "*". Staged rollout for 2026.9.4: set the canary UUID, then widen.
+OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS = env("OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS", default="")
+
+# Automatic 5.28 -> 9.4 upgrade at idle time (apps/orchestrator/openclaw_auto_upgrade.py).
+# OFF unless OPENCLAW_AUTO_UPGRADE_ENABLED is true. The allowlist works like the
+# image rollout one: EMPTY MEANS NOBODY, "*" means every 5.28 tenant. The tag
+# defaults to OPENCLAW_IMAGE_TAG and must be an immutable 2026.9.4-<sha>. Jev
+# only breaks ties on unrecognised failures, behind its own flag. Container App
+# env var names MUST match.
+OPENCLAW_AUTO_UPGRADE_ENABLED = env.bool("OPENCLAW_AUTO_UPGRADE_ENABLED", default=False)
+OPENCLAW_AUTO_UPGRADE_TENANT_IDS = env("OPENCLAW_AUTO_UPGRADE_TENANT_IDS", default="")
+OPENCLAW_AUTO_UPGRADE_TAG = env("OPENCLAW_AUTO_UPGRADE_TAG", default="")
+OPENCLAW_AUTO_UPGRADE_JEV_ENABLED = env.bool("OPENCLAW_AUTO_UPGRADE_JEV_ENABLED", default=False)
 
 # Dropped-turn retry canary gate. The Azure Container App env var name MUST
 # match RETRY_DROPPED_TENANT_IDS exactly. Comma-separated tenant UUIDs; empty
@@ -220,6 +253,9 @@ LOGGING = {
             "formatter": "verbose",
             "filters": ["redact_byo_paste_body", "redact_telegram_token"],
         },
+    },
+    "loggers": {
+        "azure": {"level": "WARNING"},
     },
     "root": {
         "handlers": ["console"],

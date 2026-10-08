@@ -15,6 +15,7 @@ from apps.crypto import box
 from apps.crypto.keys import mint_and_wrap_dek
 from apps.orchestrator.azure_client import _MOCK_KEK_REGISTRY
 from apps.pii.redactor import DetectedEntity, RedactionOutcome, as_confirmed
+from apps.pii.testsupport import neural_ran
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage
 from apps.router.pending_queue import (
     DeliveryState,
@@ -320,16 +321,13 @@ class RouterTranscriptLedgerTest(TestCase):
             "id": "webhook-ref",
             "choices": [{"message": {"content": "assistant masked"}}],
         }
-        with patch(
-            "apps.pii.redactor.redact_user_message_checked",
-            return_value=RedactionOutcome("hello [PERSON_1]", True, "redacted"),
-        ):
-            _capture_telegram_webhook_transcript(
-                tenant,
-                update_id=991,
-                raw_user_text="hello Alice",
-                result=result,
-            )
+        _capture_telegram_webhook_transcript(
+            tenant,
+            update_id=991,
+            user_outcome=RedactionOutcome("hello [PERSON_1]", True, "redacted"),
+            occurred_at=timezone.now(),
+            result=result,
+        )
         self.assertEqual(TranscriptEvent.objects.filter(tenant=tenant).count(), 2)
         self.assertEqual(
             TranscriptEvent.objects.get(tenant=tenant, role="assistant").delivery_state,
@@ -337,16 +335,13 @@ class RouterTranscriptLedgerTest(TestCase):
         )
 
         failed_tenant = self._tenant("webhook-failed")
-        with patch(
-            "apps.pii.redactor.redact_user_message_checked",
-            return_value=RedactionOutcome("raw Alice", False, "redaction-error"),
-        ):
-            _capture_telegram_webhook_transcript(
-                failed_tenant,
-                update_id=992,
-                raw_user_text="raw Alice",
-                result=result,
-            )
+        _capture_telegram_webhook_transcript(
+            failed_tenant,
+            update_id=992,
+            user_outcome=RedactionOutcome("raw Fakenamealpha", False, "redaction-error"),
+            occurred_at=timezone.now(),
+            result=result,
+        )
         quarantine = TranscriptCaptureQuarantine.objects.get(
             tenant=failed_tenant,
             source_type=TranscriptEvent.SourceType.TELEGRAM_WEBHOOK,
@@ -355,14 +350,13 @@ class RouterTranscriptLedgerTest(TestCase):
         self.assertFalse(TranscriptEvent.objects.filter(tenant=failed_tenant, role="user").exists())
 
         disabled = self._tenant("webhook-disabled", enabled=False)
-        with patch("apps.pii.redactor.redact_user_message_checked") as redact:
-            _capture_telegram_webhook_transcript(
-                disabled,
-                update_id=993,
-                raw_user_text="raw Alice",
-                result=result,
-            )
-        redact.assert_not_called()
+        _capture_telegram_webhook_transcript(
+            disabled,
+            update_id=993,
+            user_outcome=RedactionOutcome("raw Fakenamealpha", False, "redaction-error"),
+            occurred_at=timezone.now(),
+            result=result,
+        )
         self.assertFalse(TranscriptEvent.objects.filter(tenant=disabled).exists())
 
     def test_disabled_flag_skips_pending_and_on_device_capture_work(self):
@@ -490,7 +484,7 @@ class RouterTranscriptLedgerTest(TestCase):
             ]
 
         with (
-            patch("apps.pii.redactor._detect_pii", side_effect=detect) as ner,
+            patch("apps.pii.redactor._detect_pii", side_effect=neural_ran(detect)) as ner,
             patch("apps.router.conversation_capture.schedule_user_md_refresh"),
         ):
             response = client.post(

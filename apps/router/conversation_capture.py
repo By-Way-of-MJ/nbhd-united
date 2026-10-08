@@ -95,6 +95,9 @@ def clean_reply_for_capture(tenant, ai_text: str | None) -> str:
     text = (ai_text or "").strip()
     if not text:
         return ""
+    from apps.router.panels import extract_panels
+
+    text, _panels = extract_panels(text)
     text = _MARKER_RE.sub("", text)
     text = _MEDIA_LINE_RE.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -196,9 +199,9 @@ def schedule_user_md_refresh(tenant) -> None:
 
     def _push() -> None:
         try:
-            from apps.orchestrator.workspace_envelope import push_user_md
+            from apps.orchestrator.workspace_envelope import TRIGGER_CONVERSATION, push_user_md
 
-            push_user_md(tenant_id, debounce_seconds=_REFRESH_DEBOUNCE_SECONDS)
+            push_user_md(tenant_id, debounce_seconds=_REFRESH_DEBOUNCE_SECONDS, trigger=TRIGGER_CONVERSATION)
         except Exception:
             logger.warning(
                 "conversation_capture: USER.md refresh failed for tenant %s",
@@ -418,7 +421,12 @@ def _recent_proactive_lines(tenant, tz) -> list[str]:
     for r in reversed(rows):  # oldest → newest so the block reads in time order
         hhmm = r.created_at.astimezone(tz).strftime("%H:%M")
         label = (r.job_name or "").strip() or "proactive"
-        body = _one_line(r.message_text, _PROACTIVE_LINE_CHARS)
+        # The weekly mission digest carries the mission's title, which any member can
+        # rename. USER.md is trusted on every turn, so only say that it was sent.
+        if label.startswith("_mission:"):
+            body = "weekly crew digest (titles and handles left out here)"
+        else:
+            body = _one_line(r.message_text, _PROACTIVE_LINE_CHARS)
         lines.append(f"- {hhmm} · {label}: {body}")
     return lines
 

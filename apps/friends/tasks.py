@@ -45,3 +45,13 @@ def mission_weekly_digest_task() -> dict:
     result = run_weekly_mission_digest()
     logger.info("mission_weekly_digest_task → %s", result)
     return result
+
+
+def project_due_nudges_task() -> dict:
+    """Projects v2: one "due tomorrow" push per (owner, step, due date), at 09:00 in
+    the owner's own time zone. Hourly; idempotent via a compare-and-set claim."""
+    from apps.friends.project_notifications import run_due_nudges, run_still_yours_nudges
+
+    result = {**run_due_nudges(), "still_yours": run_still_yours_nudges()}
+    logger.info("project_due_nudges_task → %s", result)
+    return result

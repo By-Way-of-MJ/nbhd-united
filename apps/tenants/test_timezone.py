@@ -147,6 +147,33 @@ class ProfileTimezoneAPITest(TestCase):
         self.assertEqual(response.status_code, 200)
         mock_update_tenant_config.assert_called_once_with(str(tenant.id))
 
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_9_4_timezone_change_moves_recurring_cron_rows(self, _mock_update, mock_invoke):
+        """9.4 gates the gateway cron.* sweep; the canonical rows move instead."""
+        from apps.cron.models import CronJob
+
+        tenant = Tenant.objects.create(
+            user=self.user, status=Tenant.Status.ACTIVE, container_id="oc-test", openclaw_version="2026.9.4"
+        )
+        recurring = CronJob.objects.create(
+            tenant=tenant,
+            name="Stretch",
+            data={"schedule": {"kind": "cron", "expr": "0 9 * * *", "tz": "UTC"}, "payload": {"kind": "agentTurn"}},
+        )
+        one_shot = CronJob.objects.create(
+            tenant=tenant,
+            name="Dentist",
+            data={"schedule": {"kind": "at", "at": "2099-01-01T00:00:00Z"}, "payload": {"kind": "agentTurn"}},
+        )
+        response = self.client.patch("/api/v1/tenants/profile/", {"timezone": "Asia/Tokyo"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        recurring.refresh_from_db()
+        one_shot.refresh_from_db()
+        self.assertEqual(recurring.data["schedule"], {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Tokyo"})
+        self.assertNotIn("tz", one_shot.data["schedule"])
+        mock_invoke.assert_not_called()
+
     @patch("apps.orchestrator.services.update_tenant_config")
     def test_non_timezone_patch_does_not_refresh_tenant_config(self, mock_update_tenant_config):
         Tenant.objects.create(user=self.user, status=Tenant.Status.ACTIVE, container_id="oc-test")

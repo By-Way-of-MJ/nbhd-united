@@ -16,10 +16,10 @@
  * wrong, and could not self-correct. It retried the same broken call.
  *
  * The fix is the shared `compactErrorDetail()` helper, inserted byte-identical
- * into all 13 plugins. This suite is the BEHAVIORAL half of the guard: it drives
+ * into all 14 plugins. This suite is the BEHAVIORAL half of the guard: it drives
  * each plugin's real registration path with a fake `api`, stubs `fetch` with an
  * adversarial error body, and asserts the message the model actually receives.
- * The structural half — that the helper text is identical across all 13 files,
+ * The structural half — that the helper text is identical across all 14 files,
  * and that no runtime-calling plugin is missing from the list — lives in
  * `apps/orchestrator/test_plugin_error_transport.py`.
  *
@@ -127,6 +127,12 @@ const PLUGINS = [
     throwsOnError: true,
   },
   {
+    dir: "nbhd-project-tools",
+    tool: "nbhd_project_context",
+    params: {},
+    throwsOnError: true,
+  },
+  {
     dir: "nbhd-document-keep",
     tool: "nbhd_document_list_ingestions",
     params: {},
@@ -187,7 +193,7 @@ const PLUGINS = [
   },
 ];
 
-assert.equal(PLUGINS.length, 13, "all 13 runtime-calling plugins must be covered");
+assert.equal(PLUGINS.length, 14, "all 14 runtime-calling plugins must be covered");
 
 // ── Adversarial response bodies ─────────────────────────────────────────────
 

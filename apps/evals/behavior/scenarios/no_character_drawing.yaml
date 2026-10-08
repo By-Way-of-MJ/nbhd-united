@@ -1,0 +1,15 @@
+# A request that invites a drawn diagram. Phones wrap box-drawing / ASCII art
+# into noise, so the always-loaded rule says: never draw with characters, use a
+# list or a Markdown table. OBSERVABLE: the reply text contains no drawing.
+id: no_character_drawing
+persona: >
+  An app user planning a six-week piece of work who asks for a visual timeline,
+  then pushes for a diagram.
+channel: ios
+script:
+  - "Give me a visual timeline for a 6-week build: weeks 1-2 audit, weeks 3-4 fixes, weeks 5-6 polish. Make it easy to see at a glance."
+  - "Can you draw that as a diagram so I can see how the phases line up?"
+hard_assertions:
+  - type: reply_nonempty
+  - type: no_character_drawing
+soft_dimensions: []

@@ -136,6 +136,9 @@ def _classify(entity_map: dict[str, Any], max_entries: int) -> tuple[dict[str, i
     junk: dict[str, dict[str, str]] = {}
     for placeholder, entry in list(entity_map.items())[:max_entries]:
         summary["examined"] += 1
+        if isinstance(entry, dict) and entry.get("provisional"):
+            summary["skipped"] += 1
+            continue
         if isinstance(entry, dict) and entry.get("retired"):
             # Owner-deleted real entities stay bound for rehydration. Junk
             # healing would write their real values back into Layer-1 stores.
@@ -188,7 +191,7 @@ def _heal_rows(tenant: Any, ph_to_name: dict[str, str]) -> int:
     raw value — so a junk value that also occurs as ordinary prose is untouched.
     """
     from apps.journal.models import Document, DocumentChunk
-    from apps.pii.store_registry import json_path_parts, registered_stores, rewrite_json_path
+    from apps.pii.store_registry import json_path_parts, registered_store, registered_stores, rewrite_json_path
 
     inner_to_name: dict[str, str] = {}
     for placeholder, name in ph_to_name.items():
@@ -274,7 +277,12 @@ def _heal_rows(tenant: Any, ph_to_name: dict[str, str]) -> int:
             for parts in json_parts:
                 field, *nested_parts = parts
                 current = getattr(row, field)
-                healed_value, changed = rewrite_json_path(current, tuple(nested_parts), _sub)
+                exclusions = (
+                    registered_store(model._meta.label).nested_json_exclusions(field)
+                    if model._meta.label.startswith("fuel.")
+                    else ()
+                )
+                healed_value, changed = rewrite_json_path(current, tuple(nested_parts), _sub, exclude_paths=exclusions)
                 if changed:
                     setattr(row, field, healed_value)
                     if field not in changed_fields:

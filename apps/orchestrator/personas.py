@@ -134,7 +134,7 @@ def render_identity_md(persona_key: str) -> str:
     )
 
 
-def _load_soul_from_key_vault() -> str | None:
+def _load_soul_from_key_vault(*, metadata_only=False) -> str | None:
     """Attempt to load the core SOUL.md content from Azure Key Vault.
 
     Returns the content string or None if unavailable.
@@ -156,25 +156,25 @@ def _load_soul_from_key_vault() -> str | None:
     try:
         from apps.orchestrator.azure_client import read_key_vault_secret
 
-        content = read_key_vault_secret(secret_name)
+        content = read_key_vault_secret(secret_name, **({"metadata_only": True} if metadata_only else {}))
         if content and content.strip():
             logger.info("Loaded SOUL.md from Key Vault secret: %s", secret_name)
             _load_soul_from_key_vault._cached = content.strip()
             return _load_soul_from_key_vault._cached
     except Exception as exc:
-        logger.warning("Failed to load SOUL.md from Key Vault: %s", exc)
+        logger.warning("Failed to load SOUL.md from Key Vault: %s", "key_vault_unavailable" if metadata_only else exc)
 
     _load_soul_from_key_vault._cached = None
     return None
 
 
-def render_soul_md(persona_key: str) -> str:
+def render_soul_md(persona_key: str, *, metadata_only=False) -> str:
     """Render SOUL.md content.
 
     Reads the core soul from Key Vault (the heart of the product).
     Falls back to a generated version from persona traits if KV is unavailable.
     """
-    kv_soul = _load_soul_from_key_vault()
+    kv_soul = _load_soul_from_key_vault(**({"metadata_only": True} if metadata_only else {}))
     if kv_soul:
         return kv_soul
 
@@ -206,7 +206,7 @@ def render_soul_md(persona_key: str) -> str:
     )
 
 
-def _load_soul_template_body() -> str | None:
+def _load_soul_template_body(*, metadata_only=False) -> str | None:
     """Load the SOUL baseline body: repo template first, then env, then Key Vault.
 
     The repo template (``templates/openclaw/SOUL.md``) is the sentinel-split
@@ -228,7 +228,7 @@ def _load_soul_template_body() -> str | None:
     env_template = os.environ.get("NBHD_SOUL_MD_TEMPLATE")
     if env_template:
         return env_template
-    return _load_soul_from_key_vault()
+    return _load_soul_from_key_vault(**({"metadata_only": True} if metadata_only else {}))
 
 
 def _hardcoded_soul_complete(traits: str) -> str:
@@ -248,7 +248,7 @@ def _hardcoded_soul_complete(traits: str) -> str:
     )
 
 
-def render_soul_managed(persona_key: str, tenant=None) -> str:
+def render_soul_managed(persona_key: str, tenant=None, *, metadata_only=False) -> str:
     """Render the platform-managed SOUL.md region (sentinel markers included).
 
     This is the region the platform re-asserts; the agent's growth region below
@@ -266,7 +266,7 @@ def render_soul_managed(persona_key: str, tenant=None) -> str:
     persona = get_persona(persona_key)
     traits = persona["soul_traits"].strip()
 
-    source = _load_soul_template_body()
+    source = _load_soul_template_body(**({"metadata_only": True} if metadata_only else {}))
     if source and SOUL_BEGIN_MARKER in source:
         # Full managed template (repo file) — just fill the persona placeholder.
         managed = source.replace("{{PERSONA_SOUL_TRAITS}}", traits)
@@ -347,7 +347,7 @@ def render_identity_managed(persona_key: str, tenant=None) -> str:
     return managed.strip() + "\n"
 
 
-def _load_agents_md_from_key_vault() -> str | None:
+def _load_agents_md_from_key_vault(*, metadata_only=False) -> str | None:
     """Attempt to load AGENTS.md template from Azure Key Vault.
 
     Returns the template string (with {{PERSONA_PERSONALITY}} placeholder) or None.
@@ -369,13 +369,13 @@ def _load_agents_md_from_key_vault() -> str | None:
     try:
         from apps.orchestrator.azure_client import read_key_vault_secret
 
-        content = read_key_vault_secret(secret_name)
+        content = read_key_vault_secret(secret_name, **({"metadata_only": True} if metadata_only else {}))
         if content and content.strip():
             logger.info("Loaded AGENTS.md from Key Vault secret: %s", secret_name)
             _load_agents_md_from_key_vault._cached = content.strip()
             return _load_agents_md_from_key_vault._cached
     except Exception as exc:
-        logger.warning("Failed to load AGENTS.md from Key Vault: %s", exc)
+        logger.warning("Failed to load AGENTS.md from Key Vault: %s", "key_vault_unavailable" if metadata_only else exc)
 
     _load_agents_md_from_key_vault._cached = None
     return None
@@ -396,7 +396,7 @@ def _load_agents_md_from_template_file() -> str | None:
         return None
 
 
-def render_agents_md(persona_key: str) -> str:
+def render_agents_md(persona_key: str, *, metadata_only=False) -> str:
     """Render AGENTS.md content for a persona.
 
     Resolution order (repo file first, so AGENTS body changes ship via CI):
@@ -426,7 +426,7 @@ def render_agents_md(persona_key: str) -> str:
         return env_template.replace("{{PERSONA_PERSONALITY}}", persona["agents_personality"])
 
     # 3. Try Key Vault (emergency hot-patch override only if the repo file is absent)
-    kv_template = _load_agents_md_from_key_vault()
+    kv_template = _load_agents_md_from_key_vault(**({"metadata_only": True} if metadata_only else {}))
     if kv_template:
         return kv_template.replace("{{PERSONA_PERSONALITY}}", persona["agents_personality"])
     # Fallback: hardcoded version
@@ -469,7 +469,7 @@ def render_agents_md(persona_key: str) -> str:
         f"    - Morning report, weather, news, focus → matching slug\n"
         f"  - `nbhd_daily_note_append` -- ONLY for unstructured quick notes that don't fit a section\n"
         f"  - `nbhd_memory_get` / `nbhd_memory_update` -- read/write long-term memory\n"
-        f"  - `nbhd_journal_context` -- session init (recent notes + memory)\n"
+        f"  - `nbhd_journal_context` -- only for cron-requested or user-requested recent context\n"
         f"- Do not invent storage APIs or bypass tenant-scoped runtime tools.\n"
     )
 
@@ -537,14 +537,27 @@ def _rules_template_dir() -> str:
     )
 
 
+_SUBAGENT_CHAT_INSTRUCTIONS = (
+    "## Slow tasks\n\n"
+    "Delegate only work likely to take more than about 30 seconds: multi-step research, "
+    "long-document analysis, or large generation. Answer simple questions directly. "
+    "Call `sessions_spawn` BEFORE starting the work, then reply immediately: "
+    '"On it — I\'ll let you know when it\'s ready." Never pass `context: "fork"`; '
+    "give only bounded context. The helper is read-only, reports back to you, and must not "
+    "send, create, publish, or act outward. On an `[Internal task completion event]`, "
+    "send exactly one `nbhd_send_to_user` update to the requester's `thread_id`, in your "
+    "normal voice, without raw run/session/delivery metadata. The bridge backstops delivery; "
+    "do not duplicate its sends. Never use `NO_REPLY`, `no_reply`, or `ANNOUNCE_SKIP` for "
+    "completion. On timeout/failure, send a brief honest reason and offer to retry."
+)
+
+
 _SUBAGENT_RULE_FILENAME = "subagents.md"
 _SUBAGENT_MESSAGING_ADDENDUM = (
     "\n\nIf `rules/subagents.md` is present in your workspace, follow it for "
     "sub-agent completion events; its internal-completion delivery exception "
     "overrides the normal-conversation rule above."
 )
-_SUBAGENT_RULE_INDEX_ANCHOR = "| `rules/messaging.md` | Cron delivery, check-in windows, automated routines |"
-_SUBAGENT_RULE_INDEX_ROW = "| `rules/subagents.md` | Slow-task delegation and app completion delivery |"
 
 
 def _subagent_workspace_surfaces_enabled(tenant) -> bool:
@@ -667,7 +680,7 @@ def _get_tenant_prompt_extras(tenant, section: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
+def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False) -> dict[str, str]:
     """Render all persona-aware workspace files.
 
     Returns a dict mapping env var names to content:
@@ -683,29 +696,29 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
     without branching the template or running a schema migration.
     """
     result = {
-        "NBHD_AGENTS_MD": render_agents_md(persona_key),
+        "NBHD_AGENTS_MD": render_agents_md(persona_key, **({"metadata_only": True} if metadata_only else {})),
         # Sentinel-split managed regions — the platform re-asserts these; the
         # agent's growth region below the END marker is merged in at write time
         # by apps.orchestrator.identity_merge (never produced here).
-        "NBHD_SOUL_MD": render_soul_managed(persona_key, tenant),
+        "NBHD_SOUL_MD": render_soul_managed(persona_key, tenant, **({"metadata_only": True} if metadata_only else {})),
         "NBHD_IDENTITY_MD": render_identity_managed(persona_key, tenant),
     }
     if _subagent_workspace_surfaces_enabled(tenant):
-        agents_md = result["NBHD_AGENTS_MD"]
-        if _SUBAGENT_RULE_INDEX_ANCHOR in agents_md:
-            result["NBHD_AGENTS_MD"] = agents_md.replace(
-                _SUBAGENT_RULE_INDEX_ANCHOR,
-                f"{_SUBAGENT_RULE_INDEX_ANCHOR}\n{_SUBAGENT_RULE_INDEX_ROW}",
-                1,
+        result["NBHD_AGENTS_MD"] += "\n\n" + _SUBAGENT_CHAT_INSTRUCTIONS
+
+    # Profile onboarding gate — use the same omission predicate as USER.md's
+    # managed Profile section. UTC is the platform default, so it does not count
+    # as a confirmed timezone; an empty city likewise omits Home location.
+    user = getattr(tenant, "user", None)
+    if user is not None:
+        user_tz = (getattr(user, "timezone", "") or "").strip()
+        city = (getattr(user, "location_city", "") or "").strip()
+        if not user_tz or user_tz == "UTC" or not city:
+            onboarding_gate = (
+                "If USER.md lacks timezone or home city, ask once and never infer; save via nbhd_update_profile."
             )
-        else:
-            # Fallback templates may not carry the standard rule table. Keep
-            # the tenant-only reference discoverable without changing the base
-            # template for everyone else.
-            result["NBHD_AGENTS_MD"] = (
-                f"{agents_md}\n\n## Additional rules\n\n- `rules/subagents.md` — "
-                "slow-task delegation and app completion delivery"
-            )
+            result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + onboarding_gate
+
     # Site publishing gate — behavioral, per-tenant. Only tenants with their own
     # website connected (site_publishing_enabled) load the publish_portfolio_image
     # tool, so the imperative cue that makes the agent actually CALL it — rather
@@ -729,6 +742,31 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
             "or ask. If publishing isn't configured, do NOT retry — say so."
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_publish_gate
+        # Shop gate — same plugin, same flag. Deliberately one line: the all-gates
+        # AGENTS.md budget was full, so this only routes selling to the shop tools
+        # (without it "sell this photo" lands in the gallery via the gate above);
+        # the confirm-before-saving rules live in the tool descriptions and are
+        # enforced in code (only `shop_confirm` + approval code writes).
+        shop_gate = (
+            "## Shop gate\n\n"
+            "For-sale items (price, stock, sold, hide) → `shop_*` tools via toolSearch, NOT "
+            "`publish_portfolio_image`. NEVER guess a price. Nothing saves until `shop_confirm`."
+        )
+        result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + shop_gate
+
+    if tenant is not None and getattr(tenant, "site_editor_enabled", False):
+        site_editor_gate = (
+            "## Website edit gate\n\n"
+            "You can edit the user's website source (text, pages, layout, images) ONLY through the `site_*` "
+            "tools — find them via toolSearch. This exception works only in the user's own site repository.\n\n"
+            "Every time: `site_read_file` first → stage with `site_stage_file` / `site_stage_upload` → "
+            "`site_show_pending` returns an approval code → show the user what will change → ONLY after they "
+            "say go, call `site_publish` with that code, `confirm: true` and a short message. Never say a change "
+            "is live unless `site_publish` returned a commit THIS turn; say updates take a few minutes. Gallery "
+            "photos use `publish_portfolio_image`. Keep edits small and content-shaped; send code rewrites to "
+            "MJ. If site editing isn't configured, don't retry."
+        )
+        result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_editor_gate
 
     # Current-location capture gate — behavioral, flag-gated, and imperative.
     # The tool being available is not enough under toolSearch: like the site-
@@ -799,8 +837,8 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
     # tenant with document_ingestion_enabled loads the nbhd_document_* tools, so
     # the block that NAMES them (record/list/forget) is gated the same way — a
     # tenant without the flag never sees a tool it doesn't have (critic finding 5).
-    # The base body's generic gate + the fleet-wide rules file carry the behavior;
-    # this adds the tool workflow. Placed BEFORE the larger Gravity block so it is
+    # The base body's generic gate carries the behavior; this adds the tool
+    # workflow. Placed BEFORE the larger Gravity block so it is
     # never the silently-truncated tail if AGENTS.md exceeds the bootstrap budget.
     if tenant is not None and getattr(tenant, "document_ingestion_enabled", False):
         document_keep_removal_gate = (
@@ -861,10 +899,10 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + sautai_gate
 
-    # Tour-guide gate — unverified manifests keep the doc-read contract
-    # byte-for-byte; only tenants whose settings-tools manifest is verified get
-    # the tool-response gate. Keep this BEFORE the larger Gravity block so it
-    # cannot become a truncated tail.
+    # Tour-guide gate — unverified manifests keep an explicit tool-discovery
+    # contract; tenants whose settings-tools manifest is verified get the direct
+    # tool-response gate. Keep this BEFORE the larger Gravity block so it cannot
+    # become a truncated tail.
     if tenant is not None and getattr(tenant, "tour_guide_enabled", False):
         if places_search_delivery_ready(tenant):
             if getattr(tenant, "situational_context_enabled", False):
@@ -903,9 +941,9 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
             tour_guide_gate = (
                 "## Tour guide\n\n"
                 "When the user asks what to do, where to eat, or how to spend time around a place — "
-                'or any message contains a "📍 Current location" line — read `docs/tour-guide.md` '
-                "THIS TURN, before answering, and follow its reply format exactly. Never ask where "
-                "the user is when a recent 📍 message exists."
+                'or any message contains a "📍 Current location" line — search for `nbhd_tour_guide` '
+                "by name, read its description, and call it THIS TURN before answering; its response "
+                "carries the exact reply format. Never ask where the user is when a recent 📍 message exists."
             )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + tour_guide_gate
 
@@ -915,7 +953,8 @@ def render_workspace_files(persona_key: str, tenant=None) -> dict[str, str]:
             "This user can reshape their journal template through you.\n"
             "- `nbhd_journal_template_get` — read the current daily-note sections.\n"
             "- `nbhd_journal_template_update` — replace the sections list.\n"
-            "- Before ANY reshape: read `docs/journal-shaping.md`, then propose the exact sections and get "
+            "- Before ANY reshape: call `nbhd_journal_template_get` to list the current sections, then propose "
+            "the exact sections and get "
             "explicit agreement. Never reshape silently.\n"
             "- Template = future structure only; existing notes are never modified by a template change.\n"
             "- Pair every section change with its check-in schedule: prefer folding into an existing check-in "

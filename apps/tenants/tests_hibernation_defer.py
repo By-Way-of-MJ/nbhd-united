@@ -172,6 +172,8 @@ class GatewayErrorPropagationThroughServicesTest(TestCase):
 
     def setUp(self):
         self.tenant = _make_active_tenant(hibernated=False, chat_id=999_000_013)
+        self.tenant.openclaw_version = "2026.5.28"  # gateway heartbeat path; 9.4 skips it
+        self.tenant.save(update_fields=["openclaw_version"])
 
     @mock.patch("apps.orchestrator.azure_client.upload_config_to_file_share")
     @mock.patch("apps.orchestrator.config_generator.generate_openclaw_config")

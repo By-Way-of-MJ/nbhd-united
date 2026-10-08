@@ -97,10 +97,16 @@ class EmptyPrescriptionGuardTests(_RuntimeFuelCase):
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertEqual(Workout.objects.get(tenant=self.tenant).status, "skipped")
 
-    def test_cardio_without_prescription_unaffected(self):
-        # The guard is scoped to the two categories that carry exercises. A run
-        # has no "exercises" and must keep logging in one shot.
-        resp = self.log({"category": "cardio", "activity": "Morning Run", "duration_minutes": 30})
+    def test_planned_cardio_without_prescription_rejected(self):
+        resp = self.log({"status": "planned", "category": "cardio", "activity": "Morning Run"})
+        self.assertEqual(resp.status_code, 400, resp.data)
+        self.assertEqual(resp.data["details"][0]["type"], "missing_prescription")
+        self.assertEqual(Workout.objects.filter(tenant=self.tenant).count(), 0)
+
+    def test_done_cardio_without_prescription_allowed(self):
+        # Completed logs describe what happened rather than a prescription the
+        # user should open and follow, so they remain outside the planned guard.
+        resp = self.log({"category": "cardio", "activity": "Morning Run"})
         self.assertEqual(resp.status_code, 201, resp.data)
 
 
@@ -280,6 +286,8 @@ class WeekOverrideBoundsTests(_RuntimeFuelCase):
             "weeks": 4,
             "days_per_week": 1,
             "start_date": "2026-06-01",
+            "repeat_policy": "intentional",
+            "repeat_reason": "Override-bounds fixture intentionally keeps one recipe",
             "schedule_json": {
                 "monday": {"category": "strength", "activity": "Full Body", "detail_json": _strength_detail()}
             },
@@ -343,7 +351,12 @@ class WeekOverrideBoundsTests(_RuntimeFuelCase):
         plan_id = created.data["id"]
         resp = self.client.patch(
             self.base(f"plans/{plan_id}/"),
-            {"weeks": 8, "week_overrides": {"6": {"monday": None}}},
+            {
+                "weeks": 8,
+                "week_overrides": {"6": {"monday": None}},
+                "repeat_policy": "intentional",
+                "repeat_reason": "Bounds test keeps the legacy recipe intentionally",
+            },
             format="json",
             **self.headers,
         )

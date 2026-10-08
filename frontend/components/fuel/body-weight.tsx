@@ -42,7 +42,7 @@ export function BodyWeight() {
       </div>
 
       {/* Trend card */}
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="flex items-start justify-between">
           <div>
             <div className="text-3xl font-semibold italic">

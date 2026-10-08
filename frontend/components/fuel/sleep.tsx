@@ -26,7 +26,7 @@ export function Sleep() {
     <div className="space-y-4">
       <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">SLEEP</div>
 
-      <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
+      <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5">
         <div className="flex items-start justify-between">
           <div>
             <div className="text-2xl sm:text-3xl font-semibold italic">

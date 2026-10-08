@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 import httpx
+from django.db import OperationalError
 from django.test import TestCase, override_settings
 
 from apps.router.poller import TelegramPoller
@@ -469,6 +470,60 @@ class TelegramPollerForwardTest(TestCase):
 
         return _post, captured
 
+    def test_only_owner_pass_carries_ingress_and_records_once(self):
+        from django.utils import timezone
+
+        from apps.pii.provisional import PiiIngress
+        from apps.pii.redactor import RedactionOutcome
+
+        framed = '[Replying to: "Fixture quote"]\n\nFakenamealpha arrived'
+        ingress = PiiIngress(channel="telegram", provider_event_id="987", occurred_at=timezone.now())
+        with (
+            patch(
+                "apps.pii.redactor.redact_user_message_checked",
+                return_value=RedactionOutcome("masked", True, "redacted"),
+            ) as redact,
+            patch("apps.pii.provisional.record_provisional_sightings") as record,
+            patch("apps.router.pending_queue.enqueue_message_for_tenant"),
+        ):
+            self.poller._forward_to_container(
+                123,
+                self.tenant,
+                framed,
+                raw_user_text="Fakenamealpha arrived",
+                provider_event_id=987,
+                pii_ingress=ingress,
+            )
+
+        self.assertEqual(redact.call_count, 2)
+        first_ingress = redact.call_args_list[0].kwargs["ingress"]
+        second_ingress = redact.call_args_list[1].kwargs["ingress"]
+        self.assertEqual(first_ingress.provider_event_id, "987")
+        self.assertIsNone(second_ingress)
+        record.assert_called_once_with(self.tenant, "Fakenamealpha arrived", first_ingress)
+
+    def test_agent_button_payload_is_not_pii_ingress(self):
+        from apps.pii.redactor import RedactionOutcome
+
+        with (
+            patch(
+                "apps.pii.redactor.redact_user_message_checked",
+                return_value=RedactionOutcome("masked", True, "redacted"),
+            ) as redact,
+            patch("apps.pii.provisional.record_provisional_sightings") as record,
+            patch("apps.router.pending_queue.enqueue_message_for_tenant"),
+        ):
+            self.poller._forward_to_container(
+                123,
+                self.tenant,
+                '[User tapped button: "Fakenamealpha"]',
+                raw_user_text="Fakenamealpha",
+                provider_event_id=987,
+            )
+
+        self.assertTrue(all(call.kwargs["ingress"] is None for call in redact.call_args_list))
+        record.assert_not_called()
+
     @patch("apps.router.pending_queue.httpx.post")
     def test_photo_forward_is_marked_is_image_singleton(self, mock_post):
         # A Telegram photo carries its [Photo attached: <path>] marker ONLY in
@@ -728,6 +783,40 @@ class TelegramPollerExtractTextTest(TestCase):
         self.assertIn("sticker", result)
         self.assertIn("😀", result)
 
+    def test_owner_segment_accepts_only_typed_text_and_user_captions(self):
+        cases = (
+            ({"message": {"text": "typed fixture"}}, "typed fixture"),
+            ({"message": {"photo": [{}], "caption": "caption fixture"}}, "caption fixture"),
+            ({"message": {"video": {}, "caption": "video caption fixture"}}, "video caption fixture"),
+        )
+        for update, expected in cases:
+            with self.subTest(update=update):
+                framed = self.poller._extract_message_text(update)
+                self.assertEqual(self.poller._extract_owner_text(update, framed), expected)
+
+    def test_successful_voice_transcript_is_owner_segment(self):
+        update = {"message": {"voice": {"file_id": "fixture"}}}
+        framed = '🎤 Voice message: "voice fixture"'
+        self.assertEqual(self.poller._extract_owner_text(update, framed), "voice fixture")
+
+    def test_generated_and_non_owner_kinds_have_no_owner_segment(self):
+        cases = (
+            ({"message": {"photo": [{}]}}, "User sent a photo"),
+            ({"message": {"voice": {"file_id": "fixture"}}}, "[Voice message — couldn't transcribe]"),
+            ({"message": {"sticker": {"emoji": "😀"}}}, "[User sent a sticker 😀]"),
+            ({"message": {"document": {"file_name": "fixture.txt"}}}, "extracted document fixture"),
+            ({"message": {"video": {"duration": 2}}}, "[User sent a video]"),
+            ({"message": {"location": {"latitude": 1, "longitude": 2}}}, "location metadata fixture"),
+            ({"message": {"contact": {"first_name": "Fixture"}}}, "contact metadata fixture"),
+            (
+                {"message": {"text": "forwarded fixture", "forward_from": {"first_name": "Fixture"}}},
+                "[Forwarded from Fixture]\nforwarded fixture",
+            ),
+        )
+        for update, framed in cases:
+            with self.subTest(update=update):
+                self.assertIsNone(self.poller._extract_owner_text(update, framed))
+
     def test_no_message(self):
         self.assertIsNone(self.poller._extract_message_text({}))
 
@@ -942,8 +1031,43 @@ class TelegramPollerOffsetAdvanceTest(TestCase):
     @patch("apps.router.poller.TelegramPoller._handle_update")
     @patch("apps.router.inbound_dedup.claim_inbound_event", return_value=True)
     @patch("apps.tenants.middleware.set_rls_context")
+    def test_infra_update_logs_marker_and_advances_offset(self, _rls, _claim, mock_handle):
+        mock_handle.side_effect = OperationalError("database unavailable")
+
+        with self.assertLogs("apps.router.poller", level="ERROR") as captured:
+            self.poller._process_update(
+                {
+                    "update_id": 9000,
+                    "message": {"text": "retry?", "chat": {"id": 12345}},
+                }
+            )
+
+        self.assertTrue(
+            any(
+                "inbound_lost_infra channel=telegram_poller update_id=9000 chat_id=12345" in line
+                for line in captured.output
+            )
+        )
+        self.assertEqual(self.poller.offset, 9001)
+
+    @patch("apps.router.poller.TelegramPoller._handle_update")
+    @patch("apps.router.inbound_dedup.claim_inbound_event", return_value=True)
+    @patch("apps.tenants.middleware.set_rls_context")
     def test_poison_update_advances_offset_to_avoid_wedge(self, _rls, _claim, mock_handle):
         # A bug handling THIS specific update must not wedge the poller.
         mock_handle.side_effect = ValueError("bad message shape")
-        self.poller._process_update({"update_id": 9001, "message": {"text": "poison"}})
+        with self.assertLogs("apps.router.poller", level="ERROR") as captured:
+            self.poller._process_update(
+                {
+                    "update_id": 9001,
+                    "message": {"text": "poison", "chat": {"id": 67890}},
+                }
+            )
+
+        self.assertTrue(
+            any(
+                "inbound_lost_poison channel=telegram_poller update_id=9001 chat_id=67890" in line
+                for line in captured.output
+            )
+        )
         self.assertEqual(self.poller.offset, 9002)

@@ -9,13 +9,19 @@ inactive at hibernation time).
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import call, patch
 
+from django.db import OperationalError
+from django.db.models import QuerySet
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from apps.cron.gateway_client import GatewayError
-from apps.orchestrator.hibernation import _capture_tenant_cron_schedules, wake_hibernated_tenant
+from apps.orchestrator.hibernation import (
+    _capture_tenant_cron_schedules,
+    _cron_active_or_imminent,
+    wake_hibernated_tenant,
+)
 from apps.orchestrator.tool_policy import OPENCLAW_CURRENT_VERSION, openclaw_version_for_image_tag
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
@@ -26,6 +32,11 @@ def _apply_config_published(mock_publish) -> bool:
     return any(call.args and call.args[0] == "apply_single_tenant_config" for call in mock_publish.call_args_list)
 
 
+# The wake-time image refresh is now gated by the per-tenant rollout allowlist
+# (image_rollout.py; default empty = nobody refreshes). "*" opts every tenant in
+# so these tests exercise the refresh mechanics; the gate's default-off behavior
+# is covered by test_wake_skips_refresh_when_not_allowlisted + test_image_rollout.
+@override_settings(OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*")
 class WakeHibernatedTenantImageRefreshTest(TestCase):
     def setUp(self):
         self.tenant = create_tenant(
@@ -37,6 +48,14 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         self.tenant.container_fqdn = "oc-wake-test.internal"
         self.tenant.hibernated_at = timezone.now()
         self.tenant.save()
+        # These tests exercise refresh mechanics with synthetic tags; the family
+        # guard and the live-image read are covered by WakeImageRefreshSafetyTest.
+        self.enterContext(patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True))
+        self.enterContext(
+            patch(
+                "apps.orchestrator.hibernation._live_openclaw_image", return_value="test.azurecr.io/nbhd-openclaw:old"
+            )
+        )
 
     @override_settings(
         OPENCLAW_IMAGE_TAG="newsha123",
@@ -58,7 +77,7 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         self.tenant.container_image_tag = "oldsha456"
         self.tenant.save(update_fields=["container_image_tag"])
 
-        result = wake_hibernated_tenant(self.tenant)
+        result = wake_hibernated_tenant(self.tenant, cron_wake=True)
 
         self.assertTrue(result)
         mock_update_image.assert_called_once_with(
@@ -70,6 +89,167 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         self.tenant.refresh_from_db()
         self.assertEqual(self.tenant.container_image_tag, "newsha123")
         self.assertIsNone(self.tenant.hibernated_at)
+
+    @override_settings(
+        OPENCLAW_IMAGE_TAG="newsha123",
+        AZURE_ACR_SERVER="test.azurecr.io",
+        OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="",
+    )
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    @patch("apps.orchestrator.azure_client.update_container_image")
+    def test_wake_skips_refresh_when_not_allowlisted(
+        self,
+        mock_update_image,
+        _mock_mount,
+        mock_wake,
+        _mock_publish,
+    ):
+        """The safety gate on the wake path: with an empty rollout allowlist a
+        hibernated tenant on a stale tag does a PLAIN wake and does NOT jump onto
+        the new (possibly unverified) image — so a deploy that bumps the tag
+        can't move the fleet via wake either."""
+        self.tenant.container_image_tag = "oldsha456"
+        self.tenant.save(update_fields=["container_image_tag"])
+
+        result = wake_hibernated_tenant(self.tenant)
+
+        self.assertTrue(result)
+        mock_update_image.assert_not_called()
+        mock_wake.assert_called_once_with("oc-wake-test")
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.container_image_tag, "oldsha456")
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_cron_wake_claims_atomically_before_azure(self, _mock_mount, mock_wake, _mock_publish):
+        events = []
+        original_update = QuerySet.update
+
+        def recording_update(queryset, **updates):
+            events.append(("update", updates, str(queryset.query)))
+            return original_update(queryset, **updates)
+
+        mock_wake.side_effect = lambda _container_id: events.append(("azure",))
+
+        with patch.object(QuerySet, "update", autospec=True, side_effect=recording_update):
+            result = wake_hibernated_tenant(self.tenant, cron_wake=True)
+
+        self.assertTrue(result)
+        claim = events[0]
+        self.assertEqual(claim[0], "update")
+        self.assertIsNone(claim[1]["hibernated_at"])
+        self.assertIn("cron_wake_at", claim[1])
+        self.assertIn("hibernated_at", claim[2])
+        self.assertIn("IS NOT NULL", claim[2])
+        self.assertEqual(events[1], ("azure",))
+
+        self.tenant.refresh_from_db()
+        self.assertIsNone(self.tenant.hibernated_at)
+        self.assertIsNotNone(self.tenant.cron_wake_at)
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_second_concurrent_wake_does_not_start_azure_twice(self, _mock_mount, mock_wake, _mock_publish):
+        stale_tenant = Tenant.objects.get(id=self.tenant.id)
+
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+        self.assertTrue(wake_hibernated_tenant(stale_tenant, cron_wake=True))
+
+        mock_wake.assert_called_once_with("oc-wake-test")
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_failed_azure_wake_rolls_back_claim_for_retry(self, _mock_mount, mock_wake, _mock_publish):
+        original_hibernated_at = self.tenant.hibernated_at
+        original_cron_wake_at = timezone.now()
+        self.tenant.cron_wake_at = original_cron_wake_at
+        self.tenant.save(update_fields=["cron_wake_at"])
+        mock_wake.side_effect = [RuntimeError("simulated Azure failure"), None]
+
+        self.assertFalse(wake_hibernated_tenant(self.tenant, cron_wake=True))
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.hibernated_at, original_hibernated_at)
+        self.assertEqual(self.tenant.cron_wake_at, original_cron_wake_at)
+
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+        self.assertEqual(mock_wake.call_count, 2)
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_already_awake_cron_wake_stamps_without_starting_azure(self, mock_mount, mock_wake, _mock_publish):
+        self.tenant.hibernated_at = None
+        self.tenant.cron_wake_at = None
+        self.tenant.save(update_fields=["hibernated_at", "cron_wake_at"])
+
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+
+        mock_mount.assert_not_called()
+        mock_wake.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertIsNotNone(self.tenant.cron_wake_at)
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_non_cron_wake_leaves_cron_wake_stamp_untouched(self, _mock_mount, _mock_wake, _mock_publish):
+        existing_stamp = timezone.now()
+        Tenant.objects.filter(id=self.tenant.id).update(cron_wake_at=existing_stamp)
+
+        self.assertTrue(wake_hibernated_tenant(self.tenant))
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.cron_wake_at, existing_stamp)
+
+    @override_settings(
+        OPENCLAW_IMAGE_TAG="newsha123",
+        AZURE_ACR_SERVER="test.azurecr.io",
+    )
+    @patch("apps.tenants.middleware.set_rls_context")
+    @patch("django.db.connection.close")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.update_container_image")
+    def test_post_azure_status_write_retries_stale_connection(
+        self,
+        _mock_update_image,
+        _mock_publish,
+        mock_close,
+        mock_set_rls,
+    ):
+        self.tenant.container_image_tag = "oldsha456"
+        self.tenant.save(update_fields=["container_image_tag"])
+        original_update = QuerySet.update
+        image_write_attempts = 0
+
+        def stale_once(queryset, **updates):
+            nonlocal image_write_attempts
+            if updates.get("container_image_tag") == "newsha123":
+                image_write_attempts += 1
+                if image_write_attempts == 1:
+                    raise OperationalError("simulated idle connection")
+            return original_update(queryset, **updates)
+
+        with patch.object(QuerySet, "update", autospec=True, side_effect=stale_once):
+            result = wake_hibernated_tenant(self.tenant, cron_wake=True)
+
+        self.assertTrue(result)
+        self.assertEqual(image_write_attempts, 2)
+        mock_close.assert_called_once_with()
+        self.assertEqual(mock_set_rls.call_args_list, [call(service_role=True)])
+
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.container_image_tag, "newsha123")
 
     @override_settings(
         OPENCLAW_IMAGE_TAG="samesha",
@@ -173,6 +353,7 @@ class OpenClawVersionForImageTagTest(TestCase):
         self.assertEqual(openclaw_version_for_image_tag(""), OPENCLAW_CURRENT_VERSION)
 
 
+@override_settings(OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*")
 class WakeConfigSchemaSyncTest(TestCase):
     """Regression guards for the 2026-06-17 crash-loop incident: a tenant
     woken onto a newer image kept a stale ``openclaw_version`` (config schema)
@@ -189,6 +370,14 @@ class WakeConfigSchemaSyncTest(TestCase):
         self.tenant.container_fqdn = "oc-schema-test.internal"
         self.tenant.hibernated_at = timezone.now()
         self.tenant.save()
+        # These tests exercise refresh mechanics with synthetic tags; the family
+        # guard and the live-image read are covered by WakeImageRefreshSafetyTest.
+        self.enterContext(patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True))
+        self.enterContext(
+            patch(
+                "apps.orchestrator.hibernation._live_openclaw_image", return_value="test.azurecr.io/nbhd-openclaw:old"
+            )
+        )
 
     @override_settings(OPENCLAW_IMAGE_TAG="2026.5.28-755d789", AZURE_ACR_SERVER="test.azurecr.io")
     @patch("apps.cron.publish.publish_task")
@@ -205,7 +394,7 @@ class WakeConfigSchemaSyncTest(TestCase):
         )
         self.tenant.refresh_from_db()
 
-        result = wake_hibernated_tenant(self.tenant)
+        result = wake_hibernated_tenant(self.tenant, cron_wake=True)
 
         self.assertTrue(result)
         mock_update_image.assert_called_once()
@@ -285,6 +474,8 @@ class CaptureTenantCronSchedulesFallbackTest(TestCase):
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-fallback-test"
         self.tenant.container_fqdn = "oc-fallback-test.internal"
+        # Gateway cron.list path; 9.4 reads the state file (see Oc94CronStateReadbackTest).
+        self.tenant.openclaw_version = "2026.5.28"
         self.tenant.save()
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
@@ -371,3 +562,190 @@ class CaptureTenantCronSchedulesFallbackTest(TestCase):
 
         self.assertEqual(result, [])
         mock_invoke.assert_not_called()
+
+
+class Oc94CronStateReadbackTest(TestCase):
+    """9.4 gates the gateway cron.list, so hibernation reads the in-container
+    helper's ``nbhd-cron-state.json``. Before this, every 9.4 tenant answered
+    ``cron_state_unknown`` forever and was never hibernated or image-bumped."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="OC94 State", telegram_chat_id=987654321)
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-oc94-state"
+        self.tenant.container_fqdn = "oc-oc94-state.internal"
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save()
+
+    def _state(self, jobs, *, age_seconds=5):
+        import json
+        import time
+
+        written = int((time.time() - age_seconds) * 1000)
+        return json.dumps({"v": 1, "writtenAtMs": written, "jobs": jobs}).encode()
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_idle_tenant_is_hibernatable(self, mock_download, mock_invoke):
+        far = int(timezone.now().timestamp() * 1000) + 6 * 3600 * 1000
+        mock_download.return_value = self._state(
+            [{"id": "a", "enabled": True, "schedule": {"kind": "cron"}, "state": {"nextRunAtMs": far}}]
+        )
+        self.assertIsNone(_cron_active_or_imminent(self.tenant))
+        mock_invoke.assert_not_called()  # never touches the gated gateway path
+        mock_download.assert_called_once_with(str(self.tenant.id), "nbhd-cron-state.json")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_running_cron_still_defers(self, mock_download):
+        now_ms = int(timezone.now().timestamp() * 1000)
+        mock_download.return_value = self._state(
+            [{"id": "a", "enabled": True, "schedule": {"kind": "cron"}, "state": {"runningAtMs": now_ms - 1000}}]
+        )
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_in_flight")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_stale_or_missing_state_stays_unknown(self, mock_download):
+        mock_download.return_value = self._state([], age_seconds=600)
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+        mock_download.return_value = None
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+        mock_download.return_value = b"{not json"
+        self.assertEqual(_cron_active_or_imminent(self.tenant), "cron_state_unknown")
+
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_capture_uses_state_file(self, mock_download):
+        jobs = [{"id": "a", "name": "Morning", "enabled": True, "schedule": {"kind": "cron", "expr": "0 7 * * *"}}]
+        mock_download.return_value = self._state(jobs)
+        self.assertEqual(_capture_tenant_cron_schedules(self.tenant), jobs)
+
+
+@override_settings(
+    OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*",
+    OPENCLAW_IMAGE_TAG="2026.9.4-newsha1",
+    AZURE_ACR_SERVER="test.azurecr.io",
+)
+class WakeImageRefreshSafetyTest(TestCase):
+    """A wake-time image refresh must prove it boots, or be put back and never retried."""
+
+    OLD_IMAGE = "test.azurecr.io/nbhd-openclaw:2026.9.4-oldsha1"
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Wake Safety", telegram_chat_id=55599911)
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-safety"
+        self.tenant.container_fqdn = "oc-safety.internal"
+        self.tenant.hibernated_at = timezone.now()
+        self.tenant.container_image_tag = "2026.9.4-oldsha1"
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save()
+        self.publish = self.enterContext(patch("apps.cron.publish.publish_task"))
+        self.update_image = self.enterContext(patch("apps.orchestrator.azure_client.update_container_image"))
+        self.enterContext(patch("apps.orchestrator.azure_client.wake_container_app"))
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False))
+        self.enterContext(patch("apps.orchestrator.hibernation._live_openclaw_image", return_value=self.OLD_IMAGE))
+
+    def _verify_calls(self):
+        return [c for c in self.publish.call_args_list if c.args and c.args[0] == "verify_wake_image_refresh"]
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    def test_refresh_schedules_health_check_with_previous_image(self, _guard):
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+        self.update_image.assert_called_once_with("oc-safety", "test.azurecr.io/nbhd-openclaw:2026.9.4-newsha1")
+        [call] = self._verify_calls()
+        self.assertEqual(call.args[1:], (str(self.tenant.id), "2026.9.4-newsha1", self.OLD_IMAGE, 1))
+        self.assertEqual(call.kwargs["delay_seconds"], 240)
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    def test_wake_for_a_message_never_refreshes(self, _guard):
+        """Nobody waits on an image pull: only cron wakes (~4 min lead) refresh."""
+        self.assertTrue(wake_hibernated_tenant(self.tenant))
+        self.update_image.assert_not_called()
+        self.assertEqual(self._verify_calls(), [])
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.container_image_tag, "2026.9.4-oldsha1")
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    def test_blocked_tag_is_not_retried(self, _guard):
+        self.tenant.image_refresh_blocked_tag = "2026.9.4-newsha1"
+        self.tenant.save(update_fields=["image_refresh_blocked_tag"])
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+        self.update_image.assert_not_called()
+        self.assertEqual(self._verify_calls(), [])
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=False)
+    def test_family_jump_is_not_a_wake_refresh(self, _guard):
+        self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
+        self.update_image.assert_not_called()
+
+    def _app(self, latest, ready):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(latest_revision_name=latest, latest_ready_revision_name=ready)
+
+    def _verify(self, app, attempt):
+        from apps.orchestrator.hibernation import verify_wake_image_refresh_task
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(container_image_tag="2026.9.4-newsha1", hibernated_at=None)
+        client = self.enterContext(patch("apps.orchestrator.azure_client.get_container_client"))
+        self.enterContext(patch("apps.orchestrator.azure_client.is_mock", return_value=False))
+        client.return_value.container_apps.get.return_value = app
+        return verify_wake_image_refresh_task(str(self.tenant.id), "2026.9.4-newsha1", self.OLD_IMAGE, attempt)
+
+    def test_ready_revision_passes(self):
+        self.assertEqual(self._verify(self._app("rev-2", "rev-2"), 1), {"status": "ready"})
+        self.update_image.assert_not_called()
+
+    def test_not_ready_retries_then_reverts_and_blocks(self):
+        self.assertEqual(self._verify(self._app("rev-2", "rev-1"), 1), {"status": "retry"})
+        self.assertEqual(self._verify_calls()[-1].args[4], 2)
+        self.update_image.assert_not_called()
+
+        self.assertEqual(self._verify(self._app("rev-2", "rev-1"), 2), {"status": "reverted"})
+        self.update_image.assert_called_once_with("oc-safety", self.OLD_IMAGE)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.container_image_tag, "2026.9.4-oldsha1")
+        self.assertEqual(self.tenant.image_refresh_blocked_tag, "2026.9.4-newsha1")
+
+    def test_superseded_refresh_is_left_alone(self):
+        from apps.orchestrator.hibernation import verify_wake_image_refresh_task
+
+        self.enterContext(patch("apps.orchestrator.azure_client.is_mock", return_value=False))
+        result = verify_wake_image_refresh_task(str(self.tenant.id), "2026.9.4-other", self.OLD_IMAGE, 2)
+        self.assertEqual(result, {"status": "superseded"})
+        self.update_image.assert_not_called()
+
+
+@override_settings(AZURE_ACR_SERVER="test.azurecr.io")
+class AwakeImageBumpSafetyTest(TestCase):
+    """apply_single_tenant_image (awake tenants) gets the same boot health check + block."""
+
+    OLD_IMAGE = "test.azurecr.io/nbhd-openclaw:2026.9.4-oldsha1"
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Awake Bump", telegram_chat_id=55599922)
+        self.tenant.status = Tenant.Status.ACTIVE
+        self.tenant.container_id = "oc-awake"
+        self.tenant.container_fqdn = "oc-awake.internal"
+        self.tenant.container_image_tag = "2026.9.4-oldsha1"
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.save()
+        self.publish = self.enterContext(patch("apps.cron.publish.publish_task"))
+        self.update_image = self.enterContext(patch("apps.orchestrator.azure_client.update_container_image"))
+        self.enterContext(patch("apps.orchestrator.services.update_tenant_config"))
+        self.enterContext(patch("apps.orchestrator.hibernation._live_openclaw_image", return_value=self.OLD_IMAGE))
+
+    def test_bump_schedules_health_check(self):
+        from apps.orchestrator.tasks import apply_single_tenant_image_task
+
+        apply_single_tenant_image_task(str(self.tenant.id), "2026.9.4-newsha1")
+        self.update_image.assert_called_once()
+        calls = [c for c in self.publish.call_args_list if c.args and c.args[0] == "verify_wake_image_refresh"]
+        self.assertEqual(calls[0].args[1:], (str(self.tenant.id), "2026.9.4-newsha1", self.OLD_IMAGE, 1))
+
+    def test_blocked_tag_is_skipped(self):
+        from apps.orchestrator.tasks import apply_single_tenant_image_task
+
+        self.tenant.image_refresh_blocked_tag = "2026.9.4-newsha1"
+        self.tenant.save(update_fields=["image_refresh_blocked_tag"])
+        apply_single_tenant_image_task(str(self.tenant.id), "2026.9.4-newsha1")
+        self.update_image.assert_not_called()

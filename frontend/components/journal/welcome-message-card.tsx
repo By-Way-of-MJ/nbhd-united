@@ -71,6 +71,7 @@ function WelcomeMessageCardContent() {
 
   return (
     <section
+      data-os-welcome
       aria-labelledby="welcome-message-title"
       className="relative mx-3 mt-3 shrink-0 animate-reveal rounded-panel border border-accent/20 bg-card/95 p-4 pr-14 shadow-panel backdrop-blur-md sm:mx-4 sm:mt-4 sm:p-5 sm:pr-16 lg:mx-6 lg:mt-6"
     >
@@ -87,7 +88,7 @@ function WelcomeMessageCardContent() {
         id="welcome-message-title"
         className="font-headline text-sm font-semibold text-ink"
       >
-        ✳️ Your assistant left you a message
+        <span data-os-legacy-title>✳️ </span>Your assistant left you a message
       </h2>
       <p className="mt-3 max-h-48 overflow-y-auto whitespace-pre-wrap break-words pr-2 text-sm leading-relaxed text-ink-muted">
         {greeting}

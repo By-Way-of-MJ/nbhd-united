@@ -66,12 +66,41 @@ DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
             "rpe_clamped",
             "weeks",  # the plan's legal week count
             "week_key",  # the out-of-range override key
+            # Phase 2c deterministic catalog/variety chain (shape only).
+            "catalog_total",
+            "catalog_matched",
+            "catalog_unmatched",
+            "catalog_coverage",
+            "matched_canonical",
+            "matched_slug",
+            "matched_alias",
+            "matched_plural",
+            "matched_equipment_prefix",
+            "guard_policy",
+            "guard_tracks",
+            "intentional_repeat",
+            "rotation_compiler_expansions",
+            "searched_before_write",
         }
     ),
     # "pattern" is the typed cron pattern (pure_reminder, ...) — it separates
     # "one tool is teaching the model badly" from "the whole cron surface is".
-    "cron": frozenset({"tz_missing", "dow_source", "schedule_kind", "pattern"}),
+    "cron": frozenset(
+        {
+            "tz_missing",
+            "dow_source",
+            "schedule_kind",
+            "pattern",
+            "cron_id",
+            "already_cancelled",
+            "origin_kind",
+            "origin_run_id",
+        }
+    ),
     "datebook": frozenset({"origin", "image_before_config"}),
+    # iOS "since you were last here" counters: reason_code is shown/tap/dismiss;
+    # `kind` is the RuntimeWriteEvent kind enum. Never an id or a title.
+    "activity_since": frozenset({"kind"}),
     # Wave 1 money-truth fixes. Deliberately shape-only: an account nickname, a
     # balance, or an APR value never appears here — `bound` and `*_count` say
     # WHICH WAY the input was wrong and HOW MANY rows were involved, which is all

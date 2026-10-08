@@ -201,6 +201,24 @@ def _remove_cron(tenant, object_id):
     name = row.name if row is not None else object_id
     if row is not None:
         row.delete()  # desired-state row gone; reconciler won't re-add the job.
+
+    # 9.4 gates the gateway cron.remove. There the container runs only the
+    # signed crons file, built from these rows: republish it now and the
+    # in-container helper removes the job. A failed publish raises, so the
+    # artifact is marked failed and retried.
+    from apps.cron.share_cron_sync import tenant_uses_file_cron_sync, write_tenant_crons_file
+
+    if tenant_uses_file_cron_sync(tenant):
+        if row is None:
+            logger.info(
+                "doc_forget: no cron row %r for tenant %s; nothing is published to remove",
+                name,
+                str(getattr(tenant, "id", ""))[:8],
+            )
+            return
+        write_tenant_crons_file(tenant)
+        return
+
     try:
         cron_remove(tenant, cron_name=name)
     except GatewayError as exc:

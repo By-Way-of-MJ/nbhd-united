@@ -1,3 +1,4 @@
+import { panelSchema } from "./panel-schema.js";
 import { wrapTool } from "../../tool-logger.js";
 const wrap = (def) => wrapTool(def, { plugin: "nbhd-journal-tools" });
 
@@ -218,7 +219,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_document_put",
       description:
-        "Create or replace a free-form narrative document. Use for daily notes, weekly/monthly reviews, project narratives, ideas, long-term memory. Do NOT use for goals or tasks — those have dedicated lifecycle tools (nbhd_goal_* and nbhd_task_*) so their status, due dates, and completion are queryable instead of buried in markdown. Kinds: daily, weekly, monthly, project, ideas, memory.",
+        "Create or replace a free-form narrative document. Use for daily notes, weekly/monthly reviews, project narratives, ideas, long-term memory. Durable behavioural directives go to `kind=memory, slug=intents`, one directive per line. Do NOT use for goals or tasks — those have dedicated lifecycle tools (nbhd_goal_* and nbhd_task_*) so their status, due dates, and completion are queryable instead of buried in markdown. Kinds: daily, weekly, monthly, project, ideas, memory.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -420,7 +421,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_daily_note_set_section",
       description:
-        "Set the content of a specific section in the daily note. REQUIRED: `section_slug` (the section to write, e.g. 'morning-report') AND `content` (the markdown). Both must be set in every call. Use for writing structured sections like Morning Report, Weather, News, Focus, or Evening Check-in. If the section describes events from a different day than today, pass `date` for THAT day rather than today's — and prefer absolute dates in the content over relative words like 'yesterday', which stop being accurate once the note is read later.",
+        "Set the content of a specific section in the daily note. This OVERWRITES the whole section: first call `nbhd_daily_note_get`, then merge the existing section with the new content so earlier content is preserved. REQUIRED: `section_slug` (the section to write, e.g. 'morning-report') AND `content` (the markdown). Both must be set in every call. Use for writing structured sections like Morning Report, Weather, News, Focus, or Evening Check-in. If the section describes events from a different day than today, pass `date` for THAT day rather than today's — and prefer absolute dates in the content over relative words like 'yesterday', which stop being accurate once the note is read later.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -453,6 +454,36 @@ export default function register(api) {
             content,
             date: asTrimmedString(input.date) || undefined,
             section_slug: sectionSlug,
+          },
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
+  // ── Weather: programmatic morning briefing ──────────────────────────
+  api.registerTool(wrap({
+      name: "nbhd_weather_briefing",
+      description:
+        "Fetch today's + tomorrow's forecast for the user's location and write the daily note's `weather` section. The NBHD runtime resolves the location itself (fresh Current location, else the profile city/coordinates), calls the weather service, and writes the section — you do NOT write the weather section and you do NOT search for weather. The response's `message_line` MUST be used VERBATIM as the weather line of the user message; never describe weather from any other source. When `status` is `no_location` or `unavailable`, `message_line` is the honest sentence to relay as-is. Optional `date` (YYYY-MM-DD) defaults to the user's local today.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          date: {
+            type: "string",
+            description: "ISO date (YYYY-MM-DD). Defaults to today in the user's timezone.",
+          },
+        },
+      },
+      async execute(_id, params) {
+        const input = asObject(params);
+        const payload = await callRuntime(api, {
+          path: tenantPath(api, "/weather/briefing/"),
+          method: "POST",
+          body: {
+            date: asTrimmedString(input.date) || undefined,
           },
         });
         return renderPayload(payload);
@@ -503,7 +534,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_memory_get",
       description:
-        "Get the user's long-term memory document (raw markdown). Contains curated preferences, goals, decisions, and lessons.",
+        "Get the user's long-term memory document (raw markdown). Use for assistant-held patterns, stable preferences, decisions, and lessons; for shared records, call nbhd_journal_search first.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -524,7 +555,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_memory_update",
       description:
-        "Replace the user's long-term memory document. Use after reviewing daily notes to curate preferences, goals, decisions, and lessons learned.",
+        "Replace the user's long-term memory document. Remember only durable names, locations, and facts; stable preferences; month-worthy patterns; and changed ongoing situations. Do not store routine details, journal duplicates, or unrequested sensitive emotions. When unsure, write less.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -556,7 +587,8 @@ export default function register(api) {
       description:
         "Load recent daily notes, long-term memory, backbone goals/tasks, and recent constellation " +
         "activity (stars the user has been working through — their pinned notes, reflections, and " +
-        "tutoring signals) in one call. Use at the start of every session to get caught up.",
+        "tutoring signals) in one call. Use when a cron preamble asks for it or when the user's request " +
+        "needs recent journal/backbone context; not at the start of ordinary chat turns.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -629,7 +661,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_journal_search",
       description:
-        "Search across all journal documents (daily notes, goals, projects, memory, reviews, etc.) by keyword or phrase. Uses full-text search. Use this to find past entries, recall what was written about a topic, or locate specific notes.",
+        "Search shared journal records first when recalling what was written about a topic. Searches all journal documents (daily notes, goals, projects, memory, reviews, etc.) by keyword or phrase using full-text search.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -711,7 +743,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_lesson_suggest",
       description:
-        "Suggest a candidate lesson for user approval. REQUIRED: `text` (the lesson/insight in 1-3 sentences) — must be set in every call. Creates a pending lesson with user-facing text, optional context, source metadata, and auto-generated tags.",
+        "Creates an approved lesson immediately in the user's constellation; there is no approval queue. First call `nbhd_lesson_search` and skip near-duplicates. Capture only a specific, actionable personal insight over trivia that will still be useful in six months; reject trivial facts, temporary logistics, and vague or untestable statements. Never write lessons into daily notes. Supply 2–4 `tags`. REQUIRED: `text` (the lesson/insight in 1-3 sentences) must be set in every call.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -734,7 +766,7 @@ export default function register(api) {
           },
           tags: {
             type: "array",
-            description: "Optional tags for auto-categorization.",
+            description: "2–4 concise tags for auto-categorization.",
             items: {
               type: "string",
             },
@@ -837,8 +869,8 @@ export default function register(api) {
         "Read the enriched context behind the user's constellation stars (lessons): their pinned " +
         "galaxy notes, the reflections they journaled on a star, and the honest signals the assistant " +
         "captured while tutoring them on it (did they restate it accurately, find edge cases, make " +
-        "connections, reach mastery). Use this to teach to how THIS person actually thinks — their " +
-        "strengths and blind spots on topics they've worked through. With no arguments it returns the " +
+        "connections, reach mastery). Tutoring signals are evidence about how the user learns: use them " +
+        "to teach to this user, and never quote a raw signal back to them. With no arguments it returns the " +
         "stars they've been most active on lately; pass `q` to search by topic, or `star_id` to drill " +
         "into one star.",
       parameters: {
@@ -892,7 +924,7 @@ export default function register(api) {
         "List YardTalk work sessions that have not yet been distilled into the journal/tasks/goals/memory primitives. " +
         "For each returned session, decide where its content belongs and write it using existing tools: " +
         "`nbhd_daily_note_append` for the work log of the session date; " +
-        "`nbhd_document_put` / `nbhd_document_append` for tasks (kind='tasks'), goals (kind='goal'), ideas, or per-project notes (kind='project'); " +
+        "`nbhd_task_*` for tasks, `nbhd_goal_*` for goals, and `nbhd_document_put` / `nbhd_document_append` for ideas or per-project notes (kind='project'); " +
         "`nbhd_memory_update` for cross-session context worth carrying forward. " +
         "Then call `nbhd_session_mark_processed` once per session with a brief record of what you wrote. " +
         "Skip a session (call mark with `skip_reason`) if it's a stub under ~30s, has no actionable content, or is purely a duplicate of something already filed. " +
@@ -1023,7 +1055,8 @@ export default function register(api) {
   );
 
   // ── Send message to user (for cron jobs / proactive messages) ──────
-  api.registerTool(wrap({
+  const panelsEnabled = asObject(api.pluginConfig).panelsEnabled === true;
+  api.registerTool((toolContext) => wrap({
     name: "nbhd_send_to_user",
     description:
       "Send a message to the user on their active channel (the NBHD app, " +
@@ -1032,11 +1065,16 @@ export default function register(api) {
       "during normal conversation — just reply directly instead. When " +
       "running inside a cron job, pass `job_name` (find it in the prompt " +
       "preamble) so the user's next inbound reply correctly threads back " +
-      "to this message.",
+      "to this message." + (panelsEnabled
+        ? " Attach optional panels when live cards help the user act " +
+          "on the report; references only, never data snapshots. Kinds: " +
+          panelSchema.items.properties.kind.enum.join(", ") + "."
+        : ""),
     parameters: {
       type: "object",
       required: ["message"],
       properties: {
+        ...(panelsEnabled ? { panels: panelSchema } : {}),
         message: {
           type: "string",
           description: "The message text to send. Supports Markdown formatting.",
@@ -1061,17 +1099,28 @@ export default function register(api) {
     async execute(_id, params) {
       const input = asObject(params);
       const message = asTrimmedString(input.message);
-      if (!message) throw new Error("message is required");
+      if (!message && !(panelsEnabled && input.panels?.length)) {
+        throw new Error(panelsEnabled ? "message or panels is required" : "message is required");
+      }
       const jobName = asTrimmedString(input.job_name);
       const threadId = asTrimmedString(input.thread_id);
       const occurrenceKey = asTrimmedString(input.occurrence_key);
       const extraHeaders = {};
+      // Runtime-owned isolated cron identity; never read this from model params.
+      const cronSession = /^agent:[^:]+:cron:([^:]+)(?::run:[^:]+)?$/u.exec(
+        asTrimmedString(toolContext?.sessionKey),
+      );
+      if (cronSession) extraHeaders["X-NBHD-Cron-Job-Id"] = cronSession[1].slice(0, 64);
       if (jobName) extraHeaders["X-NBHD-Job-Name"] = jobName.slice(0, 64);
       if (occurrenceKey) extraHeaders["X-NBHD-Occurrence-Key"] = occurrenceKey.slice(0, 64);
       const payload = await callRuntime(api, {
         path: tenantPath(api, "/send-to-user/"),
         method: "POST",
-        body: { message, ...(threadId ? { thread_id: threadId } : {}) },
+        body: {
+          message,
+          ...(threadId ? { thread_id: threadId } : {}),
+          ...(panelsEnabled && input.panels !== undefined ? { panels: input.panels } : {}),
+        },
         extraHeaders,
       });
       return renderPayload(payload);
@@ -1363,7 +1412,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_workspace_delete",
       description:
-        "Delete a workspace label. The default workspace cannot be deleted. Workspaces no longer route chat messages — deletion only removes the label, not any conversation history. Always confirm with the user before deleting.",
+        "Delete a workspace label with a mandatory preview→confirm handshake. The first call returns a preview + confirm_token and does not delete; show it, ask the user, then call again with the token. The default workspace cannot be deleted. Deletion removes only the label, not conversation history.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1372,6 +1421,10 @@ export default function register(api) {
             type: "string",
             description: "The workspace slug to delete.",
           },
+          confirm_token: {
+            type: "string",
+            description: "Token returned by the first preview call. Omit initially; replay unchanged only after explicit approval.",
+          },
         },
         required: ["slug"],
       },
@@ -1379,9 +1432,11 @@ export default function register(api) {
         const input = asObject(params);
         const slug = asTrimmedString(input.slug);
         if (!slug) throw new Error("slug is required");
+        const confirmToken = asTrimmedString(input.confirm_token);
         const payload = await callRuntime(api, {
           path: tenantPath(api, `/workspaces/${encodeURIComponent(slug)}/`),
           method: "DELETE",
+          body: confirmToken ? { confirm_token: confirmToken } : undefined,
         });
         return renderPayload(payload);
       },
@@ -1699,7 +1754,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_purpose_update",
       description:
-        "Update a North Star — refine the statement or pillars, or mark a confirmed one as 'evolving' when the user is actively reshaping their direction. PATCH semantics (only included fields change). This CANNOT confirm a proposed purpose — use nbhd_purpose_confirm (with the user's explicit yes) for that. To retire a direction the user has moved past, set status='retired' (non-destructive; preserved for history).",
+        "Update a North Star — refine the statement or pillars, or mark a confirmed one as 'evolving' when the user is actively reshaping their direction. PATCH semantics (only included fields change). This CANNOT confirm a proposed purpose — use nbhd_purpose_confirm (with the user's explicit yes) for that.",
       parameters: {
         type: "object",
         additionalProperties: false,

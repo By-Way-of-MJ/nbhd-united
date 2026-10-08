@@ -13,8 +13,10 @@ function formatDate(dateStr: string): string {
 
 export function PendingGoal({
   extraction,
+  openSky = false,
 }: {
   extraction: HorizonsPendingExtraction;
+  openSky?: boolean;
 }) {
   const approveMutation = useApproveExtractionMutation();
   const dismissMutation = useDismissExtractionMutation();
@@ -39,6 +41,18 @@ export function PendingGoal({
   const badgeClasses = isGoal
     ? "text-accent bg-accent/10"
     : "text-signal bg-signal/10";
+
+  if (openSky) return (
+    <article className="border-t border-os-hairline py-4">
+      <p className="text-sm leading-relaxed text-os-ink">{extraction.text}</p>
+      {extraction.source_date ? <p className="mt-2 text-xs text-os-faint">From {formatDate(extraction.source_date)}</p> : null}
+      <div className="mt-3 flex gap-4">
+        <button className="os-btn" disabled={busy} onClick={() => approveMutation.mutate(extraction.id, { onSuccess: () => setResolved("approved") })}>{isGoal ? "Add goal" : "Add task"}</button>
+        <button className="os-btn-text" disabled={busy} onClick={() => dismissMutation.mutate(extraction.id, { onSuccess: () => setResolved("dismissed") })}>Not now</button>
+      </div>
+      {approveMutation.isError || dismissMutation.isError ? <p role="alert" className="mt-2 text-xs text-os-danger">Couldn’t save. Please try again.</p> : null}
+    </article>
+  );
 
   return (
     <article className={`glass-card-horizons border-l-4 ${borderColor} p-5 flex flex-col justify-between md:p-6`}>

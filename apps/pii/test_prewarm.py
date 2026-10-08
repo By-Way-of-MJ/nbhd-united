@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -51,6 +52,38 @@ class PiiWorkerPrewarmTests(SimpleTestCase):
         self.worker.log.info.assert_any_call("post_worker_init: PII pipeline warmed")
 
     @patch("apps.crypto.prewarm.start_prewarm_thread")
+    def test_shared_transport_pings_without_constructing_local_detector(self, _dek_prewarm):
+        with (
+            patch.dict(os.environ, {"PII_DETECTOR_TRANSPORT": "shared", "PII_SHARED_WARM_WAIT_S": "0"}),
+            patch("apps.pii.shared_client.ping_shared_detector", return_value=True) as ping,
+            patch("apps.pii.engine.get_pii_pipeline") as loader,
+        ):
+            _post_worker_init()(self.worker)
+
+        ping.assert_called_once()
+        loader.assert_not_called()
+        shared_logs = [
+            call for call in self.worker.log.info.call_args_list if "PII shared transport ready" in call.args[0]
+        ]
+        self.assertEqual(len(shared_logs), 1)
+
+    @patch("apps.crypto.prewarm.start_prewarm_thread")
+    def test_shared_transport_warm_timeout_fails_open(self, _dek_prewarm):
+        with (
+            patch.dict(os.environ, {"PII_DETECTOR_TRANSPORT": "shared", "PII_SHARED_WARM_WAIT_S": "0"}),
+            patch("apps.pii.shared_client.ping_shared_detector", return_value=False),
+            patch("apps.pii.engine.get_pii_pipeline") as loader,
+        ):
+            _post_worker_init()(self.worker)
+
+        loader.assert_not_called()
+        self.worker.log.warning.assert_called_once_with(
+            "post_worker_init: PII shared transport not ready after %.1f s; "
+            "failing open (unconfirmed receipts) until ready",
+            0.0,
+        )
+
+    @patch("apps.crypto.prewarm.start_prewarm_thread")
     @patch("apps.pii.engine.get_pii_pipeline", side_effect=RuntimeError("model unavailable"))
     def test_worker_hook_logs_load_failure_and_does_not_raise(self, loader, _dek_prewarm):
         _post_worker_init()(self.worker)
@@ -67,6 +100,9 @@ class PiiWorkerPrewarmTests(SimpleTestCase):
         transformers.AutoModelForTokenClassification = SimpleNamespace(from_pretrained=Mock())
         transformers.pipeline = Mock()
 
+        # Load native dependencies outside patch.dict: restoring sys.modules
+        # must not unload torch's Python modules while its extension stays loaded.
+        engine.get_pattern_recognizers()
         with patch.dict(sys.modules, {"transformers": transformers}):
             _post_worker_init()(self.worker)
             result = redact_text("Email synthetic.person@example.com", tier="starter")
@@ -76,6 +112,18 @@ class PiiWorkerPrewarmTests(SimpleTestCase):
         self.worker.log.error.assert_called_once()
         self.assertNotIn("synthetic.person@example.com", result)
         self.assertIn("[EMAIL_ADDRESS_", result)
+
+    @patch("apps.crypto.prewarm.start_prewarm_thread")
+    def test_pattern_recognizers_warm_for_local_and_shared_workers(self, _dek_prewarm):
+        for transport in ("local", "shared"):
+            with (
+                patch.dict(os.environ, {"PII_DETECTOR_TRANSPORT": transport}),
+                patch("apps.pii.shared_client.ping_shared_detector", return_value=True),
+                patch("apps.pii.engine.get_pii_pipeline"),
+                patch("apps.pii.engine.get_pattern_recognizers") as patterns,
+            ):
+                _post_worker_init()(self.worker)
+            patterns.assert_called_once_with()
 
 
 class ModelFreeDjangoContextTests(SimpleTestCase):
