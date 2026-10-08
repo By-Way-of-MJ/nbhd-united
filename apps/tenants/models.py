@@ -213,6 +213,17 @@ class Tenant(models.Model):
         help_text="OpenClaw image tag whose wake-time refresh failed its health check and was reverted; "
         "the wake path will not try this tag again",
     )
+    image_plugin_ids = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Plugin dirs the running OpenClaw image reported at its last boot (container-started hook)",
+    )
+    image_plugins_tag = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="container_image_tag that image_plugin_ids was reported under; a mismatch means unknown",
+    )
     openclaw_version = models.CharField(
         max_length=20,
         default=OPENCLAW_CURRENT_VERSION,

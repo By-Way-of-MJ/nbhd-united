@@ -74,6 +74,30 @@ class RuntimeContainerStartedView(APIView):
         tenant = tenant_or_resp
         record_runtime_write_activity(tenant)
 
+        # Record which plugin dirs this image ships (config_generator only loads
+        # image-dependent plugins the image reported). When that flips whether
+        # the project tools load, refresh the config now: the gateway is up, so
+        # the image is proven to carry what it just reported. Never fatal.
+        try:
+            from apps.friends.project_flags import project_tools_ready
+            from apps.orchestrator.image_plugins import record_image_plugins
+
+            ready_before = project_tools_ready(tenant)
+            body = request.data if isinstance(request.data, dict) else {}
+            record_image_plugins(tenant, body.get("plugins"))
+            if project_tools_ready(tenant) != ready_before:
+                from apps.cron.publish import publish_task
+
+                tenant.bump_pending_config()
+                publish_task("apply_single_tenant_config", str(tenant.id))
+                logger.info(
+                    "RuntimeContainerStartedView: project tools %s for tenant %s after image plugin report",
+                    "ready" if not ready_before else "withdrawn",
+                    tenant_id,
+                )
+        except Exception:
+            logger.exception("RuntimeContainerStartedView: image plugin report failed for tenant %s", tenant_id)
+
         # Self-heal AGENTS.md on every boot: re-assert the authoritative render
         # (persona + per-tenant gates + Gravity) to the file share. AGENTS.md is
         # seed-once at boot from a provision-time env snapshot that goes stale, so

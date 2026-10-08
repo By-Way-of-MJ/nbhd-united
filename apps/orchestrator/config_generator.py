@@ -1673,7 +1673,13 @@ def effective_primary_model(tenant: Tenant) -> str:
     return resolve_tenant_models(tenant)[0]["primary"]
 
 
-WHISPER_DEFAULT_MODEL = {"provider": "openai", "model": "gpt-4o-mini-transcribe"}
+# OpenRouter ignores chat-style provider routing for STT, so privacy is pinned by
+# model choice: this slug has only DeepInfra and Groq endpoints, both on
+# OpenRouter's ZDR endpoint list. Keep aligned with Django's OPENROUTER_STT_MODEL.
+OPENROUTER_STT_MODEL = {"provider": "openrouter", "model": "openai/whisper-large-v3-turbo"}
+# Pre-seal container speech-to-text (OpenAI direct with the platform key). Still emitted
+# for tenants outside ``CONTAINER_ZDR_TENANT_IDS`` until the canary widens to the fleet.
+LEGACY_OPENAI_STT_MODEL = {"provider": "openai", "model": "gpt-4o-mini-transcribe"}
 
 # Heartbeat model — the heartbeat is the one routine cron that's pure judgment
 # ("is anything genuinely new?" — it cross-references the daily note + heartbeat
@@ -2316,10 +2322,12 @@ def _build_tools_section(
         for tool_name in datebook_calendar_deny_overlay():
             if tool_name not in deny:
                 deny.append(tool_name)
+    from apps.router.chat_gates import container_zdr_enabled
+
     tools["media"] = {
         "audio": {
             "enabled": True,
-            "models": [WHISPER_DEFAULT_MODEL],
+            "models": [OPENROUTER_STT_MODEL if container_zdr_enabled(tenant) else LEGACY_OPENAI_STT_MODEL],
         },
     }
     # Tool-call loop detection. Off by default upstream — we turn it on as
@@ -2611,10 +2619,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
             ).strip(),
             str(getattr(settings, "OPENCLAW_USAGE_REPORTER_PLUGIN_PATH", "") or "").strip(),
         ),
-        (
-            str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_ID", "") or "").strip(),
-            str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_PATH", "") or "").strip(),
-        ),
         # Settings plugin — primary-model read + switch (nbhd_get_preferred_model_state,
         # nbhd_set_preferred_model). Unconditional in production via base.py default
         # so every tenant can ask its assistant about models and route switch
@@ -2764,10 +2768,12 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     # Projects v2 plugin — read the user's shared projects, save a PRIVATE draft, and
     # SUGGEST changes the user approves in the app (DIRECTIVE_neighborhood_projects
     # §4). Deliberately NOT gated on friends_enabled: a user's part of a project is
-    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag.
-    from apps.friends.project_flags import projects_v2_enabled
+    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag,
+    # and on the running image having reported the plugin dir: 2026.9.4 never
+    # starts its gateway when this names a dir the image lacks (2026-10-08).
+    from apps.friends.project_flags import project_tools_ready
 
-    if getattr(tenant, "neighborhood_enabled", False) and projects_v2_enabled(tenant):
+    if getattr(tenant, "neighborhood_enabled", False) and project_tools_ready(tenant):
         _plugin_defs.append(
             (
                 str(getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_ID", "nbhd-project-tools") or "").strip(),
@@ -3068,7 +3074,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     # models routed through OpenRouter (e.g. DEEPSEEK_MODEL).
 
     if _active_plugins:
-        image_gen_id = str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_ID", "") or "").strip()
         usage_reporter_id = str(
             getattr(settings, "OPENCLAW_USAGE_PLUGIN_ID", "")
             or getattr(settings, "OPENCLAW_USAGE_REPORTER_PLUGIN_ID", "")
@@ -3096,10 +3101,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         conversation_hook_plugin_ids.discard("")
         plugin_config: dict[str, Any] = {
             "allow": [pid for pid, _ in _active_plugins],
-            "entries": {
-                pid: ({"enabled": True, "config": {"tier": tier}} if pid == image_gen_id else {"enabled": True})
-                for pid, _ in _active_plugins
-            },
+            "entries": {pid: {"enabled": True} for pid, _ in _active_plugins},
         }
 
         # These config-loaded plugins use OpenClaw conversation hooks. In
@@ -3392,8 +3394,17 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     if _parse_version(oc_version) >= (2026, 4, 15):
         models_section = config.setdefault("models", {})
         providers = models_section.setdefault("providers", {})
+        from apps.router.chat_gates import container_zdr_enabled
+
         providers["openrouter"] = {
             "baseUrl": "https://openrouter.ai/api/v1",
+            # Per-request ZDR routing on container chat (gated canary — see
+            # ``container_zdr_enabled``). Absent for ungated tenants.
+            **(
+                {"params": {"provider": {"zdr": True, "data_collection": "deny"}}}
+                if container_zdr_enabled(tenant)
+                else {}
+            ),
             # Declared so the static registry can resolve them — see
             # OPENROUTER_DECLARED_MODELS for why this list stays minimal.
             # Emitted for BYO tenants too: it only extends the ``openrouter``

@@ -10,7 +10,7 @@
     "runtime/openclaw/chmod-audit-baseline.txt": "0a60a19c4764b8505d1be2a0f0d479463597200a67e2e1ea43600f2c3dc22ed1",
     "runtime/openclaw/claude-settings.json": "614e293f08fb4da96c49ef51b2e7eb9fcd2ee59e0af36c234128445797100a9f",
     "runtime/openclaw/claude-with-token.sh": "50406b15276f3c17ae11c6b543f70bd98ce302d3c6a714c867df4e56cbb4ab08",
-    "runtime/openclaw/entrypoint.sh": "cd669b9b416ca8bdf2cf9eda77af5bd9d0f304fcde2872253a5465be77c70358",
+    "runtime/openclaw/entrypoint.sh": "83485f7ee1e8f9441c15f63d2de591cb9dd3ba13a3573e9a409a3a5ccbdc22f2",
     "runtime/openclaw/evals/upload_security_corpus.test.js": "525b669803160f4c85fa62516cc5b6f04ec80a25416e3638aeca29501aa97b43",
     "runtime/openclaw/external-content-wrap.js": "b8272be20fbbd13d78a2e6dc19fff85e9360291cd8c9660466c50d1b4ab234ee",
     "runtime/openclaw/external-content-wrap.test.js": "8987e0bb6e4a9bdfb90ae34a9669bea61a19c28074da5f58f9cdbf1d76055870",
@@ -24,7 +24,7 @@
     "runtime/openclaw/pinned-runtime/package-lock.json": "c5b06690c89a4c3bdc7f1cc5534e76458520b08eb8f176511f3fe349932fb2b5",
     "runtime/openclaw/pinned-runtime/package.json": "f2f295b8e3e209682c86bd314d67003fb3faaa3232f46051705f3e988bfd2121",
     "runtime/openclaw/plugins/assert-hook-activation.mjs": "6021e8e0e1fc7addd7c7d1068d3160e928188241a23bc1d5a0bf4e274aee6120",
-    "runtime/openclaw/plugins/error-transport.test.js": "2806128cb8d41e3fb7f046747a6d4808a89e7fac5d95d5a24175b9ad41e7b9b8",
+    "runtime/openclaw/plugins/error-transport.test.js": "41b5e6bc6b0f70bca4b3b5b3e13e83ce70a0326337d1bb44ec5d7e9595f42acf",
     "runtime/openclaw/plugins/hook-activation-contract.mjs": "32d1b581b2e4ef57ac6efababc20066516c180f64045f01af85d6ee9a0ad80a8",
     "runtime/openclaw/plugins/hook-activation.test.mjs": "08ee86e1febbfc9c24e6cd6cd048e773db353d5803f35ada56bbda710d083b9a",
     "runtime/openclaw/plugins/nbhd-activity-stream/index.js": "a52b2c964f04e35dc23aff0032840ddf6de5a3a3a0787affe5fbfcbfa7c1d4ea",
@@ -73,9 +73,6 @@
     "runtime/openclaw/plugins/nbhd-google-tools/index.test.mjs": "d7c47bc1a7645be92940727ecfb31853b3fab04e0b0991c4870beea572ca663e",
     "runtime/openclaw/plugins/nbhd-google-tools/openclaw.plugin.json": "2accfe71d433576c735250afbbbc8f0004faf4da051a89104303ad69f563627a",
     "runtime/openclaw/plugins/nbhd-google-tools/package.json": "957981afe0fd05ea67bbddd5768e64d19b0b2fe1b79aa527c3377654e0252289",
-    "runtime/openclaw/plugins/nbhd-image-gen/index.js": "96afc75f3aa0b97e33e6129e186921f81450941cac83a0c4a128bfab87bd7ba9",
-    "runtime/openclaw/plugins/nbhd-image-gen/openclaw.plugin.json": "61a9fa613bd7d0f6379b842a19063f344e81e9d4be0b3c1c033b107ecbadf545",
-    "runtime/openclaw/plugins/nbhd-image-gen/package.json": "c0795e071b41310198ddbdc2e97b02be4a39186bd1cd15474e5bf90f4cb519b7",
     "runtime/openclaw/plugins/nbhd-insights-tools/index.js": "e8934df37d93f2dbdea0e23e21553bce52746caa1d66541ef794f956c4f80a7e",
     "runtime/openclaw/plugins/nbhd-insights-tools/openclaw.plugin.json": "944eedaa9c304231fc4cb40a6ff55d4f7965b5e2ab042379a0287de70c3082eb",
     "runtime/openclaw/plugins/nbhd-insights-tools/package.json": "8d42edf8e4628dc6d55fe070abaf2cc7fb03cb2c48dbd1a4b8d2448ece9395de",
@@ -137,7 +134,7 @@
     "runtime/openclaw/redact-stdout.test.mjs": "9a4fcbe1c0ce2ea5dd6aff97132800ab528d95a183f9c82963cb3fab2613cf79",
     "runtime/openclaw/suppress-chmod-eperm.js": "07e2725180039d269434c77335891dd1f360ee0b7bf9af1efbe24e4c53d31eb3",
     "runtime/openclaw/suppress-chmod-eperm.test.mjs": "35a6fa8c3e975218a5acd42ad8c3187624f47f15a93d71fa322ee08b2fbdfe65",
-    "runtime/openclaw/tool-logger.js": "f06aee4e3762d20c53b8a4f760ff08536718009b7f2d3ee7877240c963b976d1",
-    "runtime/openclaw/tool-logger.test.js": "32bbddacf7fa7c6eb7f7473da4c94dabe606e24ba4f2e9922378181ecdedaace"
+    "runtime/openclaw/tool-logger.js": "38ec8ff1bb673dfecf9055a962834bad88c423923e5c6907f5211cc498ceea6d",
+    "runtime/openclaw/tool-logger.test.js": "c8fcb05c6fd15dd3bc1c187059592ff8743d668de0cb98d30790bbe1a16a2f8e"
   }
 }

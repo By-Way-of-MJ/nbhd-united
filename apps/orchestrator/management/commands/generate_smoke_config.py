@@ -87,6 +87,10 @@ class Command(BaseCommand):
                 tenant.datebook_manifest_ok = True
                 tenant.datebook_enabled = True
                 tenant.datebook_events_consent_at = timezone.now()
+                # The smoke boots the image built from this commit, which ships
+                # every plugin dir; stand in for its container-started report.
+                tenant.image_plugin_ids = ["nbhd-project-tools"]
+                tenant.image_plugins_tag = tenant.container_image_tag
                 tenant.save()
 
             if options["maximal"]:
@@ -96,6 +100,9 @@ class Command(BaseCommand):
                     SUBAGENT_TENANT_IDS=str(tenant.id),
                     USAGE_HOOKS_TENANT_IDS=str(tenant.id),
                     PROJECTS_V2_TENANT_IDS=str(tenant.id),
+                    # Seal-egress PR-B: let the real `openclaw doctor` judge the ZDR provider
+                    # params + OpenRouter speech-to-text entry before any tenant gets them.
+                    CONTAINER_ZDR_TENANT_IDS=str(tenant.id),
                 ):
                     config_json = config_to_json(generate_openclaw_config(tenant))
             else:

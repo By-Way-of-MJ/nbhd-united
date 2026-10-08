@@ -263,14 +263,36 @@ class PluginAndEnvelopeTests(TestCase):
         self.a.neighborhood_enabled = True
         self.a.friends_enabled = False
         self.a.save(update_fields=["neighborhood_enabled", "friends_enabled"])
+        self._image_reports_project_tools(self.a)
         with override_settings(PROJECTS_V2_TENANT_IDS=str(self.a.id)):
             self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
         with override_settings(PROJECTS_V2_TENANT_IDS=""):
             self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
 
+    def _image_reports_project_tools(self, tenant):
+        from apps.orchestrator.image_plugins import record_image_plugins
+
+        record_image_plugins(tenant, ["nbhd-project-tools"])
+
+    def test_plugin_and_tool_pointer_wait_for_the_image_to_report_the_plugin(self):
+        """The flag alone must not load a plugin dir the image may not ship."""
+        from .envelope import render_projects
+
+        self.a.neighborhood_enabled = True
+        self.a.save(update_fields=["neighborhood_enabled"])
+        with override_settings(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
+            text = render_projects(self.a)
+            self.assertIn("a project with @ben", text)
+            self.assertNotIn("nbhd_project_context", text)
+            self._image_reports_project_tools(self.a)
+            self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
+            self.assertIn("nbhd_project_context", render_projects(self.a))
+
     def test_envelope_never_carries_another_members_words(self):
         from .envelope import render_projects
 
+        self._image_reports_project_tools(self.a)
         with override_settings(PROJECTS_V2_TENANT_IDS="*"):
             text = render_projects(self.a)
         self.assertIn("a project with @ben", text)
