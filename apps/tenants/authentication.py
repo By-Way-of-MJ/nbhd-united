@@ -91,7 +91,7 @@ class JWTAuthenticationWithRLS(JWTAuthentication):
         tenant = getattr(user, "tenant", None)
         if tenant:
             _tenant_context.tenant = tenant
-            set_rls_context(tenant_id=tenant.id, user_id=user.id)
+            set_rls_context(tenant_id=tenant.id, user_id=user.id, as_tenant=True)
             # Subscriber authenticated: any synchronous decrypt under this
             # request is an owner reading their own data. Upgrades the "system"
             # the middleware set at request entry.
@@ -139,7 +139,7 @@ class PersonalAccessTokenAuthentication(BaseAuthentication):
         tenant = getattr(user, "tenant", None)
         if tenant:
             _tenant_context.tenant = tenant
-            set_rls_context(tenant_id=tenant.id, user_id=user.id)
+            set_rls_context(tenant_id=tenant.id, user_id=user.id, as_tenant=True)
             # PAT authenticates the subscriber; a synchronous decrypt under it
             # is an owner-initiated read. Same upgrade as the JWT path.
             audit.set_principal("owner_request")

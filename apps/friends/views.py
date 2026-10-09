@@ -16,12 +16,14 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.tenants.rls import RLSRequestTransactionMixin
+
 from . import access, circles, services
 from .serializers import InviteCreateSerializer, NeighborProfileSerializer, WaveCreateSerializer
 from .throttling import AdoptDayThrottle, MessageSendHourThrottle, WaveSendDayThrottle
 
 
-class FriendsView(APIView):
+class FriendsView(RLSRequestTransactionMixin, APIView):
     """Base: authenticated + Neighborhood-enabled, resolves the caller's tenant."""
 
     permission_classes = [IsAuthenticated]
@@ -112,6 +114,10 @@ class ProfilePhotoView(FriendsView):
     before anything is stored (``apps/friends/photos.py``)."""
 
     parser_classes = [MultiPartParser, FormParser]
+
+    def dispatch(self, request, *args, **kwargs):
+        # Photo moderation can take 40s; this endpoint touches no RLS tables.
+        return APIView.dispatch(self, request, *args, **kwargs)
 
     def post(self, request):
         from . import photos

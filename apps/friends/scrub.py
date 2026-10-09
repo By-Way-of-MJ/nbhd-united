@@ -228,7 +228,8 @@ def scrub_shared_lesson(shared_lesson_id, pending_share_id: str | None = None) -
     from . import access
     from .models import PendingShare, SharedLesson
 
-    shared_lesson = access.get_shared_lesson(shared_lesson_id)
+    with access.backstop_service_context():
+        shared_lesson = access.get_shared_lesson(shared_lesson_id)
     if shared_lesson is None:
         return {"ok": False, "reason": "shared_lesson_not_found"}
 

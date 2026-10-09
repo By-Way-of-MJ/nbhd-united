@@ -81,10 +81,7 @@ def _dispatch(fn) -> None:
 
     def _run():
         try:
-            from . import access
-
-            with access.backstop_service_context():
-                fn()
+            fn()
         except Exception:  # noqa: BLE001
             logger.exception("project push dispatch failed")
 
@@ -194,17 +191,19 @@ def notify_step_unblocked(goal, step_id, blocker_title: str, actor_tenant) -> No
     def fn():
         from . import access
 
-        step = access.project_steps(goal).filter(id=step_id).first()
-        if step is None or step.status in {"done", "skipped"}:
-            return
-        owner_ids = (
-            access.project_assignments(goal)
-            .filter(step=step, status="accepted")
-            .values_list("membership_id", flat=True)
-        )
+        with access.backstop_service_context():
+            step = access.project_steps(goal).filter(id=step_id).first()
+            if step is None or step.status in {"done", "skipped"}:
+                return
+            owner_ids = (
+                access.project_assignments(goal)
+                .filter(step=step, status="accepted")
+                .values_list("membership_id", flat=True)
+            )
+            members = _members(goal, ids=owner_ids)
         body = f"“{_short(step.title)}” can start now — “{_short(blocker_title, 40)}” is done"
         _deliver(
-            _members(goal, ids=owner_ids),
+            members,
             ptype="step_unblocked",
             body=body,
             mission_id=goal.id,
@@ -301,8 +300,13 @@ def notify_now_owner(goal, membership_id, actor_tenant) -> None:
 def _step_owners(goal, step):
     from . import access
 
-    ids = access.project_assignments(goal).filter(step=step, status="accepted").values_list("membership_id", flat=True)
-    return _members(goal, ids=list(ids))
+    with access.backstop_service_context():
+        ids = (
+            access.project_assignments(goal)
+            .filter(step=step, status="accepted")
+            .values_list("membership_id", flat=True)
+        )
+        return _members(goal, ids=list(ids))
 
 
 def notify_step_needs_look(goal, step, actor_tenant) -> None:
@@ -380,21 +384,23 @@ def run_due_nudges(now=None) -> dict:
     now = now or timezone.now()
     sent = claimed = 0
     with access.backstop_service_context():
-        for row in access.due_nudge_candidates():
-            tenant = row.membership.tenant
-            if not projects_v2_enabled(tenant):
-                continue
-            local = now.astimezone(tenant_tz(tenant))
-            due = row.step.due_date
-            if local.hour != NUDGE_LOCAL_HOUR or due != local.date() + timedelta(days=1):
-                continue
+        candidates = list(access.due_nudge_candidates())
+    for row in candidates:
+        tenant = row.membership.tenant
+        if not projects_v2_enabled(tenant):
+            continue
+        local = now.astimezone(tenant_tz(tenant))
+        due = row.step.due_date
+        if local.hour != NUDGE_LOCAL_HOUR or due != local.date() + timedelta(days=1):
+            continue
+        with access.backstop_service_context():
             if row.due_nudged_for == due or not access.claim_due_nudge(row.id, due):
                 continue
-            claimed += 1
-            body = f"“{_short(row.step.title)}” is due tomorrow"
-            sent += _deliver(
-                [row.membership], ptype="step_due", body=body, mission_id=row.step.shared_goal_id, step_id=row.step_id
-            )
+        claimed += 1
+        body = f"“{_short(row.step.title)}” is due tomorrow"
+        sent += _deliver(
+            [row.membership], ptype="step_due", body=body, mission_id=row.step.shared_goal_id, step_id=row.step_id
+        )
     return {"claimed": claimed, "sent": sent}
 
 
@@ -425,29 +431,31 @@ def run_still_yours_nudges(now=None) -> dict:
     sent = claimed = 0
     asked_today = set()
     with access.backstop_service_context():
-        for row in access.still_yours_candidates(now):
-            tenant = row.membership.tenant
-            if tenant.id in asked_today or not projects_v2_enabled(tenant):
-                continue
-            local = now.astimezone(tenant_tz(tenant))
-            due = row.step.due_date
-            late = (local.date() - due).days
-            if local.hour != NUDGE_LOCAL_HOUR or not QUIET_AFTER_DAYS <= late <= QUIET_UNTIL_DAYS:
-                continue
-            if row.kept_at and row.kept_at > now - timedelta(days=KEPT_QUIET_DAYS):
-                continue
-            if row.responded_at and row.responded_at > now - timedelta(days=QUIET_AFTER_DAYS):
-                continue
+        candidates = list(access.still_yours_candidates(now))
+    for row in candidates:
+        tenant = row.membership.tenant
+        if tenant.id in asked_today or not projects_v2_enabled(tenant):
+            continue
+        local = now.astimezone(tenant_tz(tenant))
+        due = row.step.due_date
+        late = (local.date() - due).days
+        if local.hour != NUDGE_LOCAL_HOUR or not QUIET_AFTER_DAYS <= late <= QUIET_UNTIL_DAYS:
+            continue
+        if row.kept_at and row.kept_at > now - timedelta(days=KEPT_QUIET_DAYS):
+            continue
+        if row.responded_at and row.responded_at > now - timedelta(days=QUIET_AFTER_DAYS):
+            continue
+        with access.backstop_service_context():
             if row.still_yours_nudged_for == due or not access.claim_still_yours_nudge(row.id, due):
                 continue
-            claimed += 1
-            asked_today.add(tenant.id)
-            body = f"Still yours? “{_short(row.step.title)}” — keep it, move the date, or let it go"
-            sent += _deliver(
-                [row.membership],
-                ptype="step_still_yours",
-                body=body,
-                mission_id=row.step.shared_goal_id,
-                step_id=row.step_id,
-            )
+        claimed += 1
+        asked_today.add(tenant.id)
+        body = f"Still yours? “{_short(row.step.title)}” — keep it, move the date, or let it go"
+        sent += _deliver(
+            [row.membership],
+            ptype="step_still_yours",
+            body=body,
+            mission_id=row.step.shared_goal_id,
+            step_id=row.step_id,
+        )
     return {"claimed": claimed, "sent": sent}
