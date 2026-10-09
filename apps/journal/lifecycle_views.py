@@ -147,6 +147,23 @@ def _parse_iso_date(raw, field_name):
         raise ValueError(f"{field_name} must be an ISO date (YYYY-MM-DD)") from exc
 
 
+def _parse_completed_after(raw, tenant):
+    """Inclusive ISO timestamp; dates/naive datetimes use the tenant timezone."""
+    if not raw:
+        return None
+    from datetime import datetime
+
+    from django.utils import timezone
+
+    from apps.common.tenant_tz import tenant_tz
+
+    try:
+        value = datetime.fromisoformat(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("completed_after must be an ISO date or datetime") from exc
+    return timezone.make_aware(value, tenant_tz(tenant)) if timezone.is_naive(value) else value
+
+
 def _parse_uuid(raw, field_name):
     """Return ``raw`` if it is a valid UUID string, else None. Raise ValueError if malformed."""
     if not raw:
@@ -320,14 +337,15 @@ class GoalAbandonView(APIView):
 
 class TaskListCreateView(APIView):
     """GET /api/v1/journal/tasks/ — list the tenant's tasks (filters: status,
-    pillar, parent_goal_id, due_before, due_after, q). POST — create a task.
+    pillar, parent_goal_id, due_before, due_after, completed_after, q). POST — create a task.
 
     The detail/transition endpoints (PATCH, complete, reopen) already exist
     above; this adds the collection read + create the connected iOS client and
     web UI need to enumerate and add tasks without going through the agent.
 
     ``?q=`` does a case-insensitive title search (capped) for the Siri
-    EntityQuery / Shortcuts disambiguation picker.
+    EntityQuery / Shortcuts disambiguation picker. ``completed_after`` is
+    inclusive; dates mean tenant-local midnight and naive datetimes are local.
     """
 
     permission_classes = [IsAuthenticated]
@@ -347,6 +365,7 @@ class TaskListCreateView(APIView):
             parent_goal_id = _parse_uuid(params.get("parent_goal_id"), "parent_goal_id")
             due_before = _parse_iso_date(params.get("due_before"), "due_before")
             due_after = _parse_iso_date(params.get("due_after"), "due_after")
+            completed_after = _parse_completed_after(params.get("completed_after"), tenant)
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         if parent_goal_id:
@@ -355,6 +374,8 @@ class TaskListCreateView(APIView):
             qs = qs.filter(due_date__lte=due_before)
         if due_after:
             qs = qs.filter(due_date__gte=due_after)
+        if completed_after:
+            qs = qs.filter(completed_at__gte=completed_after)
         qs = qs.order_by("-updated_at")
         q = (params.get("q") or "").strip()
         if q:

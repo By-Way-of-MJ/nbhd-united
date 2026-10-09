@@ -118,6 +118,11 @@ def suppress_refresh():
         _SUPPRESS.active = prev
 
 
+def refresh_suppressed() -> bool:
+    """Explicit multi-recipient receivers must honor the same batch boundary."""
+    return getattr(_SUPPRESS, "active", False)
+
+
 def register_section(
     *,
     key: str,
@@ -181,7 +186,7 @@ def _universal_refresh_receiver(sender, instance, **kwargs) -> None:
     dev) the push runs synchronously inside the on_commit callback — no
     thread, behavior is deterministic.
     """
-    if getattr(_SUPPRESS, "active", False):
+    if refresh_suppressed():
         return
     tenant_id = _resolve_tenant_id(instance)
     if tenant_id is None:
@@ -189,10 +194,10 @@ def _universal_refresh_receiver(sender, instance, **kwargs) -> None:
 
     def _push() -> None:
         # Lazy import — avoids circular imports at module load.
-        from apps.orchestrator.workspace_envelope import push_user_md
+        from apps.orchestrator.workspace_envelope import TRIGGER_REGISTRY_SIGNAL, push_user_md
 
         try:
-            push_user_md(tenant_id, debounce_seconds=0)
+            push_user_md(tenant_id, debounce_seconds=0, trigger=TRIGGER_REGISTRY_SIGNAL, sender_model=sender.__name__)
         except Exception:
             logger.warning(
                 "USER.md refresh from registry failed for tenant %s (sender=%s)",

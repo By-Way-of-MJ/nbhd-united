@@ -34,6 +34,8 @@ _SCHEDULE_TARGET = "apps.cron.services.create_typed_cron"
 class WorkoutCongratsTriggerTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Congrats Test", telegram_chat_id=800900)
+        self.tenant.openclaw_version = "2026.5.28"  # gateway cron.add path
+        self.tenant.save(update_fields=["openclaw_version"])
         self.user = self.tenant.user
         self.client = APIClient()
         refresh = RefreshToken.for_user(self.user)
@@ -75,6 +77,7 @@ class WorkoutCongratsTriggerTests(TestCase):
         # contain ':' or whitespace.
         self.assertNotIn(":", kwargs["name"])
         self.assertEqual(kwargs["typed_payload"]["activity"], "Push Day")
+        self.assertEqual(kwargs["typed_payload"]["workout_id"], str(w.id))
 
         # Durable stamp set atomically.
         w.refresh_from_db()

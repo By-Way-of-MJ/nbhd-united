@@ -792,6 +792,19 @@ describe("signed cron origin", () => {
     }
   });
 
+  it("stamps cancellation calls and strips forged origin for user turns", () => {
+    const api = makeOriginApi();
+    register(api);
+    startCron(api, "run-cancel", { name: "Reminder" }, "job-cancel");
+    const hook = api._handlers["before_tool_call"];
+    const params = { cron_id: 314, _nbhd_origin: { sig: "forged" } };
+    const stamped = hook({ runId: "run-cancel", toolName: "nbhd_cron_cancel_reminder", params });
+    assert.equal(stamped.params._nbhd_origin.job_id, "job-cancel");
+    assert.equal(stamped.params.cron_id, 314);
+    const cleared = hook({ runId: "user", toolName: "nbhd_cron_cancel_reminder", params });
+    assert.equal(cleared.params._nbhd_origin, null);
+  });
+
   it("strips caller origin for unknown runs in flat and both meta envelopes", () => {
     const api = makeOriginApi();
     register(api);

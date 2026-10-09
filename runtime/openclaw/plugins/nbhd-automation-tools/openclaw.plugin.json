@@ -6,7 +6,9 @@
     "tools": [
       "nbhd_cron_create_pure_reminder",
       "nbhd_cron_create_quote_user_intent",
-      "nbhd_cron_create_domain_summary"
+      "nbhd_cron_create_domain_summary",
+      "nbhd_cron_list_reminders",
+      "nbhd_cron_cancel_reminder"
     ]
   },
   "configSchema": {

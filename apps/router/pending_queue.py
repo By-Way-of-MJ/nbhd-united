@@ -59,6 +59,7 @@ from apps.billing.services import (
     resolve_model_for_attribution,
 )
 from apps.common.eval_sink import blocks_real_transport_for_identifier, suppresses_real_transport
+from apps.orchestrator.gateway_url import gateway_base_url
 from apps.pii.authoring import placeholder_redactions
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage, RuntimeWriteActivity
 from apps.router.reply_text import clamp_reply_text
@@ -666,6 +667,10 @@ def _resolve_chat_timeout(tenant: Tenant) -> float:
     import to keep the queue module self-contained and avoid a circular
     coupling between router → orchestrator → router.
     """
+    local_timeout = getattr(settings, "LOCAL_TEST_CHAT_TIMEOUT", None)
+    if getattr(settings, "LOCAL_TEST_ROOT", "") and local_timeout:
+        return float(local_timeout)
+
     from apps.billing.constants import (
         DEFAULT_CHAT_TIMEOUT,
         REASONING_MODEL_TIMEOUT,
@@ -741,8 +746,11 @@ def enqueue_message_for_tenant(
     # UPDATE so concurrent first messages from a never-messaged tenant don't
     # race-overwrite an earlier timestamp; the filter makes the second write
     # a no-op. This is the activation signal used to measure the onboarding
-    # drop-off cohort.
-    Tenant.objects.filter(id=tenant.id, first_message_at__isnull=True).update(first_message_at=timezone.now())
+    # drop-off cohort. The field is monotonic (never returns to null), so a
+    # non-null in-memory value — however stale — proves the stamp exists and the
+    # UPDATE round-trip is skipped; a stale null just runs today's no-op UPDATE.
+    if tenant.first_message_at is None:
+        Tenant.objects.filter(id=tenant.id, first_message_at__isnull=True).update(first_message_at=timezone.now())
 
     def _publish_drain() -> None:
         try:
@@ -1485,6 +1493,7 @@ def drain_pending_messages_for_tenant_task(
 
     Returns a small dict for logging/testing.
     """
+    task_started = time.monotonic()
     tenant = Tenant.objects.select_related("user").filter(id=tenant_id).first()
     if not tenant or not tenant.container_fqdn:
         # A missing FQDN means one of two very different things, and they
@@ -1709,7 +1718,7 @@ def drain_pending_messages_for_tenant_task(
         elif channel == PendingMessage.Channel.TELEGRAM:
             outcome = _drain_telegram_batch(tenant, batch, chat_timeout)
         elif channel == PendingMessage.Channel.IOS:
-            outcome = _drain_ios_batch(tenant, batch, chat_timeout)
+            outcome = _drain_ios_batch(tenant, batch, chat_timeout, task_started=task_started)
         else:
             raise ValueError(f"Unknown channel: {channel!r}")
         gateway_responded = outcome.gateway_responded
@@ -1853,6 +1862,7 @@ def drain_pending_messages_for_tenant_task(
         # whose follow-up health probe also says down, so a genuine turn
         # timeout against a live container still flows through the normal
         # bounded retry path.
+        wake_failed = False
         if tenant.hibernated_at is not None and container_down:
             from apps.billing.services import check_budget
 
@@ -1872,7 +1882,15 @@ def drain_pending_messages_for_tenant_task(
                 # On a failed wake we fall through to the bounded failure path
                 # below, which advances the attempt counter and eventually
                 # drops + apologizes. (canary 148ccf1c, 2026-06-25)
-                woke = wake_hibernated_tenant(tenant)
+                # Publish the rich-client phase before the blocking Azure wake.
+                _mark_ios_waking(channel, batch)
+                woke = False
+                try:
+                    woke = wake_hibernated_tenant(tenant)
+                finally:
+                    wake_failed = not woke
+                    if wake_failed:
+                        _clear_ios_waking(channel, batch)
                 if woke:
                     for row in batch:
                         row.delivery_in_flight_until = None
@@ -1883,7 +1901,6 @@ def drain_pending_messages_for_tenant_task(
                         _WAKE_DEFER_SECONDS,
                     )
                     _notify_waking(tenant, channel, channel_user_id or "")
-                    _mark_ios_waking(channel, batch)
                     _reschedule_drain(
                         tenant,
                         channel,
@@ -1923,7 +1940,8 @@ def drain_pending_messages_for_tenant_task(
                 boot_state,
                 _WAKE_DEFER_SECONDS,
             )
-            _mark_ios_waking(channel, batch)
+            if not wake_failed:
+                _mark_ios_waking(channel, batch)
             _reschedule_drain(
                 tenant,
                 channel,
@@ -2069,7 +2087,7 @@ def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
     ``GET /chat/messages/<id>/`` can render "your assistant is waking up"
     instead of indefinite typing dots. Telegram gets the same signal via
     ``_notify_waking``'s push ack; rich clients have no push transport.
-    Idempotent — re-stamping on each boot-grace retry is harmless."""
+    Preserve the first stamp across provisioning and boot-grace retries."""
     if channel != PendingMessage.Channel.IOS or not batch:
         return
     client_ids = _ios_client_msg_ids(batch)
@@ -2082,9 +2100,29 @@ def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
             tenant_id=batch[0].tenant_id,
             client_msg_id__in=client_ids,
             status=AppChatMessage.Status.PENDING,
+            waking_at__isnull=True,
         ).update(waking_at=timezone.now())
     except Exception:
         logger.exception("drain_pending: failed to stamp waking_at for ios batch")
+
+
+def _clear_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
+    """A failed wake must not leave pending app turns advertising progress."""
+    if channel != PendingMessage.Channel.IOS or not batch:
+        return
+    client_ids = _ios_client_msg_ids(batch)
+    if not client_ids:
+        return
+    try:
+        from apps.router.models import AppChatMessage
+
+        AppChatMessage.objects.filter(
+            tenant_id=batch[0].tenant_id,
+            client_msg_id__in=client_ids,
+            status=AppChatMessage.Status.PENDING,
+        ).update(waking_at=None)
+    except Exception:
+        logger.exception("drain_pending: failed to clear waking_at for ios batch")
 
 
 def _is_tenant_container_live(tenant: Tenant) -> bool:
@@ -2100,7 +2138,7 @@ def _is_tenant_container_live(tenant: Tenant) -> bool:
     This helper performs network I/O and must only be called outside
     ``transaction.atomic()``.
     """
-    url = f"https://{tenant.container_fqdn}/health"
+    url = f"{gateway_base_url(tenant)}/health"
     try:
         response = httpx.get(url, timeout=_CONTAINER_HEALTH_TIMEOUT_SECONDS)
     except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
@@ -2380,7 +2418,7 @@ def _send_apology_for_dropped_pending_message(tenant: Tenant, msg: PendingMessag
 
 
 def _build_batch_chat_content(
-    batch: list[PendingMessage], fallback_user_id: str, channel: str | None = None
+    batch: list[PendingMessage], fallback_user_id: str, channel: str | None = None, *, tenant=None
 ) -> tuple[str, str, str]:
     """Build the ``content`` string + routing context for a deliverable batch.
 
@@ -2435,6 +2473,7 @@ def _build_batch_chat_content(
         user_timezone=user_tz,
         timestamps=timestamps,
         channel=channel,
+        tenant=tenant,
     )
     return content, user_param, user_tz
 
@@ -2479,7 +2518,7 @@ def _drain_line_batch(tenant: Tenant, batch: list[PendingMessage], timeout: floa
     # drains, the LINE Reply API window (~1 min) is almost always
     # closed. We always Push.
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
@@ -2609,7 +2648,7 @@ def _drain_telegram_batch(tenant: Tenant, batch: list[PendingMessage], timeout: 
 
     content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
@@ -2674,7 +2713,13 @@ def _drain_telegram_batch(tenant: Tenant, batch: list[PendingMessage], timeout: 
 # ---------------------------------------------------------------------------
 
 
-def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float) -> DrainOutcome:
+def _drain_ios_batch(
+    tenant: Tenant,
+    batch: list[PendingMessage],
+    timeout: float,
+    *,
+    task_started: float | None = None,
+) -> DrainOutcome:
     """Forward a deliverable iOS/app batch to the container as one OC turn,
     then PERSIST the reply to ``AppChatMessage`` for the client to poll.
 
@@ -2684,7 +2729,12 @@ def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float
     healthy gateway response (liveness signal — see ``_drain_line_batch``).
     On an OpenRouter credit-limit the turn(s) are marked errored so polling
     clients aren't stuck pending.
+
+    ``task_started`` (``time.monotonic()`` at drain-task entry) only feeds the
+    timing log line below.
     """
+    if task_started is None:
+        task_started = time.monotonic()
     if not batch:
         return DrainOutcome(
             Disposition.DELIVER,
@@ -2694,7 +2744,7 @@ def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float
         )
 
     thread_id = batch[0].channel_user_id
-    content, user_param, user_tz = _build_batch_chat_content(batch, thread_id, channel="ios")
+    content, user_param, user_tz = _build_batch_chat_content(batch, thread_id, channel="ios", tenant=tenant)
 
     # Bridge proactive-message continuity into the iOS turn. Unlike the
     # Telegram/LINE ingress handlers (which prepend this block before enqueue),
@@ -2742,7 +2792,7 @@ def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float
 
     content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
 
-    url = f"https://{tenant.container_fqdn}/v1/chat/completions"
+    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 
     gateway_token = get_gateway_token_for_tenant(tenant)
@@ -2761,7 +2811,9 @@ def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float
         "X-OpenClaw-Message-Channel": "ios",
     }
 
+    post_started = time.monotonic()
     resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)
+    post_ended = time.monotonic()
     if _looks_like_openrouter_credit_limit(resp):
         credit_result = _handle_openrouter_credit_limit(tenant, channel="ios", channel_user_id=thread_id)
         if credit_result == "ceiling_raised":
@@ -2782,7 +2834,20 @@ def _drain_ios_batch(tenant: Tenant, batch: list[PendingMessage], timeout: float
     result = resp.json()
 
     ai_text = _extract_ai_response(result)
-    _store_ios_turn_reply(tenant, batch, ai_text)
+    reply_write_ms = _store_ios_turn_reply(tenant, batch, ai_text)
+    # Latency attribution for the app chat path: everything the control plane
+    # spends around the model turn. pre_post_ms = drain-task entry → gateway
+    # POST (tenant load, claim, proactive/recap reads); post_ms = the model turn;
+    # reply_write_ms = reply cleaning + the committed AppChatMessage write (-1
+    # when no reply row was written). Log-only.
+    logger.info(
+        "drain_pending: ios turn timing tenant=%s batch=%d pre_post_ms=%d post_ms=%d reply_write_ms=%d",
+        str(tenant.id)[:8],
+        len(batch),
+        int((post_started - task_started) * 1000),
+        int((post_ended - post_started) * 1000),
+        int(reply_write_ms) if reply_write_ms is not None else -1,
+    )
     _record_usage_safe(tenant, result, message_count=len(batch))
     # Refresh the USER.md "Conversation so far" digest so isolated proactive /
     # cron sessions (Morning Briefing, Evening Check-in, the cron heartbeat)
@@ -2854,27 +2919,32 @@ def _dispatch_push(target, *args) -> None:
         logger.warning("ios: push dispatch failed (non-fatal)", exc_info=True)
 
 
-def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: str | None) -> None:
+def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: str | None) -> float | None:
     """Persist the assistant reply onto the AppChatMessage rows for this
     batch so the polling client can read it. Empty / gateway-error replies
-    flip the turn to ``error`` so the client doesn't poll forever."""
+    flip the turn to ``error`` so the client doesn't poll forever.
+
+    Returns the milliseconds spent getting a non-empty reply committed (the
+    span a polling client waits on), for the drain timing log; ``None`` when no
+    reply row was written."""
     from apps.router.models import AppChatMessage
     from apps.router.push_views import notify_app_reply_error, notify_app_reply_ready
 
     client_ids = _ios_client_msg_ids(batch)
     if not client_ids:
-        return
-    retried_turns = dict(
-        AppChatMessage.objects.filter(
-            tenant=tenant,
-            client_msg_id__in=client_ids,
-            status=AppChatMessage.Status.PENDING,
-            retried_at__isnull=False,
-        ).values_list("client_msg_id", "id")
-    )
-    retried_client_ids = list(retried_turns)
+        return None
+    write_started = time.monotonic()
     now = timezone.now()
-    if ai_text:
+    from apps.router.panels import extract_panels, prepare_panels
+
+    ai_text, panels = extract_panels(ai_text or "")
+    panels = prepare_panels(tenant, panels)
+    from apps.router.character_drawing import has_character_drawing
+
+    if has_character_drawing(ai_text):
+        # Measure-only: AGENTS.md bans character drawings; count how often it slips.
+        logger.info("chat_reply_character_drawing tenant=%s chars=%d", tenant.id, len(ai_text))
+    if ai_text or panels:
         # A coalesced batch (N>1) yields ONE combined reply. Attach it to a single
         # representative row (the last message in the batch) so the since-feed,
         # thread history, and the USER.md digest each emit exactly one assistant
@@ -2906,6 +2976,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 # Quick-reply button labels ride the same representative row, for
                 # the same reason. null when the reply carried no marker.
                 quick_replies=quick_replies or None,
+                panels=panels or None,
                 # The "View in Journal" deep-link rides the same representative row,
                 # for the same reason. null when the reply carried no marker.
                 journal_link=journal_link or None,
@@ -2914,6 +2985,10 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
             if other_ids:
                 AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=other_ids).update(
                     reply_text="",
+                    panels=None,
+                    quick_replies=None,
+                    journal_link=None,
+                    reply_redactions=None,
                     status=AppChatMessage.Status.READY,
                     replied_at=now,
                     partial_text="",
@@ -2925,14 +3000,41 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
         # the device shows one "reply ready" notification, not N. The lock-screen
         # body uses the REHYDRATED copy (``push_text``) — ``reply_text`` is stored
         # placeholder-space, so pushing ``text`` would leak a raw ``[PERSON_1]``.
+        reply_write_ms = (time.monotonic() - write_started) * 1000
         _dispatch_push(notify_app_reply_ready, tenant, [rep_id], push_text)
-        for client_msg_id in retried_client_ids:
+        # Only feeds the retry_succeeded log line, so it runs AFTER the reply is
+        # committed (the client can already read it) instead of in front of the
+        # write. The rows are READY by now, hence no status filter. Fail-open: a
+        # read error here must not fail a drain whose reply already landed — that
+        # would retry the batch and re-run the model turn.
+        try:
+            retried_turn_ids = list(
+                AppChatMessage.objects.filter(
+                    tenant=tenant,
+                    client_msg_id__in=client_ids,
+                    retried_at__isnull=False,
+                ).values_list("id", flat=True)
+            )
+        except Exception:
+            logger.warning("ios: retried-turn lookup failed after reply write (non-fatal)", exc_info=True)
+            retried_turn_ids = []
+        for turn_id in retried_turn_ids:
             logger.info(
                 "retry_succeeded count=1 tenant=%s turn=%s",
                 str(tenant.id)[:8],
-                str(retried_turns[client_msg_id])[:16],
+                str(turn_id)[:16],
             )
+        return reply_write_ms
     else:
+        retried_turns = dict(
+            AppChatMessage.objects.filter(
+                tenant=tenant,
+                client_msg_id__in=client_ids,
+                status=AppChatMessage.Status.PENDING,
+                retried_at__isnull=False,
+            ).values_list("client_msg_id", "id")
+        )
+        retried_client_ids = list(retried_turns)
         AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=client_ids).update(
             status=AppChatMessage.Status.ERROR,
             error="empty_response",
@@ -2947,6 +3049,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
             _dispatch_push(notify_app_reply_error, tenant, ordinary_client_ids)
         for client_msg_id in retried_client_ids:
             _notify_retry_exhausted(tenant, retried_turns[client_msg_id], client_msg_id, "empty_response")
+        return None
 
 
 def _store_ios_turn_error(tenant: Tenant, batch: list[PendingMessage], reason: str) -> None:
@@ -3090,8 +3193,10 @@ def relay_ai_response_to_telegram(tenant: Tenant, chat_id: int, ai_text: str) ->
     # Telegram has no transport for either here, so just strip the markers
     # (never let them leak as raw text).
     from apps.router.journal_link import extract_journal_link
+    from apps.router.panels import extract_panels
     from apps.router.quick_replies import extract_quick_replies
 
+    ai_text, _panels = extract_panels(ai_text)
     ai_text, _quick_replies = extract_quick_replies(ai_text, tenant_id=tenant.id, channel="telegram_drain")
     ai_text, _journal_link = extract_journal_link(ai_text, tenant_id=tenant.id, channel="telegram_drain")
 
@@ -3370,23 +3475,20 @@ def _send_telegram_photo(chat_id: int, photo_path: str, tenant: Tenant) -> bool:
 
         from azure.storage.fileshare import ShareFileClient
 
-        from apps.orchestrator.azure_client import get_storage_client
+        from apps.orchestrator.storage_credentials import run_with_key
 
-        storage_client = get_storage_client()
-        keys = storage_client.storage_accounts.list_keys(
-            settings.AZURE_RESOURCE_GROUP,
-            account_name,
-        )
-        account_key = keys.keys[0].value
         share_name = f"ws-{str(tenant.id)[:20]}"
 
-        file_client = ShareFileClient(
-            account_url=f"https://{account_name}.file.core.windows.net",
-            share_name=share_name,
-            file_path=share_path,
-            credential=account_key,
-        )
-        data = file_client.download_file().readall()
+        def operation(account_key):
+            file_client = ShareFileClient(
+                account_url=f"https://{account_name}.file.core.windows.net",
+                share_name=share_name,
+                file_path=share_path,
+                credential=account_key,
+            )
+            return file_client.download_file().readall()
+
+        data = run_with_key(tenant.id, operation)
 
         ext = share_path.rsplit(".", 1)[-1].lower() if "." in share_path else "jpg"
         mime = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")

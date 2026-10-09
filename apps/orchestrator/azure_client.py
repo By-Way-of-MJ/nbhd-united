@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from typing import Any
 
 from django.conf import settings
+
+from .local_test import local_root, mock_kek, share_path
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +364,7 @@ def store_tenant_internal_key_in_key_vault(tenant_id: str, plaintext_key: str) -
     return secret_name
 
 
-def read_key_vault_secret(secret_name: str) -> str | None:
+def read_key_vault_secret(secret_name: str, *, metadata_only: bool = False) -> str | None:
     """Read a secret value from Azure Key Vault.
 
     Returns the secret value or None if not found / not configured.
@@ -383,7 +386,10 @@ def read_key_vault_secret(secret_name: str) -> str | None:
         secret = client.get_secret(secret_name)
         return secret.value
     except Exception as exc:
-        logger.warning("Failed to read KV secret %s: %s", secret_name, exc)
+        if metadata_only:
+            logger.warning("Key Vault failure reason=secret_read_failed")
+        else:
+            logger.warning("Failed to read KV secret %s: %s", secret_name, exc)
         return None
 
 
@@ -442,7 +448,7 @@ def create_tenant_kek(tenant_id: str) -> str:
 
     if _is_mock():
         kek_version = "mock-v1"
-        _MOCK_KEK_REGISTRY[tid] = {"key": os.urandom(32), "kek_version": kek_version, "deleted": False}
+        _MOCK_KEK_REGISTRY[tid] = {"key": mock_kek(tid) or os.urandom(32), "kek_version": kek_version, "deleted": False}
         logger.info("[MOCK] Created tenant KEK for tenant %s (version=%s)", tid, kek_version)
         return kek_version
 
@@ -472,6 +478,9 @@ def wrap_dek(tenant_id: str, dek: bytes) -> tuple[bytes, str]:
 
     if _is_mock():
         entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None and (key := mock_kek(tid)) is not None:
+            entry = {"key": key, "kek_version": "mock-v1", "deleted": False}
+            _MOCK_KEK_REGISTRY[tid] = entry
         if entry is None:
             raise LookupError(f"No KEK minted for tenant {tid} — call create_tenant_kek first")
         wrapped = _mock_kek_xor(dek, entry["key"])
@@ -510,6 +519,9 @@ def unwrap_dek(tenant_id: str, wrapped: bytes) -> bytes:
 
     if _is_mock():
         entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None and (key := mock_kek(tid)) is not None:
+            entry = {"key": key, "kek_version": "mock-v1", "deleted": False}
+            _MOCK_KEK_REGISTRY[tid] = entry
         if entry is None:
             raise LookupError(f"Cannot unwrap DEK for tenant {tid} — KEK was purged or never minted")
         if entry.get("deleted"):
@@ -550,8 +562,14 @@ def begin_delete_kek(tenant_id: str) -> None:
     """
     tid = str(tenant_id)
 
+    if local_root(tid) is not None:
+        raise RuntimeError("Key deletion/recovery is unsupported in the persistent local test adapter")
+
     if _is_mock():
         entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None and (key := mock_kek(tid)) is not None:
+            entry = {"key": key, "kek_version": "mock-v1", "deleted": False}
+            _MOCK_KEK_REGISTRY[tid] = entry
         if entry is not None:
             entry["deleted"] = True
         logger.info("[MOCK] Soft-deleted tenant KEK for tenant %s", tid)
@@ -584,8 +602,14 @@ def recover_kek(tenant_id: str) -> None:
     """
     tid = str(tenant_id)
 
+    if local_root(tid) is not None:
+        raise RuntimeError("Key deletion/recovery is unsupported in the persistent local test adapter")
+
     if _is_mock():
         entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None and (key := mock_kek(tid)) is not None:
+            entry = {"key": key, "kek_version": "mock-v1", "deleted": False}
+            _MOCK_KEK_REGISTRY[tid] = entry
         if entry is None:
             raise LookupError(f"Cannot recover KEK for tenant {tid} — already purged or never minted")
         entry["deleted"] = False
@@ -627,6 +651,9 @@ def kek_liveness(tenant_id: str) -> str:
 
     if _is_mock():
         entry = _MOCK_KEK_REGISTRY.get(tid)
+        if entry is None and (key := mock_kek(tid)) is not None:
+            entry = {"key": key, "kek_version": "mock-v1", "deleted": False}
+            _MOCK_KEK_REGISTRY[tid] = entry
         if entry is None:
             return "absent"
         return "recoverable" if entry.get("deleted") else "live"
@@ -670,6 +697,9 @@ def purge_kek(tenant_id: str) -> None:
     this code does. Never wire this into an automated/scheduled path.
     """
     tid = str(tenant_id)
+
+    if local_root(tid) is not None:
+        raise RuntimeError("Key deletion/recovery is unsupported in the persistent local test adapter")
 
     if _is_mock():
         _MOCK_KEK_REGISTRY.pop(tid, None)
@@ -738,6 +768,9 @@ def download_config_from_file_share(tenant_id: str) -> bytes | None:
     share_name = f"ws-{str(tenant_id)[:20]}"
 
     if _is_mock():
+        path = share_path(tenant_id, "openclaw.json")
+        if path is not None:
+            return path.read_bytes() if path.exists() else None
         logger.info("[MOCK] download_config_from_file_share %s", share_name)
         return None
 
@@ -748,24 +781,21 @@ def download_config_from_file_share(tenant_id: str) -> bytes | None:
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.fileshare import ShareFileClient
 
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(
-        settings.AZURE_RESOURCE_GROUP,
-        account_name,
-    )
-    account_key = keys.keys[0].value
-    account_url = f"https://{account_name}.file.core.windows.net"
+    from apps.orchestrator.storage_credentials import run_with_key
 
-    file_client = ShareFileClient(
-        account_url=account_url,
-        share_name=share_name,
-        file_path="openclaw.json",
-        credential=account_key,
-    )
-    try:
-        return file_client.download_file().readall()
-    except ResourceNotFoundError:
-        return None
+    def download(account_key):
+        file_client = ShareFileClient(
+            account_url=f"https://{account_name}.file.core.windows.net",
+            share_name=share_name,
+            file_path="openclaw.json",
+            credential=account_key,
+        )
+        try:
+            return file_client.download_file().readall()
+        except ResourceNotFoundError:
+            return None
+
+    return run_with_key(tenant_id, download)
 
 
 # C0 control codepoints to strip from any text written to the file share —
@@ -790,6 +820,39 @@ def sanitize_share_text(content: str) -> str:
     return content.translate(_SHARE_TEXT_STRIP)
 
 
+def _upload_with_parent_repair(
+    file_client, payload, *, account_url, share_name, file_path, credential, known_dirs=None
+) -> None:
+    """Upload first, repairing missing parents before exactly one retry."""
+    from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+    from azure.storage.fileshare import ShareDirectoryClient, StorageErrorCode
+
+    try:
+        file_client.upload_file(payload, length=len(payload))
+    except ResourceNotFoundError as exc:
+        if getattr(exc, "error_code", None) != StorageErrorCode.PARENT_NOT_FOUND:
+            raise
+        parts = file_path.split("/")
+        for i in range(1, len(parts)):
+            dir_path = "/".join(parts[:i])
+            if known_dirs is not None and dir_path in known_dirs:
+                continue
+            dir_client = ShareDirectoryClient(
+                account_url=account_url,
+                share_name=share_name,
+                directory_path=dir_path,
+                credential=credential,
+            )
+            try:
+                dir_client.create_directory()
+            except ResourceExistsError as conflict:
+                if getattr(conflict, "error_code", None) != StorageErrorCode.RESOURCE_ALREADY_EXISTS:
+                    raise
+            if known_dirs is not None:
+                known_dirs.add(dir_path)
+        file_client.upload_file(payload, length=len(payload))
+
+
 def _put_share_file(
     tenant_id: str,
     file_path: str,
@@ -804,7 +867,7 @@ def _put_share_file(
     Pass ``text=`` for text files (auto-sanitized via ``sanitize_share_text``)
     or ``data=`` for binary (passed through untouched). Consolidates the
     client/auth setup, parent-directory creation, skip-if-exists, and the
-    single atomic ``upload_file`` PUT (no tmp+rename — that race produced the
+    ``upload_file`` create file + upload ranges (no tmp+rename — that race produced the
     2026-05-22 null-byte corruption). Routing all writes through here means the
     text sanitize can never be forgotten by a future writer.
     """
@@ -814,6 +877,19 @@ def _put_share_file(
     share_name = f"ws-{str(tenant_id)[:20]}"
 
     if _is_mock():
+        path = share_path(tenant_id, file_path)
+        if path is not None:
+            if skip_if_exists and path.exists():
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = sanitize_share_text(text).encode() if text is not None else data
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+                temporary.write(payload)
+            try:
+                os.replace(temporary.name, path)
+            finally:
+                if os.path.exists(temporary.name):
+                    os.unlink(temporary.name)
         logger.info("[MOCK] Uploaded %s to file share %s", file_path, share_name)
         return
 
@@ -822,43 +898,154 @@ def _put_share_file(
         raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
 
     from azure.core.exceptions import ResourceNotFoundError
-    from azure.storage.fileshare import ShareDirectoryClient, ShareFileClient
+    from azure.storage.fileshare import ShareFileClient
 
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(settings.AZURE_RESOURCE_GROUP, account_name)
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import acquire_account_key, run_with_lease
+
+    lease = acquire_account_key(tenant_id)
     account_url = f"https://{account_name}.file.core.windows.net"
 
     if skip_if_exists:
-        check_client = ShareFileClient(
-            account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
-        )
-        try:
-            check_client.get_file_properties()
-            logger.info("Skipping upload of %s to file share %s (already exists)", file_path, share_name)
-            return
-        except ResourceNotFoundError:
-            pass  # File missing — fall through and write it
 
-    if ensure_dirs:
-        parts = file_path.split("/")
-        for i in range(1, len(parts)):
-            dir_path = "/".join(parts[:i])
-            dir_client = ShareDirectoryClient(
-                account_url=account_url, share_name=share_name, directory_path=dir_path, credential=account_key
+        def exists(account_key):
+            check_client = ShareFileClient(
+                account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
             )
             try:
-                dir_client.create_directory()
-            except Exception:
-                pass  # Already exists
+                check_client.get_file_properties()
+            except ResourceNotFoundError:
+                return False
+            return True
+
+        present, lease = run_with_lease(tenant_id, lease, exists)
+        if present:
+            logger.info("Skipping upload of %s to file share %s (already exists)", file_path, share_name)
+            return
 
     payload = sanitize_share_text(text).encode("utf-8") if text is not None else data
 
-    file_client = ShareFileClient(
-        account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
-    )
-    file_client.upload_file(payload, length=len(payload))
+    def upload(account_key):
+        file_client = ShareFileClient(
+            account_url=account_url, share_name=share_name, file_path=file_path, credential=account_key
+        )
+        if ensure_dirs:
+            _upload_with_parent_repair(
+                file_client,
+                payload,
+                account_url=account_url,
+                share_name=share_name,
+                file_path=file_path,
+                credential=account_key,
+            )
+        else:
+            file_client.upload_file(payload, length=len(payload))
+
+    run_with_lease(tenant_id, lease, upload)
     logger.info("Uploaded %s (%d bytes) to file share %s", file_path, len(payload), share_name)
+
+
+# Container-local EmptyDir mounts shadow these share paths, so the runtime never
+# reads them; migration undo neither restores nor deletes them.
+_UNDO_SKIP_DIRS = frozenset({"agents", "plugin-runtime-deps", "index"})
+
+
+def _share_clients(tenant_id: str, *, snapshot: str | None = None):
+    from azure.storage.fileshare import ShareClient
+
+    from apps.orchestrator.storage_credentials import acquire_account_key
+
+    account_name = str(getattr(settings, "AZURE_STORAGE_ACCOUNT_NAME", "") or "").strip()
+    if not account_name:
+        raise ValueError("AZURE_STORAGE_ACCOUNT_NAME is not configured")
+    lease = acquire_account_key(tenant_id)
+    url = f"https://{account_name}.file.core.windows.net"
+    share = f"ws-{str(tenant_id)[:20]}"
+    return lease, lambda key, snap=snapshot: ShareClient(
+        account_url=url, share_name=share, snapshot=snap, credential=key
+    )
+
+
+def snapshot_tenant_share(tenant_id: str) -> str:
+    """Point-in-time snapshot of the tenant's workspace share; returns its id."""
+    if _is_mock():
+        return "mock-snapshot"
+    from apps.orchestrator.storage_credentials import run_with_lease
+
+    lease, share = _share_clients(tenant_id)
+    snapshot, _ = run_with_lease(tenant_id, lease, lambda key: share(key).create_snapshot()["snapshot"])
+    return snapshot
+
+
+def _walk_share(share_client, path=""):
+    """Yield ("dir"|"file", relative_path) for a share, skipping shadowed dirs."""
+    directory = share_client.get_directory_client(path) if path else share_client.get_directory_client()
+    for item in directory.list_directories_and_files():
+        child = f"{path}/{item['name']}" if path else item["name"]
+        if not path and item["name"] in _UNDO_SKIP_DIRS:
+            continue
+        if item["is_directory"]:
+            yield "dir", child
+            yield from _walk_share(share_client, child)
+        else:
+            yield "file", child
+
+
+def restore_tenant_share(tenant_id: str, snapshot: str) -> dict:
+    """Mirror a snapshot back onto the live share (migration undo).
+
+    Every snapshot file is rewritten byte-for-byte; files created since the
+    snapshot are deleted. Shadowed EmptyDir paths are left alone.
+    """
+    if _is_mock():
+        return {"restored": 0, "deleted": 0}
+    from azure.core.exceptions import ResourceExistsError
+
+    from apps.orchestrator.storage_credentials import run_with_lease
+
+    lease, share = _share_clients(tenant_id, snapshot=snapshot)
+
+    def restore(key):
+        source, live = share(key), share(key, None)
+        wanted = list(_walk_share(source))
+        wanted_files = {p for kind, p in wanted if kind == "file"}
+        for kind, path in wanted:
+            if kind == "dir":
+                try:
+                    live.get_directory_client(path).create_directory()
+                except ResourceExistsError:
+                    pass
+        for path in sorted(wanted_files):
+            payload = source.get_file_client(path).download_file().readall()
+            live.get_file_client(path).upload_file(payload, length=len(payload))
+        extra = [p for kind, p in _walk_share(live) if kind == "file" and p not in wanted_files]
+        for path in extra:
+            live.get_file_client(path).delete_file()
+        return {"restored": len(wanted_files), "deleted": len(extra)}
+
+    result, _ = run_with_lease(tenant_id, lease, restore)
+    return result
+
+
+def copy_revision(container_name: str, from_revision: str, revision_suffix: str, *, operation_timeout=300) -> None:
+    """Redeploy an earlier revision's exact template under a new suffix."""
+    if _is_mock():
+        return
+    client = get_container_client()
+    group = settings.AZURE_RESOURCE_GROUP
+    source = client.container_apps_revisions.get_revision(group, container_name, from_revision)
+    app = client.container_apps.get(group, container_name)
+    app.template = source.template
+    app.template.revision_suffix = revision_suffix
+    client.container_apps.begin_update(group, container_name, app).result(timeout=operation_timeout)
+
+
+def restart_revision(container_name: str, revision_name: str) -> None:
+    """Restart a revision's replicas in place (no new revision)."""
+    if _is_mock():
+        return
+    get_container_client().container_apps_revisions.restart_revision(
+        settings.AZURE_RESOURCE_GROUP, container_name, revision_name
+    )
 
 
 def upload_config_to_file_share(tenant_id: str, config_json: str) -> None:
@@ -964,6 +1151,9 @@ def delete_workspace_file(tenant_id: str, file_path: str) -> None:
     share_name = f"ws-{str(tenant_id)[:20]}"
 
     if _is_mock():
+        path = share_path(tenant_id, file_path)
+        if path is not None:
+            path.unlink(missing_ok=True)
         logger.info("[MOCK] Deleted %s from file share %s", file_path, share_name)
         return
 
@@ -974,20 +1164,22 @@ def delete_workspace_file(tenant_id: str, file_path: str) -> None:
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.fileshare import ShareFileClient
 
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(settings.AZURE_RESOURCE_GROUP, account_name)
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import acquire_account_key, run_with_lease
+
+    lease = acquire_account_key(tenant_id)
     account_url = f"https://{account_name}.file.core.windows.net"
 
-    file_client = ShareFileClient(
-        account_url=account_url,
-        share_name=share_name,
-        file_path=file_path,
-        credential=account_key,
-    )
+    def client(account_key):
+        return ShareFileClient(
+            account_url=account_url,
+            share_name=share_name,
+            file_path=file_path,
+            credential=account_key,
+        )
+
     try:
-        file_client.get_file_properties()
-        file_client.delete_file()
+        _, lease = run_with_lease(tenant_id, lease, lambda key: client(key).get_file_properties())
+        run_with_lease(tenant_id, lease, lambda key: client(key).delete_file())
     except ResourceNotFoundError:
         logger.debug("Workspace file %s is already absent from file share %s", file_path, share_name)
         return
@@ -1019,6 +1211,9 @@ def download_workspace_file_binary(tenant_id: str, file_path: str) -> bytes | No
     share_name = f"ws-{str(tenant_id)[:20]}"
 
     if _is_mock():
+        path = share_path(tenant_id, file_path)
+        if path is not None:
+            return path.read_bytes() if path.exists() else None
         logger.info("[MOCK] Binary download of %s from file share %s", file_path, share_name)
         return None
 
@@ -1029,23 +1224,21 @@ def download_workspace_file_binary(tenant_id: str, file_path: str) -> bytes | No
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.fileshare import ShareFileClient
 
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(
-        settings.AZURE_RESOURCE_GROUP,
-        account_name,
-    )
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import run_with_key
 
-    file_client = ShareFileClient(
-        account_url=f"https://{account_name}.file.core.windows.net",
-        share_name=share_name,
-        file_path=file_path,
-        credential=account_key,
-    )
-    try:
-        return file_client.download_file().readall()
-    except ResourceNotFoundError:
-        return None
+    def download(account_key):
+        file_client = ShareFileClient(
+            account_url=f"https://{account_name}.file.core.windows.net",
+            share_name=share_name,
+            file_path=file_path,
+            credential=account_key,
+        )
+        try:
+            return file_client.download_file().readall()
+        except ResourceNotFoundError:
+            return None
+
+    return run_with_key(tenant_id, download)
 
 
 def download_workspace_file(tenant_id: str, file_path: str) -> str | None:
@@ -1059,6 +1252,9 @@ def download_workspace_file(tenant_id: str, file_path: str) -> str | None:
     share_name = f"ws-{str(tenant_id)[:20]}"
 
     if _is_mock():
+        path = share_path(tenant_id, file_path)
+        if path is not None:
+            return path.read_text() if path.exists() else None
         logger.info("[MOCK] Download of %s from file share %s", file_path, share_name)
         return None
 
@@ -1069,25 +1265,23 @@ def download_workspace_file(tenant_id: str, file_path: str) -> str | None:
     from azure.core.exceptions import ResourceNotFoundError
     from azure.storage.fileshare import ShareFileClient
 
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(
-        settings.AZURE_RESOURCE_GROUP,
-        account_name,
-    )
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import run_with_key
 
-    file_client = ShareFileClient(
-        account_url=f"https://{account_name}.file.core.windows.net",
-        share_name=share_name,
-        file_path=file_path,
-        credential=account_key,
-    )
-    try:
-        downloader = file_client.download_file()
-        data = downloader.readall()
-    except ResourceNotFoundError:
-        return None
-    return data.decode("utf-8", errors="replace")
+    def download(account_key):
+        file_client = ShareFileClient(
+            account_url=f"https://{account_name}.file.core.windows.net",
+            share_name=share_name,
+            file_path=file_path,
+            credential=account_key,
+        )
+        try:
+            downloader = file_client.download_file()
+            data = downloader.readall()
+        except ResourceNotFoundError:
+            return None
+        return data.decode("utf-8", errors="replace")
+
+    return run_with_key(tenant_id, download)
 
 
 def register_environment_storage(tenant_id: str) -> None:
@@ -1113,30 +1307,28 @@ def register_environment_storage(tenant_id: str) -> None:
 
     storage_name = f"ws-{str(tenant_id)[:20]}"
 
-    # Get storage account key programmatically
-    storage_client = get_storage_client()
-    keys = storage_client.storage_accounts.list_keys(
-        settings.AZURE_RESOURCE_GROUP,
-        account_name,
-    )
-    account_key = keys.keys[0].value
+    from apps.orchestrator.storage_credentials import run_with_key
 
-    container_client = get_container_client()
-    container_client.managed_environments_storages.create_or_update(
-        resource_group_name=settings.AZURE_RESOURCE_GROUP,
-        environment_name=env_name,
-        storage_name=storage_name,
-        storage_envelope=ManagedEnvironmentStorage(
-            properties=ManagedEnvironmentStorageProperties(
-                azure_file=AzureFileProperties(
-                    account_name=account_name,
-                    account_key=account_key,
-                    access_mode="ReadWrite",
-                    share_name=storage_name,
+    def register(account_key):
+        container_client = get_container_client()
+        container_client.managed_environments_storages.create_or_update(
+            resource_group_name=settings.AZURE_RESOURCE_GROUP,
+            environment_name=env_name,
+            storage_name=storage_name,
+            storage_envelope=ManagedEnvironmentStorage(
+                properties=ManagedEnvironmentStorageProperties(
+                    azure_file=AzureFileProperties(
+                        account_name=account_name,
+                        account_key=account_key,
+                        access_mode="ReadWrite",
+                        share_name=storage_name,
+                    ),
                 ),
             ),
-        ),
-    )
+        )
+
+    run_with_key(tenant_id, register)
+
     logger.info("Registered environment storage %s for tenant %s", storage_name, tenant_id)
 
 
@@ -1338,6 +1530,34 @@ def create_container_app(
                             # and causes intermittent CIAO ANNOUNCEMENT CANCELLED
                             # crashes on startup.
                             {"name": "OPENCLAW_DISABLE_BONJOUR", "value": "1"},
+                            # OpenClaw 2026.9.4 relocated ALL runtime state (the
+                            # state/flows/tasks/plugin-state SQLite DBs, locks,
+                            # caches, tmp) under resolveStateDir(), and now reads
+                            # those SQLite files through a read-only snapshot
+                            # *worker* subprocess. That snapshot/read fails on the
+                            # Azure Files (SMB) share — "SQLite read-only worker
+                            # returned invalid JSON" → the gateway refuses to boot
+                            # (confirmed 2026-09-16 on the demo-tenant canary). The
+                            # default stateDir is $HOME/.openclaw, i.e. the share.
+                            # Fix: point stateDir at a local EmptyDir (``oc-state``
+                            # volume below) so every SQLite lands off SMB, and PIN
+                            # config + workspace back to the share EXPLICITLY —
+                            # moving stateDir alone silently drags the workspace
+                            # (AGENTS.md/SOUL.md/IDENTITY.md/memory) onto ephemeral
+                            # disk (9.4 workspace default is $stateDir/workspace
+                            # unless OPENCLAW_WORKSPACE_DIR is set; OPENCLAW_CONFIG_PATH
+                            # wins unconditionally). XDG_CACHE_HOME keeps the
+                            # snapshot staging root on the same local mount instead
+                            # of a HOME-derived path. All four are identical across
+                            # tenants, so they live in this static list (not
+                            # workspace_env). NOTE: like NODE_OPTIONS above, changes
+                            # here only reach NEWLY provisioned tenants — existing
+                            # tenants need the one-shot ``ensure_oc_state_dir_mount``
+                            # retrofit (env vars + volume + mount).
+                            {"name": "OPENCLAW_STATE_DIR", "value": "/home/node/oc-state"},
+                            {"name": "OPENCLAW_CONFIG_PATH", "value": "/home/node/.openclaw/openclaw.json"},
+                            {"name": "OPENCLAW_WORKSPACE_DIR", "value": "/home/node/.openclaw/workspace"},
+                            {"name": "XDG_CACHE_HOME", "value": "/home/node/oc-state/cache"},
                             *[{"name": k, "value": v} for k, v in (workspace_env or {}).items()],
                         ],
                         "volumeMounts": [
@@ -1368,6 +1588,19 @@ def create_container_app(
                                 "volumeName": "index-cache",
                                 "mountPath": "/home/node/.openclaw/index",
                             },
+                            # OpenClaw 2026.9.4 state tree (all SQLite + locks +
+                            # caches) — kept OFF the SMB share on local ephemeral
+                            # storage via OPENCLAW_STATE_DIR (see the env block
+                            # above). 9.4's read-only SQLite snapshot worker can't
+                            # operate on SMB, so the gateway won't boot with state
+                            # on the share. Wiped on restart, which is fine: the
+                            # durable truth (config + workspace/memory) stays on
+                            # the share, crons re-seed from Postgres, transcripts
+                            # live in Postgres.
+                            {
+                                "volumeName": "oc-state",
+                                "mountPath": "/home/node/oc-state",
+                            },
                         ],
                     },
                 ],
@@ -1376,6 +1609,10 @@ def create_container_app(
                         "name": "workspace",
                         "storageType": "AzureFile",
                         "storageName": f"ws-{str(tenant_id)[:20]}",
+                        # Mount the share owned by node at 0o700 so OpenClaw
+                        # 2026.9.4's fs-safe directory-mode verification passes
+                        # (see _WORKSPACE_MOUNT_OPTIONS).
+                        "mountOptions": _WORKSPACE_MOUNT_OPTIONS,
                     },
                     {
                         "name": "sessions-scratch",
@@ -1387,6 +1624,10 @@ def create_container_app(
                     },
                     {
                         "name": "index-cache",
+                        "storageType": "EmptyDir",
+                    },
+                    {
+                        "name": "oc-state",
                         "storageType": "EmptyDir",
                     },
                 ],
@@ -1729,6 +1970,120 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
     )
 
 
+def site_editor_kv_secret_name(tenant: Any) -> str:
+    """Return the canonical Key Vault secret name for a tenant's site token."""
+    if not tenant.key_vault_prefix:
+        raise ValueError(f"Tenant {tenant.id} has no key_vault_prefix")
+    return f"{tenant.key_vault_prefix}-github-site-token"
+
+
+def ensure_site_editor_secret(tenant: Any, *, enabled: bool, force_revision: bool = False) -> bool:
+    """Reconcile the Kiho site-editor Key Vault reference and env binding.
+
+    A changed template creates a new Container Apps revision. Callers that
+    just wrote a new value at the same Key Vault name may pass
+    ``force_revision=True`` to activate that rotation even when the binding
+    shape is already correct. The token value never enters this function.
+
+    Returns ``True`` only when a new revision was persisted.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Reconciled site-editor secret for tenant=%s enabled=%s", tenant.id, enabled)
+        return False
+
+    if not tenant.container_id:
+        raise ValueError(f"Tenant {tenant.id} has no container_id")
+    if enabled and not tenant.managed_identity_id:
+        raise ValueError(f"Tenant {tenant.id} has no managed_identity_id")
+
+    client = get_container_client()
+    app = client.container_apps.get(settings.AZURE_RESOURCE_GROUP, tenant.container_id)
+    openclaw = next((container for container in app.template.containers if container.name == "openclaw"), None)
+    if openclaw is None:
+        raise ValueError(f"Container {tenant.container_id} has no openclaw container")
+
+    secret_name = "github-site-token"
+    env_name = "NBHD_SITE_GITHUB_TOKEN"
+    kv_secret_name = site_editor_kv_secret_name(tenant) if enabled else ""
+
+    def field(entry: Any, *names: str) -> Any:
+        for name in names:
+            if isinstance(entry, dict) and name in entry:
+                return entry[name]
+            value = getattr(entry, name, None)
+            if value is not None:
+                return value
+        return None
+
+    secrets = list(app.configuration.secrets or [])
+    existing_secret = next((entry for entry in secrets if _entry_name(entry) == secret_name), None)
+    env_list = list(openclaw.env or [])
+    existing_env = next((entry for entry in env_list if _entry_name(entry) == env_name), None)
+    changed = False
+
+    if enabled:
+        desired_secret = _build_container_secret(
+            secret_name,
+            plain_value="",
+            key_vault_secret_name=kv_secret_name,
+            identity_id=tenant.managed_identity_id,
+        )
+
+        def desired_field_matches(key: str, value: Any) -> bool:
+            actual = field(existing_secret, key, {"keyVaultUrl": "key_vault_url"}.get(key, key))
+            if key in ("identity", "keyVaultUrl"):
+                return str(actual).lower() == str(value).lower()
+            return actual == value
+
+        secret_matches = existing_secret is not None and all(
+            desired_field_matches(key, value) for key, value in desired_secret.items()
+        )
+        if not secret_matches:
+            app.configuration.secrets = [entry for entry in secrets if _entry_name(entry) != secret_name] + [
+                desired_secret
+            ]
+            changed = True
+        env_matches = (
+            existing_env is not None
+            and field(existing_env, "secretRef", "secret_ref") == secret_name
+            and field(existing_env, "value") in (None, "")
+        )
+        if not env_matches:
+            openclaw.env = [entry for entry in env_list if _entry_name(entry) != env_name] + [
+                {"name": env_name, "secretRef": secret_name}
+            ]
+            changed = True
+    else:
+        filtered_secrets = [entry for entry in secrets if _entry_name(entry) != secret_name]
+        filtered_env = [entry for entry in env_list if _entry_name(entry) != env_name]
+        if len(filtered_secrets) != len(secrets):
+            app.configuration.secrets = filtered_secrets
+            changed = True
+        if len(filtered_env) != len(env_list):
+            openclaw.env = filtered_env
+            changed = True
+
+    if not changed and not force_revision:
+        return False
+
+    import hashlib
+    import time
+
+    app.template.revision_suffix = f"s{hashlib.sha256(f'site-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        tenant.container_id,
+        app,
+    ).result()
+    logger.info(
+        "Reconciled site-editor secret for tenant=%s container=%s enabled=%s",
+        tenant.id,
+        tenant.container_id,
+        enabled,
+    )
+    return True
+
+
 _PLUGIN_RUNTIME_DEPS_VOLUME = "plugin-runtime-deps"
 _PLUGIN_RUNTIME_DEPS_PATH = "/home/node/.openclaw/plugin-runtime-deps"
 
@@ -1738,6 +2093,36 @@ _PLUGIN_RUNTIME_DEPS_PATH = "/home/node/.openclaw/plugin-runtime-deps"
 # in config_generator for the corresponding openclaw.json shape.
 _INDEX_CACHE_VOLUME = "index-cache"
 _INDEX_CACHE_PATH = "/home/node/.openclaw/index"
+
+# OpenClaw 2026.9.4 runtime-state tree (all SQLite + locks + caches). 9.4 reads
+# its state SQLite via a read-only snapshot worker that fails on the SMB share
+# ("SQLite read-only worker returned invalid JSON" → gateway won't boot). Keep
+# the whole stateDir on local ephemeral storage via OPENCLAW_STATE_DIR, and pin
+# config + workspace back to the share so the user's memory is NOT dragged onto
+# ephemeral disk. Kept in sync with the static env + volume block in the
+# provisioning template above. Mirror any change in both places.
+_OC_STATE_VOLUME = "oc-state"
+_OC_STATE_PATH = "/home/node/oc-state"
+_OC_STATE_ENV = {
+    "OPENCLAW_STATE_DIR": "/home/node/oc-state",
+    "OPENCLAW_CONFIG_PATH": "/home/node/.openclaw/openclaw.json",
+    "OPENCLAW_WORKSPACE_DIR": "/home/node/.openclaw/workspace",
+    "XDG_CACHE_HOME": "/home/node/oc-state/cache",
+}
+
+# OpenClaw 2026.9.4's fs-safe layer verifies that directories it touches are
+# owned by the node user (uid 1000) and carry mode 0o700, and throws
+# "FsSafeError: directory final mode could not be verified" otherwise. By
+# default the AzureFile (SMB) share mounts ROOT-owned at 0o755, so even the
+# share ROOT (parent of openclaw.json / its lock) fails the check and the
+# node user cannot chmod it (EPERM). umask 077 only fixes dirs we create, not
+# the mount root. These CIFS mount options mount the share owned by node at
+# 0o700 dirs / 0o600 files so fs-safe passes without any chmod. nobrl (SMB has
+# no byte-range locks), mfsymlinks (symlink emulation), cache=none + serverino
+# for lock-file consistency. Django writes the share via the Files REST API,
+# unaffected by these mount-time options.
+_WORKSPACE_VOLUME = "workspace"
+_WORKSPACE_MOUNT_OPTIONS = "uid=1000,gid=1000,dir_mode=0700,file_mode=0600,mfsymlinks,nobrl,cache=none,serverino"
 
 
 def _ensure_empty_dir_mount_in_template(app, volume_name: str, mount_path: str) -> bool:
@@ -1790,6 +2175,92 @@ def _ensure_index_cache_in_template(app) -> bool:
     index-cache EmptyDir mount on the openclaw container.
     """
     return _ensure_empty_dir_mount_in_template(app, _INDEX_CACHE_VOLUME, _INDEX_CACHE_PATH)
+
+
+def _ensure_container_env_in_template(app, env: dict[str, str]) -> bool:
+    """Upsert env vars onto the ``openclaw`` container in a template, in place.
+
+    Idempotent — returns True if any value was added or changed, False if
+    every requested name already had the requested value. Existing env vars
+    not in ``env`` are left untouched. Caller persists the change.
+    """
+    from azure.mgmt.appcontainers.models import EnvironmentVar
+
+    modified = False
+    for container in app.template.containers:
+        if container.name != "openclaw":
+            continue
+        current = list(container.env or [])
+        by_name = {e.name: e for e in current}
+        for name, value in env.items():
+            existing = by_name.get(name)
+            if existing is None:
+                current.append(EnvironmentVar(name=name, value=value))
+                modified = True
+            elif existing.value != value:
+                existing.value = value
+                modified = True
+        container.env = current
+        break
+    return modified
+
+
+def _ensure_workspace_mount_options_in_template(app) -> bool:
+    """Set the node-owned 0o700 CIFS mount options on the ``workspace``
+    AzureFile volume so OpenClaw 2026.9.4's fs-safe directory-mode check
+    passes. Idempotent; returns True if changed.
+    """
+    modified = False
+    for volume in app.template.volumes or []:
+        if volume.name == _WORKSPACE_VOLUME and getattr(volume, "storage_type", None) == "AzureFile":
+            if getattr(volume, "mount_options", None) != _WORKSPACE_MOUNT_OPTIONS:
+                volume.mount_options = _WORKSPACE_MOUNT_OPTIONS
+                modified = True
+            break
+    return modified
+
+
+def _ensure_oc_state_dir_in_template(app) -> bool:
+    """Mutate a Container App template in place for the OpenClaw 2026.9.4
+    storage readiness: the node-owned workspace mount options, the ``oc-state``
+    EmptyDir volume + mount, AND the four env vars that point stateDir at it
+    while pinning config + workspace to the share. Returns True if anything
+    changed.
+    """
+    opts_changed = _ensure_workspace_mount_options_in_template(app)
+    mount_changed = _ensure_empty_dir_mount_in_template(app, _OC_STATE_VOLUME, _OC_STATE_PATH)
+    env_changed = _ensure_container_env_in_template(app, _OC_STATE_ENV)
+    return opts_changed or mount_changed or env_changed
+
+
+def ensure_oc_state_dir_mount(container_name: str) -> bool:
+    """Idempotently retrofit the OpenClaw 2026.9.4 state relocation onto an
+    existing Container App (env vars + ``oc-state`` EmptyDir volume + mount).
+
+    New tenants get this from the provisioning template; existing tenants
+    (env vars are NOT rewritten by image/config bumps) need this one-shot.
+    Returns True if a new revision was created, False if already present.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Ensured oc-state dir mount + env on %s", container_name)
+        return False
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    if not _ensure_oc_state_dir_in_template(app):
+        return False
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Retrofitted oc-state dir mount + env onto %s", container_name)
+    return True
 
 
 def _ensure_gateway_readiness_probe_in_template(app) -> None:
@@ -1858,15 +2329,37 @@ def ensure_plugin_runtime_deps_mount(container_name: str) -> bool:
     return True
 
 
-def update_container_image(container_name: str, image: str) -> None:
+def _image_revision_tag_part(image: str) -> str:
+    """Return the stable, compact revision-suffix part for an image tag."""
+    import hashlib
+
+    tag = image.rsplit(":", 1)[-1] if ":" in image else "latest"
+    return f"u{hashlib.sha256(tag.encode()).hexdigest()[:6]}"
+
+
+def _new_image_revision_suffix(image: str) -> str:
+    """Return a compact image revision suffix with a per-attempt nonce."""
+    import hashlib
+    import time
+
+    nonce = hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:4]
+    return f"{_image_revision_tag_part(image)}-{nonce}"
+
+
+def update_container_image(
+    container_name: str,
+    image: str,
+    *,
+    revision_suffix: str | None = None,
+    operation_timeout: int | None = None,
+    retrofit_storage: bool = False,
+) -> None:
     """Update the container image of an existing Container App.
 
     This triggers a new revision, effectively restarting the container.
     Also ensures the EmptyDir mounts and gateway readiness probe are present
     so fleet image bumps roll out the template fixes in the same revision.
     """
-    import hashlib
-
     if _is_mock():
         logger.info("[MOCK] Updated image to %s on %s", image, container_name)
         return
@@ -1885,20 +2378,27 @@ def update_container_image(container_name: str, image: str) -> None:
     _ensure_plugin_runtime_deps_in_template(app)
     _ensure_index_cache_in_template(app)
     _ensure_gateway_readiness_probe_in_template(app)
+    # Explicit migration only; ordinary image updates preserve main behavior.
+    if retrofit_storage:
+        _ensure_oc_state_dir_in_template(app)
 
-    # Generate a unique revision suffix from the image tag to avoid
-    # "revision with suffix already exists" errors.
-    # Azure limits suffix to 64 chars and requires lowercase alphanumeric + hyphens.
-    tag = image.rsplit(":", 1)[-1] if ":" in image else "latest"
-    suffix = hashlib.sha256(tag.encode()).hexdigest()[:6]
-    app.template.revision_suffix = f"u{suffix}"
+    # Keep the stable tag-derived part for image comparisons, but mint a
+    # per-attempt nonce so applying the same tag still creates a new revision.
+    # The 12-character result stays well below Azure's 64-character limit and
+    # contains only lowercase alphanumerics and a hyphen.
+    suffix = revision_suffix or _new_image_revision_suffix(image)
+    app.template.revision_suffix = suffix
 
-    client.container_apps.begin_create_or_update(
+    poller = client.container_apps.begin_create_or_update(
         settings.AZURE_RESOURCE_GROUP,
         container_name,
         app,
-    ).result()
-    logger.info("Updated image to %s on %s (revision suffix: u%s)", image, container_name, suffix)
+    )
+    if operation_timeout is None:
+        poller.result()
+    else:
+        poller.result(timeout=operation_timeout)
+    logger.info("Updated image to %s on %s (revision suffix: %s)", image, container_name, suffix)
 
 
 def scale_container_app(container_name: str, *, min_replicas: int, max_replicas: int) -> None:

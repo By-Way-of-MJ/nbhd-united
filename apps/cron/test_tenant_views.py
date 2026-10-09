@@ -1333,7 +1333,12 @@ class RegenerateTenantCronsTest(TestCase):
         self.user, self.tenant = _create_user_and_tenant()
         self.tenant.postgres_cron_canonical = True
         self.tenant.container_fqdn = "oc-test.example.com"
-        self.tenant.save(update_fields=["postgres_cron_canonical", "container_fqdn"])
+        # This suite exercises the 2026.5.28 gateway reconcile path (cron.add/
+        # list/remove, caps, at-reaping). 2026.9.4 tenants take the signed-file
+        # path instead (apps/cron/share_cron_sync.py, tested in
+        # test_share_cron_sync.py), so pin the version — the default is 2026.9.4.
+        self.tenant.openclaw_version = "2026.5.28"
+        self.tenant.save(update_fields=["postgres_cron_canonical", "container_fqdn", "openclaw_version"])
 
     def test_skips_when_flag_off(self):
         from apps.orchestrator.cron_reconcile import regenerate_tenant_crons
@@ -1429,7 +1434,7 @@ class RegenerateTenantCronsTest(TestCase):
 
         # No CronJob rows = empty desired. Container has one job that we
         # consider managed (no underscore prefix).
-        mock_invoke.side_effect = lambda tenant, tool, args: (
+        mock_invoke.side_effect = lambda tenant, tool, args, **kwargs: (
             {"details": {"jobs": [{"name": "Old Task", "id": "j1"}]}} if tool == "cron.list" else None
         )
         result = regenerate_tenant_crons(self.tenant)
@@ -1503,7 +1508,7 @@ class RegenerateTenantCronsTest(TestCase):
         stale_ms = int(time.time() * 1000) - 2 * 60 * 60 * 1000  # 2h ago
         calls: list[tuple[str, dict]] = []
 
-        def _stub(tenant, tool, args):
+        def _stub(tenant, tool, args, **kwargs):
             calls.append((tool, args))
             if tool == "cron.list":
                 return {
@@ -1643,7 +1648,7 @@ class RegenerateTenantCronsTest(TestCase):
         ]
         remove_calls: list[str] = []
 
-        def _stub(tenant, tool, args):
+        def _stub(tenant, tool, args, **kwargs):
             if tool == "cron.list":
                 return {"details": {"jobs": jobs}}
             if tool == "cron.remove":
@@ -1791,3 +1796,108 @@ class RuntimeContainerStartedTest(TestCase):
     def test_hook_unauthorized(self):
         resp = self.client.post(f"/api/cron/runtime/{self.tenant.id}/container-started/")
         self.assertEqual(resp.status_code, 401)
+
+    def _boot(self, body=None):
+        url = f"/api/cron/runtime/{self.tenant.id}/container-started/"
+        with patch("apps.orchestrator.cron_reconcile.regenerate_tenant_crons", return_value={}):
+            if body is None:
+                return self.client.post(url, **self.headers)
+            return self.client.post(url, body, format="json", **self.headers)
+
+    def _projects_tenant(self, image_tag="2026.9.4-aaaaaaa"):
+        self.tenant.neighborhood_enabled = True
+        self.tenant.container_image_tag = image_tag
+        self.tenant.save(update_fields=["neighborhood_enabled", "container_image_tag"])
+
+    @patch("apps.cron.publish.publish_task")
+    def test_plugin_report_turns_project_tools_on_and_refreshes_config(self, mock_publish):
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        pending = self.tenant.pending_config_version
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertFalse(project_tools_ready(self.tenant))
+            resp = self._boot({"plugins": ["nbhd-journal-tools", "nbhd-project-tools"]})
+            self.assertEqual(resp.status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugin_ids, ["nbhd-journal-tools", "nbhd-project-tools"])
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+        self.assertEqual(self.tenant.pending_config_version, pending + 1)
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+
+    @patch("apps.cron.publish.publish_task")
+    def test_image_without_a_report_never_gets_project_tools(self, mock_publish):
+        """Older images POST an empty body: the 2026-10-08 crash-loop case."""
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+        from apps.orchestrator.config_generator import generate_openclaw_config
+
+        self._projects_tenant()
+        pending = self.tenant.pending_config_version
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertEqual(self._boot().status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertFalse(project_tools_ready(self.tenant))
+            paths = generate_openclaw_config(self.tenant).get("plugins", {}).get("load", {}).get("paths", [])
+        self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", paths)
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        self.assertEqual(self.tenant.pending_config_version, pending)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_report_from_another_image_tag_is_not_trusted(self, mock_publish):
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self._boot({"plugins": ["nbhd-project-tools"]})
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+            # The tenant moves to another image: unknown until that image reports.
+            self.tenant.container_image_tag = "2026.9.4-bbbbbbb"
+            self.tenant.save(update_fields=["container_image_tag"])
+            self.assertFalse(project_tools_ready(self.tenant))
+            # An old image boots (no report) and stays without the tools.
+            mock_publish.reset_mock()
+            self._boot()
+            self.tenant.refresh_from_db()
+            self.assertFalse(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_outgoing_replica_hook_without_report_does_not_withdraw_tools(self, mock_publish):
+        """Image roll: the old revision's replica can fire its empty hook last."""
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self._boot({"plugins": ["nbhd-project-tools"]})
+            mock_publish.reset_mock()
+            pending = Tenant.objects.get(id=self.tenant.id).pending_config_version
+            self.assertEqual(self._boot().status_code, 200)
+            self.tenant.refresh_from_db()
+            self.assertTrue(project_tools_ready(self.tenant))
+        self.assertEqual(self.tenant.image_plugin_ids, ["nbhd-project-tools"])
+        self.assertEqual(self.tenant.pending_config_version, pending)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_malformed_plugin_report_is_ignored(self, mock_publish):
+        self._projects_tenant()
+        resp = self._boot({"plugins": ["../etc", 7, "NBHD-Project-Tools", {"a": 1}]})
+        self.assertEqual(resp.status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        self.assertEqual(self._boot({"plugins": "nbhd-project-tools"}).status_code, 200)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.image_plugin_ids, [])
+        mock_publish.assert_not_called()

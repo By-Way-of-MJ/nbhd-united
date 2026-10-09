@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.orchestrator.config_generator import (
     _CONTEXTUAL_LOCATION_CONFIRM_ASK_BLOCK,
@@ -11,11 +11,14 @@ from apps.orchestrator.config_generator import (
     _HEARTBEAT_CONTEXTUAL_LOCATION_RULE,
     _MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK,
     _MORNING_BRIEFING_LEGACY_WEATHER_STEP,
-    _MORNING_BRIEFING_PROMPT_TEMPLATE,
+    _MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE,
+    _MORNING_BRIEFING_TOOL_WEATHER_SECTION,
+    _MORNING_BRIEFING_TOOL_WEATHER_STEP,
     _MORNING_BRIEFING_WEATHER_STEP,
     _build_evening_checkin_prompt,
     _build_heartbeat_checkin_prompt,
     _build_morning_briefing_prompt,
+    _render_morning_briefing_template,
     _with_morning_briefing_away_tour_pill,
     build_cron_seed_jobs,
 )
@@ -135,7 +138,7 @@ class ContextualLocationPromptEmissionTest(TestCase):
                 weather_step = _MORNING_BRIEFING_WEATHER_STEP.format(location="UTC")
 
                 prompt = _build_morning_briefing_prompt(self.tenant)
-                expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=weather_step)
+                expected = _render_morning_briefing_template(weather_step=weather_step, tool_weather=False)
 
                 self.assertEqual(prompt.encode(), expected.encode())
                 self.assertNotIn(_MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK, prompt)
@@ -145,7 +148,7 @@ class ContextualLocationPromptEmissionTest(TestCase):
         self._set_tour(enabled=False)
         tour_off_prompt = _build_morning_briefing_prompt(self.tenant)
         weather_step = _MORNING_BRIEFING_LEGACY_WEATHER_STEP.format(location="UTC")
-        expected = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=weather_step)
+        expected = _render_morning_briefing_template(weather_step=weather_step, tool_weather=False)
 
         self._set_tour(enabled=True, readiness_field="places_search_manifest_ok")
         tour_on_prompt = _build_morning_briefing_prompt(self.tenant)
@@ -198,3 +201,71 @@ class ContextualLocationPromptEmissionTest(TestCase):
             "No sensors/third-party/guesses",
         ):
             self.assertIn(required, block)
+
+
+_PINNED_MORNING_BRIEFING_TOOL_WEATHER_STEP = (
+    "1. Weather: call `nbhd_weather_briefing` ONCE (no arguments). It reads the user's "
+    "location itself (fresh Current location, else the profile), fetches the forecast, "
+    "and already writes the daily note's weather section. Keep its `message_line` for "
+    "step 11. If the tool is not available in this session, treat the weather as "
+    "unavailable. NEVER use web_search, web_fetch, curl, or exec for weather, and never "
+    "describe weather from memory or from any other source.\n"
+)
+
+
+class BriefingWeatherToolLaneTest(TestCase):
+    """BRIEFING_WEATHER_TOOL_TENANT_IDS swaps the whole weather lane, per tenant."""
+
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Briefing Weather Lane",
+            telegram_chat_id=86120002,
+        )
+        self.tenant.user.location_city = "Osaka"
+        self.tenant.user.save()
+
+    def _set_flag(self, enabled: bool) -> None:
+        self.tenant.situational_context_enabled = enabled
+        self.tenant.save(update_fields=["situational_context_enabled"])
+
+    def test_gated_prompt_is_the_tool_lane_in_both_situational_lanes(self):
+        expected = _render_morning_briefing_template(
+            weather_step=_MORNING_BRIEFING_TOOL_WEATHER_STEP, tool_weather=True
+        )
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=str(self.tenant.id)):
+            for enabled in (False, True):
+                with self.subTest(situational_context_enabled=enabled):
+                    self._set_flag(enabled)
+                    prompt = _build_morning_briefing_prompt(self.tenant)
+                    self.assertEqual(prompt.encode(), expected.encode())
+                    self.assertIn(_MORNING_BRIEFING_TOOL_WEATHER_SECTION, prompt)
+                    self.assertIn(_MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE, prompt)
+                    self.assertNotIn("web_search is the only weather tool", prompt)
+                    self.assertNotIn("Search results vary in structure", prompt)
+                    self.assertNotIn("SNAPSHOT home base", prompt)
+                    self.assertNotIn("Osaka", prompt)
+
+    def test_ungated_prompt_keeps_the_search_lane(self):
+        for enabled, step in ((True, _MORNING_BRIEFING_WEATHER_STEP), (False, _MORNING_BRIEFING_LEGACY_WEATHER_STEP)):
+            with (
+                self.subTest(situational_context_enabled=enabled),
+                override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=""),
+            ):
+                self._set_flag(enabled)
+                prompt = _build_morning_briefing_prompt(self.tenant)
+                self.assertIn(step.format(location="Osaka"), prompt)
+                self.assertNotIn("nbhd_weather_briefing", prompt)
+                self.assertIn("never describe weather you didn't get", prompt)
+
+    def test_wildcard_opens_every_tenant_and_other_ids_do_not(self):
+        other = create_tenant(display_name="Other", telegram_chat_id=86120003)
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS="*"):
+            self.assertIn("nbhd_weather_briefing", _build_morning_briefing_prompt(other))
+        with override_settings(BRIEFING_WEATHER_TOOL_TENANT_IDS=str(self.tenant.id)):
+            self.assertNotIn("nbhd_weather_briefing", _build_morning_briefing_prompt(other))
+
+    def test_tool_weather_step_is_byte_pinned(self):
+        self.assertEqual(
+            _MORNING_BRIEFING_TOOL_WEATHER_STEP.encode(),
+            _PINNED_MORNING_BRIEFING_TOOL_WEATHER_STEP.encode(),
+        )

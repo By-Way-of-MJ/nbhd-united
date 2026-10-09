@@ -320,3 +320,70 @@ class CreditLedger(models.Model):
 
     def __str__(self) -> str:
         return f"{self.kind} {self.amount} ({self.tenant_id})"
+
+
+class AppStoreSubscription(models.Model):
+    """One Apple auto-renewable subscription (keyed on Apple's original transaction
+    id). Apple's status is the source of truth: every notification or app sync only
+    TRIGGERS a refresh from the App Store Server API (``apple_iap.refresh``), so
+    late or out-of-order messages can't flip it the wrong way. ``tenant`` is null
+    while a purchase can't yet be bound to an NBHD account (e.g. made outside the
+    app with no ``appAccountToken``)."""
+
+    class Status(models.TextChoices):
+        ACTIVE = "active", "Active"
+        GRACE = "grace", "In billing grace period"
+        BILLING_RETRY = "billing_retry", "Billing retry (not entitled)"
+        EXPIRED = "expired", "Expired"
+        REVOKED = "revoked", "Revoked"
+        UNKNOWN = "unknown", "Unknown"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(
+        Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="app_store_subscriptions"
+    )
+    original_transaction_id = models.CharField(max_length=64, unique=True)
+    product_id = models.CharField(max_length=128, blank=True, default="")
+    environment = models.CharField(max_length=16, blank=True, default="")  # Production | Sandbox
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.UNKNOWN)
+    # Denormalised "does this grant the plan right now": status active/grace AND
+    # (Production, or a Sandbox purchase by an allow-listed user). Recomputed on every
+    # refresh; the entitlement queries read only this.
+    entitles = models.BooleanField(default=False, db_default=False)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    auto_renew = models.BooleanField(null=True, blank=True)
+    app_account_token = models.UUIDField(null=True, blank=True)
+    # Newest Apple-signed date applied; anything older changes nothing.
+    signed_date = models.DateTimeField(null=True, blank=True)
+    bound_at = models.DateTimeField(null=True, blank=True)
+    last_status_payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "app_store_subscriptions"
+        indexes = [models.Index(fields=["tenant", "entitles"])]
+
+    def __str__(self) -> str:
+        return f"appstore:{self.original_transaction_id} {self.environment} {self.status}"
+
+
+class AppStoreNotification(models.Model):
+    """Ledger of App Store Server Notifications (V2): idempotency on Apple's
+    ``notificationUUID`` and an audit trail. Only signature-verified payloads land."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    notification_uuid = models.CharField(max_length=64, unique=True)
+    notification_type = models.CharField(max_length=48)
+    subtype = models.CharField(max_length=48, blank=True, default="")
+    environment = models.CharField(max_length=16, blank=True, default="")
+    original_transaction_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    signed_date = models.DateTimeField(null=True, blank=True)
+    outcome = models.CharField(max_length=32, blank=True, default="")
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "app_store_notifications"
+
+    def __str__(self) -> str:
+        return f"{self.notification_type}/{self.subtype} {self.notification_uuid}"

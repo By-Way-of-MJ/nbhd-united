@@ -7,6 +7,7 @@ import { ConfirmDialog } from "@/components/journal/confirm-dialog";
 import { IconMore } from "@/components/icons/constellation";
 import { SectionCard } from "@/components/section-card";
 import { Skeleton, SectionCardSkeleton } from "@/components/skeleton";
+import { NeighborhoodPage } from "@/components/neighborhood/neighborhood-page";
 import { StatusPill } from "@/components/status-pill";
 import { emitToast } from "@/components/toast";
 import { fetchCircleSharePreview, fetchSharePreview } from "@/lib/api";
@@ -47,6 +48,7 @@ import {
   useSendMessageMutation,
   useSendWaveMutation,
   useShareLessonMutation,
+  useTenantQuery,
   useThreadMessagesQuery,
   useThreadsQuery,
   useUnfriendMutation,
@@ -85,6 +87,12 @@ function avatarStyle(hue: number): CSSProperties {
 }
 
 export default function FriendsPage() {
+  const { data: tenant } = useTenantQuery();
+  return tenant?.web_redesign ? <NeighborhoodPage /> : <LegacyFriendsPage />;
+}
+
+// The pre-redesign Neighborhood, unchanged for tenants without web_redesign.
+function LegacyFriendsPage() {
   const { data, isLoading } = useNeighborhoodQuery();
   const { data: pendingShares = [] } = usePendingSharesQuery();
   const { data: threads = [], isLoading: threadsLoading } = useThreadsQuery();
@@ -93,6 +101,8 @@ export default function FriendsPage() {
   const blockMutation = useBlockWaveMutation();
   const unfriendMutation = useUnfriendMutation();
   const openThreadMutation = useOpenThreadMutation();
+  const { data: tenant } = useTenantQuery();
+  const openSky = !!tenant?.web_redesign;
 
   const [confirmTarget, setConfirmTarget] = useState<Neighbor | null>(null);
   const [reviewingShare, setReviewingShare] = useState<PendingShare | null>(null);
@@ -145,7 +155,7 @@ export default function FriendsPage() {
   return (
     <div className="mx-auto pb-24">
       {/* ── Hero ── */}
-      <header className="mb-8 sm:mb-10">
+      <header data-os-legacy-title className="mb-8 sm:mb-10">
         <span className="mb-2 block text-[10px] font-bold uppercase tracking-[0.24em] text-signal sm:text-xs">
           Neighborhood
         </span>
@@ -160,7 +170,7 @@ export default function FriendsPage() {
         </p>
       </header>
 
-      <div className="space-y-6">
+      <div data-os-neighborhood className="space-y-6">
         {isLoading ? (
           <>
             <SectionCardSkeleton lines={2} />
@@ -174,6 +184,8 @@ export default function FriendsPage() {
                   {pendingShares.map((share) => (
                     <div
                       key={share.id}
+                      data-os-approval
+                      data-os-row
                       className="flex items-start gap-3 rounded-xl border border-border bg-surface/60 p-3"
                     >
                       <div className="min-w-0 flex-1">
@@ -197,7 +209,7 @@ export default function FriendsPage() {
 
             <MissionActionsCard delay={hasApprovals ? 80 : 0} />
 
-            {hasRequests && (
+            {hasRequests && !openSky && (
               <SectionCard
                 title="Requests"
                 subtitle="Waves waiting on a reply."
@@ -280,7 +292,7 @@ export default function FriendsPage() {
             <SectionCard
               title="Messages"
               subtitle={
-                threads.length > 0
+                threads.length > 0 && !openSky
                   ? `${threads.length} ${threads.length === 1 ? "conversation" : "conversations"}`
                   : undefined
               }
@@ -305,8 +317,8 @@ export default function FriendsPage() {
             </SectionCard>
 
             <SectionCard
-              title="Neighbors"
-              subtitle={`${neighbors.length} ${neighbors.length === 1 ? "neighbor" : "neighbors"}`}
+              title={openSky ? "Manage neighbors" : "Neighbors"}
+              subtitle={openSky ? undefined : `${neighbors.length} ${neighbors.length === 1 ? "neighbor" : "neighbors"}`}
               delay={(hasApprovals ? 80 : 0) + (hasRequests ? 80 : 0) + 80}
             >
               {neighbors.length === 0 ? (
@@ -337,11 +349,21 @@ export default function FriendsPage() {
               onCreateMission={() => setCreatingMission(true)}
             />
 
-            <CirclesCard
-              delay={(hasApprovals ? 80 : 0) + (hasRequests ? 80 : 0) + 160}
-              onOpenCircle={setOpenCircleId}
-              onCreateCircle={() => setCreatingCircle(true)}
-            />
+            {openSky ? (
+              <button
+                type="button"
+                onClick={() => setCreatingCircle(true)}
+                className="os-focus min-h-[40px] rounded-full border border-os-ring px-4 text-[0.8125rem] text-os-ink transition hover:border-os-accent-line hover:text-os-accent"
+              >
+                Start a circle
+              </button>
+            ) : (
+              <CirclesCard
+                delay={(hasApprovals ? 80 : 0) + (hasRequests ? 80 : 0) + 160}
+                onOpenCircle={setOpenCircleId}
+                onCreateCircle={() => setCreatingCircle(true)}
+              />
+            )}
             <JoinCircleForm />
 
             <ShareLessonCard />
@@ -408,8 +430,8 @@ function NeighborRow({
   onMessage: () => void;
 }) {
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-border bg-surface/60 p-3">
-      <span className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(neighbor.avatar_hue)} aria-hidden />
+    <div data-os-row className="flex items-center gap-3 rounded-xl border border-border bg-surface/60 p-3">
+      <span data-os-avatar data-initial={neighbor.display_name.slice(0, 1)} className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(neighbor.avatar_hue)} aria-hidden />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-ink">{neighbor.display_name}</p>
         <p className="truncate text-xs text-ink-faint">@{neighbor.handle}</p>
@@ -440,9 +462,9 @@ function ThreadRow({ thread, onOpen }: { thread: ChatThread; onOpen: () => void 
     <button
       type="button"
       onClick={onOpen}
-      className="flex min-h-[44px] w-full items-center gap-3 rounded-xl border border-border bg-surface/60 p-3 text-left transition hover:bg-surface-hover"
+      data-os-row className="flex min-h-[44px] w-full items-center gap-3 rounded-xl border border-border bg-surface/60 p-3 text-left transition hover:bg-surface-hover"
     >
-      <span className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(thread.avatar_hue)} aria-hidden />
+      <span data-os-avatar data-initial={thread.display_name.slice(0, 1)} className="h-9 w-9 shrink-0 rounded-full" style={avatarStyle(thread.avatar_hue)} aria-hidden />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
           <p className="truncate text-sm font-medium text-ink">{thread.display_name}</p>

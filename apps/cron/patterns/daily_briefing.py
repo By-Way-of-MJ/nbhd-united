@@ -31,6 +31,8 @@ from typing import Any
 from pydantic import Field, field_validator
 
 from apps.billing.constants import DEEPSEEK_FLASH_MODEL
+from apps.router.chat_gates import chat_panels_tool_enabled
+from apps.router.panels import MORNING_PANEL_INSTRUCTION
 
 from . import register_handler
 from .base import (
@@ -158,6 +160,9 @@ class DailyBriefingHandler(PatternHandler):
             "  - To mention today's calendar, you MUST call "
             f"{calendar_instruction} and quote event titles/times "
             "as returned. Do not paraphrase times.\n"
+            '  - Calendar entries are plans, even after their end time; never write "done", "banked", '
+            '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+            "for that activity, or the user confirms it.\n"
             "  - Every factual claim in the briefing must trace to a tool "
             "result from this turn. Anything you can't ground via a tool "
             "call, omit.\n"
@@ -169,6 +174,9 @@ class DailyBriefingHandler(PatternHandler):
             "literal marker `[block: daily_briefing]` so downstream tooling "
             "can identify the render type."
         )
+
+        if chat_panels_tool_enabled(tenant):
+            message += "\n\n" + MORNING_PANEL_INSTRUCTION
 
         return {
             "name": name,
@@ -199,6 +207,8 @@ class DailyBriefingHandler(PatternHandler):
         # execute it because the tools aren't in the allowlist.
         calendar_tool = calendar_read_tool_for_tenant(tenant)
         query_tools = [calendar_tool if tool == "nbhd_calendar_list_events" else tool for tool in _BRIEFING_QUERY_TOOLS]
+        if chat_panels_tool_enabled(tenant):
+            query_tools.append("nbhd_fuel_summary")
         return ["nbhd_send_to_user", *query_tools]
 
     def get_outbound_contract(

@@ -14,6 +14,7 @@ from apps.orchestrator.azure_client import (
     create_container_app,
     create_tenant_file_share,
     delete_workspace_file,
+    ensure_oc_state_dir_mount,
     ensure_plugin_runtime_deps_mount,
     register_environment_storage,
     store_tenant_internal_key_in_key_vault,
@@ -403,6 +404,7 @@ class CreateTenantFileShareTest(SimpleTestCase):
             create_tenant_file_share("tenant-abc")
 
 
+@override_settings(AZURE_STORAGE_KEY_CACHE_TENANT_IDS="")
 class RegisterEnvironmentStorageTest(SimpleTestCase):
     @patch("apps.orchestrator.azure_client._is_mock", return_value=True)
     def test_mock_mode_skips_azure_call(self, _mock_is_mock):
@@ -426,7 +428,7 @@ class RegisterEnvironmentStorageTest(SimpleTestCase):
         mock_storage_client = MagicMock()
         mock_get_storage_client.return_value = mock_storage_client
         mock_storage_client.storage_accounts.list_keys.return_value = SimpleNamespace(
-            keys=[SimpleNamespace(value="fake-key-123")],
+            keys=[SimpleNamespace(value="key1-unused"), SimpleNamespace(value="fake-key-123")],
         )
 
         mock_container_client = MagicMock()
@@ -546,6 +548,70 @@ class UpdateContainerImageTest(SimpleTestCase):
         )
         poller.result.assert_called_once()
 
+    @patch("time.time_ns", side_effect=[1, 2])
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_same_tag_updates_mint_distinct_valid_revision_suffixes(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+        _mock_time_ns,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = MagicMock(name="openclaw")
+        container.name = "openclaw"
+        app = MagicMock()
+        app.template.containers = [container]
+        mock_client.container_apps.get.return_value = app
+
+        revision_suffixes = []
+
+        def capture_suffix(_resource_group, _container_name, updated_app):
+            revision_suffixes.append(updated_app.template.revision_suffix)
+            return MagicMock()
+
+        mock_client.container_apps.begin_create_or_update.side_effect = capture_suffix
+        image = "nbhdunited.azurecr.io/nbhd-openclaw:abc123"
+
+        update_container_image("oc-tenant", image)
+        update_container_image("oc-tenant", image)
+
+        self.assertEqual(len(set(revision_suffixes)), 2)
+        tag_parts = {suffix.rsplit("-", 1)[0] for suffix in revision_suffixes}
+        self.assertEqual(len(tag_parts), 1)
+        for suffix in revision_suffixes:
+            self.assertRegex(suffix, r"^[a-z0-9]+-[a-z0-9]{4}$")
+
+    @patch("time.time_ns", return_value=1)
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_revision_suffix_is_valid_for_long_tag(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+        _mock_time_ns,
+    ):
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = MagicMock(name="openclaw")
+        container.name = "openclaw"
+        app = MagicMock()
+        app.template.containers = [container]
+        mock_client.container_apps.get.return_value = app
+
+        long_tag = "Release_2026.08.28-" + "A" * 120
+        update_container_image(
+            "oc-tenant",
+            f"nbhdunited.azurecr.io/nbhd-openclaw:{long_tag}",
+        )
+
+        suffix = app.template.revision_suffix
+        self.assertLessEqual(len(suffix), 64)
+        self.assertRegex(suffix, r"^[a-z0-9]+-[a-z0-9]{4}$")
+
 
 @override_settings(
     AZURE_LOCATION="westus2",
@@ -616,6 +682,29 @@ class PluginRuntimeDepsMountTest(SimpleTestCase):
             "/home/node/.openclaw/index",
         )
 
+        # oc-state EmptyDir — OpenClaw 2026.9.4 keeps its whole runtime-state
+        # tree (all SQLite) here, OFF the SMB share, or the gateway won't boot
+        # ("SQLite read-only worker returned invalid JSON").
+        self.assertIn("oc-state", volumes)
+        self.assertEqual(volumes["oc-state"]["storageType"], "EmptyDir")
+        self.assertIn("oc-state", mounts)
+        self.assertEqual(mounts["oc-state"]["mountPath"], "/home/node/oc-state")
+
+        # The workspace AzureFile share mounts node-owned at 0o700 so 9.4's
+        # fs-safe directory-mode verification passes on the share root.
+        self.assertIn("uid=1000", volumes["workspace"]["mountOptions"])
+        self.assertIn("dir_mode=0700", volumes["workspace"]["mountOptions"])
+
+        # The 9.4 state-relocation env: stateDir points at the local mount,
+        # while config + workspace are pinned BACK to the share (so the user's
+        # memory is not dragged onto ephemeral disk), and the SQLite snapshot
+        # staging root (XDG_CACHE_HOME) sits on the same local mount.
+        env_map = {e["name"]: e.get("value") for e in template["containers"][0]["env"]}
+        self.assertEqual(env_map["OPENCLAW_STATE_DIR"], "/home/node/oc-state")
+        self.assertEqual(env_map["OPENCLAW_CONFIG_PATH"], "/home/node/.openclaw/openclaw.json")
+        self.assertEqual(env_map["OPENCLAW_WORKSPACE_DIR"], "/home/node/.openclaw/workspace")
+        self.assertEqual(env_map["XDG_CACHE_HOME"], "/home/node/oc-state/cache")
+
     @override_settings(AZURE_RESOURCE_GROUP="rg-test")
     @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
     @patch("apps.orchestrator.azure_client.get_container_client")
@@ -667,6 +756,85 @@ class PluginRuntimeDepsMountTest(SimpleTestCase):
         added = ensure_plugin_runtime_deps_mount("oc-tenant")
 
         self.assertFalse(added)
+        mock_client.container_apps.begin_create_or_update.assert_not_called()
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_ensure_oc_state_retrofit_adds_env_volume_and_mount(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        """The 9.4 retrofit adds the oc-state EmptyDir volume + mount AND the
+        four relocation env vars, without clobbering existing env."""
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        existing_env = SimpleNamespace(name="OPENCLAW_DISABLE_BONJOUR", value="1")
+        container = SimpleNamespace(
+            name="openclaw",
+            volume_mounts=[SimpleNamespace(volume_name="workspace")],
+            env=[existing_env],
+        )
+        workspace_vol = SimpleNamespace(name="workspace", storage_type="AzureFile", mount_options=None)
+        app = MagicMock()
+        app.template.containers = [container]
+        app.template.volumes = [workspace_vol]
+        mock_client.container_apps.get.return_value = app
+        mock_client.container_apps.begin_create_or_update.return_value = MagicMock()
+
+        changed = ensure_oc_state_dir_mount("oc-tenant")
+
+        self.assertTrue(changed)
+        volume_names = {v.name for v in app.template.volumes}
+        self.assertIn("oc-state", volume_names)
+        mount_names = {m.volume_name for m in container.volume_mounts}
+        self.assertIn("oc-state", mount_names)
+        # Workspace share gets node-owned 0o700 mount options for 9.4 fs-safe.
+        self.assertIn("uid=1000", workspace_vol.mount_options)
+        self.assertIn("dir_mode=0700", workspace_vol.mount_options)
+
+        env_map = {e.name: e.value for e in container.env}
+        self.assertEqual(env_map["OPENCLAW_STATE_DIR"], "/home/node/oc-state")
+        self.assertEqual(env_map["OPENCLAW_CONFIG_PATH"], "/home/node/.openclaw/openclaw.json")
+        self.assertEqual(env_map["OPENCLAW_WORKSPACE_DIR"], "/home/node/.openclaw/workspace")
+        self.assertEqual(env_map["XDG_CACHE_HOME"], "/home/node/oc-state/cache")
+        # Pre-existing env preserved.
+        self.assertEqual(env_map["OPENCLAW_DISABLE_BONJOUR"], "1")
+        mock_client.container_apps.begin_create_or_update.assert_called_once()
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_ensure_oc_state_retrofit_is_idempotent(
+        self,
+        mock_get_container_client,
+        _mock_is_mock,
+    ):
+        """A container already carrying the mount + all four env values is a
+        no-op — no new revision."""
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = SimpleNamespace(
+            name="openclaw",
+            volume_mounts=[SimpleNamespace(volume_name="oc-state")],
+            env=[
+                SimpleNamespace(name="OPENCLAW_STATE_DIR", value="/home/node/oc-state"),
+                SimpleNamespace(name="OPENCLAW_CONFIG_PATH", value="/home/node/.openclaw/openclaw.json"),
+                SimpleNamespace(name="OPENCLAW_WORKSPACE_DIR", value="/home/node/.openclaw/workspace"),
+                SimpleNamespace(name="XDG_CACHE_HOME", value="/home/node/oc-state/cache"),
+            ],
+        )
+        app = MagicMock()
+        app.template.containers = [container]
+        app.template.volumes = [SimpleNamespace(name="oc-state")]
+        mock_client.container_apps.get.return_value = app
+
+        changed = ensure_oc_state_dir_mount("oc-tenant")
+
+        self.assertFalse(changed)
         mock_client.container_apps.begin_create_or_update.assert_not_called()
 
     @override_settings(AZURE_RESOURCE_GROUP="rg-test")
@@ -727,13 +895,17 @@ _VALID_UPLOAD_CONFIG_JSON = json.dumps(
     AZURE_RESOURCE_GROUP="rg-nbhd-prod",
     AZURE_STORAGE_ACCOUNT_NAME="stnbhdprod",
 )
+@override_settings(AZURE_STORAGE_KEY_CACHE_TENANT_IDS="")
 class DeleteWorkspaceFileTest(SimpleTestCase):
     @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
     @patch("apps.orchestrator.azure_client.get_storage_client")
     @patch("azure.storage.fileshare.ShareFileClient")
     def test_existing_workspace_file_is_deleted(self, mock_share_cls, mock_get_storage, _mock_is_mock):
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
 
         delete_workspace_file("148ccf1c-ef13-47f8-ada1-a98fa90e14a0", "workspace/rules/subagents.md")
@@ -750,7 +922,10 @@ class DeleteWorkspaceFileTest(SimpleTestCase):
         from azure.core.exceptions import ResourceNotFoundError
 
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
         file_client = mock_share_cls.return_value
         file_client.get_file_properties.side_effect = ResourceNotFoundError("missing")
@@ -764,6 +939,7 @@ class DeleteWorkspaceFileTest(SimpleTestCase):
     AZURE_RESOURCE_GROUP="rg-nbhd-prod",
     AZURE_STORAGE_ACCOUNT_NAME="stnbhdprod",
 )
+@override_settings(AZURE_STORAGE_KEY_CACHE_TENANT_IDS="")
 class UploadConfigToFileShareTest(SimpleTestCase):
     """Guard against the kwarg-leak class that corrupted canary on 2026-05-22.
 
@@ -785,7 +961,10 @@ class UploadConfigToFileShareTest(SimpleTestCase):
     @patch("azure.storage.fileshare.ShareFileClient")
     def test_upload_config_uses_direct_upload_file_with_length(self, mock_share_cls, mock_get_storage, _mock_is_mock):
         fake_storage = MagicMock()
-        fake_storage.storage_accounts.list_keys.return_value.keys = [MagicMock(value="k")]
+        fake_storage.storage_accounts.list_keys.return_value.keys = [
+            MagicMock(value="key1-unused"),
+            MagicMock(value="k"),
+        ]
         mock_get_storage.return_value = fake_storage
 
         upload_config_to_file_share(

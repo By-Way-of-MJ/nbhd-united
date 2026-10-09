@@ -230,12 +230,31 @@ class GenerateSmokeConfigCommandTests(TestCase):
         paths = config.get("plugins", {}).get("load", {}).get("paths", [])
         self.assertTrue(any("nbhd-friends-tools" in p for p in paths))
         self.assertIn("/opt/nbhd/plugins/nbhd-journal-shaping", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", paths)
         self.assertIn("/opt/nbhd/plugins/nbhd-document-keep", paths)
+        self.assertIn("/opt/nbhd/plugins/nbhd-site-editor", paths)
         entries = config.get("plugins", {}).get("entries", {})
         self.assertIn("nbhd-journal-shaping", entries)
         self.assertTrue(entries["nbhd-journal-shaping"]["config"]["journalShapingEnabled"])
         self.assertIn("nbhd-document-keep", entries)
         self.assertTrue(entries["nbhd-document-keep"]["config"]["documentIngestionEnabled"])
+        self.assertEqual(
+            entries["nbhd-site-editor"]["config"],
+            {
+                "owner": "smoke-owner",
+                "repo": "smoke-repo",
+                "branch": "main",
+                "allowPaths": ["web/src/pages/*.js", "web/public/index.html"],
+                "denyPaths": [".github/**"],
+                "maxTextBytes": 262144,
+                "maxImageBytes": 2097152,
+                "maxFiles": 20,
+                "maxTotalBytes": 5242880,
+                "deployMinutes": 6,
+                "authorEmail": "nbhd-site-editor@users.noreply.github.com",
+                "siteNotes": "Home page hero = web/public/hero.jpg.",
+            },
+        )
         self.assertEqual(
             entries["nbhd-subagent-bridge"]["hooks"],
             {"allowConversationAccess": True, "timeoutMs": 30000},
@@ -245,13 +264,15 @@ class GenerateSmokeConfigCommandTests(TestCase):
             "nbhd-routing-context",
             "nbhd-activity-stream",
             "nbhd-stream-progress",
+            # cron-enforcement's before_prompt_build records the cron runId->jobId
+            # for the origin stamp; 2026.9.4 blocks it without this policy.
+            "nbhd-cron-enforcement",
         ):
             with self.subTest(conversation_hook_plugin=plugin_id):
                 self.assertEqual(
                     entries[plugin_id]["hooks"],
                     {"allowConversationAccess": True, "timeoutMs": 30000},
                 )
-        self.assertNotIn("hooks", entries["nbhd-cron-enforcement"])
         self.assertEqual(entries["nbhd-usage-reporter"]["hooks"], {"allowConversationAccess": True})
         self.assertEqual(
             entries["nbhd-usage-reporter"]["config"],

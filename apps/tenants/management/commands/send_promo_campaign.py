@@ -222,7 +222,14 @@ class Command(BaseCommand):
         else:
             audience_qs = base.filter(
                 Q(tenant__status=Tenant.Status.ACTIVE, tenant__is_trial=True)
-                | Q(tenant__status=Tenant.Status.SUSPENDED, tenant__stripe_subscription_id="")
+                # never subscribed: no live Stripe id AND none that ended (ids are now
+                # cleared when a subscription ends) AND no App Store subscription
+                | Q(
+                    tenant__status=Tenant.Status.SUSPENDED,
+                    tenant__stripe_subscription_id="",
+                    tenant__stripe_subscription_ended_at__isnull=True,
+                    tenant__app_store_subscriptions__isnull=True,
+                )
             )
 
         if owner_email:

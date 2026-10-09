@@ -84,7 +84,7 @@ test("all cron-create tools forward origin and the OpenClaw tool-call id", async
     assert.deepEqual(body.origin, origin, name);
     assert.equal(result.details.json.id, `cron-${index}`, name);
     assert.match(result.content[0].text, new RegExp(`cron-${index}`), name);
-    assert.equal(Object.hasOwn(tool.parameters.properties, "_nbhd_origin"), false, name);
+    assert.equal(Object.hasOwn(tool.parameters.properties, "_nbhd_origin"), true, name);
   }
 });
 
@@ -147,5 +147,42 @@ test("409 request-id and name conflicts return clear, non-creation text", async 
     assert.match(result.content[0].text, expected);
     assert.match(result.content[0].text, /Nothing new was created/i);
     assert.equal(result.details.error, code);
+  }
+});
+
+
+test("list reminders uses tenant-authenticated GET with optional disabled rows", async () => {
+  const tool = registeredTools().get("nbhd_cron_list_reminders");
+  for (const includeDisabled of [false, true]) {
+    globalThis.fetch = async (url, options) => {
+      assert.equal(String(url), `https://automation.invalid/api/v1/integrations/runtime/tenant-test/crons/reminders/${includeDisabled ? "?include_disabled=true" : ""}`);
+      assert.equal(options.method, "GET");
+      assert.equal(options.body, undefined);
+      assert.equal(options.headers["X-NBHD-Tenant-Id"], "tenant-test");
+      assert.equal(options.headers["X-NBHD-Internal-Key"], "internal-test");
+      return new Response(JSON.stringify({ reminders: [{ id: 314, name: "Japanese class" }] }));
+    };
+    const result = await tool.execute("list", { include_disabled: includeDisabled });
+    assert.equal(result.details.json.reminders[0].id, 314);
+  }
+});
+
+test("cancel forwards reminder id and origin and returns the confirmed name", async () => {
+  globalThis.fetch = async (url, options) => {
+    assert.match(String(url), /\/crons\/cancel\/$/);
+    assert.equal(options.method, "POST");
+    assert.deepEqual(JSON.parse(options.body), { cron_id: 314, origin });
+    return new Response(JSON.stringify({ cancelled: true, name: "Japanese class", schedule: "Every Wednesday at 19:30 (Asia/Tokyo)" }));
+  };
+  const result = await registeredTools().get("nbhd_cron_cancel_reminder").execute("cancel", { cron_id: 314, _nbhd_origin: origin });
+  assert.equal(result.details.json.cancelled, true);
+  assert.match(result.content[0].text, /Japanese class/);
+});
+
+test("cancel never reports success for errors or unconfirmed responses", async () => {
+  const tool = registeredTools().get("nbhd_cron_cancel_reminder");
+  for (const status of [404, 409, 502, 200]) {
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: "not_cancelled" }), { status });
+    await assert.rejects(tool.execute("cancel", { cron_id: 314 }), /runtime error|not confirmed/);
   }
 });

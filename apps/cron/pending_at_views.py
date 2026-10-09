@@ -13,6 +13,7 @@ Scheduled Tasks card.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 
 from rest_framework import status
@@ -20,8 +21,11 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
+
 from .cache import is_container_unavailable_error, read_jobs_from_cache
 from .gateway_client import GatewayError, invoke_gateway_tool
+from .share_cron_sync import tenant_uses_file_cron_sync
 from .tenant_views import _get_tenant_for_user, _is_hidden_cron, _require_active_tenant
 
 logger = logging.getLogger(__name__)
@@ -90,6 +94,22 @@ def _extract_at_jobs(raw_jobs: list[dict]) -> list[dict]:
     return out
 
 
+def _pending_at_rows(tenant):
+    """Enabled ``kind:"at"`` CronJob rows, in the gateway job shape.
+
+    9.4 gates the gateway ``cron.list``; Postgres is the source of truth and
+    the signed ``nbhd-crons.json`` is built from these same rows, so this is
+    what the container is running (``share_cron_sync._desired_jobs``).
+    """
+    from apps.cron.models import CronJob
+    from apps.orchestrator.cron_reconcile import _row_to_cron_dict
+
+    return [
+        (row, _row_to_cron_dict(row))
+        for row in CronJob.objects.filter(tenant=tenant, enabled=True, data__schedule__kind="at").order_by("id")
+    ]
+
+
 class PendingAtCronView(APIView):
     """GET ``/api/v1/cron-jobs/pending-at/`` — list pending one-off reminders.
 
@@ -108,6 +128,16 @@ class PendingAtCronView(APIView):
 
     def get(self, request):
         tenant = _get_tenant_for_user(request.user)
+
+        # 9.4: read Postgres (fresh even while hibernated; the gateway list is gated).
+        if tenant_uses_file_cron_sync(tenant):
+            now_ms = int(time.time() * 1000)
+            jobs = [
+                j
+                for j in _extract_at_jobs([job for _, job in _pending_at_rows(tenant)])
+                if (j["firesAtMs"] or 0) > now_ms
+            ]
+            return Response({"jobs": jobs, "soft_cap": AT_CRON_SOFT_CAP, "stale": False})
 
         # Hibernated tenants: gateway is down, serve from snapshot.
         if tenant.hibernated_at:
@@ -149,6 +179,17 @@ class PendingAtCronCancelView(APIView):
 
     def delete(self, request, name: str):
         tenant = _get_tenant_for_user(request.user)
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response()
+        # 9.4: delete the Postgres row; the delete signal republishes the signed
+        # crons file and the in-container helper removes the job.
+        if tenant_uses_file_cron_sync(tenant):
+            for row, job in _pending_at_rows(tenant):
+                if row.name == name and not _is_hidden_cron(row.name, job.get("source")):
+                    row.delete()
+                    return Response(status=status.HTTP_204_NO_CONTENT)
+            return Response({"detail": "Pending reminder not found."}, status=status.HTTP_404_NOT_FOUND)
+
         try:
             _require_active_tenant(tenant)
         except GatewayError as exc:

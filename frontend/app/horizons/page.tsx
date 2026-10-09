@@ -3,6 +3,9 @@
 import dynamic from "next/dynamic";
 import { useEffect, useState, type ReactNode } from "react";
 
+import { TasksSection, TopTasksSection } from "@/components/horizons/tasks-section";
+import { GoalsProjects } from "@/components/horizons/goals-projects";
+import { HorizonsSkyHeader } from "@/components/open-sky/horizons-sky";
 import { GoalCard } from "@/components/goal-card";
 import { MoodTrendSparkline } from "@/components/horizons/mood-trend-sparkline";
 import { NorthStarSection } from "@/components/horizons/north-star-section";
@@ -16,7 +19,7 @@ import {
   isEngagementDemoEnabled,
   subscribeToEngagementDemoFlag,
 } from "@/lib/engagement/flag";
-import { useHorizonsQuery } from "@/lib/queries";
+import { useHorizonsQuery, useTenantQuery } from "@/lib/queries";
 
 function QuietSection({
   title,
@@ -58,7 +61,7 @@ const PillarsTodayCard = dynamic(
 function HorizonsSkeleton() {
   return (
     <div className="space-y-6 sm:space-y-8">
-      <div>
+      <div data-os-legacy-title>
         <h1 className="font-headline text-4xl font-semibold tracking-tight text-ink sm:text-5xl">
           Horizons
         </h1>
@@ -88,8 +91,10 @@ function HorizonsSkeleton() {
 }
 
 export default function HorizonsPage() {
+  const { data: tenant } = useTenantQuery();
+  const openSky = !!tenant?.web_redesign;
   const [engagementDemoEnabled, setEngagementDemoEnabled] = useState(false);
-  const { data, isLoading, error } = useHorizonsQuery();
+  const { data, isPending, error } = useHorizonsQuery();
   const [showAllInsights, setShowAllInsights] = useState(false);
 
   useEffect(() => {
@@ -102,14 +107,14 @@ export default function HorizonsPage() {
     });
   }, []);
 
-  if (isLoading) {
+  if (isPending) {
     return <HorizonsSkeleton />;
   }
 
   if (error) {
     return (
       <div className="space-y-6">
-        <div>
+        <div data-os-legacy-title>
           <h1 className="font-headline text-4xl font-semibold tracking-tight text-ink sm:text-5xl">
             Horizons
           </h1>
@@ -129,18 +134,25 @@ export default function HorizonsPage() {
 
   return (
     <div className="space-y-8 sm:space-y-12">
-      <div className="space-y-2">
+      {!openSky ? <div className="space-y-2" data-os-legacy-title>
         <h1 className="font-headline text-4xl font-semibold tracking-tight text-ink sm:text-5xl">
           Horizons
         </h1>
         <p className="text-lg font-light text-ink-muted">
           Your goals, your momentum.
         </p>
-      </div>
+      </div> : null}
+
+      {openSky ? <>
+        <HorizonsSkyHeader title="Horizons" statement={data.north_star?.find((star) => star.status === "confirmed" || star.status === "evolving")?.statement} />
+        <TopTasksSection />
+        <GoalsProjects goals={data.goals} />
+        <TasksSection goals={data.goals} />
+      </> : null}
 
       {engagementDemoEnabled ? <PillarsTodayCard delay={80} /> : null}
 
-      <NorthStarSection items={data.north_star ?? []} delay={80} />
+      <div id="north-star"><NorthStarSection items={data.north_star ?? []} delay={80} /></div>
 
       {engagementDemoEnabled ? null : (
         <section
@@ -151,7 +163,7 @@ export default function HorizonsPage() {
         </section>
       )}
 
-      <QuietSection title="Active Goals" delay={220}>
+      {!openSky ? <QuietSection title="Active Goals" delay={220}>
         {data.goals.length > 0 ? (
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6">
             {data.goals.map((goal) => (
@@ -166,13 +178,13 @@ export default function HorizonsPage() {
             </p>
           </div>
         )}
-      </QuietSection>
+      </QuietSection> : null}
 
       {data.pending_extractions.length > 0 ? (
-        <QuietSection title="Waiting on you" delay={300}>
+        <QuietSection title={openSky ? "From your journal" : "Waiting on you"} delay={300}>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 md:gap-6 lg:grid-cols-3">
             {data.pending_extractions.map((extraction) => (
-              <PendingGoal key={extraction.id} extraction={extraction} />
+              <PendingGoal key={extraction.id} extraction={extraction} openSky={openSky} />
             ))}
           </div>
         </QuietSection>

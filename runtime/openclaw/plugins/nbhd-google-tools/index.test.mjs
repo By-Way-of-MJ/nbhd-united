@@ -118,3 +118,13 @@ test("runtime error payloads are surfaced with error code/detail", async () => {
     /invalid_request \(bad query\)/,
   );
 });
+
+test("calendar plans require independent completion evidence", () => {
+  const { api, tools } = buildApi();
+  register(api);
+  const description = tools.get("nbhd_calendar_list_events").description;
+  assert.ok(description.includes("Calendar entries are plans, even after their end time"));
+  assert.ok(description.includes('never write "done", "banked", "already done", or ✅ unless'));
+  assert.ok(description.includes("Core meditation, Fuel workout, or task is marked done"));
+  assert.ok(description.includes("for that activity, or the user confirms it"));
+});

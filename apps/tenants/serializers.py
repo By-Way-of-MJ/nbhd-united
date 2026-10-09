@@ -77,6 +77,9 @@ class TenantSerializer(serializers.ModelSerializer):
     effective_model = serializers.SerializerMethodField()
     free_model_offer = serializers.SerializerMethodField()
     friends_agent_propose_enabled = serializers.SerializerMethodField()
+    web_redesign = serializers.SerializerMethodField()
+    projects_v2_enabled = serializers.SerializerMethodField()
+    subscription = serializers.SerializerMethodField()
 
     class Meta:
         model = Tenant
@@ -86,10 +89,13 @@ class TenantSerializer(serializers.ModelSerializer):
             "status",
             "model_tier",
             "has_active_subscription",
+            "subscription",
             "trial_days_remaining",
             "trial_started_at",
             "trial_ends_at",
             "is_trial",
+            "is_synthetic",
+            "is_eval_sink",
             "container_id",
             "container_fqdn",
             "messages_today",
@@ -120,11 +126,25 @@ class TenantSerializer(serializers.ModelSerializer):
             "datebook_enabled",
             "core_enabled",
             "constellation_enabled",
+            "neighborhood_enabled",
             "friends_enabled",
             "friends_agent_propose_enabled",
             "byo_models_enabled",
+            "web_redesign",
+            "projects_v2_enabled",
         )
         read_only_fields = fields
+
+    def get_projects_v2_enabled(self, obj):
+        from apps.friends.project_flags import projects_v2_enabled
+
+        return projects_v2_enabled(obj)
+
+    def get_web_redesign(self, obj):
+        """Open Sky web console gate (WEB_REDESIGN_TENANT_IDS, fail-closed)."""
+        from apps.router.chat_gates import web_redesign_enabled
+
+        return web_redesign_enabled(obj)
 
     def get_friends_agent_propose_enabled(self, obj):
         """Whether the assistant may PROPOSE shares/mission-tasks (PR9). Read via
@@ -160,8 +180,19 @@ class TenantSerializer(serializers.ModelSerializer):
         except Exception:  # noqa: BLE001
             return {"active": False}
 
+    def get_subscription(self, obj):
+        """Source-neutral plan state for the apps (Stripe or App Store)."""
+        from apps.billing.apple_iap import subscription_summary
+
+        try:
+            return subscription_summary(obj)
+        except Exception:  # noqa: BLE001 — never break the profile over this
+            return {"active": bool(obj.has_entitlement), "source": "", "status": ""}
+
     def get_has_active_subscription(self, obj):
-        has_real_subscription = bool(obj.stripe_subscription_id) and obj.status != Tenant.Status.DELETED
+        from apps.billing.entitlement import is_paying
+
+        has_real_subscription = is_paying(obj) and obj.status != Tenant.Status.DELETED
         on_trial = bool(obj.is_trial) and obj.trial_ends_at and obj.trial_ends_at > timezone.now()
         return has_real_subscription or on_trial
 

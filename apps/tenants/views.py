@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import timedelta
 
 from django.db import connection, transaction
 from django.utils import timezone
@@ -14,6 +15,7 @@ from rest_framework.views import APIView
 from apps.common.cache import tenant_cache
 from apps.cron.publish import publish_task
 from apps.orchestrator.config_generator import TIER_MODEL_CONFIGS
+from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
 
 from .models import Tenant
 from .serializers import HeartbeatConfigSerializer, TenantRegistrationSerializer, TenantSerializer, UserSerializer
@@ -196,7 +198,11 @@ class RetryProvisioningView(APIView):
         tenant.save(update_fields=["status", "updated_at"])
 
         try:
-            publish_task("provision_tenant", str(tenant.id))
+            publish_task(
+                "provision_tenant",
+                str(tenant.id),
+                idempotency_key=f"provision-{tenant.id}-retry-{int(timezone.now().timestamp())}",
+            )
             logger.info(
                 "tenant_provisioning tenant_id=%s user_id=%s stage=user_retry_queued",
                 tenant.id,
@@ -363,6 +369,9 @@ class HeartbeatConfigView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response()
+
         serializer = HeartbeatConfigSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -523,6 +532,12 @@ class ProfileView(APIView):
         return Response(UserSerializer(request.user).data)
 
     def patch(self, request):
+        if (
+            "timezone" in request.data
+            and (tenant := getattr(request.user, "tenant", None)) is not None
+            and cron_edits_fenced(tenant)
+        ):
+            return cron_fenced_response()
         original_timezone = request.user.timezone
         serializer = UserSerializer(request.user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -617,14 +632,22 @@ class ProfileView(APIView):
                                 tenant.id,
                             )
 
+                        from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
+
                         try:
-                            result = apply_or_defer_gateway_call(
-                                tenant,
-                                _sync_cron_timezones,
-                                label="profile.timezone.cron_sweep",
-                            )
-                            if result is DEFERRED:
-                                applied_state = "pending"
+                            if tenant_uses_file_cron_sync(tenant):
+                                # 9.4 gates the gateway cron.* sweep. Move the
+                                # canonical rows instead; each save republishes
+                                # the signed crons file (works while hibernated).
+                                _sync_cron_row_timezones(tenant, request.user.timezone)
+                            else:
+                                result = apply_or_defer_gateway_call(
+                                    tenant,
+                                    _sync_cron_timezones,
+                                    label="profile.timezone.cron_sweep",
+                                )
+                                if result is DEFERRED:
+                                    applied_state = "pending"
                         except Exception:
                             logger.exception(
                                 "Failed to sync cron timezones for tenant %s",
@@ -636,6 +659,27 @@ class ProfileView(APIView):
         response_data = dict(serializer.data)
         response_data["applied"] = applied_state
         return Response(response_data)
+
+
+def _sync_cron_row_timezones(tenant, new_tz: str) -> int:
+    """Point every recurring (``kind:"cron"``) CronJob row at ``new_tz``.
+
+    ``at`` schedules are absolute instants and ``every`` has no clock, so only
+    cron expressions move. Typed rows keep ``data.schedule`` through the derive
+    signal. Returns the number of rows changed.
+    """
+    from apps.cron.models import CronJob
+
+    changed = 0
+    for row in CronJob.objects.filter(tenant=tenant, data__schedule__kind="cron"):
+        schedule = dict((row.data or {}).get("schedule") or {})
+        if schedule.get("tz") == new_tz:
+            continue
+        row.data = {**row.data, "schedule": {**schedule, "tz": new_tz}}
+        row.save(update_fields=["data"])
+        changed += 1
+    logger.info("Moved %d cron row timezone(s) to %s for tenant %s", changed, new_tz, tenant.id)
+    return changed
 
 
 def _do_hard_delete(user) -> None:
@@ -726,7 +770,19 @@ class DeleteAccountView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        has_active_sub = bool(tenant and tenant.stripe_subscription_id)
+        # Deliberately Stripe-only (DIRECTIVE_ios_in_app_purchase.md §2.5): only a Stripe
+        # subscription can be cancelled from here. An App Store subscription can't — the
+        # app shows "Manage subscription" before calling this, and the account is
+        # deleted now; Apple's later notifications for it are answered and ignored.
+        from apps.billing.entitlement import has_apple_subscription
+
+        apple_still_billing = bool(tenant) and has_apple_subscription(tenant)
+        # Someone who pays through the App Store is deleted now, never scheduled: a
+        # scheduled deletion plus Apple can then only mean "subscribed on the iPhone
+        # after scheduling", which the App Store handler treats as keeping the account.
+        has_active_sub = bool(tenant and tenant.stripe_subscription_id) and not apple_still_billing
+        if apple_still_billing and tenant.stripe_subscription_id:
+            _cancel_stripe_now(tenant)
 
         if has_active_sub:
             # ── Has subscription: cancel at period end, schedule deletion ──────
@@ -804,7 +860,29 @@ class DeleteAccountView(APIView):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-            return Response({"scheduled": False, "detail": "Account deleted."}, status=status.HTTP_200_OK)
+            detail = "Account deleted."
+            if apple_still_billing:
+                detail += " Your App Store subscription keeps billing until you cancel it in iPhone Settings."
+            return Response(
+                {"scheduled": False, "detail": detail, "apple_subscription_active": apple_still_billing},
+                status=status.HTTP_200_OK,
+            )
+
+
+def _cancel_stripe_now(tenant) -> None:
+    """Cancel a Stripe subscription immediately (the account is being deleted now)."""
+    from apps.billing.apple_iap import _alert, _stripe
+    from apps.billing.views import _is_missing_subscription_error
+
+    try:
+        _stripe().Subscription.cancel(tenant.stripe_subscription_id)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_subscription_error(exc):
+            logger.warning("Account-delete: could not cancel Stripe for %s", tenant.id, exc_info=True)
+            _alert(
+                f"NBHD: account {str(tenant.id)[:8]} deleted but its Stripe subscription "
+                f"{tenant.stripe_subscription_id} could not be cancelled — cancel it by hand."
+            )
 
 
 class PreferredModelView(APIView):
@@ -1136,12 +1214,18 @@ class EntityRegistryListView(APIView):
     }
 
     def get(self, request):
+
         from apps.pii.entity_registry import coerce
 
         try:
             tenant = request.user.tenant
         except Tenant.DoesNotExist:
             return Response({"detail": "No tenant found."}, status=status.HTTP_404_NOT_FOUND)
+
+        from .entity_registry_views import REGISTRY_QUERY_PARAMS, paged_registry_response
+
+        if REGISTRY_QUERY_PARAMS.intersection(request.query_params):
+            return paged_registry_response(tenant, request.query_params)
 
         entries = []
         for placeholder, raw_entry in (tenant.pii_entity_map or {}).items():
@@ -1296,6 +1380,7 @@ class EntityRegistryListView(APIView):
                     current["notes"] = notes
                 new_value = to_storage_value(
                     current.get("name", ""),
+                    existing=entity_map[placeholder],
                     relationship=current.get("relationship", ""),
                     notes=current.get("notes", ""),
                     updated_at=now,
@@ -1333,6 +1418,13 @@ class EntityRegistryListView(APIView):
         tenant.pii_entity_map = entity_map
         tenant.pii_type_counters = stored_counters
         tenant.pii_denylist = denylist
+        from apps.pii.provisional import lifecycle_source
+
+        logger.info(
+            "pii_policy_owner_action tenant=%s action=always_hide source=%s",
+            tenant.pk,
+            lifecycle_source(new_value),
+        )
 
         return Response(
             {
@@ -1357,7 +1449,7 @@ class EntityRegistryItemView(APIView):
     permission_classes = [IsAuthenticated]
 
     # Cap field lengths so a malicious payload can't bloat the JSONField.
-    _MAX_NAME = 200
+    _MAX_NAME = 256
     _MAX_RELATIONSHIP = 80
     _MAX_NOTES = 500
 
@@ -1425,6 +1517,7 @@ class EntityRegistryItemView(APIView):
             # kept entry does not bounce back into the review queue on edit.
             new_value = to_storage_value(
                 current.get("name", ""),
+                existing=entity_map[placeholder],
                 relationship=current.get("relationship", ""),
                 notes=current.get("notes", ""),
                 updated_at=current["updated_at"],
@@ -1447,7 +1540,12 @@ class EntityRegistryItemView(APIView):
         )
 
     def delete(self, request, placeholder: str):
-        from apps.pii.entity_registry import canonical_key, coerce, get_name, normalize_denylist_key
+        from apps.pii.entity_registry import (
+            canonical_key,
+            get_name,
+            normalize_denylist_key,
+            to_storage_value,
+        )
 
         try:
             tenant = request.user.tenant
@@ -1467,9 +1565,14 @@ class EntityRegistryItemView(APIView):
                 )
 
             now = timezone.now().isoformat()
-            retired = coerce(entity_map[placeholder])
-            retired["retired"] = True
-            retired["retired_at"] = now
+            raw = entity_map[placeholder]
+            retired = to_storage_value(
+                get_name(raw),
+                existing=raw,
+                retired=True,
+                retired_at=now,
+                retired_reason="owner",
+            )
             entity_map[placeholder] = retired
             key = normalize_denylist_key(retired.get("name", ""))
             has_active_same_name = any(
@@ -1507,7 +1610,13 @@ class EntityRegistryBulkDeleteView(APIView):
     _MAX_BATCH = 1000
 
     def post(self, request):
-        from apps.pii.entity_registry import canonical_key, coerce, get_name, normalize_denylist_key
+        from apps.pii.entity_registry import (
+            canonical_key,
+            get_name,
+            normalize_denylist_key,
+            to_storage_value,
+        )
+        from apps.pii.provisional import lifecycle_source
 
         try:
             tenant = request.user.tenant
@@ -1560,9 +1669,18 @@ class EntityRegistryBulkDeleteView(APIView):
                     continue
                 entry = entity_map[placeholder]
                 deleted.append(placeholder)
-                retired = coerce(entry)
-                retired["retired"] = True
-                retired["retired_at"] = now
+                logger.info(
+                    "pii_policy_owner_action tenant=%s action=stop_hiding source=%s",
+                    tenant.pk,
+                    lifecycle_source(entry),
+                )
+                retired = to_storage_value(
+                    get_name(entry),
+                    existing=entry,
+                    retired=True,
+                    retired_at=now,
+                    retired_reason="owner",
+                )
                 entity_map[placeholder] = retired
                 key = normalize_denylist_key(get_name(entry))
                 if key:
@@ -1631,6 +1749,8 @@ class PIIReviewQueueView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        from django.conf import settings
+
         from apps.pii.entity_registry import coerce
 
         try:
@@ -1647,12 +1767,24 @@ class PIIReviewQueueView(APIView):
             entry = coerce(raw)
             if entry.get("reviewed_at"):
                 continue
+            provisional = isinstance(raw, dict) and bool(raw.get("provisional"))
+            expires_at = None
+            if provisional and raw.get("last_seen_at"):
+                from django.utils.dateparse import parse_datetime
+
+                last_seen = parse_datetime(str(raw["last_seen_at"]))
+                if last_seen is not None:
+                    expires_at = (last_seen + timedelta(hours=settings.PII_PROVISIONAL_TTL_HOURS)).isoformat()
             unreviewed.append(
                 {
                     "placeholder": placeholder,
                     "name": entry.get("name", ""),
                     "relationship": entry.get("relationship", ""),
                     "notes": entry.get("notes", ""),
+                    "persistence": "provisional" if provisional else "permanent",
+                    "expires_at": expires_at,
+                    "seen_event_count": len(raw.get("seen_events") or []) if isinstance(raw, dict) else 0,
+                    "seen_date_count": len(raw.get("seen_dates") or []) if isinstance(raw, dict) else 0,
                 }
             )
 
@@ -1678,7 +1810,7 @@ class PIIReviewQueueKeepView(APIView):
     _MAX_BATCH = 1000
 
     def post(self, request):
-        from apps.pii.entity_registry import coerce, to_storage_value
+        from apps.pii.provisional import transition_binding
 
         try:
             tenant = request.user.tenant
@@ -1711,35 +1843,12 @@ class PIIReviewQueueKeepView(APIView):
         kept: list[str] = []
         not_found: list[str] = []
 
-        # Serialize the read-modify-write per tenant: the inbound redactor and
-        # the (retired) arbiter sweep overwrite the whole pii_entity_map dict.
-        # Re-read the row under a lock so stamping reviewed_at can't be
-        # clobbered by — or clobber — a concurrent mint/delete.
-        with transaction.atomic():
-            locked = Tenant.objects.select_for_update().filter(pk=tenant.pk).first()
-            entity_map = dict((locked.pii_entity_map if locked else None) or {})
-
-            now = timezone.now().isoformat()
-            for placeholder in placeholders:
-                if placeholder not in entity_map:
-                    not_found.append(placeholder)
-                    continue
-                current = coerce(entity_map[placeholder])
-                # Rebuild via to_storage_value to keep the entry compact and
-                # preserve every stamp (updated_at, arbiter_judged_at) alongside
-                # the new reviewed_at, so keeping never drops identity metadata.
-                entity_map[placeholder] = to_storage_value(
-                    current.get("name", ""),
-                    relationship=current.get("relationship", ""),
-                    notes=current.get("notes", ""),
-                    updated_at=current.get("updated_at"),
-                    arbiter_judged_at=current.get("arbiter_judged_at"),
-                    reviewed_at=now,
-                )
+        for placeholder in placeholders:
+            result = transition_binding(tenant, placeholder, "keep")
+            if result.outcome == "missing":
+                not_found.append(placeholder)
+            elif result.outcome in {"kept", "promoted"}:
                 kept.append(placeholder)
-
-            Tenant.objects.filter(pk=tenant.pk).update(pii_entity_map=entity_map)
-        tenant.pii_entity_map = entity_map
 
         return Response({"kept": kept, "not_found": not_found}, status=status.HTTP_200_OK)
 
@@ -1760,7 +1869,7 @@ class PIIDenylistListView(APIView):
     """
 
     permission_classes = [IsAuthenticated]
-    _MAX_NAME = 200
+    _MAX_NAME = 256
 
     def get(self, request):
         try:
@@ -1848,9 +1957,8 @@ class PIIDenylistListView(APIView):
 class PIIDenylistItemView(APIView):
     """Remove a single denylist entry by canonical key.
 
-    Removal re-enables redaction for the canonical key on future
-    messages; existing entity_map entries with the same key resume
-    driving the Step 1 regex pass.
+    Removal permits future detection for the canonical key. Retired bindings
+    remain retired; entity-registry/restore/ explicitly reactivates them.
     """
 
     permission_classes = [IsAuthenticated]
@@ -1872,7 +1980,7 @@ class PIIDenylistItemView(APIView):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
-            # Un-ignore never restores retired bindings; restoration is a separate future action.
+            # Un-ignore never restores retired bindings; restoration uses entity-registry/restore/.
             del denylist[key]
             Tenant.objects.filter(pk=tenant.pk).update(pii_denylist=denylist)
         tenant.pii_denylist = denylist
@@ -1893,7 +2001,7 @@ class PIIDenylistBulkView(APIView):
     """
 
     permission_classes = [IsAuthenticated]
-    _MAX_NAME = 200
+    _MAX_NAME = 256
     _MAX_BATCH = 1000
 
     def post(self, request):

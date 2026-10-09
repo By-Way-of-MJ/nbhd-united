@@ -15,9 +15,11 @@ from .runtime_views import (
     RuntimeCalendarEventsView,
     RuntimeCalendarFreeBusyView,
     RuntimeConstellationNotesView,
+    RuntimeCronCancelReminderView,
     RuntimeCronCreateDomainSummaryView,
     RuntimeCronCreatePureReminderView,
     RuntimeCronCreateQuoteUserIntentView,
+    RuntimeCronListRemindersView,
     RuntimeCronPhase2SummaryView,
     RuntimeCurrentStatusView,
     RuntimeDailyNoteAppendView,
@@ -46,6 +48,9 @@ from .runtime_views import (
     RuntimeNeighborhoodContextView,
     RuntimePlacesSearchView,
     RuntimeProfileUpdateView,
+    RuntimeProjectDraftView,
+    RuntimeProjectProposeView,
+    RuntimeProjectsContextView,
     RuntimeProposeMissionTaskView,
     RuntimeProposeShareView,
     RuntimeReconcileScanView,
@@ -61,6 +66,7 @@ from .runtime_views import (
     RuntimeTaskSkipView,
     RuntimeUsageReportView,
     RuntimeUserMemoryView,
+    RuntimeWeatherBriefingView,
     RuntimeWeeklyReviewsView,
     RuntimeWorkspaceDetailView,
     RuntimeWorkspaceListView,
@@ -175,6 +181,11 @@ urlpatterns = [
         name="runtime-daily-note-append",
     ),
     path(
+        "runtime/<uuid:tenant_id>/weather/briefing/",
+        RuntimeWeatherBriefingView.as_view(),
+        name="runtime-weather-briefing",
+    ),
+    path(
         "runtime/<uuid:tenant_id>/long-term-memory/",
         RuntimeUserMemoryView.as_view(),
         name="runtime-long-term-memory",
@@ -233,6 +244,13 @@ urlpatterns = [
         RuntimeProposeMissionTaskView.as_view(),
         name="runtime-propose-mission-task",
     ),
+    path("runtime/<uuid:tenant_id>/projects/", RuntimeProjectsContextView.as_view(), name="runtime-projects"),
+    path(
+        "runtime/<uuid:tenant_id>/projects/<uuid:mission_id>/propose/",
+        RuntimeProjectProposeView.as_view(),
+        name="runtime-project-propose",
+    ),
+    path("runtime/<uuid:tenant_id>/project-drafts/", RuntimeProjectDraftView.as_view(), name="runtime-project-drafts"),
     # Constellation enriched notes — galaxy notes, star reflections, tutoring signals
     path(
         "runtime/<uuid:tenant_id>/constellation/notes/",
@@ -355,6 +373,16 @@ urlpatterns = [
     ),
     # Typed cron creation (feat/cron-typed-patterns) — one endpoint per
     # agent-creatable pattern. See CONTINUITY_cron-typed-patterns.md.
+    path(
+        "runtime/<uuid:tenant_id>/crons/reminders/",
+        RuntimeCronListRemindersView.as_view(),
+        name="runtime-cron-list-reminders",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/crons/cancel/",
+        RuntimeCronCancelReminderView.as_view(),
+        name="runtime-cron-cancel-reminder",
+    ),
     path(
         "runtime/<uuid:tenant_id>/crons/pure_reminder/",
         RuntimeCronCreatePureReminderView.as_view(),

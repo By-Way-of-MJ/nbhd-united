@@ -23,6 +23,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.core import compose, render, services
 from apps.core.models import CoreProfile, MeditationSession, MeditationStatus
+from apps.core.test_utils import ComposeSchemaCacheMixin
 from apps.lessons.models import Lesson, StarJournalEntry, TutoringSession
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
@@ -34,6 +35,14 @@ _HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 def _valid_manifest(*, total: int = 600) -> dict:
     """A minimal manifest that passes ``validate_manifest`` (canonical arc)."""
     return {
+        "lesson": {
+            "tradition": "taoist",
+            "intention": "release-control",
+            "teaching_slug": "wu-wei",
+            "core_teaching": "Let attention settle without force.",
+            "summary": "Release the urge to force calm. Let the breath move on its own.",
+            "practice": "Feel the breath without changing it.",
+        },
         "schema_version": 1,
         "title": "Letting go",
         "theme": "release work tension",
@@ -498,6 +507,19 @@ class RenderMeditationOrchestrationTests(TestCase):
             manifest=manifest if manifest is not None else _valid_manifest(),
         )
 
+    @override_settings(GEMINI_TTS_MODEL="gemini-2.5-flash-preview-tts")
+    def test_model_setting_still_allows_legacy_rollback(self):
+        session = self._session()
+        with (
+            patch.object(render, "render_manifest_to_audio", return_value=_fake_result()) as mock_render,
+            patch.object(services, "upload_workspace_file_binary"),
+            patch.object(services, "notify_meditation_ready"),
+        ):
+            services.render_meditation(session)
+        self.assertEqual(mock_render.call_args.kwargs["model"], "gemini-2.5-flash-preview-tts")
+        session.refresh_from_db()
+        self.assertEqual(session.model, "gemini-2.5-flash-preview-tts")
+
     def test_happy_path_sets_ready_and_fields(self):
         session = self._session()
         with (
@@ -512,7 +534,7 @@ class RenderMeditationOrchestrationTests(TestCase):
         self.assertEqual(session.status, MeditationStatus.READY)
         self.assertEqual(session.duration_ms, 601_000)
         self.assertEqual(session.guidance_text, "flattened narration")
-        self.assertEqual(session.model, "gemini-2.5-flash-preview-tts")
+        self.assertEqual(session.model, "gemini-3.8-flash-lite-tts")
         self.assertEqual(session.artifact_manifest_sha256, services._manifest_sha256(session.manifest))
         tid = str(self.tenant.id)
         self.assertEqual(session.audio_url, f"https://api.example.test/api/v1/meditations/{tid}/{session.id}.mp3")
@@ -1091,14 +1113,21 @@ class NotifyMeditationReadyTests(TestCase):
         self.assertIn("Alice", text)
         self.assertNotIn("[PERSON_0]", text)
 
-    def test_no_channel_linked_does_not_send(self):
+    def test_no_transport_delivers_to_app_feed(self):
+        from apps.router.models import ProactiveOutbound
+
         self.tenant.user.telegram_chat_id = None
         self.tenant.user.save(update_fields=["telegram_chat_id"])
         session = self._session()
-        with patch("apps.router.services.send_telegram_message") as mock_send:
+        with (
+            patch("apps.router.services.send_telegram_message") as mock_send,
+            patch("apps.router.proactive_context._dispatch_ios_push") as mock_push,
+        ):
             delivered = services.notify_meditation_ready(session)
-        self.assertFalse(delivered)
+        self.assertTrue(delivered)
+        self.assertEqual(ProactiveOutbound.objects.get(tenant=self.tenant).channel, "app")
         mock_send.assert_not_called()
+        mock_push.assert_not_called()
 
     def test_app_only_user_delivered_via_app_channel(self):
         # iOS-only user (no Telegram/LINE, has a registered device) → delivered
@@ -1679,7 +1708,7 @@ def _over_segmented_manifest() -> dict:
 
 
 @override_settings(OPENROUTER_API_KEY="test-or-key")
-class ComposeAuthoringTests(SimpleTestCase):
+class ComposeAuthoringTests(ComposeSchemaCacheMixin, SimpleTestCase):
     def _ok(self, content, model="test/primary"):
         """A ``chat_completion`` return value: ``(response_json, model_used)``."""
         return ({"choices": [{"message": {"content": content}}]}, model)
@@ -1740,10 +1769,11 @@ class ComposeAuthoringTests(SimpleTestCase):
 
         # WISDOM LESSON — one small idea, broad traditions, chosen for today, never preachy.
         self.assertIn("WISDOM LESSON", system)
-        for tradition in ("Stoic", "Zen", "Buddhist", "Taoist", "Sufi", "Christian-contemplative", "Jewish"):
+        from apps.core.lesson import TRADITIONS
+
+        for tradition in TRADITIONS:
             self.assertIn(tradition, system)
-        self.assertIn("science of mind", system)
-        self.assertIn("serve what today's signals show", system)
+        self.assertIn("support today's concrete aspect and chosen intention", system)
         self.assertIn("Never preach", system)
         self.assertIn("never presume what this person believes", system)
 
@@ -1894,11 +1924,12 @@ class ComposeAuthoringTests(SimpleTestCase):
             self.assertRaises(compose.ComposeError),
         ):
             compose.author_manifest({}, model="some/model")
-        cc.assert_called_once()
+        self.assertEqual(cc.call_count, 2)  # schema -> JSON mode, still pinned to one model
+        self.assertEqual({c.args[0] for c in cc.call_args_list}, {"some/model"})
 
     def test_falls_back_when_primary_truncates_json(self):
         # Primary drifts to truncated (here, non-English) JSON — the live 06-25
-        # failure; the next candidate returns a valid manifest → compose succeeds.
+        # failure; JSON-mode fallback returns a valid manifest → compose succeeds.
         truncated = '{"schema_version": 1, "title": "轻放责备", "theme": "温柔'
         with patch(
             "apps.core.compose.chat_completion",
@@ -1913,22 +1944,28 @@ class ComposeAuthoringTests(SimpleTestCase):
         # raises ComposeError; it must fall through, not abort the chain.
         with patch(
             "apps.core.compose.chat_completion",
-            side_effect=[self._ok("[1, 2, 3]"), self._ok(json.dumps(_valid_manifest()))],
+            side_effect=[self._ok("[1, 2, 3]"), self._ok("[1, 2, 3]"), self._ok(json.dumps(_valid_manifest()))],
         ) as cc:
             out = compose.author_manifest({})
         self.assertEqual(render.validate_manifest(out), [])
-        self.assertEqual(cc.call_count, 2)
+        self.assertEqual(cc.call_count, 3)
+        self.assertNotEqual(cc.call_args_list[1].args[0], cc.call_args_list[2].args[0])
 
     def test_falls_back_when_primary_over_produces_segments(self):
         over = _over_segmented_manifest()
         self.assertTrue(any("too many spoken" in e for e in render.validate_manifest(over)))
         with patch(
             "apps.core.compose.chat_completion",
-            side_effect=[self._ok(json.dumps(over)), self._ok(json.dumps(_valid_manifest()))],
+            side_effect=[
+                self._ok(json.dumps(over)),
+                self._ok(json.dumps(over)),
+                self._ok(json.dumps(_valid_manifest())),
+            ],
         ) as cc:
             out = compose.author_manifest({})
         self.assertEqual(render.validate_manifest(out), [])
-        self.assertEqual(cc.call_count, 2)
+        self.assertEqual(cc.call_count, 3)
+        self.assertNotEqual(cc.call_args_list[1].args[0], cc.call_args_list[2].args[0])
 
     def test_falls_back_when_primary_transport_errors(self):
         # Primary transport-errors on BOTH its attempt and its one transient
@@ -1965,9 +2002,10 @@ class ComposeAuthoringTests(SimpleTestCase):
         sleep.assert_called_once()  # backoff before the retry
 
     def test_content_failure_is_not_retried(self):
-        # A non-transient failure (unparseable content) must NOT trigger the
-        # same-model retry — it falls straight through to the next candidate.
+        # After schema fallback, unparseable JSON-mode content goes straight to
+        # the next candidate without a corrective or transient retry.
         with (
+            patch("apps.core.compose._SCHEMA_REJECTED_MODELS", {compose._compose_models()[0]}),
             patch("apps.core.compose.time.sleep") as sleep,
             patch(
                 "apps.core.compose.chat_completion",
@@ -1989,7 +2027,14 @@ class ComposeAuthoringTests(SimpleTestCase):
             patch("apps.core.compose.time.sleep"),
             patch(
                 "apps.core.compose.chat_completion",
-                side_effect=[self._ok(over), self._ok("not json"), RuntimeError("503"), RuntimeError("503")],
+                side_effect=[
+                    self._ok(over),
+                    self._ok(over),  # invalid + corrective retry
+                    self._ok("not json"),
+                    self._ok("not json"),  # schema + JSON mode
+                    RuntimeError("503"),
+                    RuntimeError("503"),  # transient + backed-off retry
+                ],
             ),
             self.assertRaises(compose.ComposeError) as ctx,
         ):
@@ -1997,7 +2042,7 @@ class ComposeAuthoringTests(SimpleTestCase):
         msg = str(ctx.exception)
         self.assertIn("too many spoken", msg)
         self.assertIn("non-JSON", msg)
-        self.assertIn("503", msg)
+        self.assertIn("RuntimeError status=None: 503", msg)
 
     def test_strips_code_fences(self):
         fenced = "```json\n" + json.dumps(_valid_manifest()) + "\n```"
@@ -2304,6 +2349,7 @@ class ComposeMeditationServiceTests(TestCase):
         session.refresh_from_db()
         self.assertTrue(session.manifest.get("phases"))
         self.assertEqual(session.title, manifest["title"])
+        self.assertEqual(session.lesson["teaching_slug"], "wu-wei")
         mock_publish.assert_called_once_with("render_meditation", str(session.id))
 
     def test_concurrent_compose_delivery_does_not_author_twice(self):
@@ -2416,21 +2462,6 @@ class MeditationSignalGatheringTests(TestCase):
         self.assertEqual(stars[0]["id"], star.id)
         self.assertEqual(stars[0]["galaxy_note"], "protect the off-days")
 
-    def test_gathers_recent_daily_note_snippets(self):
-        from apps.journal.models import Document
-
-        Document.objects.create(
-            tenant=self.tenant,
-            kind="daily",
-            slug=str(timezone.now().date()),
-            title="Today",
-            markdown="# Daily\nFelt scattered this morning but found focus after a walk.",
-        )
-        snippets = services.gather_meditation_signals(self.tenant).get("recent_notes")
-        self.assertTrue(snippets)
-        self.assertIn("found focus after a walk", snippets[0])
-        self.assertNotIn("# Daily", snippets[0])  # heading stripped
-
     def test_format_signals_renders_constellation(self):
         signals = {
             "constellation_stars": [
@@ -2440,6 +2471,7 @@ class MeditationSignalGatheringTests(TestCase):
                     "galaxy_note": "say it out loud",
                     "journal_entries": [{"text": "it shrank once I named it"}],
                     "tutoring_insights": [{"mastery_achieved": True}],
+                    "recent_activity": True,
                 }
             ],
         }
@@ -2539,22 +2571,31 @@ class MeditationLookBackTests(TestCase):
         self.assertEqual(recent[0]["date"], (date.today() - timedelta(days=1)).isoformat())
 
     def test_only_sits_that_reached_the_person_are_counted(self):
-        # DELIVERED counts (they heard it); a failed or still-in-flight sit was
-        # never heard, so it is no reason to avoid a theme.
+        # Library titles count for variety, independently of practice evidence.
+        self._sit(0, status=MeditationStatus.DONE, title="Finished It")
         self._sit(1, status=MeditationStatus.DELIVERED, title="Heard It")
         self._sit(2, status=MeditationStatus.FAILED, title="Never Rendered")
         self._sit(3, status=MeditationStatus.PENDING, title="Still Pending")
         self._sit(4, status=MeditationStatus.RENDERING, title="Mid Render")
         titles = [e["title"] for e in services.gather_meditation_signals(self.tenant)["recent_meditations"]]
-        self.assertEqual(titles, ["Heard It"])
+        self.assertEqual(titles, ["Finished It", "Heard It"])
 
-    def test_look_back_window_is_ten_sits(self):
-        for days_ago in range(1, 15):
+    def test_look_back_window_is_twenty_sits(self):
+        for days_ago in range(1, 25):
             self._sit(days_ago)
         recent = services.gather_meditation_signals(self.tenant)["recent_meditations"]
-        self.assertEqual(len(recent), 10)
+        self.assertEqual(len(recent), 20)
         self.assertEqual(recent[0]["title"], "Sit 1")  # newest kept
-        self.assertEqual(recent[-1]["title"], "Sit 10")  # the 11th-oldest is dropped
+        self.assertEqual(recent[-1]["title"], "Sit 20")  # the 21st-oldest is dropped
+
+    def test_history_includes_intention_but_does_not_invent_legacy_intention(self):
+        self._sit(1, lesson={"tradition": "taoist", "intention": "release-control"})
+        self._sit(2, lesson={"tradition": "zen"})
+        self._sit(3, lesson={})
+        recent = services._recent_meditation_entries(self.tenant)
+        self.assertEqual(recent[0]["lesson"]["intention"], "release-control")
+        self.assertNotIn("intention", recent[1]["lesson"])
+        self.assertNotIn("lesson", recent[2])
 
     def test_sit_with_neither_title_nor_theme_is_dropped(self):
         self._sit(1, title="", theme="")

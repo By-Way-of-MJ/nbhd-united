@@ -1,23 +1,23 @@
 """Regression coverage for the hibernate-idle vs wake-for-cron race.
 
 The bug (canary 2026-05-11 07:00 JST):
-``hibernate_idle_tenants_task`` runs at minute 0 of every hour. The
+``hibernate_idle_tenants_task`` used to run at minute 0 of every hour. The
 canary's morning briefing is also scheduled at minute 0 (07:00 user
 local). ``wake_for_cron_task`` had brought the container up at :56,
 set ``cron_wake_at = now()``, and scheduled the morning briefing to
 fire at :00. At :00, ``hibernate_idle_tenants_task`` saw
-``last_message_at`` > 2h ago and (without checking ``cron_wake_at``)
+``last_message_at`` was past the idle cutoff and (without checking ``cron_wake_at``)
 hibernated the container — Azure terminated the container at :00:47
 with reason ``ManuallyStopped``, killing the about-to-fire briefing.
 
 The cron-wake re-hibernation lifecycle is owned by
 ``check_cron_wake_idle_task`` (which knows about upcoming crons via
-``_next_cron_within_window`` and decides correctly). The hourly idle
+``_next_cron_within_window`` and decides correctly). The periodic idle
 sweep should defer to it while ``cron_wake_at`` is fresh.
 
 These tests pin: hibernate_idle_tenants_task skips tenants whose
 cron_wake_at is recent, but still hibernates when cron_wake_at is
-NULL (normal idle case) or stale (>2h, defensive fallback if a
+NULL (normal idle case) or stale (past the configured idle cutoff, defensive fallback if a
 check_cron_wake_idle ever gets dropped).
 """
 
@@ -26,9 +26,11 @@ from __future__ import annotations
 from datetime import timedelta
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
+from apps.orchestrator import hibernation
+from apps.orchestrator.hibernation import wake_hibernated_tenant
 from apps.orchestrator.tasks import hibernate_idle_tenants_task
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
@@ -36,6 +38,10 @@ from apps.tenants.services import create_tenant
 
 class HibernateIdleCronWakeRaceTests(TestCase):
     """Pin: hibernate_idle_tenants must not race with wake_for_cron."""
+
+    def setUp(self):
+        # Successful idle cases require a known-empty live cron list.
+        self.enterContext(patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []}))
 
     def _make_idle_tenant(self, *, suffix: int) -> Tenant:
         tenant = create_tenant(
@@ -45,6 +51,7 @@ class HibernateIdleCronWakeRaceTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = f"oc-race-{suffix}"
         tenant.container_fqdn = f"oc-race-{suffix}.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.last_message_at = timezone.now() - timedelta(hours=3)
         tenant.save()
         return tenant
@@ -53,7 +60,7 @@ class HibernateIdleCronWakeRaceTests(TestCase):
     def test_skips_tenant_with_recent_cron_wake(self, mock_hibernate):
         """The exact 2026-05-11 canary scenario in test form.
 
-        Tenant was woken for cron 5 min ago. Idle for 3h otherwise. Hourly
+        Tenant was woken for cron 5 min ago. Idle for 3h otherwise. The
         sweep must NOT hibernate — check_cron_wake_idle owns the lifecycle.
         """
         tenant = self._make_idle_tenant(suffix=1)
@@ -77,10 +84,47 @@ class HibernateIdleCronWakeRaceTests(TestCase):
         mock_hibernate.assert_called_once_with(tenant)
         self.assertEqual(result["hibernated"], 1)
 
+    @override_settings(TENANT_IDLE_HIBERNATE_MINUTES=30)
+    @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
+    def test_hibernates_after_configured_30_minute_idle_cutoff(self, mock_hibernate):
+        tenant = self._make_idle_tenant(suffix=20)
+        tenant.last_message_at = timezone.now() - timedelta(minutes=31)
+        tenant.save(update_fields=["last_message_at"])
+
+        result = hibernate_idle_tenants_task()
+
+        mock_hibernate.assert_called_once_with(tenant)
+        self.assertEqual(result["hibernated"], 1)
+
+    @override_settings(TENANT_IDLE_HIBERNATE_MINUTES=45)
+    @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
+    def test_idle_cutoff_setting_is_overridable(self, mock_hibernate):
+        tenant = self._make_idle_tenant(suffix=22)
+        tenant.last_message_at = timezone.now() - timedelta(minutes=31)
+        tenant.save(update_fields=["last_message_at"])
+
+        result = hibernate_idle_tenants_task()
+
+        mock_hibernate.assert_not_called()
+        self.assertEqual(result["hibernated"], 0)
+
+    @override_settings(TENANT_IDLE_HIBERNATE_MINUTES=30)
+    @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
+    def test_never_messaged_tenant_uses_provisioned_at_fallback(self, mock_hibernate):
+        tenant = self._make_idle_tenant(suffix=21)
+        tenant.last_message_at = None
+        tenant.provisioned_at = timezone.now() - timedelta(minutes=31)
+        tenant.save(update_fields=["last_message_at", "provisioned_at"])
+
+        result = hibernate_idle_tenants_task()
+
+        mock_hibernate.assert_called_once_with(tenant)
+        self.assertEqual(result["hibernated"], 1)
+
     @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
     def test_hibernates_when_cron_wake_at_is_stale(self, mock_hibernate):
         """Defensive: if check_cron_wake_idle got dropped (cron_wake_at stuck
-        at >2h old), the hourly sweep still reclaims the container.
+        past the idle cutoff), the periodic sweep still reclaims the container.
         """
         tenant = self._make_idle_tenant(suffix=3)
         tenant.cron_wake_at = timezone.now() - timedelta(hours=4)
@@ -122,6 +166,27 @@ class HibernateIdleCronWakeRaceTests(TestCase):
         self.assertEqual(result["hibernated"], 0)
         self.assertEqual(result["skipped_cron_wake"], 1)
 
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_idle_sweep_during_azure_wake_does_not_rehibernate(self, _mock_mount, _mock_publish):
+        tenant = self._make_idle_tenant(suffix=5)
+        tenant.hibernated_at = timezone.now()
+        tenant.save(update_fields=["hibernated_at"])
+
+        def run_sweep_during_wake(_container_id):
+            result = hibernate_idle_tenants_task()
+            self.assertEqual(result["hibernated"], 0)
+
+        with (
+            patch("apps.orchestrator.azure_client.wake_container_app", side_effect=run_sweep_during_wake),
+            patch.object(hibernation, "hibernate_idle_tenant", return_value=True) as mock_hibernate,
+        ):
+            result = wake_hibernated_tenant(tenant, cron_wake=True)
+
+        self.assertTrue(result)
+        mock_hibernate.assert_not_called()
+
 
 class HibernateIdleImminentCronTests(TestCase):
     """The 2026-05-12 12:00 canary case: long-running awake tenant gets
@@ -139,6 +204,7 @@ class HibernateIdleImminentCronTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = f"oc-imm-{suffix}"
         tenant.container_fqdn = f"oc-imm-{suffix}.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.last_message_at = timezone.now() - timedelta(hours=3)
         tenant.save()
         return tenant
@@ -147,7 +213,7 @@ class HibernateIdleImminentCronTests(TestCase):
     @patch("apps.orchestrator.hibernation._cron_active_or_imminent", return_value="cron_in_flight")
     def test_defers_when_cron_in_flight(self, mock_defer, mock_hibernate):
         """A cron currently mid-execution (state.runningAtMs set) must
-        not be killed by the hourly sweep.
+        not be killed by the periodic sweep.
         """
         self._make_idle_tenant(suffix=1)
 
@@ -209,6 +275,34 @@ class HibernateIdleImminentCronTests(TestCase):
         called_with = mock_hibernate.call_args[0][0]
         self.assertIn(called_with, {tenant_busy, tenant_quiet})
 
+    @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_defers_when_cron_state_read_fails(self, mock_invoke, mock_hibernate):
+        from apps.cron.gateway_client import GatewayError
+
+        self._make_idle_tenant(suffix=6)
+        mock_invoke.side_effect = GatewayError("bad_gateway", status_code=502)
+        with self.assertLogs("apps.orchestrator.hibernation", level="WARNING"):
+            result = hibernate_idle_tenants_task()
+        mock_hibernate.assert_not_called()
+        self.assertEqual(result["hibernated"], 0)
+        self.assertEqual(result["skipped_imminent_cron"], 1)
+
+    @patch("apps.orchestrator.hibernation.hibernate_idle_tenant", return_value=True)
+    @patch("apps.cron.gateway_client.requests.post")
+    @patch("apps.cron.gateway_client._get_gateway_token", return_value="test-token")
+    def test_defers_when_cron_state_requests_time_out(self, _mock_token, mock_post, mock_hibernate):
+        import requests
+
+        self._make_idle_tenant(suffix=7)
+        mock_post.side_effect = requests.Timeout("busy")
+        with self.assertLogs("apps.orchestrator.hibernation", level="WARNING"):
+            result = hibernate_idle_tenants_task()
+        self.assertEqual(mock_post.call_count, 2)
+        mock_hibernate.assert_not_called()
+        self.assertEqual(result["hibernated"], 0)
+        self.assertEqual(result["skipped_imminent_cron"], 1)
+
 
 class CronActiveOrImminentTests(TestCase):
     """Unit tests for ``_cron_active_or_imminent`` itself."""
@@ -218,6 +312,7 @@ class CronActiveOrImminentTests(TestCase):
         tenant.status = Tenant.Status.ACTIVE
         tenant.container_id = "oc-cron-defer"
         tenant.container_fqdn = "oc-cron-defer.internal"
+        tenant.openclaw_version = "2026.5.28"  # gateway cron.list path (9.4 reads the state file)
         tenant.save()
         return tenant
 
@@ -271,17 +366,18 @@ class CronActiveOrImminentTests(TestCase):
         self.assertIsNone(_cron_active_or_imminent(tenant))
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
-    def test_returns_none_when_gateway_unreachable(self, mock_invoke):
-        """Conservative on failure: don't block the sweep if cron.list
-        fails — the 2h idle cutoff and cron_wake_at are still backstops.
-        """
+    def test_returns_unknown_when_gateway_unreachable(self, mock_invoke):
         from apps.cron.gateway_client import GatewayError
         from apps.orchestrator.hibernation import _cron_active_or_imminent
 
         tenant = self._make_tenant()
-        mock_invoke.side_effect = GatewayError("boom")
-
-        self.assertIsNone(_cron_active_or_imminent(tenant))
+        for error in (GatewayError("boom"), GatewayError("bad_gateway", status_code=502), GatewayError("timeout")):
+            with self.subTest(error=str(error)):
+                mock_invoke.side_effect = error
+                with self.assertLogs("apps.orchestrator.hibernation", level="WARNING") as logs:
+                    self.assertEqual(_cron_active_or_imminent(tenant), "cron_state_unknown")
+                self.assertIn(str(tenant.id), logs.output[0])
+                self.assertIn("deferring hibernation/image replacement", logs.output[0])
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
     def test_skips_disabled_jobs(self, mock_invoke):

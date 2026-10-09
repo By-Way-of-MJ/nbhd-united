@@ -21,8 +21,11 @@ from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
 
 
-def _make_active_tenant(*, name: str, chat_id: int) -> Tenant:
+def _make_active_tenant(*, name: str, chat_id: int, openclaw_version: str = "2026.5.28") -> Tenant:
+    # Default 5.28 = the gateway cron.list path these tests mock; 9.4 reads the
+    # in-container state file instead (Oc94StateFileTest).
     t = create_tenant(display_name=name, telegram_chat_id=chat_id)
+    t.openclaw_version = openclaw_version
     t.status = Tenant.Status.ACTIVE
     t.container_id = f"oc-{name.lower().replace(' ', '-')}"
     t.container_fqdn = f"{t.container_id}.example.com"
@@ -172,3 +175,28 @@ class EnsureAtCronWakesTaskTest(TestCase):
         self.assertEqual(mock_publish.call_count, 2)
         keys = [c.kwargs["idempotency_key"] for c in mock_publish.call_args_list]
         self.assertEqual(keys[0], keys[1])
+
+
+class Oc94StateFileTest(TestCase):
+    """9.4 gates the gateway cron.list; the backstop reads the helper's state file."""
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.orchestrator.azure_client.download_workspace_file_binary")
+    def test_schedules_wake_from_state_file(self, mock_download, mock_invoke, mock_publish):
+        import json
+
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        tenant = _make_active_tenant(name="Sweep 94", chat_id=111111194, openclaw_version="2026.9.4")
+        now_ms = int(time.time() * 1000)
+        fires_ms = now_ms + 30 * 60 * 1000
+        job = _at_job(name="laundry", job_id="at-94", fires_ms=fires_ms)
+        job.pop("payload")  # the state file never carries payloads
+        mock_download.return_value = json.dumps({"v": 1, "writtenAtMs": now_ms, "jobs": [job]}).encode()
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["scheduled"], 1)
+        mock_invoke.assert_not_called()
+        self.assertEqual(mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{tenant.id}-{fires_ms}")

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 import re
@@ -12,7 +10,6 @@ from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from django.core import signing
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone as tz
@@ -25,6 +22,12 @@ from rest_framework.views import APIView
 from apps.billing.services import record_usage
 from apps.common.tenant_tz import safe_zoneinfo, tenant_today, tenant_tz_name
 from apps.common.windows import Window, resolve_window
+from apps.integrations.confirmation_tokens import (
+    CONFIRM_TOKEN_MAX_AGE_SECONDS,
+    confirm_token_failure,
+    confirmation_digest,
+    issue_confirm_token,
+)
 from apps.integrations.content_sanitize import neutralize_remote_image_markdown
 from apps.journal.document_authoring import (
     get_or_create_authored_document,
@@ -50,10 +53,15 @@ from apps.journal.session_models import Session
 from apps.lessons.models import Lesson
 from apps.lessons.serializers import LessonSerializer
 from apps.lessons.services import search_lessons
+from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
 from apps.orchestrator.personas import get_persona
 from apps.orchestrator.tour_guide import places_search_delivery_ready, tour_guide_delivery_ready
 from apps.pii.egress import KnownValueResponseGuardMixin
-from apps.router.document_write_guard import assert_write_allowed_for_document_turn, record_runtime_write_activity
+from apps.router.document_write_guard import (
+    assert_write_allowed_for_document_turn,
+    record_runtime_write_activity,
+    record_runtime_write_event,
+)
 from apps.tenants.models import Tenant
 
 from .apple_maps import search_places
@@ -81,6 +89,47 @@ from .services import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REDDIT_CONFIRM_TOKEN_SALT = "apps.integrations.reddit.outward-confirm.v1"
+_REDDIT_CONFIRM_GUIDANCE = (
+    "Show this exact draft to the user and wait for an explicit yes; then call again with confirm_token unchanged."
+)
+_WORKSPACE_DELETE_CONFIRM_TOKEN_SALT = "apps.integrations.workspace.delete-confirm.v1"
+_WORKSPACE_DELETE_CONFIRM_GUIDANCE = (
+    "Show this workspace deletion preview, obtain explicit confirmation, then retry with confirm_token unchanged."
+)
+
+
+def _action_confirmation_context(*, tenant: Tenant, action: str, parameters: dict) -> dict:
+    """Bind a token to tenant, action, and a hash of the exact parameters."""
+    return {
+        "tenant_id": str(tenant.id),
+        "action": action,
+        "parameters_hash": confirmation_digest(parameters),
+    }
+
+
+def _confirmation_required_response(
+    *,
+    context: dict,
+    preview: dict,
+    salt: str,
+    guidance: str,
+    reason: str,
+) -> Response:
+    payload = {
+        "status": "confirmation_required",
+        "preview": preview,
+        "confirm_token": issue_confirm_token(context, salt=salt),
+        "confirm_token_expires_in_seconds": CONFIRM_TOKEN_MAX_AGE_SECONDS,
+        "guidance": guidance,
+    }
+    response_status = status.HTTP_200_OK
+    if reason != "missing":
+        payload.update({"error": "confirmation_required", "reason": reason})
+        response_status = status.HTTP_400_BAD_REQUEST
+    return Response(payload, status=response_status)
+
 
 _SITUATION_CAPTURE_GUIDANCE = (
     "Acknowledge this capture in one short clause. If the user objects, do not record again and drop the subject."
@@ -1016,6 +1065,7 @@ class RuntimeGoalListCreateView(KnownValueResponseGuardMixin, APIView):
             )
 
         goal = serializer.save(pii_receipts=receipts)
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id}, verb="created")
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_201_CREATED,
@@ -1076,6 +1126,7 @@ class RuntimeGoalDetailView(APIView):
         serializer = GoalSerializer(goal, data=authored_data, partial=True, context={"tenant": tenant})
         serializer.is_valid(raise_exception=True)
         serializer.save(pii_receipts=receipts)
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -1107,6 +1158,7 @@ class RuntimeGoalAchieveView(APIView):
 
         _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.achieve")
         goal.mark_achieved()
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -1138,6 +1190,7 @@ class RuntimeGoalAbandonView(APIView):
 
         _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.abandon")
         goal.abandon()
+        record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
             status=status.HTTP_200_OK,
@@ -1918,7 +1971,7 @@ class RuntimeDailyNotesView(KnownValueResponseGuardMixin, APIView):
                 "tenant_id": str(tenant.id),
                 "date": str(d),
                 "markdown": doc.markdown,
-                "sections": parse_daily_sections(doc.markdown),
+                "sections": parse_daily_sections(doc.markdown, template=get_default_template(tenant=tenant)),
             },
             status=200,
         )
@@ -2017,21 +2070,17 @@ class RuntimeDailyNoteAppendView(APIView):
             field="markdown",
         )
         content = authored.text
+        template = get_default_template(tenant=tenant)
 
-        with transaction.atomic():
-            # Re-read under a row lock so concurrent appends are serialised
-            # and neither writer loses its entry (lost-update prevention).
-            doc = Document.objects.select_for_update().get(pk=doc.pk)
-            md = doc.markdown or ""
+        if section_slug_str:
+            doc = _upsert_authored_daily_section(tenant, doc, section_slug_str, authored, template=template)
+        else:
+            with transaction.atomic():
+                # Re-read under a row lock so concurrent appends are serialised
+                # and neither writer loses its entry (lost-update prevention).
+                doc = Document.objects.select_for_update().get(pk=doc.pk)
+                md = doc.markdown or ""
 
-            if section_slug_str:
-                heading = resolve_daily_section_heading(
-                    tenant=tenant,
-                    markdown=md,
-                    section_slug=section_slug_str,
-                )
-                doc.markdown = upsert_markdown_section(md, heading, content)
-            else:
                 # Quick-log append with timestamp
                 now = _tenant_now(tenant)
                 timestamp = now.strftime("%H:%M")
@@ -2039,24 +2088,155 @@ class RuntimeDailyNoteAppendView(APIView):
                 entry = f"- **{timestamp}** ({persona_name}) — {content}"
                 doc.markdown = md.rstrip() + "\n\n" + entry + "\n"
 
-            doc.pii_receipts = merge_field_receipt(
-                doc.pii_receipts,
-                "markdown",
-                authored.receipt,
-                stored_text=doc.markdown,
-            )
-            doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+                doc.pii_receipts = merge_field_receipt(
+                    doc.pii_receipts,
+                    "markdown",
+                    authored.receipt,
+                    stored_text=doc.markdown,
+                )
+                doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+
+        if section_slug_str == "energy-mood":
+            from apps.journal.mood import bridge_daily_note_mood
+
+            bridge_daily_note_mood(tenant=tenant, note_date=d, content=content, writer="runtime")
+
+        record_runtime_write_event(
+            tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if _created else "updated"
+        )
 
         response_payload = {
             "tenant_id": str(tenant.id),
             "date": str(d),
             "markdown": doc.markdown,
-            "sections": parse_daily_sections(doc.markdown),
+            "sections": parse_daily_sections(doc.markdown, template=template),
         }
         if date_attribution_warning:
             response_payload["date_attribution_warning"] = date_attribution_warning
 
         return Response(response_payload, status=status.HTTP_201_CREATED)
+
+
+def _upsert_authored_daily_section(
+    tenant: Tenant, doc: Document, section_slug: str, authored, *, template=None
+) -> Document:
+    """Lock the daily note, replace one ``##`` section with an authored fragment, fold the receipt.
+
+    The one section-write path for agent-authored daily-note sections: the
+    append view (``nbhd_daily_note_set_section``) and the programmatic weather
+    endpoint both go through here so locking, heading resolution and PII
+    receipt merging cannot drift between them.
+    """
+    with transaction.atomic():
+        # Re-read under a row lock so concurrent writers are serialised and
+        # neither loses its section (lost-update prevention).
+        doc = Document.objects.select_for_update().get(pk=doc.pk)
+        md = doc.markdown or ""
+        heading = resolve_daily_section_heading(
+            tenant=tenant,
+            markdown=md,
+            section_slug=section_slug,
+            template=template,
+        )
+        doc.markdown = upsert_markdown_section(md, heading, authored.text)
+        doc.pii_receipts = merge_field_receipt(
+            doc.pii_receipts,
+            "markdown",
+            authored.receipt,
+            stored_text=doc.markdown,
+        )
+        doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+    return doc
+
+
+def _write_daily_note_section(tenant: Tenant, d: date, section_slug: str, content: str, *, seam: str) -> Document:
+    """Get-or-create the day's note, PII-author ``content``, and set one section."""
+    slug = str(d)
+    doc, _created = get_or_create_authored_document(
+        tenant,
+        kind="daily",
+        slug=slug,
+        title=_default_title("daily", slug),
+        markdown_factory=lambda: _default_markdown("daily", slug, tenant=tenant),
+        seam="journal.daily_note.default_body.runtime",
+        defer_detection=True,
+    )
+    authored = _author_runtime_document(tenant, content, seam=seam, field="markdown")
+    return _upsert_authored_daily_section(tenant, doc, section_slug, authored)
+
+
+class RuntimeWeatherBriefingView(APIView):
+    """POST fetch the briefing weather programmatically and write the note's ``weather`` section.
+
+    Backs the ``nbhd_weather_briefing`` plugin tool. The model never composes
+    weather: Django resolves the location, calls Open-Meteo, renders fixed
+    strings (``apps.orchestrator.briefing_weather``), writes the section itself
+    and returns ``message_line`` for the model to relay VERBATIM. Non-ok
+    statuses are written too — the honest "no location" / "couldn't fetch"
+    line is the whole point. Idempotent per day.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        from apps.orchestrator.briefing_weather import (
+            fetch_briefing_weather,
+            weather_message_line,
+            weather_section_markdown,
+        )
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+
+        try:
+            explicit_date = _parse_iso_date(request.data.get("date"), field_name="date")
+        except ValueError as exc:
+            return Response(
+                {"error": "invalid_request", "detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        d = explicit_date or _tenant_today(tenant)
+
+        report = fetch_briefing_weather(tenant, on_date=d)
+        section_markdown = weather_section_markdown(report)
+        message_line = weather_message_line(report)
+        _write_daily_note_section(
+            tenant,
+            d,
+            "weather",
+            section_markdown,
+            seam="journal.daily_note.weather.runtime",
+        )
+        logger.info(
+            "briefing_weather_written tenant=%s date=%s status=%s source=%s",
+            str(tenant.id)[:8],
+            d,
+            report.status,
+            report.source,
+        )
+        return Response(
+            {
+                "tenant_id": str(tenant.id),
+                "date": str(d),
+                "status": report.status,
+                "source": report.source,
+                "unit": report.unit,
+                "location_label": report.location_label,
+                "message_line": message_line,
+                "section_markdown": section_markdown,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _upsert_markdown_section(md: str, heading: str, body: str) -> str:
@@ -2580,7 +2760,9 @@ class RuntimeLessonCreateView(KnownValueResponseGuardMixin, APIView):
         return Response(
             {
                 "tenant_id": str(tenant.id),
+                "status": "approved",
                 "lesson": LessonSerializer(lesson).data,
+                "guidance": ("Tell the user it was added to their constellation; do not say it awaits approval."),
             },
             status=201,
         )
@@ -2735,6 +2917,10 @@ class RuntimeConstellationNotesView(APIView):
             return Response({"error": "constellation_failed", "detail": str(exc)}, status=500)
 
         payload["tenant_id"] = str(tenant.id)
+        payload["guidance"] = (
+            "Tutoring signals are evidence about how the user learns; use them to teach to this user. "
+            "Never quote a raw signal back to them."
+        )
         return Response(payload, status=200)
 
 
@@ -2926,6 +3112,11 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
                     update_fields.append("title")
                 doc.pii_receipts = {**(doc.pii_receipts or {}), **receipts}
                 doc.save(update_fields=[*update_fields, "pii_receipts", "updated_at"])
+
+        if doc.kind != Document.Kind.MEMORY:
+            record_runtime_write_event(
+                tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if created else "updated"
+            )
 
         return Response(
             {
@@ -3392,6 +3583,11 @@ class RuntimeDocumentAppendView(KnownValueResponseGuardMixin, APIView):
             )
             doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
 
+        if doc.kind != Document.Kind.MEMORY:
+            record_runtime_write_event(
+                tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if _created else "updated"
+            )
+
         return Response(
             {
                 "tenant_id": str(tenant.id),
@@ -3426,6 +3622,8 @@ class RuntimeProfileUpdateView(APIView):
         tenant, tenant_failure = _load_tenant_or_404(tenant_id)
         if tenant_failure is not None or tenant is None:
             return tenant_failure
+        if "timezone" in request.data and cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
         record_runtime_write_activity(tenant)
 
         user = tenant.user
@@ -3680,9 +3878,9 @@ class RuntimeSituationUpdateView(APIView):
                 source="assistant",
             )
         if changed:
-            from apps.orchestrator.workspace_envelope import push_user_md_in_background
+            from apps.orchestrator.workspace_envelope import TRIGGER_PLACE_OBSERVATION, push_user_md_in_background
 
-            push_user_md_in_background(tenant)
+            push_user_md_in_background(tenant, trigger=TRIGGER_PLACE_OBSERVATION)
 
         guidance = _SITUATION_CAPTURE_GUIDANCE
         home_city = str(getattr(tenant.user, "location_city", "") or "").strip()
@@ -4251,6 +4449,8 @@ class RuntimeCronPhase2SummaryView(KnownValueResponseGuardMixin, APIView):
         tenant, tenant_failure = _load_tenant_or_404(tenant_id)
         if tenant_failure is not None or tenant is None:
             return tenant_failure
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
         record_runtime_write_activity(tenant)
 
         data = request.data or {}
@@ -4436,7 +4636,7 @@ class RuntimeWorkspaceListView(APIView):
             name=name,
             slug=slug,
             description=description,
-            description_embedding=_embed_workspace_description(description),
+            description_embedding=_embed_workspace_description(tenant, description),
             is_default=False,
         )
 
@@ -4509,7 +4709,7 @@ class RuntimeWorkspaceDetailView(APIView):
         if "description" in request.data:
             new_description = str(request.data.get("description", "")).strip()
             workspace.description = new_description
-            workspace.description_embedding = _embed_workspace_description(new_description)
+            workspace.description_embedding = _embed_workspace_description(tenant, new_description)
             updated_fields.extend(["description", "description_embedding"])
 
         if updated_fields:
@@ -4532,7 +4732,6 @@ class RuntimeWorkspaceDetailView(APIView):
         tenant, tenant_failure = _load_tenant_or_404(tenant_id)
         if tenant_failure is not None or tenant is None:
             return tenant_failure
-        record_runtime_write_activity(tenant)
 
         from apps.journal.models import Workspace
 
@@ -4552,8 +4751,42 @@ class RuntimeWorkspaceDetailView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        # If deleting the active workspace, fall back to default
         was_active = tenant.active_workspace_id == workspace.id
+        preview = {
+            "slug": workspace.slug,
+            "name": workspace.name,
+            "content_counts": {"associated_records": 0},
+            "will_fall_back_to_default": was_active,
+        }
+        context = _action_confirmation_context(
+            tenant=tenant,
+            action="workspace_delete",
+            parameters=preview,
+        )
+        body = request.data if isinstance(request.data, dict) else {}
+        confirm_token = str(body.get("confirm_token") or "").strip()
+        confirmation_failure = "missing"
+        if confirm_token:
+            confirmation_failure = confirm_token_failure(
+                confirm_token,
+                context,
+                salt=_WORKSPACE_DELETE_CONFIRM_TOKEN_SALT,
+            )
+        if confirmation_failure is not None:
+            return _confirmation_required_response(
+                context=context,
+                preview=preview,
+                salt=_WORKSPACE_DELETE_CONFIRM_TOKEN_SALT,
+                guidance=_WORKSPACE_DELETE_CONFIRM_GUIDANCE,
+                reason=confirmation_failure,
+            )
+
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+        record_runtime_write_activity(tenant)
+
+        # If deleting the active workspace, fall back to default
         if was_active:
             default_ws = Workspace.objects.filter(tenant=tenant, is_default=True).first()
             tenant.active_workspace = default_ws
@@ -4795,10 +5028,34 @@ class RedditToolView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        params = {k: v for k, v in request.data.items() if k not in {"action", "confirm_token"}}
+
+        if action in {"post", "reply"}:
+            preview = {"action": action, **params}
+            context = _action_confirmation_context(
+                tenant=tenant,
+                action=f"reddit_{action}",
+                parameters=params,
+            )
+            confirm_token = str(request.data.get("confirm_token") or "").strip()
+            confirmation_failure = "missing"
+            if confirm_token:
+                confirmation_failure = confirm_token_failure(
+                    confirm_token,
+                    context,
+                    salt=_REDDIT_CONFIRM_TOKEN_SALT,
+                )
+            if confirmation_failure is not None:
+                return _confirmation_required_response(
+                    context=context,
+                    preview=preview,
+                    salt=_REDDIT_CONFIRM_TOKEN_SALT,
+                    guidance=_REDDIT_CONFIRM_GUIDANCE,
+                    reason=confirmation_failure,
+                )
+
         if action in {"post", "reply", "edit", "delete_post", "delete_comment"}:
             record_runtime_write_activity(tenant)
-
-        params = {k: v for k, v in request.data.items() if k != "action"}
 
         try:
             result = execute_reddit_tool(tenant, action, params)
@@ -4846,7 +5103,7 @@ class RedditToolView(APIView):
 # docs/sautai-phase0-contract.md.
 
 _SAUTAI_MAX_PROMPT_CHARS = 2000
-_SAUTAI_CONFIRM_TOKEN_MAX_AGE_SECONDS = 10 * 60
+_SAUTAI_CONFIRM_TOKEN_MAX_AGE_SECONDS = CONFIRM_TOKEN_MAX_AGE_SECONDS
 _SAUTAI_CONFIRM_TOKEN_SALT = "apps.integrations.sautai.generate-confirm.v1"
 
 
@@ -4880,32 +5137,17 @@ def _sautai_confirmation_context(*, tenant: Tenant, request_payload: dict, tool_
     }
 
 
-def _sautai_confirmation_digest(context: dict) -> str:
-    canonical = json.dumps(context, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def _sautai_issue_confirm_token(context: dict) -> str:
-    digest = _sautai_confirmation_digest(context)
-    return signing.TimestampSigner(salt=_SAUTAI_CONFIRM_TOKEN_SALT).sign(digest)
+    return issue_confirm_token(context, salt=_SAUTAI_CONFIRM_TOKEN_SALT)
 
 
 def _sautai_confirm_token_failure(confirm_token: str, context: dict) -> str | None:
-    """Return an agent-facing failure reason, or ``None`` for a valid token."""
-    if len(confirm_token) > 512:
-        return "invalid"
-    try:
-        signed_digest = signing.TimestampSigner(salt=_SAUTAI_CONFIRM_TOKEN_SALT).unsign(
-            confirm_token,
-            max_age=_SAUTAI_CONFIRM_TOKEN_MAX_AGE_SECONDS,
-        )
-    except signing.SignatureExpired:
-        return "expired"
-    except signing.BadSignature:
-        return "invalid"
-    if not hmac.compare_digest(signed_digest, _sautai_confirmation_digest(context)):
-        return "mismatch"
-    return None
+    return confirm_token_failure(
+        confirm_token,
+        context,
+        salt=_SAUTAI_CONFIRM_TOKEN_SALT,
+        max_age=_SAUTAI_CONFIRM_TOKEN_MAX_AGE_SECONDS,
+    )
 
 
 def _sautai_display_date(value: date) -> str:
@@ -5518,6 +5760,8 @@ class _RuntimeCronCreateBase(KnownValueResponseGuardMixin, APIView):
         tenant, tenant_failure = _load_tenant_or_404(tenant_id)
         if tenant_failure is not None or tenant is None:
             return tenant_failure
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
 
         blocked = assert_write_allowed_for_document_turn(tenant)
         if blocked is not None:
@@ -5609,6 +5853,77 @@ class _RuntimeCronCreateBase(KnownValueResponseGuardMixin, APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+class RuntimeCronListRemindersView(KnownValueResponseGuardMixin, APIView):
+    """GET /runtime/<tenant_id>/crons/reminders/?include_disabled=true"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "cron_list_runtime_response"
+    pii_egress_text_fields = _CRON_EGRESS_TEXT_FIELDS | {"name", "schedule"}
+
+    def get(self, request, tenant_id):
+        from apps.cron.services import list_user_crons
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        return Response(
+            {
+                "reminders": list_user_crons(
+                    tenant,
+                    include_disabled=request.query_params.get("include_disabled", "").lower() == "true",
+                )
+            }
+        )
+
+
+class RuntimeCronCancelReminderView(KnownValueResponseGuardMixin, APIView):
+    """POST /runtime/<tenant_id>/crons/cancel/ {cron_id, origin?}"""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "cron_cancel_runtime_response"
+    pii_egress_text_fields = _CRON_EGRESS_TEXT_FIELDS | {"name", "schedule"}
+
+    def post(self, request, tenant_id):
+        from apps.actions.origin import verify_origin_stamp
+        from apps.cron.gateway_client import GatewayError
+        from apps.cron.models import CronJob
+        from apps.cron.services import TypedCronError, cancel_user_cron
+
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+        data = request.data if isinstance(request.data, dict) else {}
+        try:
+            result = cancel_user_cron(
+                tenant, data.get("cron_id"), origin_stamp=verify_origin_stamp(tenant, data.get("origin"))
+            )
+        except CronJob.DoesNotExist:
+            return Response({"error": "reminder_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        except TypedCronError as exc:
+            if exc.code == "assistant_updating":
+                return cron_fenced_response(assistant=True)
+            return Response({"error": exc.code, "detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except GatewayError:
+            return Response(
+                {"error": "cancellation_not_propagated", "detail": "Retry the cancel call."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
 
 
 class RuntimeCronCreatePureReminderView(_RuntimeCronCreateBase):
@@ -5836,6 +6151,75 @@ class RuntimeProposeMissionTaskView(APIView):
         )
 
 
+_PROJECT_EGRESS_TEXT_FIELDS = frozenset({"title", "goal", "name", "owner", "my_linked_goal"})
+
+
+class RuntimeProjectsContextView(KnownValueResponseGuardMixin, APIView):
+    """GET runtime/<tid>/projects/ — the tid's OWN shared projects (Projects v2).
+
+    Other members' text arrives fenced as untrusted data; their notes never arrive.
+    Reading this marks the next 15 minutes of proposals as "based on project text"."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "friends_projects_runtime_response"
+    pii_egress_text_fields = _PROJECT_EGRESS_TEXT_FIELDS
+
+    def get(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.runtime_context(tenant))
+
+
+class RuntimeProjectDraftView(APIView):
+    """POST runtime/<tid>/project-drafts/ — the assistant saves a PRIVATE starter plan
+    for its own human. Shares nothing; the human publishes (or not) from the app."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        record_runtime_write_activity(tenant)
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.create_draft(tenant, request.data), status=status.HTTP_201_CREATED)
+
+
+class RuntimeProjectProposeView(APIView):
+    """POST runtime/<tid>/projects/<mission_id>/propose/ — the assistant SUGGESTS
+    changes. A proposal only: the human approves in the app; the assistant cannot."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id, mission_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        record_runtime_write_activity(tenant)
+
+        from apps.friends import project_assistant
+
+        return Response(project_assistant.propose(tenant, mission_id, request.data), status=status.HTTP_201_CREATED)
+
+
 # ── Document information-keeping (provenance ledger + keep manifest + forget) ─
 #
 # Backs the nbhd-document-keep plugin's three tools. The keep endpoint VALIDATES
@@ -5916,6 +6300,8 @@ class RuntimeDocumentForgetView(APIView):
         tenant, tenant_failure = _load_tenant_or_404(tenant_id)
         if tenant_failure is not None or tenant is None:
             return tenant_failure
+        if cron_edits_fenced(tenant):
+            return cron_fenced_response(assistant=True)
         record_runtime_write_activity(tenant)
 
         result = forget_ingestion(tenant, ingestion_id)

@@ -1,10 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import {
-  DM_Serif_Display,
-  Plus_Jakarta_Sans,
-  Space_Grotesk,
-  Instrument_Serif,
-} from "next/font/google";
+import localFont from "next/font/local";
 
 import { AppShell } from "@/components/app-shell";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -12,33 +7,59 @@ import { Providers } from "@/app/providers";
 
 import "./globals.css";
 
-const plusJakarta = Plus_Jakarta_Sans({
-  subsets: ["latin"],
+// Fonts are self-hosted (app/fonts/, SIL OFL) so the static-export build never
+// fetches Google Fonts — that download flaked in CI and failed builds. Variable
+// files declare the same weight range next/font/google served.
+//
+// globals.css :root redefines --font-body/-display/-headline/-serif with the
+// literal family names ("Plus Jakarta Sans", …) and wins over the classes
+// below (it is imported after them), so those four @font-face rules keep the
+// real names via `declarations`. --font-measure is only set here: next/font/local
+// points the variable at the default family name, so Schibsted must not override it.
+
+const plusJakarta = localFont({
+  src: "./fonts/PlusJakartaSans-Variable.woff2",
   variable: "--font-body",
   display: "swap",
-  weight: ["400", "500", "600", "700"],
+  weight: "400 700",
+  declarations: [{ prop: "font-family", value: "'Plus Jakarta Sans'" }],
 });
 
-const dmSerif = DM_Serif_Display({
-  subsets: ["latin"],
+const dmSerif = localFont({
+  src: "./fonts/DMSerifDisplay-Regular.woff2",
   variable: "--font-display",
   display: "swap",
   weight: "400",
+  adjustFontFallback: "Times New Roman",
+  declarations: [{ prop: "font-family", value: "'DM Serif Display'" }],
 });
 
-const spaceGrotesk = Space_Grotesk({
-  subsets: ["latin"],
+const spaceGrotesk = localFont({
+  src: "./fonts/SpaceGrotesk-Variable.woff2",
   variable: "--font-headline",
   display: "swap",
-  weight: ["400", "500", "600", "700"],
+  weight: "400 700",
+  declarations: [{ prop: "font-family", value: "'Space Grotesk'" }],
 });
 
-const instrumentSerif = Instrument_Serif({
-  subsets: ["latin"],
+const instrumentSerif = localFont({
+  // Open Sky page titles use the upright face; legacy pull-quotes the italic.
+  src: [
+    { path: "./fonts/InstrumentSerif-Regular.woff2", weight: "400", style: "normal" },
+    { path: "./fonts/InstrumentSerif-Italic.woff2", weight: "400", style: "italic" },
+  ],
   variable: "--font-serif",
   display: "swap",
-  weight: "400",
-  style: "italic",
+  adjustFontFallback: "Times New Roman",
+  declarations: [{ prop: "font-family", value: "'Instrument Serif'" }],
+});
+
+// THE MEASURE onboarding screens (building / paused → subscribe).
+const schibstedGrotesk = localFont({
+  src: "./fonts/SchibstedGrotesk-Variable.woff2",
+  variable: "--font-measure",
+  display: "swap",
+  weight: "400 500",
 });
 
 export const metadata: Metadata = {
@@ -75,7 +96,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`h-full ${plusJakarta.variable} ${dmSerif.variable} ${spaceGrotesk.variable} ${instrumentSerif.variable}`}
+      className={`h-full ${plusJakarta.variable} ${dmSerif.variable} ${spaceGrotesk.variable} ${instrumentSerif.variable} ${schibstedGrotesk.variable}`}
     >
       <body className="overflow-x-hidden bg-bg">
         <ThemeProvider>

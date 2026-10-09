@@ -11,8 +11,10 @@ from rest_framework.test import APIClient
 from apps.cron.models import CronJob
 from apps.journal.models import Document
 from apps.router.cron_delivery import (
+    _CLAIM_STALE,
     _claim_delivery_attempt,
     _rate_counts,
+    _reclaim_stale_delivery_attempt,
     _split_message,
     degraded_occurrence_key,
 )
@@ -77,6 +79,54 @@ class CronDeliveryViewTest(TestCase):
     def test_auth_required(self):
         resp = self.client.post(self.url, {"message": "hello"}, format="json")
         self.assertEqual(resp.status_code, 401)
+
+    def test_unknown_tenant_returns_404_with_one_content_free_log(self):
+        from uuid import uuid4
+
+        tenant_id = str(uuid4())
+        url = self.url.replace(str(self.tenant.id), tenant_id)
+        with (
+            patch("apps.router.cron_delivery.validate_internal_runtime_request"),
+            self.assertLogs("apps.router.cron_delivery", level="WARNING") as logs,
+            patch("apps.router.proactive_context._dispatch_ios_push") as push,
+            patch("apps.router.cron_delivery.httpx.Client") as transport,
+        ):
+            response = self.client.post(url, {"message": "private synthetic content"}, format="json")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"error": "tenant_not_found"})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(f"tenant={tenant_id[:8]} job=- reason=tenant_not_found status=404", logs.output[0])
+        self.assertNotIn("private", logs.output[0])
+        push.assert_not_called()
+        transport.assert_not_called()
+
+    def test_reject_logging_covers_auth_payload_throttle_and_transport(self):
+        from rest_framework.response import Response
+
+        from apps.router.cron_delivery import CronDeliveryView
+
+        for code, error, reason in (
+            (401, "internal_auth_failed", "internal_auth_failed"),
+            (400, "private payload", "invalid_payload"),
+            (404, "tenant_not_found", "tenant_not_found"),
+            (429, "rate_limited", "rate_limited"),
+            (502, "telegram_send_failed", "telegram_send_failed"),
+            (502, "line_send_failed", "line_send_failed"),
+            (503, "app_delivery_not_recorded", "app_delivery_not_recorded"),
+            (503, "eval_delivery_not_recorded", "eval_delivery_not_recorded"),
+            (503, "telegram_not_configured", "telegram_not_configured"),
+            (503, "line_not_configured", "line_not_configured"),
+        ):
+            with self.subTest(code=code, error=error):
+                with (
+                    patch.object(CronDeliveryView, "post", return_value=Response({"error": error}, status=code)),
+                    self.assertLogs("apps.router.cron_delivery", level="WARNING") as logs,
+                ):
+                    resp = self.client.post(self.url, {"message": "private body"}, format="json")
+                self.assertEqual(resp.status_code, code)
+                self.assertEqual(len(logs.output), 1)
+                self.assertIn(f"reason={reason} status={code}", logs.output[0])
+                self.assertNotIn("private", logs.output[0])
 
     def test_missing_message(self):
         resp = self.client.post(self.url, {}, format="json", **self._headers())
@@ -209,6 +259,101 @@ class CronDeliveryViewTest(TestCase):
         self.assertEqual(stored.channel, "line")
         self.assertEqual(stored.quick_replies, ["👍 Good day", "🫤 Mixed", "👎 Rough"])
         self.assertNotIn("quick-replies", stored.message_text)
+
+    @patch("apps.router.proactive_context._dispatch_ios_push")
+    def test_app_insight_marker_stripped_and_recorded(self, _push):
+        """A scheduled send never shows raw ``[[insight:...]]`` in the app feed."""
+        from apps.insights.models import AssistantInsight
+        from apps.router.models import DeviceToken
+
+        DeviceToken.objects.create(tenant=self.tenant, user=self.user, token="i" * 64)
+
+        resp = self.client.post(
+            self.url,
+            {
+                "message": (
+                    "Nice. [[insight:fuel/morning_workouts]]Both of today's sessions were in the "
+                    "books before 9 a.m.[[/insight]] Mobility is still on the plan."
+                )
+            },
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["channel"], "app")
+        stored = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(
+            stored.message_text,
+            "Nice. Both of today's sessions were in the books before 9 a.m. Mobility is still on the plan.",
+        )
+        insight = AssistantInsight.objects.get(tenant=self.tenant)
+        self.assertEqual(insight.pillar, "fuel")
+        self.assertEqual(insight.statement, "Both of today's sessions were in the books before 9 a.m.")
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_telegram_insight_marker_stripped_before_send(self, mock_client_cls):
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_http.post.return_value = mock_resp
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        resp = self.client.post(
+            self.url,
+            {"message": "Morning. [[insight:journal/mood]]You write more on rough days.[[/insight]]"},
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        sent_text = mock_http.post.call_args.kwargs["json"]["text"]
+        self.assertEqual(sent_text, "Morning. You write more on rough days.")
+        self.assertNotIn("insight", ProactiveOutbound.objects.get(tenant=self.tenant).message_text)
+
+    @patch("apps.router.proactive_context._dispatch_ios_push")
+    def test_app_block_marker_stripped_before_persist(self, _push):
+        """The typed-cron ``[block: ...]`` render marker never reaches the app feed."""
+        from apps.router.models import DeviceToken
+
+        DeviceToken.objects.create(tenant=self.tenant, user=self.user, token="b" * 64)
+
+        resp = self.client.post(
+            self.url,
+            {"message": "[block: task_hygiene]\n**Weekly task hygiene** — nothing looked clearly done."},
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        stored = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(stored.message_text, "**Weekly task hygiene** — nothing looked clearly done.")
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_telegram_inline_block_marker_stripped_before_send(self, mock_client_cls):
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.is_success = True
+        mock_resp.status_code = 200
+        mock_http.post.return_value = mock_resp
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        resp = self.client.post(
+            self.url,
+            {"message": "[block: daily_briefing] Good morning!\nTwo events today."},
+            format="json",
+            **self._headers(),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        sent_text = mock_http.post.call_args.kwargs["json"]["text"]
+        self.assertEqual(sent_text, "Good morning!\nTwo events today.")
+        self.assertNotIn("[block", ProactiveOutbound.objects.get(tenant=self.tenant).message_text)
 
     @patch("apps.router.proactive_context._dispatch_ios_push")
     def test_app_quick_reply_marker_stripped_before_send_and_persisted(self, _push):
@@ -582,7 +727,7 @@ class DeliveryDedupTest(TestCase):
             ),
         )
 
-    def test_unique_constraint_claim_race_suppresses_existing_claim(self):
+    def test_live_claim_suppresses_existing_claim(self):
         occurrence_key = degraded_occurrence_key(
             tenant_id=self.tenant.id,
             job_name="hourly-heartbeat",
@@ -607,6 +752,116 @@ class DeliveryDedupTest(TestCase):
         self.assertEqual(duplicate.data["status"], "duplicate_suppressed")
         self.assertEqual(duplicate.data["prior_state"], DeliveryAttempt.State.CLAIMED)
         self.assertEqual(DeliveryAttempt.objects.get(tenant=self.tenant).id, winner.id)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_stale_claim_is_reclaimed_and_sent_once(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        occurrence_key = degraded_occurrence_key(
+            tenant_id=self.tenant.id,
+            job_name="hourly-heartbeat",
+            fired_at=self.fired_at,
+        )
+        abandoned = DeliveryAttempt.objects.create(
+            tenant=self.tenant,
+            occurrence_key=occurrence_key,
+            job_name="hourly-heartbeat",
+            channel="telegram",
+        )
+        DeliveryAttempt.objects.filter(pk=abandoned.pk).update(
+            claimed_at=self.fired_at - _CLAIM_STALE - timedelta(minutes=1)
+        )
+
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING") as logs:
+            response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 1)
+        attempt = DeliveryAttempt.objects.get(tenant=self.tenant)
+        self.assertEqual(attempt.id, abandoned.id)
+        self.assertEqual(attempt.state, DeliveryAttempt.State.SENT)
+        self.assertEqual(attempt.claimed_at, self.fired_at)
+        self.assertIn("delivery_stale_claim_reclaimed", "\n".join(logs.output))
+
+    def test_two_stale_reclaim_attempts_have_one_conditional_update_winner(self):
+        occurrence_key = degraded_occurrence_key(
+            tenant_id=self.tenant.id,
+            job_name="hourly-heartbeat",
+            fired_at=self.fired_at,
+        )
+        abandoned = DeliveryAttempt.objects.create(
+            tenant=self.tenant,
+            occurrence_key=occurrence_key,
+            job_name="hourly-heartbeat",
+            channel="telegram",
+        )
+        stale_at = self.fired_at - _CLAIM_STALE - timedelta(minutes=1)
+        DeliveryAttempt.objects.filter(pk=abandoned.pk).update(claimed_at=stale_at)
+
+        first_snapshot = DeliveryAttempt.objects.get(pk=abandoned.pk)
+        second_snapshot = DeliveryAttempt.objects.get(pk=abandoned.pk)
+
+        first_result, first_count = _reclaim_stale_delivery_attempt(first_snapshot, now=self.fired_at)
+        second_result, second_count = _reclaim_stale_delivery_attempt(second_snapshot, now=self.fired_at)
+
+        self.assertEqual(first_result, "reclaimed")
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_result, "lost")
+        self.assertEqual(second_count, 1)
+        self.assertEqual(DeliveryAttempt.objects.get(pk=abandoned.pk).claimed_at, self.fired_at)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_stale_reclaim_cap_marks_attempt_failed_with_reason(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        occurrence_key = degraded_occurrence_key(
+            tenant_id=self.tenant.id,
+            job_name="hourly-heartbeat",
+            fired_at=self.fired_at,
+        )
+        abandoned = DeliveryAttempt.objects.create(
+            tenant=self.tenant,
+            occurrence_key=occurrence_key,
+            job_name="hourly-heartbeat",
+            channel="telegram",
+        )
+
+        for _ in range(3):
+            DeliveryAttempt.objects.filter(pk=abandoned.pk).update(
+                claimed_at=self.fired_at - _CLAIM_STALE - timedelta(minutes=1)
+            )
+            with (
+                patch("apps.router.cron_delivery.timezone.now", return_value=self.fired_at),
+                self.assertLogs("apps.router.cron_delivery", level="WARNING"),
+            ):
+                claimed, duplicate = _claim_delivery_attempt(
+                    tenant=self.tenant,
+                    occurrence_key=occurrence_key,
+                    job_name="hourly-heartbeat",
+                    channel="telegram",
+                )
+            self.assertEqual(claimed.id, abandoned.id)
+            self.assertIsNone(duplicate)
+
+        DeliveryAttempt.objects.filter(pk=abandoned.pk).update(
+            claimed_at=self.fired_at - _CLAIM_STALE - timedelta(minutes=1)
+        )
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING") as logs:
+            response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "reclaim_exhausted")
+        mock_http.post.assert_not_called()
+        attempt = DeliveryAttempt.objects.get(pk=abandoned.pk)
+        self.assertEqual(attempt.state, DeliveryAttempt.State.FAILED)
+        self.assertIsNotNone(attempt.resolved_at)
+        self.assertIn("stale claim reclaim limit reached", attempt.response_excerpt)
+        self.assertIn("delivery_stale_claim_reclaim_exhausted", "\n".join(logs.output))
+
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING"):
+            repeated = self._post()
+        self.assertEqual(repeated.json()["status"], "reclaim_exhausted")
+        self.assertEqual(DeliveryAttempt.objects.get(pk=abandoned.pk).id, abandoned.id)
+        mock_http.post.assert_not_called()
 
 
 @override_settings(

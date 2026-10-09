@@ -108,9 +108,55 @@ def render_profile(tenant: Tenant) -> str:
     if city:
         lines.append(f"- Home location: {city}")
 
+    interests = (getattr(user, "preferences", None) or {}).get("onboarding_interests", "")
+    if isinstance(interests, list):
+        interests = ", ".join(str(item).strip() for item in interests if str(item).strip())
+    elif not isinstance(interests, str):
+        interests = ""
+    interests = interests.strip()
+    if interests:
+        lines.append(f"- Interests and priorities: {interests}")
+
     if not lines:
         return ""
     return "\n".join(lines)
+
+
+def render_safe_user_md(tenant: Tenant, existing: str | None = None) -> str | None:
+    """Mint profile/existing-file PII, then render a confirmed-safe envelope.
+
+    Onboarding is a human-authored ingress seam, so it uses the same ``mint=all``
+    policy as chat (with the user's own name included). Existing unmanaged text
+    is also redacted before merge so the one-off fleet repair can remove the
+    historical raw onboarding block without exposing or discarding agent notes.
+    Any redaction failure returns ``None`` and callers must skip the write.
+    """
+    from apps.orchestrator.workspace_envelope import merge_into_user_md, render_managed_region
+    from apps.pii.redactor import MINT_NEVER, redact_user_message_checked
+
+    profile = render_profile(tenant)
+    if profile:
+        profile_outcome = redact_user_message_checked(profile, tenant, allow_user_name=False)
+        if not profile_outcome.confirmed:
+            return None
+
+    safe_existing = existing
+    if existing and existing.strip():
+        existing_outcome = redact_user_message_checked(existing, tenant, allow_user_name=False)
+        if not existing_outcome.confirmed:
+            return None
+        safe_existing = existing_outcome.text
+
+    managed = render_managed_region(tenant)
+    managed_outcome = redact_user_message_checked(
+        managed,
+        tenant,
+        allow_user_name=False,
+        mint=MINT_NEVER,
+    )
+    if not managed_outcome.confirmed:
+        return None
+    return merge_into_user_md(safe_existing, managed_outcome.text)
 
 
 def _situation_enabled(tenant: Tenant) -> bool:
@@ -121,6 +167,23 @@ def _observation_age_seconds(now, observed_at) -> int:
     if observed_at is None:
         return 0
     return max(0, int((now - observed_at).total_seconds()))
+
+
+def is_place_fresh(situation, now=None) -> bool:
+    """The ONE freshness rule for ``current_place_label``.
+
+    ``render_situation`` (USER.md ``## Right now``) and the programmatic
+    briefing weather (``apps.orchestrator.briefing_weather``) both decide
+    "is this place still where the user is?" with this predicate, so the
+    place the agent sees and the place the forecast is fetched for can never
+    disagree.
+    """
+    if situation is None:
+        return False
+    now = now or timezone.now()
+    label = (getattr(situation, "current_place_label", "") or "").strip()
+    observed_at = getattr(situation, "current_place_last_observed_at", None)
+    return bool(label and observed_at and now - observed_at <= PLACE_DECAY)
 
 
 def _format_place_observed_at(tenant: Tenant, observed_at, now) -> str:
@@ -178,11 +241,7 @@ def render_situation(tenant: Tenant) -> str:
 
     place_label = (situation.current_place_label or "").strip()
     place_age_s = _observation_age_seconds(now, situation.current_place_last_observed_at)
-    place_fresh = bool(
-        place_label
-        and situation.current_place_last_observed_at
-        and now - situation.current_place_last_observed_at <= PLACE_DECAY
-    )
+    place_fresh = is_place_fresh(situation, now)
     known_away = bool(place_label and place_label.casefold() != home.casefold())
     traveling = bool(place_fresh and known_away)
 

@@ -15,6 +15,7 @@ import httpx
 from django.conf import settings
 
 from apps.common.eval_sink import blocks_real_transport_for_identifier
+from apps.orchestrator.gateway_url import gateway_base_url
 from apps.tenants.models import Tenant, User
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,16 @@ def _channel_via(channel: str | None) -> str:
     return f" via {label}" if label else ""
 
 
-def build_chat_context_marker(channel: str | None = None) -> str:
+def _panel_chat_context(channel, tenant) -> str:
+    from apps.router.chat_gates import chat_shape_enabled
+    from apps.router.panels import CHAT_PANEL_INSTRUCTION
+
+    if (channel or "").strip().lower() in {"ios", "app"} and chat_shape_enabled(tenant):
+        return CHAT_PANEL_INSTRUCTION
+    return ""
+
+
+def build_chat_context_marker(channel: str | None = None, *, tenant=None) -> str:
     """Single-line marker injected before ad-hoc user messages.
 
     Tells the agent the turn is a conversational message (NBHD app / Telegram /
@@ -92,10 +102,10 @@ def build_chat_context_marker(channel: str | None = None) -> str:
     return (
         f"[chat{_channel_via(channel)}: user is mid-conversation, reply concisely "
         "without loading workspace docs unless the question explicitly requires it]\n"
-    )
+    ) + _panel_chat_context(channel, tenant)
 
 
-def build_coalesced_chat_marker(channel: str | None = None) -> str:
+def build_coalesced_chat_marker(channel: str | None = None, *, tenant=None) -> str:
     """Marker variant for coalesced multi-message turns.
 
     Replaces the standard ``build_chat_context_marker()`` when N>1 inbound
@@ -111,7 +121,7 @@ def build_coalesced_chat_marker(channel: str | None = None) -> str:
         "while you were waking up — treat as one combined request; if any later "
         "message supersedes an earlier one, follow the later one; do not reply to "
         "each message separately]\n"
-    )
+    ) + _panel_chat_context(channel, tenant)
 
 
 def format_coalesced_user_content(
@@ -121,6 +131,7 @@ def format_coalesced_user_content(
     timestamps: list[datetime] | None = None,
     workspace_prefix: str = "",
     channel: str | None = None,
+    tenant=None,
 ) -> str:
     """Build the user-message content for a coalesced multi-message turn.
 
@@ -137,7 +148,11 @@ def format_coalesced_user_content(
     if len(raw_texts) < 2:
         raise ValueError("format_coalesced_user_content requires >= 2 entries")
 
-    header = build_datetime_context(user_timezone) + build_coalesced_chat_marker(channel) + (workspace_prefix or "")
+    header = (
+        build_datetime_context(user_timezone)
+        + build_coalesced_chat_marker(channel, tenant=tenant)
+        + (workspace_prefix or "")
+    )
 
     lines: list[str] = []
     for idx, raw in enumerate(raw_texts, start=1):
@@ -316,6 +331,8 @@ async def forward_to_openclaw(
     timeout: float = 10.0,
     max_retries: int = 0,
     retry_delay: float = 5.0,
+    failure_sink: dict | None = None,
+    tenant: Tenant | None = None,
 ) -> dict | None:
     """Forward a Telegram update to an OpenClaw instance's gateway.
 
@@ -324,7 +341,7 @@ async def forward_to_openclaw(
     the scale-up even if it times out. The user is told to retry in ~30s,
     by which time the container is warm.
     """
-    url = f"https://{container_fqdn}/telegram-webhook"
+    url = f"{gateway_base_url(tenant, fqdn=container_fqdn)}/telegram-webhook"
 
     attempt = 0
     while True:
@@ -357,9 +374,23 @@ async def forward_to_openclaw(
                 container_fqdn,
                 attempt,
             )
+            if failure_sink is not None:
+                failure_sink["reason"] = "timeout"
+            return None
+        except httpx.ConnectError as e:
+            logger.error("Error forwarding to %s: %s", container_fqdn, e)
+            if failure_sink is not None:
+                failure_sink["reason"] = "connect_error"
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.error("Error forwarding to %s: %s", container_fqdn, e)
+            if failure_sink is not None:
+                failure_sink["reason"] = f"http_{e.response.status_code}"
             return None
         except httpx.HTTPError as e:
             logger.error("Error forwarding to %s: %s", container_fqdn, e)
+            if failure_sink is not None:
+                failure_sink["reason"] = "http_error"
             return None
 
 

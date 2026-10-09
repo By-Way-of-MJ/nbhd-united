@@ -394,7 +394,7 @@ export default function register(api) {
     wrap({
       name: "nbhd_insights_record",
       description:
-        "Record an observation you've just raised with the user — your interpretation of a pattern, not a raw number. Status starts as 'open' until the user confirms or refutes. Use `evidence_refs` to point to the specific snapshots/window that support the claim (e.g. {snapshot_ids: [...], window: '8w'}). The `topic` accepts either a canonical slug or a natural string; if it's new, the registry creates a 'proposed' topic that ops can later promote. Skip noise — single-week blips, <10% baseline deltas, things the user already explicitly mentioned.",
+        "Primarily record new observations inline in the reply as `[[insight:pillar/slug]]…[[/insight]]`; use this direct tool only as a rare fallback. Record an observation you've just raised with the user — your interpretation of a pattern, not a raw number. Status starts as 'open' until the user confirms or refutes. Use `evidence_refs` to point to the specific snapshots/window that support the claim (e.g. {snapshot_ids: [...], window: '8w'}). The `topic` accepts either a canonical slug or a natural string; if it's new, the registry creates a 'proposed' topic that ops can later promote. Skip noise — single-week blips, <10% baseline deltas, things the user already explicitly mentioned.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -451,7 +451,7 @@ export default function register(api) {
     wrap({
       name: "nbhd_insights_confirm",
       description:
-        "Mark an existing insight as confirmed by the user. Call this when the user agrees with an observation you raised. Idempotent — re-confirms just append to the response history.",
+        "Use this to confirm an existing insight after evidence: call when the user agrees with an observation you raised. Idempotent — re-confirms just append to the response history.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -490,7 +490,7 @@ export default function register(api) {
     wrap({
       name: "nbhd_insights_refute",
       description:
-        "Mark an existing insight as refuted — the user corrected you. The row stays on record so you remember being wrong (and don't re-raise the same thing). Be quick to refute; refusing to admit wrong is the failure mode.",
+        "Use this to refute an existing insight after evidence: call when the user corrects you. The row stays on record so you remember being wrong (and don't re-raise the same thing). Be quick to refute; refusing to admit wrong is the failure mode.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -692,7 +692,7 @@ export default function register(api) {
     wrap({
       name: "nbhd_yesterdays_signals",
       description:
-        "Cross-pillar snapshot of yesterday's activity across Fuel (workouts), Journal (entries, energy), and Lessons (approved, pending). Includes 'today_so_far' to catch late-logging and 'notable_gaps' flags (e.g. 'journal_dark_3_days') the backend pre-computes as cheap hints — you decide whether to act on them. Use this before deciding whether to ask a signal-driven Personal Question or to ground a Heartbeat nudge in a fresh fact. Tenant-tz-aware; 'yesterday' is the previous calendar day in the user's local timezone. The Core pillar is intentionally omitted (no data model yet).",
+        "Cross-pillar snapshot of yesterday's activity across Fuel (workouts), Journal (entries, energy), and Lessons (approved, pending). Includes 'today_so_far' to catch late-logging and 'notable_gaps' flags (e.g. 'journal_dark_3_days') the backend pre-computes as cheap hints — you decide whether to act on them. Use this before deciding whether to ask a signal-driven Personal Question or to ground a Heartbeat nudge in a fresh fact. Tenant-tz-aware; 'yesterday' is the previous calendar day in the user's local timezone. Core counts are COMPLETED sits (the person finished listening), by local day. Fuel counts are workouts with status=done. Anything not counted here did not happen — never congratulate a workout or meditation these counts do not show.",
       parameters: {
         type: "object",
         additionalProperties: false,

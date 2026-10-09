@@ -153,24 +153,27 @@ class ETagMiddlewareTest(TestCase):
         result = mw(self.factory.get("/x/"))
         self.assertIn("ETag", result)
         self.assertTrue(result["ETag"].startswith('"'))
-        self.assertEqual(result["Cache-Control"], "private, max-age=10, stale-while-revalidate=60")
+        self.assertEqual(result["Cache-Control"], "private, no-store")
         self.assertIn("Authorization", result["Vary"])
 
-    def test_returns_304_on_match(self):
+    def test_never_answers_304_so_a_phone_never_reuses_an_old_copy(self):
+        """2026-10-08: the iPhone URL cache served a days-old plan after a 304 whose
+        ETag matched the current body. A matching If-None-Match still gets the body."""
+        from django.http import JsonResponse
+
+        first = self._mw(JsonResponse({"a": 1}))(self.factory.get("/x/"))
+        second = self._mw(JsonResponse({"a": 1}))(self.factory.get("/x/", HTTP_IF_NONE_MATCH=first["ETag"]))
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.content, b'{"a": 1}')
+        self.assertEqual(second["Cache-Control"], "private, no-store")
+
+    def test_a_view_that_sets_its_own_cache_control_keeps_it(self):
         from django.http import JsonResponse
 
         response = JsonResponse({"a": 1})
-        mw = self._mw(response)
-        # First request — get the ETag.
-        first = mw(self.factory.get("/x/"))
-        etag = first["ETag"]
-        # Second request with If-None-Match should yield 304.
-        # Re-build middleware because the response object is single-use after render.
-        response2 = JsonResponse({"a": 1})
-        mw2 = self._mw(response2)
-        second = mw2(self.factory.get("/x/", HTTP_IF_NONE_MATCH=etag))
-        self.assertEqual(second.status_code, 304)
-        self.assertEqual(second["ETag"], etag)
+        response["Cache-Control"] = "public, max-age=300"
+        result = self._mw(response)(self.factory.get("/x/"))
+        self.assertEqual(result["Cache-Control"], "public, max-age=300")
 
     def test_skips_non_200(self):
         from django.http import JsonResponse

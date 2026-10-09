@@ -8,8 +8,8 @@ within the phase-arc grammar (fixed bookends, its choice of middle — see
 
 LLM access mirrors the project's other Django-side calls (apps/insights/synthesis.py,
 apps/pii/arbiter.py): the shared ``apps.common.openrouter.chat_completion`` client
-with JSON mode. Like those callers it tries an ORDERED CHAIN of low-cost OpenRouter
-models rather than a single one, so a single model's hiccup on this structured task
+with a manifest/lesson JSON schema and per-model JSON-mode fallback. It tries an
+ORDERED CHAIN of low-cost OpenRouter models rather than a single one, so a single model's hiccup on this structured task
 no longer fails the whole compose. Each candidate is parsed AND validated — a model
 that answers with unusable *content* (not just an empty body) also falls through to
 the next. Kept LEAN on purpose — sparse speech (~6-12 TTS calls) so a low Gemini
@@ -23,10 +23,12 @@ import logging
 import time
 
 from django.conf import settings
+from pydantic import ValidationError
 
 from apps.billing.constants import DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL, GEMMA_MODEL
-from apps.common.openrouter import chat_completion
+from apps.common.openrouter import NoUsableChoicesError, chat_completion, local_llm
 from apps.core import render
+from apps.core.lesson import INTENTIONS, TRADITIONS, MeditationLesson, MeditationManifest, normalize_teaching_slug
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +46,11 @@ DEFAULT_COMPOSE_MODEL = GEMMA_MODEL
 _FALLBACK_COMPOSE_MODELS = [DEEPSEEK_FLASH_MODEL, DEEPSEEK_MODEL]
 _MAX_OUTPUT_TOKENS = 3000  # headroom: holistic manifests carry many explicit-silence segments
 _LLM_TIMEOUT_S = 60
+_SCHEMA_REJECTED_MODELS: set[str] = set()
 # A transient hiccup (timeout / 429 / 5xx) on the FIRST attempt of a model gets
 # ONE retry after a short backoff before we give up on that model and fall to the
-# next. Content failures (unparseable / invalid manifest) are NOT retried — a
-# retry can't fix bad content, so we fall straight through to the next model.
+# next. Separately, invalid manifests and variety clashes share ONE corrective
+# retry per model, with the rejected answer and redacted validation feedback.
 _RETRY_BACKOFF_S = 2.0
 _TRANSIENT_MARKERS = (
     "429",
@@ -65,7 +68,7 @@ _TRANSIENT_MARKERS = (
 # The look-back block is the one prompt section that grows with use — a daily
 # sitter accumulates history forever. Cap it so the recent list can never crowd
 # out this week's actual signals (whole entries only; oldest dropped first).
-_RECENT_MEDITATIONS_CHAR_BUDGET = 1200
+_RECENT_MEDITATIONS_CHAR_BUDGET = 2600
 
 # Rough per-phase time budgets (seconds) for the ~10-min arc — guidance the model
 # paces toward and a fallback when it omits one. The model now OWNS the allocation
@@ -120,6 +123,15 @@ _SYSTEM_PROMPT = (
     '  global_tone: "soft, slow, warm; unhurried with generous space"\n'
     "  total_target_seconds: 600\n"
     "  ambient: null\n"
+    "  lesson: { tradition, intention, teaching_slug, core_teaching, summary, practice }\n"
+    f"    tradition: exactly one of {', '.join(TRADITIONS)}; other is the honest exit\n"
+    f"    intention: exactly one of {', '.join(INTENTIONS)}; other is the honest exit when none fits\n"
+    "    intention names the personal invitation actually expressed in the narration, independent of tradition.\n"
+    "    Use release-control for invitations to loosen planning or control; do not relabel them to evade variety.\n"
+    "    teaching_slug: kebab-case tag for the ONE idea, 2-40 characters\n"
+    "    core_teaching: one sentence, at most 200 characters\n"
+    "    summary: 2-3 sentences, at most 400 characters\n"
+    "    practice: what the body/attention actually does, at most 200 characters\n"
     "  phases: the sit's arc — you choose today's shape, within the grammar below\n\n"
     "PHASE ARC — the bookends are fixed, the middle is yours:\n"
     "- The FIRST phase is always arrival and the LAST is always closing.\n"
@@ -161,6 +173,9 @@ _SYSTEM_PROMPT = (
     "one re-anchoring cue, the closing takeaway — while a guided one sits at the high end. Never name the "
     "density and never add a key for it.\n\n"
     "VARIETY — every sit must feel like a new doorway:\n"
+    "- Do not repeat an intention in AVOID INTENTIONS; choose a different personal invitation, not just a new label.\n"
+    "- Do not reuse any `teaching_slug` that appears in RECENT MEDITATIONS.\n"
+    "- Do not use the same `tradition` as either of the two most recent sits.\n"
     "- Your input may include a RECENT MEDITATIONS list (newest first, with each sit's title and theme). "
     "That list is what you must NOT repeat.\n"
     "- The title must not repeat or near-echo any recent title — not the same words, and not the same "
@@ -168,9 +183,9 @@ _SYSTEM_PROMPT = (
     "- Vary the imagery you reach for, how you open the sit, and what the practice focuses on, measured "
     "against those recent sits.\n\n"
     "WISDOM LESSON — each sit teaches ONE small idea:\n"
-    "- Draw it from the breadth of contemplative thought: Stoic, Zen, broader Buddhist, Taoist, Sufi, "
-    "Christian-contemplative, Jewish, or secular philosophy and the science of mind.\n"
-    "- CHOOSE the idea to serve what today's signals show this person is carrying — not at random. Rotate "
+    f"- Draw it from these traditions: {', '.join(TRADITIONS)}.\n"
+    "- The teaching in the phases and the closing takeaway must express the SAME idea as lesson.\n"
+    "- CHOOSE the idea to support today's concrete aspect and chosen intention. Rotate "
     "which tradition you draw on against the recent sits.\n"
     "- Teach it plainly and invitationally, in a sentence or two, within core_practice or a teaching "
     'phase. Attribute it simply where that helps ("the Stoics called this…", "there is a Zen word for this…").\n'
@@ -201,8 +216,9 @@ _SYSTEM_PROMPT = (
     "- Speech text is short (1-3 sentences), calm, second-person, present-tense. Never read instructions aloud.\n"
     '- Always address them as "you". NEVER use a name or any [BRACKETED_TOKEN] — those are voiced literally by TTS.\n'
     "- The heart of the sit — core_practice, or whichever middle phase carries it — is the personalized part: "
-    "gently name what the signals suggest they're carrying, and offer permission to set it down. Be specific "
-    "but kind; never clinical, never list their data back.\n"
+    "pick ONE concrete aspect of today and offer ONE intention from the intention vocabulary. "
+    "Do NOT treat planning, organizing, building, or ambition as a flaw to fix unless today's signals "
+    "explicitly show distress about it. Be kind and specific; never clinical, never list their data back.\n"
     "- closing gives one small carry-forward intention.\n\n"
     "OUTPUT FORMAT (strict):\n"
     "- Write ALL text — title, theme, every speech segment — in ENGLISH.\n"
@@ -237,7 +253,9 @@ def _constellation_line(star: dict) -> str:
     latest = insights[0] if insights else {}
     stage = star.get("stage", "")
 
-    if latest.get("mastery_achieved"):
+    if not star.get("recent_activity"):
+        engagement = "a saved insight of theirs"
+    elif latest.get("mastery_achieved"):
         engagement = "something they've been settling into"
     elif latest.get("restated_accurately") is False:
         engagement = "something still taking shape for them"
@@ -281,11 +299,28 @@ def _recent_meditation_lines(entries: list, *, budget: int = _RECENT_MEDITATIONS
         line += f'"{title}"' if title else "(untitled)"
         if theme:
             line += f" — {theme}"
+        lesson = entry.get("lesson") or {}
+        if isinstance(lesson, dict) and lesson.get("tradition") and lesson.get("teaching_slug"):
+            teaching = " ".join(str(lesson.get("core_teaching") or "").split())
+            line += f" [{lesson['tradition']}/{lesson['teaching_slug']}: {teaching}]"
         if used + len(line) + 1 > budget:  # +1 for the newline it will be joined with
             break
         lines.append(line)
         used += len(line) + 1
     return lines
+
+
+def _recent_intentions(entries: list) -> list[tuple[dict, str]]:
+    """Known intentions within five sits, including legacy sits in the window."""
+    result = []
+    for entry in entries[:5]:
+        if not isinstance(entry, dict):
+            continue
+        lesson = entry.get("lesson")
+        intention = lesson.get("intention") if isinstance(lesson, dict) else None
+        if intention in INTENTIONS and intention != "other":
+            result.append((entry, intention))
+    return result
 
 
 def _format_signals(signals: dict, target_seconds: float = render.DEFAULT_TOTAL_TARGET_SECONDS) -> str:
@@ -295,17 +330,23 @@ def _format_signals(signals: dict, target_seconds: float = render.DEFAULT_TOTAL_
     if recent_meditations:
         lines.append("RECENT MEDITATIONS (newest first):")
         lines.extend(recent_meditations)
-    notes = signals.get("recent_notes") or []
-    if notes:
-        lines.append("Recent daily-note snippets:")
-        lines.extend(f"- {n}" for n in notes[:6])
+    intentions = dict.fromkeys(i for _, i in _recent_intentions(signals.get("recent_meditations") or []))
+    if intentions:
+        # Independent of the prose history budget: never truncate this constraint.
+        lines.append("AVOID INTENTIONS (used in last 5 sits): " + ", ".join(intentions))
+    words = signals.get("recent_user_words") or []
+    if words:
+        lines.append(
+            "In their own words recently: (these are the person's words; anchor on at most one concrete thing)"
+        )
+        lines.extend(f"- {word}" for word in words[:8])
     stars = signals.get("constellation_stars") or []
     if stars:
         lines.append(
-            "Stars they've been working through in their constellation (durable lessons they're "
-            "actively revisiting) — let these gently shape the heart of the sit:"
+            "Optional constellation star (a durable saved lesson): it MAY gently shape one moment "
+            "of the sit if relevant; it need not determine the theme:"
         )
-        lines.extend(_constellation_line(s) for s in stars[:4])
+        lines.extend(_constellation_line(s) for s in stars[:1])
     goals = signals.get("active_goals") or []
     if goals:
         lines.append(
@@ -318,8 +359,8 @@ def _format_signals(signals: dict, target_seconds: float = render.DEFAULT_TOTAL_
         lines.append(f"What they've asked to keep in mind: {signals['additional_context']}")
     if len(lines) == 1:
         lines.append(
-            "- (little specific signal this week — compose a gentle, universal sit about arriving, "
-            "breathing, and setting down whatever today held)"
+            "- (little specific signal this week — choose one present-moment aspect, such as breath or "
+            "contact with the chair, and one fresh intention from the vocabulary; do not invent a burden)"
         )
     minutes = max(1, round(target_seconds / 60))
     scale = target_seconds / render.DEFAULT_TOTAL_TARGET_SECONDS
@@ -395,7 +436,7 @@ def _strip_code_fences(text: str) -> str:
 def _is_transient(exc: Exception) -> bool:
     """A transport hiccup worth one retry (timeout / rate-limit / 5xx), vs. a hard
     failure (bad content, auth) where a retry can't help."""
-    return any(marker in str(exc).lower() for marker in _TRANSIENT_MARKERS)
+    return isinstance(exc, NoUsableChoicesError) or any(marker in str(exc).lower() for marker in _TRANSIENT_MARKERS)
 
 
 def _call_model(model_id: str, messages: list, api_key: str, body: dict) -> tuple[dict, str]:
@@ -414,6 +455,24 @@ def _call_model(model_id: str, messages: list, api_key: str, body: dict) -> tupl
         return chat_completion(model_id, messages, api_key=api_key, timeout=_LLM_TIMEOUT_S, **body)
 
 
+def _redact_content(value, tenant, *, seam: str, redact_keys: bool = False):
+    """Scrub content leaves before adding any instructions or template prose."""
+    from apps.pii.egress import redact_known_values
+
+    if isinstance(value, str):
+        return redact_known_values(tenant, value, seam=seam)
+    if isinstance(value, list):
+        return [_redact_content(item, tenant, seam=seam, redact_keys=redact_keys) for item in value]
+    if isinstance(value, dict):
+        return {
+            (redact_known_values(tenant, key, seam=seam) if redact_keys else key): _redact_content(
+                item, tenant, seam=seam, redact_keys=redact_keys
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def author_manifest(signals: dict, *, voice: str = "", model: str = "", tenant=None) -> dict:
     """Author a validated render manifest from raw signals via the LLM chain.
 
@@ -421,22 +480,21 @@ def author_manifest(signals: dict, *, voice: str = "", model: str = "", tenant=N
     parses, normalizes, AND passes ``render.validate_manifest`` wins. Each model
     gets ONE backed-off retry on a transient transport error (timeout / 429 / 5xx)
     before it's abandoned. A candidate that fails transport (after its retry),
-    returns unparseable JSON, returns valid JSON that isn't a manifest object, or
-    returns a structurally-invalid manifest is logged and the next candidate is
-    tried. Raises ``ComposeError`` if the key is missing or every candidate fails
+    returns unparseable JSON even in JSON mode, or exhausts its corrective retry
+    is logged and the next candidate is tried. Invalid manifests and repeated
+    lessons share one corrective retry on that model. If no model succeeds,
+    the last valid clashing sit wins unless CORE_COMPOSE_STRICT_VARIETY is on.
+    Raises ``ComposeError`` if the key is missing or every candidate fails
     (carrying every candidate's failure reason for diagnosis).
     """
     api_key = getattr(settings, "OPENROUTER_API_KEY", "") or ""
-    if not api_key:
+    if not api_key and local_llm() is None:
         raise ComposeError("OPENROUTER_API_KEY not configured")
     target_seconds = _target_seconds_from_signals(signals)
     from apps.pii.egress import append_entity_legend, redact_known_values
 
-    guarded_signals = redact_known_values(
-        tenant,
-        _format_signals(signals, target_seconds),
-        seam="meditation_compose_prompt",
-    )
+    safe_signals = _redact_content(signals, tenant, seam="meditation_compose_prompt")
+    guarded_signals = _format_signals(safe_signals, target_seconds)
     guarded_signals = append_entity_legend(
         tenant,
         guarded_signals,
@@ -449,7 +507,10 @@ def author_manifest(signals: dict, *, voice: str = "", model: str = "", tenant=N
     body = {
         "max_tokens": _MAX_OUTPUT_TOKENS,
         "temperature": 0.7,
-        "response_format": {"type": "json_object"},
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "meditation_manifest", "schema": MeditationManifest.model_json_schema()},
+        },
     }
 
     candidates = _compose_models(model)
@@ -459,35 +520,148 @@ def author_manifest(signals: dict, *, voice: str = "", model: str = "", tenant=N
         failures.append(f"{model_id}: {reason}")
         logger.warning("compose: model %s failed — %s", model_id, reason)
 
+    def _correction(content: str, rejection: str) -> list[dict]:
+        return [
+            {"role": "assistant", "content": redact_known_values(tenant, content, seam="meditation_compose_retry")},
+            {"role": "user", "content": rejection},
+        ]
+
+    recent = [e for e in (signals.get("recent_meditations") or []) if isinstance(e, dict)]
+    lessons = [(e, e.get("lesson") or {}) for e in recent if isinstance(e.get("lesson"), dict)]
+    traditions = [(e, lesson["tradition"]) for e, lesson in lessons if lesson.get("tradition")][:2]
+    slugs = [(e, str(lesson["teaching_slug"])) for e, lesson in lessons if lesson.get("teaching_slug")]
+    intentions = _recent_intentions(signals.get("recent_meditations") or [])
+    last_valid_clash = None
+    last_clash_reason = ""
+
     for model_id in candidates:
-        try:
-            data, _used = _call_model(model_id, messages, api_key, body)
-            content = _strip_code_fences((data["choices"][0]["message"]["content"] or "").strip())
-        except Exception as exc:  # noqa: BLE001 — record + fall through to the next model
-            _record(model_id, f"LLM call failed: {str(exc)[:160]}")
-            continue
+        model_body = dict(body)
+        if model_id in _SCHEMA_REJECTED_MODELS:
+            model_body["response_format"] = {"type": "json_object"}
+        model_messages = list(messages)
+        retry_reason = ""
+        for attempt in range(2):
+            try:
+                try:
+                    data, _used = _call_model(model_id, model_messages, api_key, model_body)
+                    content = _strip_code_fences((data["choices"][0]["message"]["content"] or "").strip())
+                    manifest = json.loads(content)
+                except Exception as exc:
+                    code = getattr(getattr(exc, "response", None), "status_code", None)
+                    schema_rejected = isinstance(exc, json.JSONDecodeError) or (code is not None and 400 <= code < 500)
+                    if not schema_rejected or model_body["response_format"]["type"] != "json_schema":
+                        raise
+                    _SCHEMA_REJECTED_MODELS.add(model_id)
+                    logger.info(
+                        "compose: schema rejected model=%s status=%s reason=%s; falling back to json_object",
+                        model_id,
+                        code,
+                        "non_json" if isinstance(exc, json.JSONDecodeError) else "http_4xx",
+                    )
+                    model_body["response_format"] = {"type": "json_object"}
+                    data, _used = _call_model(model_id, model_messages, api_key, model_body)
+                    content = _strip_code_fences((data["choices"][0]["message"]["content"] or "").strip())
+                    manifest = json.loads(content)
+            except json.JSONDecodeError:
+                _record(model_id, f"non-JSON response retry_reason={retry_reason or 'none'}")
+                break
+            except Exception as exc:  # noqa: BLE001 — record + next candidate
+                code = getattr(getattr(exc, "response", None), "status_code", None)
+                _record(
+                    model_id,
+                    f"LLM call failed: {type(exc).__name__} status={code}: {str(exc)[:80]} retry_reason={retry_reason or 'none'}",
+                )
+                break
 
-        try:
-            manifest = json.loads(content)
-        except json.JSONDecodeError:
-            _record(model_id, f"non-JSON response: {content[:120]!r}")
-            continue
+            try:
+                manifest = _normalize(manifest, voice, target_seconds)
+                lesson = MeditationLesson.model_validate(manifest.get("lesson"))
+                manifest["lesson"] = lesson.model_dump()
+                MeditationManifest.model_validate(manifest)
+                errors = render.validate_manifest(manifest)
+                if errors:
+                    errors = render.validate_manifest(
+                        _redact_content(manifest, tenant, seam="meditation_compose_retry", redact_keys=True)
+                    ) or ["invalid manifest"]
+                failure = "invalid manifest: " + "; ".join(errors[:3])
+            except ValidationError as exc:
+                # ValidationError strings include input_value (private model-authored text).
+                errors = [e["msg"] for e in exc.errors()][:3]
+                failure = "invalid manifest/lesson: " + ", ".join(e["type"] for e in exc.errors())
+            except ComposeError as exc:
+                errors = [str(exc)]
+                failure = "invalid manifest shape"
+            except (TypeError, AttributeError):
+                errors = ["invalid manifest shape"]
+                failure = "invalid manifest shape"
 
-        # _normalize raises ComposeError on valid-but-non-dict JSON (e.g. a top-level
-        # array or quoted string — a real drift mode); treat that like any other bad
-        # content and fall through rather than aborting the whole chain.
-        try:
-            manifest = _normalize(manifest, voice, target_seconds)
-        except ComposeError as exc:
-            _record(model_id, str(exc))
-            continue
+            if errors:
+                _record(model_id, f"{failure} reason=invalid_manifest retry_reason={retry_reason or 'none'}")
+                if not attempt:
+                    retry_reason = "invalid_manifest"
+                    model_messages = model_messages + _correction(
+                        content, "Rejected: " + "; ".join(errors[:3]) + ". Return the corrected JSON object only."
+                    )
+                    continue
+                break
 
-        errors = render.validate_manifest(manifest)
-        if errors:
-            _record(model_id, "invalid manifest: " + "; ".join(errors[:3]))
-            continue
+            clash = next(
+                (
+                    e
+                    for e, slug in slugs
+                    if normalize_teaching_slug(slug) == normalize_teaching_slug(lesson.teaching_slug)
+                ),
+                None,
+            )
+            clash_reason = "teaching_slug"
+            if clash is None:
+                clash_reason = "tradition"
+                clash = next((e for e, tradition in traditions if tradition == lesson.tradition), None)
+            if clash is None:
+                clash_reason = "intention"
+                clash = next((e for e, intention in intentions if intention == lesson.intention), None)
+            if clash is None:
+                logger.info(
+                    "compose: outcome=%s reason=%s model=%s slug=%s",
+                    "accepted_after_retry" if attempt else "accepted_first",
+                    retry_reason or "none",
+                    model_id,
+                    lesson.teaching_slug,
+                )
+                return manifest
 
-        return manifest
+            last_valid_clash = manifest
+            last_clash_reason = clash_reason
+            if attempt:
+                _record(model_id, f"variety_clash reason={clash_reason} retry_reason={retry_reason}")
+                break
+            echoed = _redact_content(
+                {
+                    "intention": lesson.intention,
+                    "slug": lesson.teaching_slug,
+                    "tradition": lesson.tradition,
+                    "date": clash.get("date", "unknown"),
+                    "traditions": [t for _, t in traditions],
+                    "slugs": [slug for _, slug in slugs],
+                    "intentions": [i for _, i in intentions],
+                },
+                tenant,
+                seam="meditation_compose_retry",
+            )
+            rejection = (
+                f"Rejected: reason={clash_reason}; intention '{echoed['intention']}' / teaching '{echoed['slug']}' / tradition '{echoed['tradition']}' repeats the sit on {echoed['date']}. "
+                f"Choose a different teaching AND a tradition not in {echoed['traditions']}; avoid all of: {echoed['slugs']}. "
+                f"Choose an intention not in {echoed['intentions']}; change the personal invitation itself."
+            )
+            retry_reason = "variety_clash"
+            model_messages = model_messages + _correction(content, rejection)
 
+    if last_valid_clash is not None and not getattr(settings, "CORE_COMPOSE_STRICT_VARIETY", False):
+        logger.warning(
+            "compose: variety clash accepted reason=%s outcome=clash_accepted slug=%s",
+            last_clash_reason,
+            last_valid_clash["lesson"]["teaching_slug"],
+        )
+        return last_valid_clash
     detail = " | ".join(failures) if failures else "no compose model configured"
     raise ComposeError(detail)

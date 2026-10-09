@@ -5,35 +5,59 @@ import { FormEvent, useState } from "react";
 interface QuickLogInputProps {
   onSubmit: (content: string) => Promise<void>;
   isPending: boolean;
+  writeFirst?: boolean;
 }
 
-export function QuickLogInput({ onSubmit, isPending }: QuickLogInputProps) {
+export function QuickLogInput({ onSubmit, isPending, writeFirst = false }: QuickLogInputProps) {
   const [content, setContent] = useState("");
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!content.trim()) return;
-    await onSubmit(content.trim());
-    setContent("");
+    if (!content.trim() || isPending) return;
+    try {
+      await onSubmit(content.trim());
+      setContent("");
+    } catch { /* The owning document view shows the append error; keep the draft. */ }
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex gap-2">
+    <>
+      {writeFirst ? <p className="mb-2 text-xs leading-relaxed text-os-faint">Write something. It lands in today’s page with the time.</p> : null}
+    <form data-os-quick-log onSubmit={handleSubmit} className="flex gap-2">
+      {writeFirst ? (
+        <textarea
+          placeholder="Write something…"
+          aria-label="Write something"
+          rows={Math.min(4, content.split("\n").length)}
+          value={content}
+          disabled={isPending}
+          onChange={(event) => setContent(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              event.currentTarget.form?.requestSubmit();
+            }
+          }}
+          className="os-write-input min-h-[44px] min-w-0 flex-1 resize-none px-3 py-2 text-base leading-relaxed text-os-ink placeholder:text-os-faint"
+        />
+      ) : (
       <input
         type="text"
-        placeholder="Quick log entry..."
+        placeholder={writeFirst ? "Write something…" : "Quick log entry..."}
         value={content}
         onChange={(e) => setContent(e.target.value)}
-        aria-label="Quick log entry"
-        className="min-h-[44px] flex-1 rounded-panel border border-border bg-surface px-3 py-2 text-sm placeholder:text-ink-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent"
+        aria-label={writeFirst ? "Write something" : "Quick log entry"}
+        className={`${writeFirst ? "min-w-0 " : ""}min-h-[44px] flex-1 rounded-panel border border-border bg-surface px-3 py-2 text-sm placeholder:text-ink-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent`}
       />
+      )}
       <button
         type="submit"
         disabled={isPending || !content.trim()}
         className="min-h-[44px] rounded-full bg-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-accent/85 disabled:opacity-55"
       >
-        {isPending ? "..." : "Log"}
+        {isPending ? "..." : writeFirst ? "Add" : "Log"}
       </button>
     </form>
+    </>
   );
 }

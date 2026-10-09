@@ -5,6 +5,7 @@
 // Document.Kind enum (stops the runtime `invalid_kind` 400s) and the
 // omission-prone tools leading with REQUIRED in their description.
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import register from "./index.js";
@@ -16,10 +17,14 @@ const PUT_KINDS = ["daily", "weekly", "monthly", "project", "ideas", "memory"];
 const DOC_KIND_TOOLS = ["nbhd_document_get", "nbhd_document_append", "nbhd_journal_search"];
 const ALL_KIND_TOOLS = [...DOC_KIND_TOOLS, "nbhd_document_put"];
 
-function collectTools() {
+function collectTools(context = {}, pluginConfig = {}) {
   const tools = {};
   const api = {
-    registerTool(def) { tools[def.name] = def; },
+    pluginConfig,
+    registerTool(def) {
+      if (typeof def === "function") def = def(context);
+      tools[def.name] = def;
+    },
     registerHook() {},
     on() {},
     logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -109,7 +114,10 @@ test("runtime field validation errors are surfaced to the model", async () => {
   const tools = {};
   const api = {
     pluginConfig: { apiBaseUrl: "https://nbhd.test" },
-    registerTool(def) { tools[def.name] = def; },
+    registerTool(def) {
+      if (typeof def === "function") def = def({});
+      tools[def.name] = def;
+    },
     registerHook() {},
     on() {},
     logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -154,6 +162,12 @@ test("journal_query.window.kind keeps its TIME-WINDOW enum (must not be clobbere
   assert.ok(!wkind.enum.includes("daily"), "must NOT have been replaced by the document enum");
 });
 
+test("purpose_update matches the runtime update statuses", () => {
+  const tool = collectTools()["nbhd_purpose_update"];
+  assert.deepEqual(tool.parameters.properties.status.enum, ["evolving", "confirmed"]);
+  assert.doesNotMatch(tool.description, /status=['\"]retired|set status.*retired/i);
+});
+
 test("omission-prone tools name their required params in the description", () => {
   const tools = collectTools();
   const expect = {
@@ -168,6 +182,96 @@ test("omission-prone tools name their required params in the description", () =>
   }
 });
 
+test("lesson and journal descriptions carry the rules-delivery contracts", () => {
+  const tools = collectTools();
+  const lesson = tools.nbhd_lesson_suggest;
+  assert.match(lesson.description, /approved lesson immediately/);
+  assert.match(lesson.description, /no approval queue/);
+  assert.match(lesson.description, /First call `nbhd_lesson_search` and skip near-duplicates/);
+  assert.match(lesson.description, /specific, actionable personal insight over trivia/);
+  assert.match(lesson.description, /useful in six months/);
+  assert.match(lesson.description, /trivial facts, temporary logistics, and vague or untestable statements/);
+  assert.match(lesson.description, /Never write lessons into daily notes/);
+  assert.match(lesson.description, /Supply 2–4 `tags`/);
+  assert.match(lesson.parameters.properties.tags.description, /2–4 concise tags/);
+
+  const setSection = tools.nbhd_daily_note_set_section.description;
+  assert.match(setSection, /OVERWRITES the whole section/);
+  assert.match(setSection, /first call `nbhd_daily_note_get`/);
+  assert.match(setSection, /merge the existing section with the new content/);
+  assert.match(setSection, /earlier content is preserved/);
+
+  const constellation = tools.nbhd_constellation_notes.description;
+  assert.match(constellation, /evidence about how the user learns/);
+  assert.match(constellation, /use them to teach to this user/);
+  assert.match(constellation, /never quote a raw signal back to them/);
+});
+
+test("workspace_delete exposes and forwards the preview confirmation token", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalBaseUrl = process.env.NBHD_API_BASE_URL;
+  const originalTenantId = process.env.NBHD_TENANT_ID;
+  const originalInternalKey = process.env.NBHD_INTERNAL_API_KEY;
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-123";
+  process.env.NBHD_INTERNAL_API_KEY = "internal-key";
+  let request;
+
+  try {
+    globalThis.fetch = async (_url, options) => {
+      request = options;
+      return { ok: true, status: 200, async text() { return "{}"; } };
+    };
+    const tool = collectTools().nbhd_workspace_delete;
+    assert.match(tool.description, /first call returns a preview \+ confirm_token/i);
+    assert.equal(tool.parameters.properties.confirm_token.type, "string");
+
+    await tool.execute("workspace-confirm", {
+      slug: "work",
+      confirm_token: "signed-workspace-token",
+    });
+
+    assert.deepEqual(JSON.parse(request.body), { confirm_token: "signed-workspace-token" });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalBaseUrl === undefined) delete process.env.NBHD_API_BASE_URL;
+    else process.env.NBHD_API_BASE_URL = originalBaseUrl;
+    if (originalTenantId === undefined) delete process.env.NBHD_TENANT_ID;
+    else process.env.NBHD_TENANT_ID = originalTenantId;
+    if (originalInternalKey === undefined) delete process.env.NBHD_INTERNAL_API_KEY;
+    else process.env.NBHD_INTERNAL_API_KEY = originalInternalKey;
+  }
+});
+
+test("memory and journal descriptions carry the W3 rules-delivery contracts", () => {
+  const tools = collectTools();
+
+  assert.ok(tools.nbhd_document_put.description.includes("Durable behavioural directives go to `kind=memory, slug=intents`, one directive per line"));
+
+  const memoryGet = tools.nbhd_memory_get.description;
+  assert.ok(memoryGet.includes("assistant-held patterns"));
+  assert.ok(memoryGet.includes("for shared records, call nbhd_journal_search first"));
+
+  const memoryUpdate = tools.nbhd_memory_update.description;
+  assert.ok(memoryUpdate.includes("durable names, locations, and facts"));
+  assert.ok(memoryUpdate.includes("stable preferences"));
+  assert.ok(memoryUpdate.includes("month-worthy patterns"));
+  assert.ok(memoryUpdate.includes("changed ongoing situations"));
+  assert.ok(memoryUpdate.includes("Do not store routine details, journal duplicates, or unrequested sensitive emotions"));
+  assert.ok(memoryUpdate.includes("When unsure, write less"));
+
+  const context = tools.nbhd_journal_context.description;
+  assert.ok(context.includes("when a cron preamble asks for it"));
+  assert.ok(context.includes("when the user's request needs recent journal/backbone context"));
+  assert.ok(context.includes("not at the start of ordinary chat turns"));
+
+  assert.ok(tools.nbhd_journal_search.description.includes("Search shared journal records first"));
+
+  const sessions = tools.nbhd_sessions_pending.description;
+  assert.ok(sessions.includes("`nbhd_task_*` for tasks, `nbhd_goal_*` for goals"));
+  assert.ok(!sessions.includes("for tasks (kind='tasks'), goals (kind='goal')"));
+});
+
 test("platform issue sender omits absent optional strings and preserves supplied context", async () => {
   const originalFetch = globalThis.fetch;
   const originalTenantId = process.env.NBHD_TENANT_ID;
@@ -175,7 +279,10 @@ test("platform issue sender omits absent optional strings and preserves supplied
   const tools = {};
   const api = {
     pluginConfig: { apiBaseUrl: "https://nbhd.test" },
-    registerTool(def) { tools[def.name] = def; },
+    registerTool(def) {
+      if (typeof def === "function") def = def({});
+      tools[def.name] = def;
+    },
     registerHook() {},
     on() {},
     logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -262,7 +369,10 @@ test("situation tool posts only place_label and reports rejected labels graceful
   const tools = {};
   const api = {
     pluginConfig: { apiBaseUrl: "https://nbhd.test" },
-    registerTool(def) { tools[def.name] = def; },
+    registerTool(def) {
+      if (typeof def === "function") def = def({});
+      tools[def.name] = def;
+    },
     registerHook() {},
     on() {},
     logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -334,4 +444,99 @@ test("situation tool posts only place_label and reports rejected labels graceful
     if (originalInternalKey === undefined) delete process.env.NBHD_INTERNAL_API_KEY;
     else process.env.NBHD_INTERNAL_API_KEY = originalInternalKey;
   }
+});
+
+
+test("send_to_user forwards runtime cron identity even without model job_name", async (t) => {
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    assert.equal(options.headers["X-NBHD-Cron-Job-Id"], "trusted-job");
+    assert.equal(options.headers["X-NBHD-Job-Name"], undefined);
+    return { ok: true, status: 200, async text() { return "{}"; } };
+  });
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  for (const sessionKey of ["agent:main:cron:trusted-job:run:run-1", "agent:main:cron:trusted-job"]) {
+    const tools = collectTools({ sessionKey });
+    await tools.nbhd_send_to_user.execute("call-1", { message: "Nice work", cron_job_id: "forged" });
+  }
+});
+
+test("send_to_user carries the generated panel reference schema and forwards panels", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const panels = [{ kind: "sleep", params: { range: "last_night" }, title: "Last night" }];
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return { ok: true, status: 200, async text() { return "{}"; } };
+  });
+  const tool = collectTools({}, { panelsEnabled: true }).nbhd_send_to_user;
+  const schema = tool.parameters.properties.panels;
+  assert.equal(schema.maxItems, 6);
+  assert.equal(schema.items.additionalProperties, false);
+  assert.equal(schema.items.properties.params.additionalProperties, false);
+  assert.equal(schema.items.properties.title.maxLength, 60);
+  assert.equal(schema.items.properties.params.properties.duration_seconds.maximum, 14400);
+  for (const kind of schema.items.properties.kind.enum) assert.ok(tool.description.includes(kind));
+  for (const message of ["Good morning", ""]) {
+    await tool.execute("call-panels", { message, panels });
+    assert.deepEqual(bodies.at(-1), { message, panels });
+  }
+});
+
+
+test("send_to_user without the strict config gate preserves original tool bytes", () => {
+  // Captured from the original tool before 1ee74fb0, including key order.
+  for (const pluginConfig of [{}, { panelsEnabled: false }, { panelsEnabled: "true" }, { panelsEnabled: 1 }]) {
+    const { description, parameters } = collectTools({}, pluginConfig).nbhd_send_to_user;
+    const digest = createHash("sha256").update(JSON.stringify({ description, parameters })).digest("hex");
+    assert.equal(digest, "ffa04b388f2eacbe08e04b88ced79141c67cf3bd3c0a517105d7107228297ff4");
+    assert.equal(parameters.properties.panels, undefined);
+    assert.doesNotMatch(description, /panels/);
+  }
+});
+
+test("disabled send_to_user never forwards unsolicited panels", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const bodies = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return { ok: true, status: 200, async text() { return "{}"; } };
+  });
+  const tool = collectTools().nbhd_send_to_user;
+  await tool.execute("disabled", { message: "Hello", panels: [{ kind: "sleep" }] });
+  assert.deepEqual(bodies, [{ message: "Hello" }]);
+  await assert.rejects(tool.execute("empty", { message: "", panels: [{ kind: "sleep" }] }), /message is required/);
+  assert.equal(bodies.length, 1);
+});
+
+test("journal manifest declares panelsEnabled as a default-off boolean", () => {
+  const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  assert.equal(manifest.configSchema.additionalProperties, false);
+  assert.equal(manifest.configSchema.properties.panelsEnabled.type, "boolean");
+  assert.equal(manifest.configSchema.properties.panelsEnabled.default, false);
+});
+
+test("nbhd_weather_briefing is registered, declared, takes only an optional date, and demands VERBATIM relay", () => {
+  const tools = collectTools();
+  const tool = tools.nbhd_weather_briefing;
+  assert.ok(tool, "nbhd_weather_briefing should be registered");
+  assert.deepEqual(Object.keys(tool.parameters.properties), ["date"]);
+  assert.ok(!Array.isArray(tool.parameters.required) || tool.parameters.required.length === 0, "date is optional");
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.match(tool.description, /VERBATIM/);
+  assert.match(tool.description, /writes? the daily note's `weather` section/i);
+  assert.match(tool.description, /never describe weather from any other source/i);
+  const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  assert.ok(manifest.contracts.tools.includes("nbhd_weather_briefing"), "manifest declares the tool");
 });

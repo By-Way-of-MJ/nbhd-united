@@ -54,6 +54,9 @@ class NeighborProfile(models.Model):
     # fragile across reinstall, so consent lives server-side on the profile.
     accepted_terms_at = models.DateTimeField(null=True, blank=True)
     accepted_terms_version = models.CharField(max_length=20, blank=True, default="")
+    # Bumped on every new profile photo (None = no photo). The photo URL carries it,
+    # so a changed photo is a new URL and clients can cache each one forever.
+    photo_version = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -554,7 +557,12 @@ class SharedGoalMembership(models.Model):
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="mission_memberships")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="+")
     role = models.CharField(max_length=8, default="member")  # owner | member
-    status = models.CharField(max_length=8, default="active")  # invited | active | left
+    status = models.CharField(max_length=8, default="active")  # invited | active | left | declined
+    muted = models.BooleanField(default=False)
+    # Projects v2 §11.1: this member's OWN Horizons goal the project serves. Private to
+    # the member (stripped from every other member's plan payload). A plain UUID, not a
+    # FK: journal.Goal is tenant-RLS data; ownership is validated at write time.
+    linked_goal_id = models.UUIDField(null=True, blank=True)
     commitment = models.CharField(max_length=200, blank=True)  # "what I'll do"
     # Idempotency for the weekly digest — compare-and-set per (member, iso-week).
     last_digest_window = models.CharField(max_length=24, blank=True)
@@ -577,6 +585,17 @@ class SharedGoalUpdate(models.Model):
 
     class Kind(models.TextChoices):
         JOINED = "joined", "Joined"
+        STEP_ADDED = "step_added", "Step added"
+        STEP_ASSIGNED = "step_assigned", "Step assigned"
+        STEP_ANSWERED = "step_answered", "Step answered"
+        STEP_DONE = "step_done", "Step done"
+        STEP_UNBLOCKED = "step_unblocked", "Step unblocked"
+        STEP_RELEASED = "step_released", "Step released"
+        STEP_SUBMITTED = "step_submitted", "Step waiting for a look"
+        STEP_QUESTIONED = "step_questioned", "Step questioned"
+        MEMBER_LEFT = "member_left", "Member left"
+        OWNER_CHANGED = "owner_changed", "Owner changed"
+        MILESTONE_REACHED = "milestone_reached", "Milestone reached"
         TASK_ADDED = "task_added", "Task added"
         TASK_COMPLETED = "task_completed", "Task completed"
         MILESTONE = "milestone", "Milestone"
@@ -587,7 +606,7 @@ class SharedGoalUpdate(models.Model):
     shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="updates")
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name="+")
-    kind = models.CharField(max_length=16, choices=Kind.choices)
+    kind = models.CharField(max_length=24, choices=Kind.choices)
     text = models.TextField(blank=True)
     payload = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -667,6 +686,25 @@ class CircleMembership(models.Model):
         return f"circle_member:{self.circle_id}:{self.tenant_id}"
 
 
+class NeighborPhoto(models.Model):
+    """One profile photo per person: a 512 px square JPEG, re-encoded on upload (so
+    no EXIF/location survives) and checked by the image safety check before it is
+    stored. Shown only to neighbors and people who share a circle or project; a
+    report hides it for the reporter. Cross-tenant data → its manager lives only in
+    ``access.py``."""
+
+    profile = models.OneToOneField(NeighborProfile, on_delete=models.CASCADE, primary_key=True, related_name="photo")
+    image = models.BinaryField()
+    content_type = models.CharField(max_length=32, default="image/jpeg")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "neighbor_photos"
+
+    def __str__(self) -> str:
+        return f"photo:{self.profile_id}"
+
+
 class ContentReport(models.Model):
     """MVP moderation: report + block + owner-unshare (design §2.10). No global
     queue at launch scale — shares are scoped + human-approved + identity-scrubbed,
@@ -681,10 +719,16 @@ class ContentReport(models.Model):
             ("shared_lesson", "Shared spark"),
             ("friend_message", "Chat"),
             ("general", "General / support"),  # Settings → Support "Report a concern" (no content id)
+            ("profile_photo", "Profile photo"),
         ],
     )
     shared_lesson = models.ForeignKey(SharedLesson, on_delete=models.CASCADE, null=True, blank=True)
     friend_message = models.ForeignKey(FriendMessage, on_delete=models.CASCADE, null=True, blank=True)
+    # A reported profile photo: the report is about the PERSON's photo, so it keeps
+    # hiding their photos from the reporter even after they change it.
+    photo_profile = models.ForeignKey(
+        NeighborProfile, on_delete=models.CASCADE, null=True, blank=True, related_name="+"
+    )
     reason = models.CharField(max_length=280)
     status = models.CharField(max_length=12, default="open")  # open | hidden | dismissed
     created_at = models.DateTimeField(auto_now_add=True)
@@ -696,3 +740,163 @@ class ContentReport(models.Model):
 
     def __str__(self) -> str:
         return f"report:{self.id} ({self.target_kind})"
+
+
+class SharedGoalMilestone(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="milestones")
+    title = models.CharField(max_length=120)
+    target_date = models.DateField(null=True, blank=True)
+    order = models.IntegerField(default=0)
+    reached_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+
+    class Meta:
+        db_table = "shared_goal_milestones"
+        ordering = ["order", "id"]
+
+
+class SharedGoalStep(models.Model):
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        IN_PROGRESS = "in_progress", "In progress"
+        # The owner says it's done; someone else still has to take a look.
+        IN_REVIEW = "in_review", "Waiting for a look"
+        DONE = "done", "Done"
+        SKIPPED = "skipped", "Skipped"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="steps")
+    milestone = models.ForeignKey(
+        SharedGoalMilestone, on_delete=models.SET_NULL, null=True, blank=True, related_name="steps"
+    )
+    title = models.CharField(max_length=120)
+    description = models.CharField(max_length=500, blank=True)
+    start_date = models.DateField(null=True, blank=True)
+    due_date = models.DateField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.OPEN)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    # Showing the work: what the owner wrote when ticking it off (cleared on reopen).
+    # db_default: migrations run when the new container boots while the old one still
+    # serves and inserts steps without knowing these columns.
+    done_note = models.CharField(max_length=500, blank=True, db_default="")
+    done_link = models.CharField(max_length=500, blank=True, db_default="")
+    # "Needs a second look": any member can switch it on before the step is done. Then
+    # ticking parks the step in ``in_review`` until a member who doesn't own it confirms.
+    needs_review = models.BooleanField(default=False, db_default=False)
+    review_set_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    order = models.IntegerField(default=0)
+    version = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+
+    class Meta:
+        db_table = "shared_goal_steps"
+        ordering = ["order", "id"]
+
+
+class SharedGoalStepAssignment(models.Model):
+    class Status(models.TextChoices):
+        ASKED = "asked", "Asked"
+        ACCEPTED = "accepted", "Accepted"
+        DECLINED = "declined", "Declined"
+        COUNTERED = "countered", "Countered"
+        # The member had (or was asked to take) this step and let it go — stepping
+        # back or leaving. ``note`` then holds their optional hand-off line.
+        RELEASED = "released", "Released"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    step = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="assignments")
+    membership = models.ForeignKey(SharedGoalMembership, on_delete=models.CASCADE, related_name="step_assignments")
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.ASKED)
+    counter_start = models.DateField(null=True, blank=True)
+    counter_due = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=500, blank=True)
+    task = models.ForeignKey("journal.Task", on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    asked_by = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="+")
+    responded_at = models.DateTimeField(null=True, blank=True)
+    # The due date this owner was last reminded about — one "due tomorrow" push per due
+    # date, claimed with a compare-and-set so overlapping cron runs never double-send.
+    due_nudged_for = models.DateField(null=True, blank=True)
+    # When this member was last asked (orders the Neighborhood decision moments).
+    asked_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    # "Not me — maybe them?": a declining member may point at another member. Nobody
+    # is asked by this; the asker decides whether to ask them.
+    suggested_membership = models.ForeignKey(
+        SharedGoalMembership, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    # "Still yours?" on an overdue step: the owner said yes (quiets the flag for a
+    # while), and the overdue date they were last asked about (one push per due date).
+    kept_at = models.DateTimeField(null=True, blank=True)
+    still_yours_nudged_for = models.DateField(null=True, blank=True)
+
+    class Meta:
+        db_table = "shared_goal_step_assignments"
+        constraints = [models.UniqueConstraint(fields=["step", "membership"], name="uq_goal_step_member")]
+
+
+class SharedGoalStepDependency(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    blocker = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="outgoing_dependencies")
+    blocked = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="incoming_dependencies")
+
+    class Meta:
+        db_table = "shared_goal_step_dependencies"
+        constraints = [
+            models.UniqueConstraint(fields=["blocker", "blocked"], name="uq_goal_step_dependency"),
+            models.CheckConstraint(
+                condition=~models.Q(blocker=models.F("blocked")), name="goal_step_no_self_dependency"
+            ),
+        ]
+
+
+class ProjectDraft(models.Model):
+    """A PRIVATE starter plan the user's own assistant wrote (Projects v2 P1c).
+
+    Visible only to ``tenant``. Nothing is shared, invited or asked until the user
+    publishes it from the app; the payload is a validated ``ProjectDraftSpec``."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="project_drafts")
+    payload = models.JSONField(default=dict)
+    source = models.CharField(max_length=10, default="chat")  # chat | template
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    published_goal = models.ForeignKey(SharedGoal, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+
+    class Meta:
+        db_table = "friends_project_drafts"
+        indexes = [models.Index(fields=["tenant", "created_at"])]
+
+
+class PendingProjectAction(models.Model):
+    """The user's assistant SUGGESTS project changes; nothing happens until the user
+    approves (Projects v2 §4, §6.1). Own-side changes apply with the user's own
+    authority; ``ask_member`` is sent as the user's request and the member answers."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        PARTIAL = "partial", "Partly applied"
+        REJECTED = "rejected", "Rejected"
+        EXPIRED = "expired", "Expired"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="pending_project_actions")
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="+")
+    payload = models.JSONField(default=dict)  # validated ProjectProposalSpec
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    # The assistant read other members' text shortly before proposing (§6.3): the
+    # card says so, and approval must come from the app, never the same chat turn.
+    from_tainted_turn = models.BooleanField(default=False)
+    result = models.JSONField(default=dict, blank=True)  # per-change outcome after approval
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "friends_pending_project_actions"
+        indexes = [models.Index(fields=["tenant", "status"])]

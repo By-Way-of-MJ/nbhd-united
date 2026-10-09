@@ -180,3 +180,11 @@ test("read and create tool descriptions explain excluded calendars", () => {
     assert.ok(registered.get(name).description.includes(EXCLUSION_DESCRIPTION_LINE));
   }
 });
+
+test("calendar plans require independent completion evidence", () => {
+  const description = tools().get("nbhd_datebook_read").description;
+  assert.ok(description.includes("Calendar entries are plans, even after their end time"));
+  assert.ok(description.includes('never write "done", "banked", "already done", or ✅ unless'));
+  assert.ok(description.includes("Core meditation, Fuel workout, or task is marked done"));
+  assert.ok(description.includes("for that activity, or the user confirms it"));
+});

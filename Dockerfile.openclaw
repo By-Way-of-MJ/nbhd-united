@@ -1,12 +1,13 @@
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 # Kept in sync with OPENCLAW_CURRENT_VERSION in
-# apps/orchestrator/tool_policy.py — both at 2026.5.28 as of the fleet
-# lock-in (PR #745 toolSearch config + #746 usage-reporter registerHook fix).
+# apps/orchestrator/tool_policy.py — both at 2026.9.4 as of this security
+# bump; the toolSearch gate lock-in was 2026.5.28 (PR #745 toolSearch config
+# + #746 usage-reporter registerHook fix).
 # tools.toolSearch is version-gated (>= 2026.5.28) in config_generator, so it
 # applies to a tenant once their openclaw_version reaches 5.28 (new provisions
 # + reactivations default to OPENCLAW_CURRENT_VERSION).
-ARG OPENCLAW_VERSION=2026.5.28
+ARG OPENCLAW_VERSION=2026.9.4
 # Pinned for Phase 1 BYO Anthropic CLI subscription. Binary is dormant
 # until a tenant with byo_models_enabled=True connects via /settings/ai-provider.
 ARG CLAUDE_CODE_VERSION=2.1.123
@@ -41,10 +42,38 @@ RUN npm install --global \
         "@googleworkspace/cli" \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
+# 9.4 caps USER.md at 4K regardless of bootstrapMaxChars. Patch every bundled
+# copy and its diagnostics to our emitted 26K budget; fail on upstream drift.
+COPY runtime/openclaw/patches /opt/nbhd/patches
+RUN node /opt/nbhd/patches/user-bootstrap-cap.mjs "$(npm root -g)/openclaw" \
+    && node /opt/nbhd/patches/user-bootstrap-cap.smoke.mjs "$(npm root -g)/openclaw"
 # OpenClaw 5.2 externalized the LINE channel plugin out of core. Pin
 # @openclaw/line to the same OPENCLAW_VERSION so the manifest's
 # minHostVersion check passes (see dist/manifest-registry-*.js).
 # Telegram, memory-core, openrouter, anthropic remain bundled in core.
+
+# Vendor the brave web-search provider INTO the image. 2026.9.4 otherwise
+# npm-installs the configured web-search provider into <configDir>/npm at boot;
+# our configDir sits on the root-owned, wipe-on-restart oc-state EmptyDir, so
+# that install fails 9.4's fs-safe check AND would re-run every boot. Installing
+# at build time (overlay fs supports chmod → fs-safe passes) and loading it via
+# plugins.load.paths makes 9.4 treat brave as already-present and skip the boot
+# install entirely (verified vs the 9.4 source: a load.paths plugin counts as
+# installed, and web search accepts it). The npm-project dir name is a hash, so
+# publish a STABLE symlink at /opt/nbhd/vendored/brave-plugin for
+# config_generator to reference; Node follows it (no --preserve-symlinks) so the
+# plugin's peer `openclaw` symlink still resolves. Build fails loudly if the
+# install layout changes.
+RUN OPENCLAW_STATE_DIR=/opt/oc-seed openclaw plugins install @openclaw/brave-plugin \
+    && BRAVE="$(find /opt/oc-seed/npm/projects -type d -path '*/node_modules/@openclaw/brave-plugin' 2>/dev/null | head -1)" \
+    && test -n "$BRAVE" && test -f "$BRAVE/package.json" \
+    && PROJECT="$(cd "$BRAVE/../../.." && pwd)" \
+    && mkdir -p /opt/nbhd/vendored \
+    && cp -a "$PROJECT/." /opt/nbhd/vendored/brave-project/ \
+    && ln -sfn "$(npm root -g)/openclaw" /opt/nbhd/vendored/brave-project/node_modules/openclaw \
+    && test -f /opt/nbhd/vendored/brave-project/node_modules/@openclaw/brave-plugin/package.json \
+    && test -e /opt/nbhd/vendored/brave-project/node_modules/openclaw/package.json \
+    && echo "[dockerfile] vendored brave -> /opt/nbhd/vendored/brave-project (real dir, peer relinked)"
 
 WORKDIR /opt/nbhd
 
@@ -64,6 +93,7 @@ COPY runtime/openclaw/plugins/nbhd-stream-progress /opt/nbhd/plugins/nbhd-stream
 COPY runtime/openclaw/plugins/nbhd-automation-tools /opt/nbhd/plugins/nbhd-automation-tools
 COPY runtime/openclaw/plugins/nbhd-cron-enforcement /opt/nbhd/plugins/nbhd-cron-enforcement
 COPY runtime/openclaw/plugins/nbhd-site-publishing /opt/nbhd/plugins/nbhd-site-publishing
+COPY runtime/openclaw/plugins/nbhd-site-editor /opt/nbhd/plugins/nbhd-site-editor
 # nbhd-document-keep is emitted into plugins.load.paths by config_generator
 # whenever document_ingestion_enabled — omitting this COPY would hard-fail boot
 # ("plugin path not found") exactly like the 2026-07-05 friends incident.
@@ -78,6 +108,8 @@ COPY runtime/openclaw/plugins/nbhd-journal-shaping /opt/nbhd/plugins/nbhd-journa
 # The scripts/check_openclaw_plugin_packaging.py CI guard now fails the build
 # if any shippable plugin is missing from this block.
 COPY runtime/openclaw/plugins/nbhd-friends-tools /opt/nbhd/plugins/nbhd-friends-tools
+# nbhd-project-tools (Projects v2) is emitted when neighborhood_enabled + projects_v2_enabled.
+COPY runtime/openclaw/plugins/nbhd-project-tools /opt/nbhd/plugins/nbhd-project-tools
 COPY runtime/openclaw/plugins/nbhd-agenda-tools /opt/nbhd/plugins/nbhd-agenda-tools
 # nbhd-doc-taint-guard is emitted into plugins.load.paths by config_generator
 # UNCONDITIONALLY (docs/upload-security-threat-model.md P0-1/P0-2) — same
@@ -88,6 +120,7 @@ COPY skills/gws-* /opt/nbhd/skills/
 COPY agent-skills /opt/nbhd/agent-skills
 COPY templates/openclaw /opt/nbhd/templates/openclaw
 COPY runtime/openclaw/proxy.js /opt/nbhd/proxy.js
+COPY runtime/openclaw/nbhd-cron-sync.mjs /opt/nbhd/nbhd-cron-sync.mjs
 COPY runtime/openclaw/suppress-chmod-eperm.js /opt/nbhd/suppress-chmod-eperm.js
 COPY runtime/openclaw/redact-stdout.js /opt/nbhd/redact-stdout.js
 COPY runtime/openclaw/tool-logger.js /opt/nbhd/tool-logger.js
@@ -95,7 +128,6 @@ COPY runtime/openclaw/external-content-wrap.js /opt/nbhd/external-content-wrap.j
 COPY runtime/openclaw/claude-with-token.sh /opt/nbhd/claude-with-token.sh
 COPY runtime/openclaw/claude-settings.json /opt/nbhd/claude-settings.json
 COPY runtime/openclaw/entrypoint.sh /usr/local/bin/nbhd-openclaw-entrypoint
-COPY runtime/openclaw/nbhd-transcribe.js /usr/local/bin/nbhd-transcribe
 
 # Vendor the site-publishing plugin's Azure SDK dependencies at build time.
 # Unlike the other nbhd plugins (Node built-ins only), this one needs
@@ -104,8 +136,13 @@ COPY runtime/openclaw/nbhd-transcribe.js /usr/local/bin/nbhd-transcribe
 RUN npm install --prefix /opt/nbhd/plugins/nbhd-site-publishing --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
-RUN chmod +x /usr/local/bin/nbhd-openclaw-entrypoint /usr/local/bin/nbhd-transcribe /opt/nbhd/claude-with-token.sh \
-    && chown -R node:node /opt/nbhd /usr/local/bin/nbhd-openclaw-entrypoint /usr/local/bin/nbhd-transcribe
+# Vendor the site-editor parser dependencies from its committed lockfile.
+# @babel/parser + postcss are pure JS, so they install without a compiler.
+RUN npm ci --prefix /opt/nbhd/plugins/nbhd-site-editor --omit=dev --no-audit --no-fund \
+    && npm cache clean --force
+
+RUN chmod +x /usr/local/bin/nbhd-openclaw-entrypoint /opt/nbhd/claude-with-token.sh \
+    && chown -R node:node /opt/nbhd /usr/local/bin/nbhd-openclaw-entrypoint
 
 USER node
 
