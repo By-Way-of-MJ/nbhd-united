@@ -2901,10 +2901,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         # Auth — provider tokens read from env vars automatically
         "auth": {
             "profiles": {
-                "anthropic:default": {
-                    "provider": "anthropic",
-                    "mode": "token",
-                },
                 "openrouter:default": {
                     "provider": "openrouter",
                     "mode": "token",

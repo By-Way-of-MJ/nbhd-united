@@ -82,6 +82,8 @@ class ConfigGeneratorTest(TestCase):
             {"zdr": True, "data_collection": "deny"},
         )
         self.assertNotIn('"provider": "openai"', json.dumps(config))
+        self.assertNotIn("anthropic:default", config["auth"]["profiles"])
+        self.assertIn("openrouter:default", config["auth"]["profiles"])
 
     def test_starter_tier_has_active_models(self):
         self.tenant.model_tier = "starter"

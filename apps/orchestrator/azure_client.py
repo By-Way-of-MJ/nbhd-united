@@ -210,8 +210,6 @@ def get_authorization_client():
 # blast radius of an MI-token leak to just the names listed here plus the
 # tenant's own internal key.
 DEFAULT_TENANT_KV_SECRETS: tuple[str, ...] = (
-    "anthropic-api-key",
-    "openai-api-key",
     "openrouter-api-key",
     "brave-api-key",
 )
@@ -1428,18 +1426,6 @@ def create_container_app(
     client = get_container_client()
     secrets = [
         _build_container_secret(
-            "anthropic-key",
-            plain_value=settings.ANTHROPIC_API_KEY,
-            key_vault_secret_name=settings.AZURE_KV_SECRET_ANTHROPIC_API_KEY,
-            identity_id=identity_id,
-        ),
-        _build_container_secret(
-            "openai-key",
-            plain_value=settings.OPENAI_API_KEY,
-            key_vault_secret_name=settings.AZURE_KV_SECRET_OPENAI_API_KEY,
-            identity_id=identity_id,
-        ),
-        _build_container_secret(
             "nbhd-internal-api-key",
             plain_value=internal_plain,
             key_vault_secret_name=internal_kv_secret,
@@ -1502,8 +1488,6 @@ def create_container_app(
                         # probe types omitted here.
                         "probes": [_gateway_readiness_probe_payload()],
                         "env": [
-                            {"name": "ANTHROPIC_API_KEY", "secretRef": "anthropic-key"},
-                            {"name": "OPENAI_API_KEY", "secretRef": "openai-key"},
                             {"name": "NBHD_INTERNAL_API_KEY", "secretRef": "nbhd-internal-api-key"},
                             {"name": "OPENCLAW_GATEWAY_TOKEN", "secretRef": "nbhd-internal-api-key"},
                             {"name": "BRAVE_API_KEY", "secretRef": "brave-key"},
@@ -1856,6 +1840,45 @@ def _entry_name(entry: Any) -> str | None:
     return getattr(entry, "name", None)
 
 
+PLATFORM_PROVIDER_SECRET_NAMES = frozenset({"anthropic-key", "openai-key"})
+PLATFORM_PROVIDER_ENV_NAMES = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY"})
+
+
+def scrub_platform_provider_bindings(app: Any) -> bool:
+    """Remove legacy platform OpenAI/Anthropic bindings from an app spec.
+
+    Returns ``True`` when the spec changed, otherwise ``False``. The caller
+    owns persistence so dry-run fleet operations can inspect without writing.
+    """
+    current_secrets = list(app.configuration.secrets or [])
+    retained_secrets = [
+        secret for secret in current_secrets if _entry_name(secret) not in PLATFORM_PROVIDER_SECRET_NAMES
+    ]
+    changed = len(retained_secrets) != len(current_secrets)
+    app.configuration.secrets = retained_secrets
+
+    for container in app.template.containers:
+        if container.name != "openclaw":
+            continue
+        current_env = list(container.env or [])
+        retained_env = [env for env in current_env if _entry_name(env) not in PLATFORM_PROVIDER_ENV_NAMES]
+        if len(retained_env) != len(current_env):
+            changed = True
+        container.env = retained_env
+        break
+
+    return changed
+
+
+def force_new_container_revision(app: Any, reason: str) -> None:
+    """Set a unique, Container Apps-safe revision suffix on an app spec."""
+    import hashlib
+    import time
+
+    seed = f"{reason}-{time.time_ns()}"
+    app.template.revision_suffix = f"b{hashlib.sha256(seed.encode()).hexdigest()[:6]}"
+
+
 def apply_byo_credentials_to_container(tenant: Any) -> None:
     """Reconcile the tenant container's BYO secret + env bindings, then
     create a new revision so the Container Apps runtime picks up any
@@ -1868,14 +1891,9 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
     user just pasted/disconnected and expects the change to take effect.
 
     Phase 1 reconciliation, for Anthropic CLI subscription only:
-      - Active cred → add `CLAUDE_CODE_OAUTH_TOKEN` env (KV-backed)
-        AND remove the `ANTHROPIC_API_KEY` env binding (auth-precedence
-        shadowing — Anthropic's CLI ranks `ANTHROPIC_API_KEY` ABOVE
-        `CLAUDE_CODE_OAUTH_TOKEN`, so the platform key would win and
-        bill against API credits instead of the user's subscription).
-      - No active cred → ensure `ANTHROPIC_API_KEY` is restored
-        (re-bound to the existing `anthropic-key` secret) and
-        `CLAUDE_CODE_OAUTH_TOKEN` is removed.
+      - Active cred → add `CLAUDE_CODE_OAUTH_TOKEN` env (KV-backed).
+      - No active cred → remove `CLAUDE_CODE_OAUTH_TOKEN`.
+      - Always scrub legacy OpenAI/Anthropic platform secret and env bindings.
 
     Idempotent — safe to call repeatedly. No-op for tenants without a
     container_id.
@@ -1911,10 +1929,11 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
 
     BYO_SECRET = "claude-code-oauth-token"
     BYO_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-    PLATFORM_ENV = "ANTHROPIC_API_KEY"
 
-    # Reconcile secrets list — drop any stale BYO entry, optionally re-add.
-    secrets = [s for s in (app.configuration.secrets or []) if _entry_name(s) != BYO_SECRET]
+    scrub_platform_provider_bindings(app)
+
+    # Reconcile the BYO secret, then optionally re-add the tenant credential.
+    secrets = [secret for secret in (app.configuration.secrets or []) if _entry_name(secret) != BYO_SECRET]
     if cred:
         secrets.append(
             _build_container_secret(
@@ -1930,18 +1949,13 @@ def apply_byo_credentials_to_container(tenant: Any) -> None:
     for container in app.template.containers:
         if container.name != "openclaw":
             continue
-        env_list = [e for e in (container.env or []) if _entry_name(e) not in (BYO_ENV, PLATFORM_ENV)]
+        env_list = [env for env in (container.env or []) if _entry_name(env) != BYO_ENV]
         if cred:
             env_list.append({"name": BYO_ENV, "secretRef": BYO_SECRET})
-        else:
-            env_list.append({"name": PLATFORM_ENV, "secretRef": "anthropic-key"})
         container.env = env_list
         break
 
-    import hashlib
-    import time
-
-    app.template.revision_suffix = f"b{hashlib.sha256(f'byo-{int(time.time_ns())}'.encode()).hexdigest()[:6]}"
+    force_new_container_revision(app, "byo")
 
     client.container_apps.begin_create_or_update(
         settings.AZURE_RESOURCE_GROUP,
