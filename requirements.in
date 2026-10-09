@@ -1,6 +1,6 @@
 # Core
 Django>=6.1.1,<6.2
-djangorestframework>=3.15
+djangorestframework>=3.18.1
 django-cors-headers
 django-environ
 psycopg[binary]
@@ -24,11 +24,11 @@ python-telegram-bot>=22.8
 qrcode[pil]
 
 # AI / LLM
-litellm>=1.100.0,<1.100.1  # 1.82.8 compromised — supply chain attack
+litellm>=1.103.2,<1.103.3  # 1.82.8 compromised — supply chain attack
 openai
 tiktoken
 pgvector
-google-genai>=2.25.0    # Gemini TTS — Core pillar meditation render (apps/core/render.py)
+google-genai>=2.27.0    # Gemini TTS — Core pillar meditation render (apps/core/render.py)
 
 # PII redaction (outgoing LLM traffic)
 presidio-analyzer>=2.2.364    # Pattern recognizers only (credit card Luhn, IBAN checksum)
@@ -43,7 +43,7 @@ presidio-analyzer>=2.2.364    # Pattern recognizers only (credit card Luhn, IBAN
 # transformers needs an explicit torch (or TF/JAX) backend; we use the
 # PyTorch path for AutoModelForTokenClassification. Pin to CPU-only torch
 # via the `torch` package — production images don't have CUDA.
-torch>=2.14.0,<3.0
+torch>=2.14.1,<3.0
 transformers>=5.9.0,<5.10.0
 sentencepiece>=0.2.2
 
@@ -55,7 +55,7 @@ httpx[http2]
 django-redis
 
 # Managed OAuth (Composio — Google integrations)
-composio>=0.21.1
+composio>=0.25.0
 
 # Azure SDK (for Container Apps, Key Vault, Managed Identity, Storage, Billing)
 azure-identity
@@ -74,7 +74,7 @@ azure-keyvault-keys>=4.11.2,<5
 # Pure Python, zero transitive dependencies — pinned exactly, and BOTH this file
 # and requirements.txt are hand-edited: pip-compile on macOS strips the
 # platform-specific pins this Linux-deployed lockfile needs.
-pypdf==6.17.0
+pypdf==6.19.0
 
 # Charts (server-side rendering for chat channels)
 matplotlib
@@ -84,7 +84,7 @@ croniter
 
 # Error / performance monitoring (Django integration ships in the core SDK,
 # auto-enabled. Inert unless SENTRY_DSN is set — see config/settings/base.py).
-sentry-sdk>=2.68.1
+sentry-sdk>=2.71.0
 
 # Utils
 whitenoise
