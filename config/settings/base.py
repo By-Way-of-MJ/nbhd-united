@@ -320,9 +320,6 @@ CHAT_SHAPE_PANELS = env(
 
 # Talk routing: explicit tenant UUID allowlist, no wildcard; dark by default.
 TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
-# Seal-egress PR-B canary gate (container STT + chat ZDR params). Comma list of tenant
-# UUIDs, or a lone "*" for everyone. Empty = nobody.
-CONTAINER_ZDR_TENANT_IDS = env("CONTAINER_ZDR_TENANT_IDS", default="")
 
 # Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
 # (empty = nobody, exact "*" = everyone). Container App env var name MUST match.

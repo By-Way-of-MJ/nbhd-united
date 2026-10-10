@@ -1677,9 +1677,6 @@ def effective_primary_model(tenant: Tenant) -> str:
 # model choice: this slug has only DeepInfra and Groq endpoints, both on
 # OpenRouter's ZDR endpoint list. Keep aligned with Django's OPENROUTER_STT_MODEL.
 OPENROUTER_STT_MODEL = {"provider": "openrouter", "model": "openai/whisper-large-v3-turbo"}
-# Pre-seal container speech-to-text (OpenAI direct with the platform key). Still emitted
-# for tenants outside ``CONTAINER_ZDR_TENANT_IDS`` until the canary widens to the fleet.
-LEGACY_OPENAI_STT_MODEL = {"provider": "openai", "model": "gpt-4o-mini-transcribe"}
 
 # Heartbeat model — the heartbeat is the one routine cron that's pure judgment
 # ("is anything genuinely new?" — it cross-references the daily note + heartbeat
@@ -2322,12 +2319,10 @@ def _build_tools_section(
         for tool_name in datebook_calendar_deny_overlay():
             if tool_name not in deny:
                 deny.append(tool_name)
-    from apps.router.chat_gates import container_zdr_enabled
-
     tools["media"] = {
         "audio": {
             "enabled": True,
-            "models": [OPENROUTER_STT_MODEL if container_zdr_enabled(tenant) else LEGACY_OPENAI_STT_MODEL],
+            "models": [OPENROUTER_STT_MODEL],
         },
     }
     # Tool-call loop detection. Off by default upstream — we turn it on as
@@ -3390,17 +3385,10 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     if _parse_version(oc_version) >= (2026, 4, 15):
         models_section = config.setdefault("models", {})
         providers = models_section.setdefault("providers", {})
-        from apps.router.chat_gates import container_zdr_enabled
-
         providers["openrouter"] = {
             "baseUrl": "https://openrouter.ai/api/v1",
-            # Per-request ZDR routing on container chat (gated canary — see
-            # ``container_zdr_enabled``). Absent for ungated tenants.
-            **(
-                {"params": {"provider": {"zdr": True, "data_collection": "deny"}}}
-                if container_zdr_enabled(tenant)
-                else {}
-            ),
+            # Per-request ZDR routing on container chat, for every tenant.
+            "params": {"provider": {"zdr": True, "data_collection": "deny"}},
             # Declared so the static registry can resolve them — see
             # OPENROUTER_DECLARED_MODELS for why this list stays minimal.
             # Emitted for BYO tenants too: it only extends the ``openrouter``

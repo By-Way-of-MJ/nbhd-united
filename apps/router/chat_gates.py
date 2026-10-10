@@ -46,16 +46,6 @@ def talk_route_enabled(tenant) -> bool:
     return _tenant_allowed(tenant, "TALK_ROUTE_TENANT_IDS")
 
 
-def container_zdr_enabled(tenant) -> bool:
-    """Seal-egress PR-B canary: container speech-to-text through OpenRouter (a ZDR-only
-    model) and per-request ZDR routing params on the container's OpenRouter provider.
-
-    Config-only and image-independent. Canary one tenant, then ``*``; remove the gate
-    once the fleet is on it.
-    """
-    return _tenant_allowed(tenant, "CONTAINER_ZDR_TENANT_IDS")
-
-
 def briefing_weather_tool_enabled(tenant) -> bool:
     """Morning Briefing weather via the ``nbhd_weather_briefing`` plugin tool.
 

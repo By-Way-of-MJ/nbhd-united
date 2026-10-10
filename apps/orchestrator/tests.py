@@ -65,7 +65,6 @@ class ConfigGeneratorTest(TestCase):
         config = generate_openclaw_config(self.tenant)
         self.assertIn("deepseek", config["agents"]["defaults"]["model"]["primary"].lower())
 
-    @override_settings(CONTAINER_ZDR_TENANT_IDS="*")
     def test_starter_tier_uses_openrouter(self):
         self.tenant.model_tier = "starter"
         config = generate_openclaw_config(self.tenant)
@@ -109,29 +108,6 @@ class ConfigGeneratorTest(TestCase):
             self.assertEqual(rate["input"], input_rate)
             self.assertEqual(rate["output"], output_rate)
 
-    def test_container_zdr_gate_off_keeps_the_previous_audio_and_provider_config(self):
-        # Canary gate: tenants outside CONTAINER_ZDR_TENANT_IDS get exactly what they had.
-        with override_settings(CONTAINER_ZDR_TENANT_IDS=""):
-            config = generate_openclaw_config(self.tenant)
-        self.assertEqual(
-            config["tools"]["media"]["audio"]["models"],
-            [{"provider": "openai", "model": "gpt-4o-mini-transcribe"}],
-        )
-        self.assertNotIn("params", config["models"]["providers"]["openrouter"])
-
-    def test_container_zdr_gate_is_per_tenant(self):
-        with override_settings(CONTAINER_ZDR_TENANT_IDS="00000000-0000-4000-8000-00000000dead"):
-            other = generate_openclaw_config(self.tenant)
-        with override_settings(CONTAINER_ZDR_TENANT_IDS=str(self.tenant.id)):
-            mine = generate_openclaw_config(self.tenant)
-        self.assertNotIn("params", other["models"]["providers"]["openrouter"])
-        self.assertEqual(
-            mine["models"]["providers"]["openrouter"]["params"]["provider"],
-            {"zdr": True, "data_collection": "deny"},
-        )
-        self.assertEqual(mine["tools"]["media"]["audio"]["models"][0]["provider"], "openrouter")
-
-    @override_settings(CONTAINER_ZDR_TENANT_IDS="*")
     def test_audio_model_defaults_to_whisper(self):
         self.tenant.model_tier = "starter"
         config = generate_openclaw_config(self.tenant)
