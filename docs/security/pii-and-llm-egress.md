@@ -54,10 +54,11 @@ env and secret bindings removed by `scrub_platform_provider_keys` on 2026-10-09
 (all 57 containers, read back from Azure). If the parked BYO scaffold is ever
 re-enabled, it swaps in `CLAUDE_CODE_OAUTH_TOKEN` (non-ZDR) for that tenant only.
 
-Residual, as of 2026-10-09: each tenant identity still holds the per-secret
-Key Vault "Secrets User" grant on `openai-api-key` and `anthropic-api-key`, so a
-compromised container identity could still read them from the vault. Revoking
-those grants is blocked by the production CanNotDelete locks and is pending.
+The tenant identities' per-secret Key Vault "Secrets User" grants on
+`openai-api-key` and `anthropic-api-key` were revoked on 2026-10-10 (114
+assignments, 57 identities x 2 secrets, read back from Azure), so a compromised
+container identity can no longer read those keys from the vault. New tenants
+are only granted the secrets in `DEFAULT_TENANT_KV_SECRETS`.
 
 Closed direct-provider paths in the 2026-08-26 sealing pass:
 
@@ -65,7 +66,7 @@ Closed direct-provider paths in the 2026-08-26 sealing pass:
 |---|---|
 | Embeddings and their six callers | OpenRouter embeddings; `provider.zdr=true` is attached per request and every caller supplies tenant context for known-value redaction |
 | Telegram voice and LINE voice | Shared `apps/router/transcription.py` OpenRouter STT seam; raw-audio exception disclosed above |
-| Container-native STT | `openrouter/openai/whisper-large-v3-turbo` (gate `CONTAINER_ZDR_TENANT_IDS`, `*` since 2026-10-09 — must stay `*` now that containers have no OpenAI key); route check requires every eligible endpoint to be ZDR |
+| Container-native STT | `openrouter/openai/whisper-large-v3-turbo` (every tenant since 2026-10-09; the canary gate and the old OpenAI path were removed 2026-10-11); route check requires every eligible endpoint to be ZDR |
 | Lessons cluster naming, copilot, tutoring, and `rewrite_lessons_actionable` | Shared `apps.common.openrouter.chat_completion`, with the mandatory per-request ZDR body |
 | `nbhd-image-gen` OpenAI plugin | Deleted from the runtime image and generated plugin allowlist |
 

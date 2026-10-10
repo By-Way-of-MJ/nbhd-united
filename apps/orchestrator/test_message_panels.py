@@ -108,12 +108,15 @@ class PanelToolConfigTests(SimpleTestCase):
         # Captured from 1ee74fb0 before changing config generation in that round;
         # re-captured 2026-10-07 when DeepSeek V4.1 Flash joined the model allowlist.
         # Re-captured 2026-10-09 when the unused ``anthropic:default`` auth profile was removed.
+        # Re-captured 2026-10-11 when the seal-egress canary gate was removed: OpenRouter
+        # speech-to-text and the ZDR provider params are now emitted for every tenant
+        # (byte-identical to the previous code with the gate set to ``*``).
         for gate in ("", "00000000-0000-4000-8000-000000000222", str(self.tenant.id)):
             with self.subTest(gate=gate), override_settings(CHAT_SHAPE_TENANT_IDS=gate):
                 config = generate_openclaw_config(self.tenant)
             self.assertEqual(
                 hashlib.sha256(self.config_bytes(config)).hexdigest(),
-                "ce6f9fb332cba0fa4279d97211c26da06274ead31d6af004fa0a83dd825eb028",
+                "1cf55b5eef93a836ea1d6bd5a5241188d5f1a39b85c28dbbfbf772db212e1f1d",
             )
             self.assertEqual(config["plugins"]["entries"]["nbhd-journal-tools"], {"enabled": True})
             assert_config_writable(config)
