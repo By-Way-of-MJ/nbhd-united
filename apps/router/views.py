@@ -11,6 +11,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from apps.billing.entitlement import is_paying
 from apps.billing.services import (
     check_budget,
     record_usage,
@@ -37,7 +38,8 @@ def _capture_telegram_webhook_transcript(
     tenant: Tenant,
     *,
     update_id: object,
-    raw_user_text: str,
+    user_outcome,
+    occurred_at,
     result: object,
 ) -> None:
     """Fail-closed capture for the live Telegram webhook path."""
@@ -49,7 +51,6 @@ def _capture_telegram_webhook_transcript(
             RedactionOutcome,
             as_confirmed,
             confirm_assistant_output,
-            redact_user_message_checked,
         )
         from apps.router.pending_queue import _extract_ai_response
         from apps.transcripts.capture import (
@@ -65,8 +66,6 @@ def _capture_telegram_webhook_transcript(
             TranscriptEvent.SourceType.TELEGRAM_WEBHOOK,
             source_event_id,
         )
-        occurred_at = timezone.now()
-        user_outcome = redact_user_message_checked(raw_user_text, tenant)
         confirmed_user = as_confirmed(user_outcome)
         if confirmed_user is not None:
             capture_transcript_event(
@@ -133,6 +132,40 @@ def _capture_telegram_webhook_transcript(
             str(tenant.id)[:8],
             str(update_id)[:32],
         )
+
+
+def _telegram_webhook_owner_text(update: dict) -> str | None:
+    """Return only typed text or an owner caption from a webhook update."""
+    message = update.get("message") or update.get("edited_message") or {}
+    if message.get("forward_from") or message.get("forward_from_chat"):
+        return None
+    return message.get("text") or message.get("caption") or None
+
+
+def _redact_telegram_webhook_ingress(
+    tenant: Tenant,
+    update_id: object,
+    message_text: str,
+    *,
+    owner_text: str | None,
+):
+    """Redact one webhook payload and reconcile only eligible owner ingress."""
+    from apps.pii.provisional import PiiIngress, record_provisional_sightings
+    from apps.pii.redactor import redact_user_message_checked
+
+    ingress = (
+        PiiIngress(
+            channel="telegram-webhook",
+            provider_event_id=str(update_id) if update_id is not None else None,
+            occurred_at=timezone.now(),
+        )
+        if owner_text is not None
+        else None
+    )
+    outcome = redact_user_message_checked(message_text, tenant, ingress=ingress)
+    if ingress is not None:
+        record_provisional_sightings(tenant, owner_text, ingress)
+    return outcome, ingress
 
 
 def _coerce_non_negative_int(value: object) -> int:
@@ -415,7 +448,7 @@ def telegram_webhook(request):
         )
 
     frontend_url = getattr(settings, "FRONTEND_URL", "https://neighborhoodunited.org").rstrip("/")
-    if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not bool(tenant.stripe_subscription_id):
+    if tenant.status == Tenant.Status.SUSPENDED and not tenant.is_trial and not is_paying(tenant):
         lang = tenant.user.language or "en"
         return JsonResponse(
             {
@@ -435,6 +468,24 @@ def telegram_webhook(request):
         _hibernate_for_quota(tenant)
         return JsonResponse(_build_budget_exhausted_message(chat_id, tenant, budget_reason))
 
+    # Separate the payload text from its optional owner-authored segment before
+    # the hibernation return. Forwarded text/captions are still redacted and
+    # delivered, but never receive owner ingress provenance.
+    msg = update.get("message") or update.get("edited_message") or {}
+    message_text = msg.get("text") or msg.get("caption") or ""
+    owner_text = _telegram_webhook_owner_text(update)
+    from apps.pii.provisional import PiiIngress
+
+    hibernation_ingress = (
+        PiiIngress(
+            channel="telegram-webhook",
+            provider_event_id=str(update_id) if update_id is not None else None,
+            occurred_at=timezone.now(),
+        )
+        if owner_text is not None
+        else None
+    )
+
     # Hibernated tenant — buffer message and wake container
     from apps.router.wake_on_message import (
         ACK_FRESH,
@@ -443,12 +494,12 @@ def telegram_webhook(request):
         handle_hibernated_message,
     )
 
-    msg_text = (update.get("message") or {}).get("text", "")
     wake_result = handle_hibernated_message(
         tenant,
         "telegram",
         update,
-        msg_text,
+        message_text,
+        pii_ingress=hibernation_ingress,
     )
     if wake_result == ACK_FRESH:
         lang = tenant.user.language or "en"
@@ -475,6 +526,7 @@ def telegram_webhook(request):
     tenant.save(update_fields=["last_message_at"])
 
     # Forward to the correct OpenClaw instance
+    failure_sink: dict[str, str] = {}
     loop = asyncio.new_event_loop()
     try:
         user_timezone = tenant.user.timezone or "UTC"
@@ -492,10 +544,18 @@ def telegram_webhook(request):
 
         proactive_block = surface_proactive_context(tenant=tenant)
 
-        msg = update.get("message") or update.get("edited_message") or {}
         # Capture the user's original text BEFORE the in-place decoration below
         # so the conversation digest stores real content, not agent markers.
-        raw_user_text = msg.get("text") or msg.get("caption") or ""
+        user_outcome, ingress = _redact_telegram_webhook_ingress(
+            tenant,
+            update_id,
+            message_text,
+            owner_text=owner_text,
+        )
+        capture_source_payload["redaction"] = {
+            "confirmed": user_outcome.confirmed,
+            "reason": user_outcome.reason,
+        }
         if "text" in msg:
             # Mark this as a conversational turn (not a scheduled cron run)
             # so the agent skips the heavy AGENTS.md "Session Start"
@@ -504,8 +564,10 @@ def telegram_webhook(request):
                 proactive_block
                 + build_datetime_context(user_timezone)
                 + build_chat_context_marker("telegram")
-                + msg["text"]
+                + user_outcome.text
             )
+        elif "caption" in msg:
+            msg["caption"] = user_outcome.text
 
         # Reasoning models need more time; the agent replies directly via bot
         # token even if this times out, but a longer window lets us capture
@@ -517,10 +579,12 @@ def telegram_webhook(request):
             forward_to_openclaw(
                 tenant.container_fqdn,
                 update,
+                tenant=tenant,
                 user_timezone=user_timezone,
                 timeout=wh_timeout,
                 max_retries=1,
                 retry_delay=5.0,
+                failure_sink=failure_sink,
             )
         )
     finally:
@@ -531,7 +595,8 @@ def telegram_webhook(request):
         _capture_telegram_webhook_transcript(
             tenant,
             update_id=update_id,
-            raw_user_text=raw_user_text,
+            user_outcome=user_outcome,
+            occurred_at=ingress.occurred_at if ingress is not None else timezone.now(),
             result=result,
         )
         # Capture the turn for the USER.md "Conversation so far" digest so
@@ -545,7 +610,7 @@ def telegram_webhook(request):
                 tenant=tenant,
                 channel="telegram",
                 channel_user_id=str(chat_id),
-                user_text=raw_user_text,
+                user_text=message_text,
                 reply_text=clean_reply_for_capture(tenant, _extract_ai_response(result)),
                 source_payload=capture_source_payload,
             )
@@ -555,6 +620,11 @@ def telegram_webhook(request):
     # Forwarding timed out — the agent likely received the message and will
     # reply asynchronously via the bot token.  Silently ack to Telegram
     # instead of sending a confusing "try again" message.
+    logger.warning(
+        "inbound_ack_unconfirmed channel=telegram_webhook update_id=%s reason=%s",
+        update_id,
+        failure_sink.get("reason", "unknown"),
+    )
     return HttpResponse("ok")
 
 
@@ -589,23 +659,20 @@ def serve_chart_image(request, tenant_id, filename):
 
         from azure.storage.fileshare import ShareFileClient
 
-        from apps.orchestrator.azure_client import get_storage_client
+        from apps.orchestrator.storage_credentials import run_with_key
 
-        storage_client = get_storage_client()
-        keys = storage_client.storage_accounts.list_keys(
-            settings.AZURE_RESOURCE_GROUP,
-            account_name,
-        )
-        account_key = keys.keys[0].value
         share_name = f"ws-{str(tenant_id)[:20]}"
 
-        file_client = ShareFileClient(
-            account_url=f"https://{account_name}.file.core.windows.net",
-            share_name=share_name,
-            file_path=f"workspace/charts/{filename}",
-            credential=account_key,
-        )
-        data = file_client.download_file().readall()
+        def operation(account_key):
+            file_client = ShareFileClient(
+                account_url=f"https://{account_name}.file.core.windows.net",
+                share_name=share_name,
+                file_path=f"workspace/charts/{filename}",
+                credential=account_key,
+            )
+            return file_client.download_file().readall()
+
+        data = run_with_key(tenant_id, operation)
 
         response = HttpResponse(data, content_type="image/png")
         response["Cache-Control"] = "public, max-age=3600"
@@ -696,23 +763,20 @@ def serve_meditation_audio(request, tenant_id, filename):
 
         from azure.storage.fileshare import ShareFileClient
 
-        from apps.orchestrator.azure_client import get_storage_client
+        from apps.orchestrator.storage_credentials import run_with_key
 
-        storage_client = get_storage_client()
-        keys = storage_client.storage_accounts.list_keys(
-            settings.AZURE_RESOURCE_GROUP,
-            account_name,
-        )
-        account_key = keys.keys[0].value
         share_name = f"ws-{str(tenant_id)[:20]}"
 
-        file_client = ShareFileClient(
-            account_url=f"https://{account_name}.file.core.windows.net",
-            share_name=share_name,
-            file_path=f"workspace/meditations/{filename}",
-            credential=account_key,
-        )
-        data = file_client.download_file().readall()
+        def operation(account_key):
+            file_client = ShareFileClient(
+                account_url=f"https://{account_name}.file.core.windows.net",
+                share_name=share_name,
+                file_path=f"workspace/meditations/{filename}",
+                credential=account_key,
+            )
+            return file_client.download_file().readall()
+
+        data = run_with_key(tenant_id, operation)
 
         # Range-aware: advertise Accept-Ranges and answer Range probes with a 206
         # so iOS AVPlayer / Safari can discover the true duration and stop at the

@@ -253,6 +253,24 @@ class ReminderRemovalBothFlagStatesTest(TestCase):
 
     def setUp(self):
         self.tenant = create_tenant(display_name="Reminder", telegram_chat_id=930001)
+        self.tenant.openclaw_version = "2026.5.28"  # gateway path; 9.4 is test_9_4_republishes_file_not_gateway
+        self.tenant.save(update_fields=["openclaw_version"])
+
+    def test_9_4_republishes_file_not_gateway(self):
+        self.tenant.openclaw_version = "2026.9.4"
+        self.tenant.postgres_cron_canonical = True
+        self.tenant.save(update_fields=["openclaw_version", "postgres_cron_canonical"])
+        name, ingestion = self._forget_one_reminder()
+        with (
+            patch("apps.cron.gateway_client.invoke_gateway_tool") as mock_invoke,
+            patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=0) as mock_write,
+            patch("apps.cron.signals._enqueue_regen"),
+        ):
+            result = forget_ingestion(self.tenant, ingestion)
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(CronJob.objects.filter(tenant=self.tenant, name=name).exists())
+        mock_write.assert_called_once_with(self.tenant)
+        mock_invoke.assert_not_called()
 
     def _forget_one_reminder(self):
         rem = _mk_reminder(self.tenant, "trash-tue")

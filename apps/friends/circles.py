@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import secrets
 
+from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
@@ -100,7 +101,8 @@ def _add_active_member(circle, tenant, user, role="member"):
     return membership
 
 
-def create_circle(tenant, user, *, name, description="", hue=210) -> Circle:
+@transaction.atomic
+def create_circle(tenant, user, *, name, description="", hue=210, agent_absorb_enabled=True) -> Circle:
     name = (name or "").strip()
     if not name:
         raise ValidationError("A circle name is required.")
@@ -117,7 +119,9 @@ def create_circle(tenant, user, *, name, description="", hue=210) -> Circle:
     thread = FriendThread.objects.create(
         kind=FriendThread.Kind.CIRCLE, circle=circle, title=name[:160], created_by=tenant
     )
-    FriendThreadMembership.objects.create(thread=thread, tenant=tenant, user=user)
+    FriendThreadMembership.objects.create(
+        thread=thread, tenant=tenant, user=user, agent_absorb_enabled=agent_absorb_enabled
+    )
     return circle
 
 
@@ -149,6 +153,7 @@ def get_circle_detail(tenant, circle_id) -> dict:
                 "handle": profile.handle if profile else None,
                 "display_name": profile.display_name if profile else "Neighbor",
                 "avatar_hue": profile.avatar_hue if profile else 210,
+                "photo_url": access.photo_url(profile),
                 "role": other.role,
                 "is_me": other.tenant_id == tenant.id,
             }
@@ -166,7 +171,8 @@ def get_circle_detail(tenant, circle_id) -> dict:
     }
 
 
-def join_circle(tenant, user, invite_code) -> dict:
+@transaction.atomic
+def join_circle(tenant, user, invite_code, *, agent_absorb_enabled=None) -> dict:
     circle = Circle.objects.filter(invite_code=(invite_code or "").strip()).first()
     if circle is None:
         raise NotFound("Invite code not found.")
@@ -176,6 +182,10 @@ def join_circle(tenant, user, invite_code) -> dict:
         raise PermissionDenied("You can only join a circle through a neighbor you're connected with.")
     _assert_circle_has_room(circle, tenant)
     _add_active_member(circle, tenant, user, role="member")
+    if agent_absorb_enabled is not None:
+        FriendThreadMembership.objects.filter(thread=_circle_thread(circle), tenant=tenant).update(
+            agent_absorb_enabled=agent_absorb_enabled
+        )
     return {"circle_id": str(circle.id), "status": "active"}
 
 
@@ -244,15 +254,24 @@ def regenerate_invite_code(tenant, circle_id) -> dict:
     return {"circle_id": str(circle.id), "invite_code": circle.invite_code}
 
 
+def _uuid_or_none(value):
+    import uuid
+
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def report_content(tenant, user, *, target_kind, target_id="", reason="", detail="") -> dict:
     """Reporter-side moderation + support intake. A content report (shared_lesson
     / friend_message) hides the item for the reporter and records it (design §10).
     A ``general`` report has no content id — it's the Settings → Support "Report a
     concern" destination (App Review #3); nothing is hidden, it lands as an open
     support row."""
-    if target_kind not in ("shared_lesson", "friend_message", "general"):
-        raise ValidationError("target_kind must be shared_lesson, friend_message, or general.")
-    is_content = target_kind in ("shared_lesson", "friend_message")
+    if target_kind not in ("shared_lesson", "friend_message", "general", "profile_photo"):
+        raise ValidationError("target_kind must be shared_lesson, friend_message, profile_photo, or general.")
+    is_content = target_kind in ("shared_lesson", "friend_message", "profile_photo")
     text = (reason or "").strip()
     if detail:
         text = (text + " — " + str(detail).strip()).strip(" —")
@@ -273,5 +292,12 @@ def report_content(tenant, user, *, target_kind, target_id="", reason="", detail
         if message is None:
             raise NotFound("No such message.")
         report.friend_message = message
+    elif target_kind == "profile_photo":
+        # target_id = the person's profile id (from their photo URL). Only a photo
+        # the reporter can actually see can be reported; the report hides it at once.
+        profile = NeighborProfile.objects.filter(id=_uuid_or_none(target_id)).first()
+        if profile is None or profile.tenant_id == tenant.id or not access.can_view_photo(tenant, profile):
+            raise NotFound("No such photo.")
+        report.photo_profile = profile
     report.save()
     return {"report_id": str(report.id), "hidden": is_content}

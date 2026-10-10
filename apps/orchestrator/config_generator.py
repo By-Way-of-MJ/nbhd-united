@@ -15,6 +15,7 @@ from django.conf import settings
 
 from apps.billing.constants import (
     ANTHROPIC_SONNET_MODEL,
+    DEEPSEEK_FLASH_41_MODEL,
     DEEPSEEK_FLASH_MODEL,
     DEEPSEEK_MODEL,
     GEMMA_DISPLAY,
@@ -41,8 +42,9 @@ from apps.tenants.models import Tenant
 # the ``bootstrapMaxChars`` emission site for the incident history. Tests that
 # assert "this block survives bootstrap" import THIS constant rather than
 # re-hardcoding the number, so a future bump can't silently strand them on a
-# stale bound.
-BOOTSTRAP_MAX_CHARS = 24000
+# stale bound. P5 size policy: raise this runtime cap and the CI ceiling in
+# test_reminder_capability.py TOGETHER by a fixed margin, never the ceiling alone.
+BOOTSTRAP_MAX_CHARS = 26000
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +65,12 @@ SUBAGENT_READ_ONLY_TOOLS: tuple[str, ...] = (
     "nbhd_finance_summary",  # Finance summary read.
     "nbhd_gravity_query",  # Grounded finance query.
     "nbhd_mission_context",  # Neighborhood mission context read.
+    "nbhd_project_context",  # Projects v2 context read (others' text fenced).
     "nbhd_neighborhood_context",  # Neighborhood context read.
     "nbhd_fuel_audit",  # Fuel history audit read.
+    "nbhd_fuel_get_plan",  # Full workout-plan read.
     "nbhd_fuel_get_workout",  # Workout read.
+    "nbhd_fuel_search_exercises",  # Illustrated exercise catalog read.
     "nbhd_fuel_summary",  # Fuel summary read.
     "nbhd_insights_baseline",  # Insight baseline read.
     "nbhd_insights_compare",  # Insight comparison read.
@@ -206,7 +211,32 @@ _CRON_CONTEXT_PREAMBLE = (
     "'everything'. Confabulated postmortems erode user trust and hide the real "
     "root cause from operators investigating later. Skip only the affected "
     "section; sections whose tools succeeded are still required.\n\n"
+    "7. Call `nbhd_journal_context` only when the task below needs recent "
+    "journal/backbone context; otherwise skip it.\n\n"
 )
+
+
+_CRON_RULE_ROWS = (
+    ("rules/journal-capture.md", "Journal capture"),
+    ("rules/lessons-constellation.md", "Lessons"),
+    ("rules/messaging.md", "Cron delivery, check-in windows, automated routines"),
+    ("rules/week-ahead.md", "Weekly review"),
+    ("rules/fuel.md", "Fuel"),
+)
+_CRON_DOC_ROWS = (
+    ("docs/tools-reference.md", "before using any tool you're unsure about"),
+    ("docs/cron-management.md", "before creating, editing, or disabling scheduled tasks"),
+    ("docs/error-handling.md", "when a tool fails or a feature isn't working"),
+)
+
+
+def _cron_rule_index(tenant: Tenant) -> str:
+    rows = list(_CRON_RULE_ROWS)
+    rows.extend(_CRON_DOC_ROWS)
+    table = "\n".join(f"| `{path}` | {load_for} |" for path, load_for in rows)
+    return (
+        f"**On-demand rule files (you can read these in this session):**\n| File | Load for |\n|---|---|\n{table}\n\n"
+    )
 
 
 # Marker used by `_wrap_message_with_phase2` and `update_system_cron_prompts` to
@@ -319,21 +349,11 @@ _TYPED_LIFECYCLE_SWAPS: tuple[tuple[str, str], ...] = (
         "which an automated turn cannot obtain — complete, skip or defer stale items instead, and "
         "leave anything that looks like junk for the user to confirm",
     ),
-    (
-        "`nbhd_document_set` with kind='tasks', slug='tasks'",
-        "`nbhd_task_create` for new actionable items (or `nbhd_task_update`/`nbhd_task_complete` "
-        "for existing tasks). Do not write goal/task content into Document anymore",
-    ),
     # ── Write-side: goals ───────────────────────────────────────────────
     (
         "`nbhd_document_append` (kind='goal', slug='goals')",
         "`nbhd_goal_create` for new goals or `nbhd_goal_update` to update an existing goal "
         "(use `nbhd_goal_achieve` / `nbhd_goal_abandon` for lifecycle changes)",
-    ),
-    (
-        "`nbhd_document_set` with kind='goal', slug='goals'",
-        "`nbhd_goal_create` for new goals (or `nbhd_goal_update`/`nbhd_goal_achieve`/"
-        "`nbhd_goal_abandon` for existing). Do not write goal content into Document anymore",
     ),
     # ── Read-side: tasks ────────────────────────────────────────────────
     (
@@ -419,18 +439,34 @@ def _prepare_cron_prompt(prompt: str, tenant: Tenant) -> str:
         "reconcile-time context only and may be hours or days old. Never use it to "
         "reason about 'today', 'this morning', 'earlier today', or whether the user "
         "has already done something today.\n"
-        "Before claiming the user has or hasn't done something today, verify against "
-        "today's daily note and journal entries. When mentioning future events, "
+        "Completion requires a Core meditation or Fuel workout marked done with completed_at, "
+        "a task marked done, or the user's explicit confirmation of that activity. "
+        "Elapsed calendar events and assistant-written daily-note lines are not proof; people skip plans. "
+        "If unconfirmed, say 'planned' or 'on the calendar', or ask; do not claim it was done or skipped. "
+        "When mentioning future events, "
         "compute exact days from the authoritative live clock (or the USER.md "
         "fallback): event date minus today = X days from now. Never say 'tomorrow' "
         "unless the math confirms exactly 1 day away.\n\n"
     )
     return _apply_typed_lifecycle_swaps(
-        date_line + time_source_instructions + _CRON_CONTEXT_PREAMBLE + prompt,
+        date_line + time_source_instructions + _CRON_CONTEXT_PREAMBLE + _cron_rule_index(tenant) + prompt,
         tenant,
     )
 
 
+# ── Morning Briefing weather: two lanes, gated per tenant ──────────────
+#
+# Programmatic lane (BRIEFING_WEATHER_TOOL_TENANT_IDS, apps/orchestrator/
+# briefing_weather.py): the `nbhd_weather_briefing` tool resolves the location,
+# calls Open-Meteo, writes the note's weather section itself and returns a
+# `message_line` the model relays verbatim. The model never searches for,
+# composes, or guesses weather — that is the whole point (invented "heavy, wet
+# and windy" briefings when web_search failed).
+#
+# Search lane (everyone else): the web_search step exactly as before, because
+# the tool only exists on images that ship the plugin and the prompt refresh is
+# fleet-wide while images roll per tenant. Its only change is the step-11
+# honesty sentence: never describe weather you didn't get.
 _MORNING_BRIEFING_WEATHER_STEP = (
     "1. Weather city: check `## Right now` in USER.md — if it shows a fresh Current location, "
     "get today's weather with `web_search` for that city. The value below is a SNAPSHOT of "
@@ -446,6 +482,84 @@ _MORNING_BRIEFING_LEGACY_WEATHER_STEP = (
     '(a follow-up search — e.g. "{location} weather tomorrow" — is fine if the first '
     "result doesn't cover tomorrow). Do NOT use web_fetch, curl, or exec — none of those "
     "are available; web_search is the only weather tool you have.\n"
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_GUIDANCE = (
+    "   Search results vary in structure: some include an hour-by-hour breakdown (time, "
+    "condition, temperature, precipitation chance, wind), others only a daily summary. "
+    "Use whatever level of detail the results actually contain — do not invent hourly "
+    "numbers that aren't there.\n"
+    "   IMPORTANT — distinguish past from future using the current time (from the date/time "
+    "line above). Only flag conditions for hours AHEAD of now. If precipitation or storms "
+    "occurred in hours before now, describe them as past — 'rained earlier this morning', "
+    "'cleared up overnight' — never say 'rainy day' for rain that already ended.\n"
+    "   If the results include an hourly/intraday breakdown, mention timing ONLY when "
+    "something notable is coming later today: a rain or storm window, a temperature swing "
+    "of 10°F+ (≈ 5.5°C), or wind picking up sharply after being calm. Flag the approximate "
+    "window and peak (e.g. 'rain ~13:00-16:00, heaviest around 14:00').\n"
+    "   If the results are daily-only, or nothing notable stands out, write a single "
+    "summary line and omit the Intraday block. Do NOT enumerate every hour. 'Sunny all "
+    "day' does not become '9am sun, 10am sun, 11am sun'.\n"
+    '   If the search returns nothing weather-related, or fails, write "Weather '
+    'unavailable" for the weather section in step 10 and continue — do not let this '
+    "block the rest of the briefing.\n"
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_SECTION = (
+    "**weather section:**\n"
+    "**Today:** temp range, conditions, what to wear\n"
+    "**Intraday:** (include ONLY if step 1 found a notable intraday window) one or two bullet lines "
+    "flagging the window — e.g. `- Rain window ~13:00–16:00 (70% at 14:00, tapering after)`, "
+    "`- Temp drops from 68°F at noon to 48°F by 18:00 — jacket if out late`. Omit this line "
+    "entirely on stable days.\n"
+    "**Tomorrow:** brief forecast; flag any thunderstorm or heavy-rain window by hour\n\n"
+    "Examples of good output (follow the same shape):\n"
+    "  Stable day (journal):\n"
+    "    **Today:** 68–74°F, partly cloudy. Light layers.\n"
+    "    **Tomorrow:** Similar, slightly warmer.\n"
+    "  Stable day (user message): `Partly cloudy, 68–74°F — light layers.`\n"
+    "  Rain window (journal):\n"
+    "    **Today:** 62–70°F, rain developing midday.\n"
+    "    **Intraday:** - Rain ~13:00–16:00 (peak 70% at 14:00). Dry after 17:00.\n"
+    "    **Tomorrow:** Clearing, 64–72°F.\n"
+    "  Rain window (user message): `Rain in Osaka ~1pm, clearing by 4pm — grab an umbrella.`\n"
+    "  Variable day (journal):\n"
+    "    **Today:** 55–78°F, thunderstorm risk late afternoon.\n"
+    "    **Intraday:** - Warm through noon, front arrives ~16:00 with thunderstorms. "
+    "Temp drops ~15°F by evening.\n"
+    "    **Tomorrow:** Cooler, 52–61°F, showers easing.\n"
+    "  Variable day (user message): `Storms around 4pm, then 15°F drop — jacket for anything after dinner.`\n\n"
+)
+
+_MORNING_BRIEFING_WEATHER_HONESTY_SENTENCE = (
+    "If you could not get weather in step 1, write `Weather couldn't be fetched this "
+    "morning.` — never describe weather you didn't get."
+)
+
+_MORNING_BRIEFING_SEARCH_WEATHER_MESSAGE_LINE = (
+    "- Weather + what to wear (1 line). If step 1 flagged a notable intraday window, add one "
+    "short clause naming it — e.g. 'Rain in Osaka ~1pm, clearing by 4pm — umbrella'. "
+    "Otherwise keep it one line. " + _MORNING_BRIEFING_WEATHER_HONESTY_SENTENCE + "\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_STEP = (
+    "1. Weather: call `nbhd_weather_briefing` ONCE (no arguments). It reads the user's "
+    "location itself (fresh Current location, else the profile), fetches the forecast, "
+    "and already writes the daily note's weather section. Keep its `message_line` for "
+    "step 11. If the tool is not available in this session, treat the weather as "
+    "unavailable. NEVER use web_search, web_fetch, curl, or exec for weather, and never "
+    "describe weather from memory or from any other source.\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_SECTION = (
+    "**weather section:** already written by `nbhd_weather_briefing` in step 1 — do NOT write or overwrite it.\n\n"
+)
+
+_MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE = (
+    "- Weather (1 line): the `message_line` returned by `nbhd_weather_briefing`, VERBATIM. "
+    "If the tool wasn't available or returned nothing, write exactly "
+    "`Weather couldn't be fetched this morning.` Never describe weather from memory, "
+    "from web_search, or from any other source.\n"
 )
 
 _PROACTIVE_SUGGESTIONS_BLOCK = (
@@ -495,25 +609,11 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "Stale news presented as current is worse than no news.\n\n"
     "Steps:\n"
     "{weather_step}"
-    "   Search results vary in structure: some include an hour-by-hour breakdown (time, "
-    "condition, temperature, precipitation chance, wind), others only a daily summary. "
-    "Use whatever level of detail the results actually contain — do not invent hourly "
-    "numbers that aren't there.\n"
-    "   IMPORTANT — distinguish past from future using the current time (from the date/time "
-    "line above). Only flag conditions for hours AHEAD of now. If precipitation or storms "
-    "occurred in hours before now, describe them as past — 'rained earlier this morning', "
-    "'cleared up overnight' — never say 'rainy day' for rain that already ended.\n"
-    "   If the results include an hourly/intraday breakdown, mention timing ONLY when "
-    "something notable is coming later today: a rain or storm window, a temperature swing "
-    "of 10°F+ (≈ 5.5°C), or wind picking up sharply after being calm. Flag the approximate "
-    "window and peak (e.g. 'rain ~13:00-16:00, heaviest around 14:00').\n"
-    "   If the results are daily-only, or nothing notable stands out, write a single "
-    "summary line and omit the Intraday block. Do NOT enumerate every hour. 'Sunny all "
-    "day' does not become '9am sun, 10am sun, 11am sun'.\n"
-    '   If the search returns nothing weather-related, or fails, write "Weather '
-    'unavailable" for the weather section in step 10 and continue — do not let this '
-    "block the rest of the briefing.\n"
+    "{weather_guidance}"
     "2. Check their calendar for today's events and upcoming 48hrs\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Check for important unread emails or messages\n"
     "4. Load recent journal context — what happened yesterday, any carry-over tasks?\n"
     "5. Load the user's goals (`nbhd_document_get` with kind='goal', slug='goals') for active goals context.\n"
@@ -545,29 +645,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "- List today's events with times\n\n"
     "### Reminders & Follow-ups\n"
     "- Anything carried over from yesterday, upcoming deadlines, things to remember\n\n"
-    "**weather section:**\n"
-    "**Today:** temp range, conditions, what to wear\n"
-    "**Intraday:** (include ONLY if step 1 found a notable intraday window) one or two bullet lines "
-    "flagging the window — e.g. `- Rain window ~13:00–16:00 (70% at 14:00, tapering after)`, "
-    "`- Temp drops from 68°F at noon to 48°F by 18:00 — jacket if out late`. Omit this line "
-    "entirely on stable days.\n"
-    "**Tomorrow:** brief forecast; flag any thunderstorm or heavy-rain window by hour\n\n"
-    "Examples of good output (follow the same shape):\n"
-    "  Stable day (journal):\n"
-    "    **Today:** 68–74°F, partly cloudy. Light layers.\n"
-    "    **Tomorrow:** Similar, slightly warmer.\n"
-    "  Stable day (user message): `Partly cloudy, 68–74°F — light layers.`\n"
-    "  Rain window (journal):\n"
-    "    **Today:** 62–70°F, rain developing midday.\n"
-    "    **Intraday:** - Rain ~13:00–16:00 (peak 70% at 14:00). Dry after 17:00.\n"
-    "    **Tomorrow:** Clearing, 64–72°F.\n"
-    "  Rain window (user message): `Rain in Osaka ~1pm, clearing by 4pm — grab an umbrella.`\n"
-    "  Variable day (journal):\n"
-    "    **Today:** 55–78°F, thunderstorm risk late afternoon.\n"
-    "    **Intraday:** - Warm through noon, front arrives ~16:00 with thunderstorms. "
-    "Temp drops ~15°F by evening.\n"
-    "    **Tomorrow:** Cooler, 52–61°F, showers easing.\n"
-    "  Variable day (user message): `Storms around 4pm, then 15°F drop — jacket for anything after dinner.`\n\n"
+    "{weather_section}"
     "**news section:**\n"
     "### Headlines\n"
     "- 2-3 relevant headlines (tech, world, topics they care about)\n\n"
@@ -590,9 +668,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "- Past lessons from the constellation that apply to today's plans\n"
     "- Skip this section if no lessons are relevant\n\n"
     "11. Send the user exactly ONE message via `nbhd_send_to_user`. Keep it concise:\n"
-    "- Weather + what to wear (1 line). If step 1 flagged a notable intraday window, add one "
-    "short clause naming it — e.g. 'Rain in Osaka ~1pm, clearing by 4pm — umbrella'. "
-    "Otherwise keep it one line.\n"
+    "{weather_message_line}"
     "- Top priority for the day (1 line)\n"
     "- Anything time-sensitive (1-2 lines)\n"
     "- Full details are in the journal\n\n"
@@ -629,6 +705,27 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
 )
 
 
+def _render_morning_briefing_template(*, weather_step: str, tool_weather: bool) -> str:
+    """Fill the morning briefing template for one weather lane.
+
+    ``tool_weather=False`` reproduces the pre-gate prompt byte-for-byte apart
+    from the step-11 honesty sentence; ``True`` swaps in the programmatic lane.
+    """
+    if tool_weather:
+        return _MORNING_BRIEFING_PROMPT_TEMPLATE.format(
+            weather_step=weather_step,
+            weather_guidance="",
+            weather_section=_MORNING_BRIEFING_TOOL_WEATHER_SECTION,
+            weather_message_line=_MORNING_BRIEFING_TOOL_WEATHER_MESSAGE_LINE,
+        )
+    return _MORNING_BRIEFING_PROMPT_TEMPLATE.format(
+        weather_step=weather_step,
+        weather_guidance=_MORNING_BRIEFING_SEARCH_WEATHER_GUIDANCE,
+        weather_section=_MORNING_BRIEFING_SEARCH_WEATHER_SECTION,
+        weather_message_line=_MORNING_BRIEFING_SEARCH_WEATHER_MESSAGE_LINE,
+    )
+
+
 _MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK = (
     "If `## Right now` shows a fresh Current location away from home base, include "
     "`Things to do nearby` among the quick-replies labels on the final marker line."
@@ -654,36 +751,51 @@ def _with_morning_briefing_away_tour_pill(prompt: str, tenant) -> str:
 
 
 def _build_morning_briefing_prompt(tenant) -> str:
-    """Build the morning briefing prompt with a pre-resolved weather search location.
+    """Build the morning briefing prompt.
 
-    Historically this baked a pre-built Open-Meteo API URL into the prompt for
-    the agent to ``web_fetch``. ``web_fetch`` is now denied fleet-wide (see
-    ``tool_policy.py`` P0-0/P0-0b — reachable, no credential gate, and a
-    zero-click exfil vector on a document-injection turn), so step 1 now uses
-    ``web_search`` instead. That tool takes a place name, not coordinates, so
-    this resolves a location LABEL rather than a lat/lon pair.
+    Weather lanes, gated per tenant by ``BRIEFING_WEATHER_TOOL_TENANT_IDS``
+    (``apps.router.chat_gates.briefing_weather_tool_enabled``):
 
-    Prefers the user's own ``location_city`` (free text set via
-    ``nbhd_update_profile``, e.g. "Osaka"); falls back to a label derived from
-    the IANA timezone. Never sends lat/lon anywhere — the previous ~11km-
-    quantized coordinates were only ever needed for the Open-Meteo query
-    string, which no longer exists.
+    - Programmatic (gated): the prompt only tells the model to call
+      ``nbhd_weather_briefing`` and relay its ``message_line`` verbatim
+      (``apps.orchestrator.briefing_weather``). No location is baked in —
+      Django resolves it at fire time from the fresh situation or the profile.
+    - Search (everyone else): ``web_search`` for a location label, as before.
+      ``web_fetch`` of a pre-built Open-Meteo URL is denied fleet-wide
+      (``tool_policy.py`` P0-0/P0-0b), so that tool takes a place name: the
+      user's own ``location_city`` when set, else a label derived from the
+      IANA timezone. Never lat/lon. Only the step-11 honesty sentence differs
+      from the pre-gate prompt.
     """
-    from apps.orchestrator.weather import resolve_weather_search_location
+    from apps.router.chat_gates import briefing_weather_tool_enabled
 
-    user = tenant.user
-    user_tz = str(getattr(user, "timezone", "") or "UTC")
-    location_city = str(getattr(user, "location_city", "") or "")
-    location = resolve_weather_search_location(location_city, user_tz)
-
-    if tenant.situational_context_enabled:
-        weather_step_template = _MORNING_BRIEFING_WEATHER_STEP
+    if briefing_weather_tool_enabled(tenant):
+        prompt = _render_morning_briefing_template(
+            weather_step=_MORNING_BRIEFING_TOOL_WEATHER_STEP,
+            tool_weather=True,
+        )
     else:
-        weather_step_template = _MORNING_BRIEFING_LEGACY_WEATHER_STEP
-    weather_step = weather_step_template.format(location=location)
+        from apps.orchestrator.weather import resolve_weather_search_location
 
-    prompt = _MORNING_BRIEFING_PROMPT_TEMPLATE.format(weather_step=weather_step)
+        user = tenant.user
+        user_tz = str(getattr(user, "timezone", "") or "UTC")
+        location_city = str(getattr(user, "location_city", "") or "")
+        location = resolve_weather_search_location(location_city, user_tz)
+
+        if tenant.situational_context_enabled:
+            weather_step_template = _MORNING_BRIEFING_WEATHER_STEP
+        else:
+            weather_step_template = _MORNING_BRIEFING_LEGACY_WEATHER_STEP
+        prompt = _render_morning_briefing_template(
+            weather_step=weather_step_template.format(location=location),
+            tool_weather=False,
+        )
     prompt = _with_morning_briefing_away_tour_pill(prompt, tenant)
+    from apps.router.chat_gates import chat_panels_tool_enabled
+    from apps.router.panels import MORNING_PANEL_INSTRUCTION
+
+    if chat_panels_tool_enabled(tenant):
+        prompt += "\n\n" + MORNING_PANEL_INSTRUCTION
     return _with_proactive_suggestions(prompt, tenant, monday_defer=True)
 
 
@@ -750,6 +862,9 @@ _EVENING_CHECKIN_PROMPT = (
     "happen before step 6 — the Journal app reads this section, so if it is empty the "
     "user will see nothing in their Journal tomorrow. Use this structure:\n"
     "### What got done today?\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "- Cross-reference morning priorities with tasks document — note completed items.\n"
     "- ✅ Item (brief description)\n\n"
     "### Goal progress\n"
@@ -929,6 +1044,9 @@ _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE = (
     "Steps:\n"
     "1. Load journal context (`nbhd_journal_context`) and recent memory files\n"
     "2. {calendar_step}\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Review the tasks and goals loaded above. Check which tasks are open vs completed. "
     "If a **North Star** section is present in your loaded context, weigh the week against it — "
     "does this week move the user toward it? Let that frame the highlights, one line at most.\n"
@@ -998,13 +1116,18 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "call `nbhd_session_mark_processed` with `{skipped: true, skip_reason: '<reason>'}` instead.\n"
     "Distillation is SILENT — do NOT send the user a message about it. Continue to Step 1.\n\n"
     "**Step 1 — Scan for anything that needs attention (in priority order):**\n"
-    "Use the daily note, tasks, and goals loaded above as your ground truth.\n"
+    "Use the daily note to avoid repeat messages; use live task and goal records for status.\n"
     "1. Memory files — anything you noted to follow up on?\n"
     "2. Calendar — any events in the next 2-3 hours? (`nbhd_calendar_list_events`)\n"
+    'Calendar entries are plans, even after their end time; never write "done", "banked", '
+    '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done '
+    "for that activity, or the user confirms it.\n"
     "3. Recent journal context — anything unfinished? (`nbhd_journal_context`)\n"
     "4. Pending lessons — any waiting for approval? (`nbhd_lessons_pending`)\n"
-    "5. Yesterday's cross-pillar signals — call `nbhd_yesterdays_signals` "
-    "for ambient awareness (workouts done, journal entries, energy, "
+    "5. Yesterday's cross-pillar signals — call `nbhd_yesterdays_signals`. "
+    "Only `workouts_done` / `sessions` counts are evidence something happened. A planned workout or a ready "
+    "meditation is NOT done; never congratulate or reference a completion that these counts do not show. "
+    "Use the tool for ambient awareness (workouts done, journal entries, energy, "
     "approved lessons). Use this ONLY to GROUND a nudge that's already "
     "warranted by 1-4 above — e.g. 'good run this morning' as natural "
     "preamble to a calendar nudge. DO NOT turn this into a quiz. DO NOT "
@@ -1015,7 +1138,7 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "For each item that seems worth mentioning:\n"
     "- Is it already in the morning-report section? → skip it\n"
     "- Is it already in the heartbeat-log section? → skip it\n"
-    "- Was it marked done or addressed anywhere in the note? → skip it\n"
+    "- Was it already addressed in a message, with no new verified status? → skip it\n"
     "- Is it genuinely new information the user hasn't seen today? → keep it\n\n"
     "**Step 3 — Act.**\n"
     "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP. "
@@ -1075,12 +1198,11 @@ _WEEKLY_REFLECTION_PROMPT = (
 _PROJECT_CHECKIN_PROMPT = (
     "Project check-in. This is a cron (isolated) session — but you CAN have a "
     "back-and-forth with the user via `nbhd_send_to_user`.\n\n"
-    "Read `rules/voice-journal.md` for the full journal routing protocol.\n\n"
     "Steps:\n"
     "1. Load today's daily note (`nbhd_daily_note_get`) — check what's already been logged today\n"
     "2. Load ALL project documents (`nbhd_document_get` with kind='project') to see what's being tracked\n"
-    "3. Load the tasks document (`nbhd_document_get` with kind='tasks', slug='tasks')\n"
-    "4. Load the goals document (`nbhd_document_get` with kind='goal', slug='goals')\n"
+    "3. Load open tasks with `nbhd_task_list({status: 'open'})`\n"
+    "4. Load active goals with `nbhd_goal_list({status: 'active'})`\n"
     "5. Compare: which tracked projects have updates today vs which have nothing logged\n"
     "6. If the daily note already has comprehensive updates for all tracked projects "
     "(e.g. from a voice journal earlier), skip the check-in entirely — do NOT message the user.\n"
@@ -1088,8 +1210,10 @@ _PROJECT_CHECKIN_PROMPT = (
     '   - "Hey, haven\'t heard about [project] today — anything happening or taking a break from it?"\n'
     "   - Group questions naturally, don't send one message per project\n"
     "8. If the user responds with updates, route them to the right journal locations:\n"
-    "   - Project-specific updates → the project's document (`nbhd_document_set` kind='project')\n"
-    "   - Tasks → tasks document\n"
+    "   - Project-specific updates → append to the existing project document with "
+    "`nbhd_document_append` (kind='project', slug=<project slug>)\n"
+    "   - Tasks → `nbhd_task_create` for new tasks or `nbhd_task_update`/`nbhd_task_complete` for existing tasks\n"
+    "   - Goals → `nbhd_goal_create` for new goals or `nbhd_goal_update`/`nbhd_goal_achieve` for existing goals\n"
     "   - General notes → daily note via `nbhd_daily_note_append`\n"
     "9. Keep the tone casual and supportive — this is a friend checking in, not a standup meeting\n"
 )
@@ -1122,7 +1246,10 @@ _FUEL_WORKOUT_PREP_PROMPT = (
     "claim the section was written, and do NOT call nbhd_send_to_user with a "
     "success message.**\n\n"
     "The fuel section should be brief (4-6 lines) and contain:\n"
-    "- **Today's workout** — activity, category, estimated duration. "
+    "The daily note only ever says what was PLANNED. Whether it happened is answered by "
+    "`nbhd_fuel_summary` / `nbhd_yesterdays_signals` (`status=done`), never by this section.\n"
+    "- Write `**Logged:** not yet` verbatim.\n"
+    "- **Today (planned):** — activity, category, estimated duration. "
     'If no workout is planned today, write "Rest day."\n'
     "- **Plan progress** — plan name, sessions completed vs total.\n"
     "- **Last night's sleep** — duration and quality if available. "
@@ -1131,7 +1258,8 @@ _FUEL_WORKOUT_PREP_PROMPT = (
     "- **Yesterday** — completed, missed, or rest.\n\n"
     "Example:\n"
     "```\n"
-    "**Today:** Push Day — Chest & Shoulders (strength, ~60 min)\n"
+    "**Today (planned):** Push Day — Chest & Shoulders (strength, ~60 min)\n"
+    "**Logged:** not yet\n"
     "**Plan:** 4-Week Strength Builder — 8/12 sessions done\n"
     "**Sleep:** 7.5h, quality 4/5 — recovery looks good\n"
     "**Yesterday:** Pull Day ✓ completed\n"
@@ -1270,7 +1398,8 @@ _BACKGROUND_TASKS_PROMPT = (
     "task/goal capture belongs to the user and to the nightly extraction pass (which dedupes "
     "and offers a one-tap undo). This maintenance run only reconciles existing items and "
     "curates the lighter stores below:\n"
-    "   - Ideas or brainstorms → ideas document (`nbhd_document_set` with kind='ideas', slug='ideas')\n"
+    "   - Ideas or brainstorms → first load the ideas document, merge the new material, then call "
+    "`nbhd_document_put` with kind='ideas', slug='ideas'\n"
     "   - Lasting patterns or preferences → memory (`nbhd_memory_update`)\n"
     "   The morning briefing reads the typed task/goal state directly and will surface anything relevant.\n"
     "7. Check the lessons constellation — if there are new approved lessons, the clusters "
@@ -1293,6 +1422,10 @@ TIER_MODEL_CONFIGS: dict[str, dict[str, Any]] = {
         DEEPSEEK_FLASH_MODEL: {"alias": "deepseek-flash"},
         DEEPSEEK_MODEL: {"alias": "deepseek"},
         GEMMA_MODEL: {"alias": "gemma"},
+        # Trial entry (2026-10-07). Kept LAST so it joins the end of every tenant's
+        # fallback chain (allowlist order minus the primary) rather than jumping
+        # ahead of the models already proven there.
+        DEEPSEEK_FLASH_41_MODEL: {"alias": "deepseek-flash-41"},
     },
 }
 
@@ -1540,7 +1673,13 @@ def effective_primary_model(tenant: Tenant) -> str:
     return resolve_tenant_models(tenant)[0]["primary"]
 
 
-WHISPER_DEFAULT_MODEL = {"provider": "openai", "model": "gpt-4o-mini-transcribe"}
+# OpenRouter ignores chat-style provider routing for STT, so privacy is pinned by
+# model choice: this slug has only DeepInfra and Groq endpoints, both on
+# OpenRouter's ZDR endpoint list. Keep aligned with Django's OPENROUTER_STT_MODEL.
+OPENROUTER_STT_MODEL = {"provider": "openrouter", "model": "openai/whisper-large-v3-turbo"}
+# Pre-seal container speech-to-text (OpenAI direct with the platform key). Still emitted
+# for tenants outside ``CONTAINER_ZDR_TENANT_IDS`` until the canary widens to the fleet.
+LEGACY_OPENAI_STT_MODEL = {"provider": "openai", "model": "gpt-4o-mini-transcribe"}
 
 # Heartbeat model — the heartbeat is the one routine cron that's pure judgment
 # ("is anything genuinely new?" — it cross-references the daily note + heartbeat
@@ -1695,13 +1834,11 @@ def _build_memory_flush_block(tenant: Tenant) -> dict:
         "systemPrompt": (
             "Session nearing compaction. Save important context now. "
             "Use nbhd_memory_update for lasting insights about the user. "
-            "Use nbhd_daily_note_append for today's notable events. "
-            "Also write a brief session summary to memory/YYYY-MM-DD.md as a workspace backup."
+            "Use nbhd_daily_note_append for today's notable events."
         ),
         "prompt": (
             "Review this conversation for anything worth remembering. "
-            "Save lasting insights via nbhd_memory_update, today's events via nbhd_daily_note_append, "
-            "and a brief summary to your workspace memory file. "
+            "Save lasting insights via nbhd_memory_update and today's events via nbhd_daily_note_append. "
             "Reply with NO_REPLY when done."
         ),
     }
@@ -2185,10 +2322,12 @@ def _build_tools_section(
         for tool_name in datebook_calendar_deny_overlay():
             if tool_name not in deny:
                 deny.append(tool_name)
+    from apps.router.chat_gates import container_zdr_enabled
+
     tools["media"] = {
         "audio": {
             "enabled": True,
-            "models": [WHISPER_DEFAULT_MODEL],
+            "models": [OPENROUTER_STT_MODEL if container_zdr_enabled(tenant) else LEGACY_OPENAI_STT_MODEL],
         },
     }
     # Tool-call loop detection. Off by default upstream — we turn it on as
@@ -2214,7 +2353,7 @@ def _build_tools_section(
     # doctor`), and the redactor masks the resulting validation error, so
     # tenants still on the 5.7 image must NOT receive it. The canary's
     # openclaw_version is bumped to 2026.5.28 in lock-step with its image.
-    # See CONTINUITY_openclaw-528-toolsearch.md.
+    # See docs/reference/tenant-runtime-and-provisioning.md, "Version gates".
     from apps.orchestrator.tool_policy import _parse_version
 
     if _parse_version(version) >= (2026, 5, 28):
@@ -2308,6 +2447,136 @@ def _build_logging_config() -> dict[str, Any]:
     }
 
 
+def _migrate_config_to_openclaw_9_4(config: dict[str, Any]) -> None:
+    """Transform a 2026.5.28-shape config into the 2026.9.4 schema, in place.
+
+    OpenClaw 2026.9.4 renamed/moved/dropped several config keys; a config still
+    carrying the old keys is rejected at gateway startup ("Invalid config:
+    Unrecognized key ...") and the container crash-loops
+    (openclaw_version_for_image_tag docstring's schema-skew class). The blocks
+    in ``generate_openclaw_config`` emit the 2026.5.28 baseline shape; this is a
+    forward transform (not inline per-key branches) so a still-on-5.28 tenant
+    whose config regenerates mid-rollout keeps the valid 5.28 shape and only
+    tenants already on >= 2026.9.4 get the migrated keys.
+
+    Transforms mirror OpenClaw's own ``doctor --fix`` migration, verified
+    against ``openclaw@2026.9.4 doctor`` on 2026-09-16
+    (docs/gateway/doctor/config-migrations.md in the pinned runtime).
+    """
+    defaults = config.get("agents", {}).get("defaults", {})
+
+    # agents.defaults.pdfMaxBytesMb -> pdfMaxMb (rename)
+    if "pdfMaxBytesMb" in defaults:
+        defaults["pdfMaxMb"] = defaults.pop("pdfMaxBytesMb")
+
+    # agents.defaults.envelopeTimezone removed — the envelope follows
+    # userTimezone (still emitted) directly.
+    defaults.pop("envelopeTimezone", None)
+
+    # agents.defaults.compaction.memoryFlush.{systemPrompt,prompt} removed —
+    # OpenClaw owns the flush prompt now; the nbhd flush steering lives in
+    # AGENTS.md so it governs every save the agent makes.
+    flush = defaults.get("compaction", {}).get("memoryFlush")
+    if isinstance(flush, dict):
+        flush.pop("systemPrompt", None)
+        flush.pop("prompt", None)
+
+    # agents.defaults.heartbeat.skipWhenBusy removed — busy deferral is a fixed
+    # runtime policy in 9.4 (docs/gateway/heartbeat.md: heartbeat config is
+    # strict), so dropping the key loses nothing.
+    heartbeat = defaults.get("heartbeat")
+    if isinstance(heartbeat, dict):
+        heartbeat.pop("skipWhenBusy", None)
+
+    # agents.defaults.memorySearch -> top-level memory.search; store.path
+    # dropped (indexes live in each agent DB); legacy provider "auto" -> openai.
+    if "memorySearch" in defaults:
+        memory_search = defaults.pop("memorySearch")
+        if isinstance(memory_search, dict):
+            store = memory_search.get("store")
+            if isinstance(store, dict):
+                store.pop("path", None)
+                if not store:
+                    memory_search.pop("store", None)
+            if memory_search.get("provider") == "auto":
+                memory_search["provider"] = "openai"
+        config.setdefault("memory", {})["search"] = memory_search
+
+    # tools.media.<kind>.models -> capability-tagged tools.media.models list
+    # (the per-kind enable flag, e.g. tools.media.audio.enabled, stays).
+    media = config.get("tools", {}).get("media")
+    if isinstance(media, dict):
+        tagged: list[dict[str, Any]] = []
+        for kind in ("audio", "image", "video"):
+            kind_cfg = media.get(kind)
+            if isinstance(kind_cfg, dict) and "models" in kind_cfg:
+                for model in kind_cfg.pop("models"):
+                    entry = dict(model) if isinstance(model, dict) else {"model": model}
+                    caps = entry.setdefault("capabilities", [])
+                    if kind not in caps:
+                        caps.append(kind)
+                    tagged.append(entry)
+        if tagged:
+            media["models"] = media.get("models", []) + tagged
+
+    # logging.redactSensitive removed — redaction is always on in 9.4; our
+    # redactPatterns stay and apply on top of the built-in set.
+    logging_cfg = config.get("logging")
+    if isinstance(logging_cfg, dict):
+        logging_cfg.pop("redactSensitive", None)
+
+    # root commitments removed — inferred commitments retired upstream.
+    config.pop("commitments", None)
+
+    # plugins.bundledDiscovery removed — discovery state moved to shared SQLite.
+    # (The 2026.9.4 hooks.allowConversationAccess requirement for the cron
+    # origin stamp is handled version-independently in the main plugin block via
+    # conversation_hook_plugin_ids, not here.)
+    plugins_cfg = config.get("plugins")
+    if isinstance(plugins_cfg, dict):
+        plugins_cfg.pop("bundledDiscovery", None)
+
+    # Web search on 9.4 via the IMAGE-VENDORED brave provider (9.4 only).
+    #
+    # 2026.9.4's doctor + gateway npm-install every "missing configured" web-search
+    # provider into <configDir>/npm at boot. A provider is "configured" when
+    # tools.web.search is enabled AND a catalog provider's env var is present —
+    # BRAVE_API_KEY pulls brave, OPENROUTER_API_KEY pulls perplexity. That install
+    # lands on our root-owned, wipe-on-restart oc-state EmptyDir: it fails fs-safe
+    # AND re-runs every boot. So instead we bake brave into the image at build
+    # time (Dockerfile.openclaw → /opt/nbhd/vendored/brave-project/node_modules/@openclaw/brave-plugin) and load it via
+    # plugins.load.paths. Verified against the 9.4 source: a plugin on load.paths
+    # counts as already-installed, so the boot install is skipped, and web search
+    # accepts a load.paths provider. Pin the provider to brave explicitly and turn
+    # perplexity OFF, or OPENROUTER_API_KEY would still trigger perplexity's boot
+    # install (targets-CmYzcNoa.mjs:116). The vendored path only exists in the 9.4
+    # image, so this is inside the 9.4 migration (5.28 tenants keep their shape).
+    _brave_path = "/opt/nbhd/vendored/brave-project/node_modules/@openclaw/brave-plugin"
+    _plugins = config.setdefault("plugins", {})
+    _load = _plugins.setdefault("load", {})
+    _paths = _load.setdefault("paths", [])
+    if _brave_path not in _paths:
+        _paths.append(_brave_path)
+    _allow = _plugins.get("allow")
+    if isinstance(_allow, list) and "brave" not in _allow:
+        _allow.append("brave")
+    _entries = _plugins.setdefault("entries", {})
+    _entries["brave"] = {"enabled": True}
+    _entries.setdefault("perplexity", {})["enabled"] = False
+    config.setdefault("tools", {}).setdefault("web", {}).setdefault("search", {}).update(
+        {"enabled": True, "provider": "brave"}
+    )
+
+    # env.<NAME> -> env.vars.<NAME>. 9.4's env block is strict: flat keys are
+    # "Unrecognized keys" (openclaw config validate, 2026.9.4-8ceb89f), which
+    # made every Google-connected 9.4 tenant's config invalid (MJ, 2026-09-25).
+    env = config.get("env")
+    if isinstance(env, dict):
+        flat = {k: env.pop(k) for k in [k for k in env if k not in ("vars", "shellEnv")]}
+        if flat:
+            env.setdefault("vars", {}).update(flat)
+
+
 def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     """Generate a complete openclaw.json for a tenant's container.
 
@@ -2349,10 +2618,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 or getattr(settings, "OPENCLAW_USAGE_REPORTER_PLUGIN_ID", "")
             ).strip(),
             str(getattr(settings, "OPENCLAW_USAGE_REPORTER_PLUGIN_PATH", "") or "").strip(),
-        ),
-        (
-            str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_ID", "") or "").strip(),
-            str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_PATH", "") or "").strip(),
         ),
         # Settings plugin — primary-model read + switch (nbhd_get_preferred_model_state,
         # nbhd_set_preferred_model). Unconditional in production via base.py default
@@ -2468,6 +2733,24 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
             )
         )
 
+    # Site-editor plugin — conditionally loaded only for tenants whose image
+    # manifest has been verified and whose dedicated feature flag is enabled.
+    # The tool self-gates on the injected config and GitHub token.
+    if getattr(tenant, "site_editor_enabled", False):
+        _plugin_defs.append(
+            (
+                str(getattr(settings, "OPENCLAW_SITE_EDITOR_PLUGIN_ID", "nbhd-site-editor") or "").strip(),
+                str(
+                    getattr(
+                        settings,
+                        "OPENCLAW_SITE_EDITOR_PLUGIN_PATH",
+                        "/opt/nbhd/plugins/nbhd-site-editor",
+                    )
+                    or ""
+                ).strip(),
+            )
+        )
+
     # Neighborhood (Friends) plugin — propose-share + neighborhood-context tools,
     # gated on friends_enabled. All tools are pull-or-propose; there is
     # deliberately no direct-post tool (the human approves every share). Mission
@@ -2478,6 +2761,25 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 str(getattr(settings, "OPENCLAW_FRIENDS_PLUGIN_ID", "nbhd-friends-tools") or "").strip(),
                 str(
                     getattr(settings, "OPENCLAW_FRIENDS_PLUGIN_PATH", "/opt/nbhd/plugins/nbhd-friends-tools") or ""
+                ).strip(),
+            )
+        )
+
+    # Projects v2 plugin — read the user's shared projects, save a PRIVATE draft, and
+    # SUGGEST changes the user approves in the app (DIRECTIVE_neighborhood_projects
+    # §4). Deliberately NOT gated on friends_enabled: a user's part of a project is
+    # their own data. Gated on the human Neighborhood + the Projects v2 rollout flag,
+    # and on the running image having reported the plugin dir: 2026.9.4 never
+    # starts its gateway when this names a dir the image lacks (2026-10-08).
+    from apps.friends.project_flags import project_tools_ready
+
+    if getattr(tenant, "neighborhood_enabled", False) and project_tools_ready(tenant):
+        _plugin_defs.append(
+            (
+                str(getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_ID", "nbhd-project-tools") or "").strip(),
+                str(
+                    getattr(settings, "OPENCLAW_PROJECT_TOOLS_PLUGIN_PATH", "/opt/nbhd/plugins/nbhd-project-tools")
+                    or ""
                 ).strip(),
             )
         )
@@ -2599,10 +2901,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         # Auth — provider tokens read from env vars automatically
         "auth": {
             "profiles": {
-                "anthropic:default": {
-                    "provider": "anthropic",
-                    "mode": "token",
-                },
                 "openrouter:default": {
                     "provider": "openrouter",
                     "mode": "token",
@@ -2658,9 +2956,11 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 # substitutions + conditional blocks put the base render at
                 # ~18.8 K, so the appended agents_md prompt-extras (person-capture
                 # reflex, task-discipline block) and ~800 chars of base tail were
-                # silently dropped at injection. 24 000 restores the full file
-                # with margin; total stays 80 000 (canary worst-case sum of all
-                # bootstrap files is comfortably under). Tests import
+                # silently dropped at injection. 24 000 restored the full file
+                # at the time; rules-delivery R4 raises the per-file cap to
+                # 26 000 with a 25 950 CI ceiling under P5. The total stays
+                # 80 000 (canary worst-case sum of all bootstrap files is
+                # comfortably under). Tests import
                 # BOOTSTRAP_MAX_CHARS (module top) instead of hardcoding this.
                 "bootstrapMaxChars": BOOTSTRAP_MAX_CHARS,
                 "bootstrapTotalMaxChars": 80000,
@@ -2770,7 +3070,6 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     # models routed through OpenRouter (e.g. DEEPSEEK_MODEL).
 
     if _active_plugins:
-        image_gen_id = str(getattr(settings, "OPENCLAW_IMAGE_GEN_PLUGIN_ID", "") or "").strip()
         usage_reporter_id = str(
             getattr(settings, "OPENCLAW_USAGE_PLUGIN_ID", "")
             or getattr(settings, "OPENCLAW_USAGE_REPORTER_PLUGIN_ID", "")
@@ -2785,15 +3084,20 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 "OPENCLAW_ROUTING_CONTEXT_PLUGIN_ID",
                 "OPENCLAW_ACTIVITY_STREAM_PLUGIN_ID",
                 "OPENCLAW_STREAM_PROGRESS_PLUGIN_ID",
+                # cron-enforcement registers before_prompt_build to record the
+                # cron runId->jobId used to sign the origin provenance stamp.
+                # 2026.5.28 tolerated it without the policy; 2026.9.4 BLOCKS the
+                # hook unless the entry sets hooks.allowConversationAccess, which
+                # silently drops the cron origin stamp (Django verify_origin_stamp
+                # then rejects cron-triggered actions). Verified against the
+                # pinned 2026.9.4 runtime 2026-09-16.
+                "OPENCLAW_CRON_ENFORCEMENT_PLUGIN_ID",
             )
         }
         conversation_hook_plugin_ids.discard("")
         plugin_config: dict[str, Any] = {
             "allow": [pid for pid, _ in _active_plugins],
-            "entries": {
-                pid: ({"enabled": True, "config": {"tier": tier}} if pid == image_gen_id else {"enabled": True})
-                for pid, _ in _active_plugins
-            },
+            "entries": {pid: {"enabled": True} for pid, _ in _active_plugins},
         }
 
         # These config-loaded plugins use OpenClaw conversation hooks. In
@@ -2884,6 +3188,39 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 "blobPathPrefix",
             )
             plugin_config["entries"][sitepub_id]["config"] = {k: _sc[k] for k in _sc_keys if _sc.get(k)}
+
+        # Site-editor plugin — whitelist and type-check every manifest key.
+        # The tenant flag is the manifest-ready gate, so no config can reach an
+        # older image whose additionalProperties:false schema lacks these keys.
+        site_editor_id = str(getattr(settings, "OPENCLAW_SITE_EDITOR_PLUGIN_ID", "nbhd-site-editor") or "").strip()
+        if site_editor_id and site_editor_id in plugin_config["entries"]:
+            editor_source = getattr(tenant, "site_editor_config", None) or {}
+            editor_config = {}
+            for key in ("owner", "repo", "branch", "authorEmail"):
+                if isinstance(editor_source.get(key), str):
+                    editor_config[key] = editor_source[key]
+            site_notes = editor_source.get("siteNotes")
+            if isinstance(site_notes, str) and len(site_notes) <= 1000:
+                editor_config["siteNotes"] = site_notes
+            for key in ("allowPaths", "denyPaths"):
+                value = editor_source.get(key)
+                if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    editor_config[key] = value
+            for key in ("maxTextBytes", "maxImageBytes", "maxFiles", "maxTotalBytes", "deployMinutes"):
+                value = editor_source.get(key)
+                if type(value) is int:
+                    editor_config[key] = value
+            plugin_config["entries"][site_editor_id]["config"] = editor_config
+
+        # CHAT_PANELS_TOOL_TENANT_IDS attests that the running image carries
+        # the panelsEnabled manifest key. Binary versions cannot prove this;
+        # canary images can also diverge from container_image_tag. Never use
+        # the image-independent shape gate here. See apps/router/PANELS.md.
+        from apps.router.chat_gates import chat_panels_tool_enabled
+
+        journal_tools_id = str(getattr(settings, "OPENCLAW_JOURNAL_PLUGIN_ID", "") or "").strip()
+        if journal_tools_id in plugin_config["entries"] and chat_panels_tool_enabled(tenant):
+            plugin_config["entries"][journal_tools_id]["config"] = {"panelsEnabled": True}
 
         # Older settings-tools manifests hard-reject unknown plugin config at
         # LOAD (additionalProperties:false), so this block stays absent until
@@ -3053,8 +3390,17 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     if _parse_version(oc_version) >= (2026, 4, 15):
         models_section = config.setdefault("models", {})
         providers = models_section.setdefault("providers", {})
+        from apps.router.chat_gates import container_zdr_enabled
+
         providers["openrouter"] = {
             "baseUrl": "https://openrouter.ai/api/v1",
+            # Per-request ZDR routing on container chat (gated canary — see
+            # ``container_zdr_enabled``). Absent for ungated tenants.
+            **(
+                {"params": {"provider": {"zdr": True, "data_collection": "deny"}}}
+                if container_zdr_enabled(tenant)
+                else {}
+            ),
             # Declared so the static registry can resolve them — see
             # OPENROUTER_DECLARED_MODELS for why this list stays minimal.
             # Emitted for BYO tenants too: it only extends the ``openrouter``
@@ -3121,6 +3467,16 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         _ts_defaults["params"] = {"cacheRetention": "long"}
         _ts_defaults["contextPruning"] = {"mode": "cache-ttl"}
 
+    # OpenClaw 2026.9.4 config-schema migration. Everything above emits the
+    # 2026.5.28 baseline; tenants already on >= 2026.9.4 get the renamed/moved/
+    # dropped keys so their gateway accepts the config. Gated so mixed-version
+    # rollout stays safe (a still-on-5.28 tenant keeps the 5.28 shape).
+    if _parse_version(oc_version) >= (2026, 9, 4):
+        _migrate_config_to_openclaw_9_4(config)
+
+    from .local_test import configure_gateway
+
+    configure_gateway(config, tenant)
     return config
 
 

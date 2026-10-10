@@ -251,6 +251,11 @@ class SystemCronsWellFormednessTests(TestCase):
                 msg=f"SYSTEM_CRONS entry {name!r} has a malformed cron expr {cron_expr!r}",
             )
 
+    def test_hibernate_idle_tenants_is_scheduled_every_ten_minutes(self):
+        entry = next(e for e in reg_cmd.SYSTEM_CRONS if e[0] == "hibernate-idle-tenants")
+        self.assertEqual(entry[1], "*/10 * * * *")
+        self.assertEqual(entry[2], "/api/cron/trigger/hibernate_idle_tenants/")
+
     def test_stale_app_chat_reaper_is_registered_every_five_minutes(self):
         from apps.cron.views import TASK_MAP
 
@@ -261,6 +266,41 @@ class SystemCronsWellFormednessTests(TestCase):
             TASK_MAP["reap_stale_app_chat_messages"],
             "apps.router.pending_queue.reap_stale_app_chat_messages_task",
         )
+
+    def test_meditation_reaper_is_registered_every_ten_minutes(self):
+        from django.urls import resolve
+        from django.utils.module_loading import import_string
+
+        from apps.core.tasks import reap_meditations
+        from apps.cron.views import TASK_MAP, trigger_task
+
+        entries = [e for e in reg_cmd.SYSTEM_CRONS if e[0] == "reap-meditations"]
+        self.assertEqual(
+            entries,
+            [("reap-meditations", "*/10 * * * *", "/api/cron/trigger/reap_meditations/")],
+        )
+        match = resolve(entries[0][2])
+        self.assertIs(match.func, trigger_task)
+        self.assertEqual(match.kwargs, {"task_name": "reap_meditations"})
+        self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), reap_meditations)
+
+    def test_tool_event_purge_is_registered_daily_at_0550_utc(self):
+        from django.urls import resolve
+        from django.utils.module_loading import import_string
+
+        from apps.cron.views import TASK_MAP, trigger_task
+        from apps.platform_logs.tasks import purge_tool_events_task
+
+        entries = [e for e in reg_cmd.SYSTEM_CRONS if e[0] == "purge-tool-events"]
+        self.assertEqual(
+            entries,
+            [("purge-tool-events", "50 5 * * *", "/api/cron/trigger/purge_tool_events/")],
+        )
+        match = resolve(entries[0][2])
+        self.assertIs(match.func, trigger_task)
+        self.assertEqual(match.kwargs, {"task_name": "purge_tool_events"})
+        self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), purge_tool_events_task)
+        self.assertEqual([e[0] for e in reg_cmd.SYSTEM_CRONS if e[1] == "50 5 * * *"], ["purge-tool-events"])
 
     def test_sautai_generation_recovery_is_registered_every_minute(self):
         from apps.cron.views import TASK_MAP
@@ -311,7 +351,7 @@ class SystemCronsWellFormednessTests(TestCase):
         """
         by_name = {name: (cron_expr, path, retries) for name, cron_expr, path, retries in reg_cmd.iter_system_crons()}
         expected = {
-            "eval-journey-chat": ("*/30 * * * *", "/api/cron/trigger/eval_journey_chat/", 0),
+            "eval-journey-chat": ("30 4 * * *", "/api/cron/trigger/eval_journey_chat/", 0),
             "eval-journey-journal": ("5 5 * * *", "/api/cron/trigger/eval_journey_journal/", 0),
             "eval-journey-wake": ("12 5 * * *", "/api/cron/trigger/eval_journey_wake/", 0),
             "eval-journey-cron": ("20 5 * * *", "/api/cron/trigger/eval_journey_cron/", 0),
@@ -373,9 +413,9 @@ class SystemCronsWellFormednessTests(TestCase):
         for name, cron_expr, _path, _retries in reg_cmd.iter_system_crons():
             if not name.startswith(("eval-journey-", "reap-stuck-eval")):
                 continue
+            if name == "eval-journey-chat":
+                continue  # the chat probe itself
             minute_field = cron_expr.split()[0]
-            if minute_field.startswith("*"):
-                continue  # the chat probe itself (*/30)
             self.assertNotIn(
                 int(minute_field),
                 chat_minutes,

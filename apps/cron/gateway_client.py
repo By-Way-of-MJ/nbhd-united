@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -10,9 +11,16 @@ import requests
 from django.conf import settings
 
 from apps.orchestrator.azure_client import read_key_vault_secret
+from apps.orchestrator.gateway_url import gateway_base_url
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
+
+# Only explicitly read-only operations may replay a proxy 502. Share the
+# attempt budget with timeout retries so mixed failures cannot multiply it.
+_PROXY_502_RETRY_TOOLS = frozenset({"cron.list"})
+_PROXY_502_BACKOFF_SECONDS = (0.5, 1.5)
+_PROXY_502_MAX_ATTEMPTS = len(_PROXY_502_BACKOFF_SECONDS) + 1
 
 
 class GatewayError(Exception):
@@ -146,7 +154,7 @@ def get_gateway_token_for_tenant(tenant: Tenant) -> str:
     return (getattr(settings, "NBHD_INTERNAL_API_KEY", "") or "").strip()
 
 
-def _get_gateway_token(tenant: Tenant) -> str:
+def _get_gateway_token(tenant: Tenant, *, metadata_only: bool = False) -> str:
     """Variant of `get_gateway_token_for_tenant` that raises on miss.
 
     Used by `invoke_gateway_tool` where a missing token always indicates
@@ -159,10 +167,29 @@ def _get_gateway_token(tenant: Tenant) -> str:
         # Last-resort KV read — keeps the historical behaviour where a
         # Django pod without `settings.NBHD_INTERNAL_API_KEY` in its env
         # could still reach the gateway via KV.
-        token = read_key_vault_secret("nbhd-internal-api-key") or ""
+        token = (
+            read_key_vault_secret("nbhd-internal-api-key", metadata_only=True)
+            if metadata_only
+            else read_key_vault_secret("nbhd-internal-api-key")
+        ) or ""
     if not token:
         raise GatewayError(f"Could not read gateway token for tenant {tenant.id}")
     return token
+
+
+def list_tenant_crons(tenant: Tenant, args: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Read-only ``cron.list`` that works on every OpenClaw version.
+
+    9.4 gates the gateway ``cron.list`` (``trusted operational run instance
+    required``), so for those tenants read the in-container helper's state file
+    instead. Returns the gateway's ``{"jobs": [...]}`` shape and raises
+    ``GatewayError`` on failure either way. The file holds ENABLED jobs only.
+    """
+    from apps.cron.share_cron_sync import read_container_cron_jobs, tenant_uses_file_cron_sync
+
+    if tenant_uses_file_cron_sync(tenant):
+        return {"jobs": read_container_cron_jobs(tenant)}
+    return invoke_gateway_tool(tenant, "cron.list", args or {})
 
 
 def invoke_gateway_tool(
@@ -171,6 +198,7 @@ def invoke_gateway_tool(
     args: dict[str, Any],
     *,
     error_log_level: int = logging.ERROR,
+    metadata_only: bool = False,
 ) -> dict[str, Any]:
     """Call a tool on a tenant's OpenClaw Gateway.
 
@@ -203,8 +231,13 @@ def invoke_gateway_tool(
             patch["delivery"] = dict(_IOS_SAFE_DELIVERY)
             args = {**args, "patch": patch}
 
-    token = _get_gateway_token(tenant)
-    url = f"https://{tenant.container_fqdn}/tools/invoke"
+    try:
+        token = _get_gateway_token(tenant, metadata_only=True) if metadata_only else _get_gateway_token(tenant)
+    except Exception:
+        if metadata_only:
+            raise GatewayError("gateway_token_unavailable") from None
+        raise
+    url = f"{gateway_base_url(tenant)}/tools/invoke"
 
     # OpenClaw /tools/invoke expects {"tool": "<name>", "action": "<action>", "args": {}}
     # e.g. "cron.list" → tool="cron", action="list"
@@ -224,8 +257,8 @@ def invoke_gateway_tool(
     # canary 2026-05-13 22:00 UTC incident hit this: Morning Briefing's
     # stale payload.model wasn't fixed before the 22:00 fire window
     # because the 22:00 reconcile timed out reading cron.list.
-    last_exc: requests.RequestException | None = None
-    for attempt in (1, 2):
+    max_attempts = _PROXY_502_MAX_ATTEMPTS if tool in _PROXY_502_RETRY_TOOLS else 2
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.post(
                 url,
@@ -233,21 +266,44 @@ def invoke_gateway_tool(
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=45,
             )
-            break
         except requests.Timeout as exc:
-            last_exc = exc
             if attempt == 1:
                 logger.warning(
-                    "Gateway %s.%s timed out (attempt 1/2) — retrying",
+                    "Gateway %s.%s timed out for tenant %s (attempt 1/2) — retrying",
                     tool_name,
                     action or "",
+                    tenant.id,
                 )
                 continue
+            if metadata_only:
+                raise GatewayError("gateway_request_failed") from None
             raise GatewayError(f"Gateway request failed: {exc}") from exc
         except requests.RequestException as exc:
+            if metadata_only:
+                raise GatewayError("gateway_request_failed") from None
             raise GatewayError(f"Gateway request failed: {exc}") from exc
-    else:  # pragma: no cover — defensive, the for-else only runs if no break
-        raise GatewayError(f"Gateway request failed: {last_exc}")
+
+        if (
+            tool in _PROXY_502_RETRY_TOOLS
+            and resp.status_code == 502
+            and '"bad_gateway"' in resp.text
+            and "upstream" in resp.text
+            and "unreachable" in resp.text
+            and attempt < max_attempts
+        ):
+            delay = _PROXY_502_BACKOFF_SECONDS[attempt - 1]
+            logger.warning(
+                "Gateway %s.%s returned 502 for tenant %s (attempt %d/%d) — retrying in %.1fs",
+                tool_name,
+                action or "",
+                tenant.id,
+                attempt,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+        break
 
     if resp.status_code != 200:
         if _is_container_unavailable(resp.status_code, resp.text):
@@ -265,12 +321,16 @@ def invoke_gateway_tool(
                 status_code=resp.status_code,
                 unavailable=True,
             )
+        if metadata_only:
+            logger.log(error_log_level, "Gateway failure status=%s reason=gateway_http_error", resp.status_code)
+            raise GatewayError("gateway_http_error", status_code=resp.status_code) from None
         logger.log(
             error_log_level,
-            "Gateway %s.%s returned %s: %s",
+            "Gateway %s.%s returned %s for tenant %s: %s",
             tool_name,
             action or "",
             resp.status_code,
+            tenant.id,
             resp.text[:500],
         )
         raise GatewayError(
@@ -278,8 +338,17 @@ def invoke_gateway_tool(
             status_code=resp.status_code,
         )
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        if metadata_only:
+            raise GatewayError("gateway_invalid_json", status_code=resp.status_code) from None
+        raise GatewayError("Gateway returned invalid JSON", status_code=resp.status_code) from exc
+    if not isinstance(data, dict):
+        raise GatewayError("Gateway returned a non-object JSON envelope", status_code=resp.status_code)
     if not data.get("ok"):
+        if metadata_only:
+            raise GatewayError("gateway_tool_failed", status_code=resp.status_code) from None
         raise GatewayError(data.get("error", "Unknown gateway error"))
 
     return data.get("result", {})

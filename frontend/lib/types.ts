@@ -75,13 +75,18 @@ export interface Tenant {
   // privacy (GRAVITY_ENABLED off server-side) — hides the tab + enable toggle.
   gravity_available: boolean;
   fuel_enabled: boolean;
+  /** Web redesign (Open Sky) — per-tenant gate WEB_REDESIGN_TENANT_IDS. Missing = off. */
+  web_redesign?: boolean;
   core_enabled: boolean;
   byo_models_enabled: boolean;
+  neighborhood_enabled: boolean;
   friends_enabled: boolean;
+  /** Projects v2 (plan · timeline · people) — per-tenant gate PROJECTS_V2_TENANT_IDS. Missing = off. */
+  projects_v2_enabled?: boolean;
 }
 
 // Core (mindfulness) pillar — generated guided meditations.
-export type MeditationStatus = "pending" | "rendering" | "ready" | "delivered" | "failed";
+export type MeditationStatus = "pending" | "rendering" | "ready" | "delivered" | "done" | "failed";
 
 /** One phase of a sit, as the API reports it: control values only (no narration). */
 export interface MeditationPhaseArcEntry {
@@ -93,6 +98,14 @@ export interface MeditationSession {
   id: string;
   date: string; // YYYY-MM-DD
   status: MeditationStatus;
+  completed_at?: string | null;
+  lesson?: {
+    tradition?: string;
+    teaching_slug?: string;
+    core_teaching?: string;
+    summary?: string;
+    practice?: string;
+  };
   /** The sit's real phase arc. Null for sessions with no stored manifest, and
    *  absent altogether from a backend deployed before phase arcs shipped. */
   phase_arc?: MeditationPhaseArcEntry[] | null;
@@ -550,6 +563,11 @@ export interface Lesson {
   created_at: string;
 }
 
+/** GET /api/v1/lessons/search/ — a lesson ranked by meaning (cosine similarity, 0–1). */
+export interface LessonSearchResult extends Lesson {
+  similarity: number | null;
+}
+
 export interface ConstellationNode {
   id: number;
   text: string;
@@ -619,12 +637,21 @@ export interface GraphData {
 }
 
 // Horizons
+export interface HorizonsGoalTask {
+  id: string;
+  title: string;
+  status: string;
+  due_date: string | null;
+}
+
 export interface HorizonsGoal {
   id: string;
   title: string;
   slug: string;
   preview: string;
   markdown?: string;
+  status?: string;
+  tasks?: HorizonsGoalTask[];
   created_at: string;
   updated_at: string;
 }
@@ -1059,6 +1086,46 @@ export interface NeighborhoodData {
   pending_outgoing: PendingWave[];
 }
 
+// GET /api/v1/friends/home/ — the aggregated Neighborhood home. `bond` is a
+// qualitative bucket (never a count); `in_my_sky` is visible only to the viewer.
+export type NeighborBond = "light" | "steady" | "strong";
+
+export interface HomeNeighbor {
+  friendship_id: string;
+  display_name: string;
+  handle: string;
+  avatar_hue: number;
+  bio?: string;
+  spark_count: number;
+  in_my_sky: boolean;
+  bond: NeighborBond;
+  friends_since: string; // YYYY-MM-DD
+  has_unread_thread: boolean;
+  thread_id: string | null;
+  // Bucketed count of this friend's friends you don't know — never exact.
+  // Optional: older servers omit it (then no glimmers, no copy).
+  reach?: null | "3+" | "5+" | "10+" | "25+" | "50+" | "100+";
+}
+
+export interface HomeWave {
+  friendship_id: string;
+  direction?: "incoming" | "outgoing";
+  display_name: string;
+  handle: string;
+  avatar_hue: number;
+  note: string;
+  created_at: string;
+}
+
+export interface NeighborhoodHome {
+  profile: { handle: string; display_name: string; avatar_hue: number } | null;
+  neighbors: HomeNeighbor[];
+  pending_in: HomeWave[];
+  pending_out: HomeWave[];
+  // Same buckets as HomeNeighbor.reach, across everyone. Optional.
+  reach_total?: null | "3+" | "5+" | "10+" | "25+" | "50+" | "100+";
+}
+
 // Response shape shared by the accept/decline/block and unfriend endpoints.
 export interface FriendshipStatusResult {
   friendship_id: string;
@@ -1082,6 +1149,13 @@ export interface FriendInvite {
   expires_at: string;
   max_uses: number;
   uses: number;
+}
+
+export interface FriendInvitePreview {
+  inviter_display_name: string;
+  inviter_handle: string;
+  inviter_hue: number;
+  valid: boolean;
 }
 
 // ── Neighborhood shares (PR2) ────────────────────────────────────────────────
@@ -1167,6 +1241,10 @@ export interface AbsorbedItem {
   from_handle: string | null;
   label: string;
   absorbed_at: string;
+  // Optional grouping hints: items sharing a group_key are one thing kept
+  // several times; kind_label is a human word for what it is.
+  group_key?: string | null;
+  kind_label?: string | null;
 }
 
 // ── Friend chat (PR5) ──────────────────────────────────────────────────────
@@ -1191,6 +1269,9 @@ export interface ChatMessage {
   text: string;
   mine: boolean;
   created_at: string;
+  // Who wrote it — what a cluster conversation shows above each message.
+  // Optional: optimistic rows and older servers omit it.
+  author?: { handle: string | null; display_name: string; avatar_hue: number; photo_url?: string | null };
 }
 
 export interface ChatPage {
@@ -1212,6 +1293,8 @@ export interface MissionTarget {
   unit?: string;
   cadence?: "daily" | "weekly" | string;
   value?: number;
+  // How the project began (iPhone "Grow together"): asking, offering or learning.
+  aid_kind?: "ask" | "offer" | "learn" | string;
 }
 
 export interface MissionSummary {
@@ -1222,6 +1305,13 @@ export interface MissionSummary {
   target_date: string | null;
   my_commitment: string;
   version: number;
+}
+
+// GET /api/v1/friends/missions/?include_invited=1 rows carry the viewer's own
+// membership state, so invitations ("asks") can be told apart from joined ones.
+export interface MissionAsk extends MissionSummary {
+  my_status: "active" | "invited";
+  my_role: "owner" | "member";
 }
 
 // One row in a mission's crew projection — handle is null if that member
@@ -1252,6 +1342,17 @@ export interface MissionDetail {
   version: number;
   my_commitment: string;
   my_role: "owner" | "member";
+  my_status?: "active" | "invited";
+  // Newest first, attributed (members only; empty for an invited preview).
+  updates?: MissionUpdate[];
+}
+
+export interface MissionUpdate {
+  id: string;
+  kind: string;
+  text: string;
+  created_at: string;
+  author_name: string;
 }
 
 // An agent-proposed Mission task for the tenant's OWN human (design §2.10) —
@@ -1317,4 +1418,181 @@ export interface CircleLeaveResult {
   circle_id: string;
   status: string;
   purged: boolean;
+}
+
+// ── Projects v2 (apps/friends/PROJECTS_V2.md) ─────────────────────────────
+// GET /api/v1/friends/missions/<id>/plan/ — the shared plan as the server sends
+// it. Dates are calendar days (YYYY-MM-DD) or null. `lib/project-plan.ts` turns
+// this into the model the project page draws.
+export type PlanHealth = "on_track" | "at_risk" | "late";
+export type PlanStepStatus = "open" | "in_progress" | "done" | "skipped";
+export type PlanAssignmentStatus = "asked" | "accepted" | "declined" | "countered";
+
+export interface PlanMemberData {
+  id: string;
+  handle: string | null;
+  display_name: string;
+  hue: number;
+  role: "owner" | "member" | string;
+  status: "invited" | "active" | "left" | "declined" | string;
+  photo_url?: string | null;
+  // Only on the viewer's own membership.
+  muted?: boolean;
+  linked_goal_id?: string | null;
+  linked_goal_title?: string | null;
+}
+
+export interface PlanAssignmentData {
+  id: string;
+  step_id?: string;
+  membership_id: string;
+  status: PlanAssignmentStatus;
+  counter_start?: string | null;
+  counter_due?: string | null;
+  note?: string;
+}
+
+export interface PlanMilestoneData {
+  id: string;
+  title: string;
+  target_date: string | null;
+  order: number;
+  reached_at?: string | null;
+  done_count?: number;
+  total?: number;
+  projected_date?: string | null;
+}
+
+export interface PlanStepData {
+  id: string;
+  milestone_id: string | null;
+  title: string;
+  description?: string;
+  start_date: string | null;
+  due_date: string | null;
+  status: PlanStepStatus;
+  order: number;
+  version: number;
+  assignments?: PlanAssignmentData[];
+  owners?: { id: string }[];
+  blocked_by_open?: string[];
+  ready?: boolean;
+  slack_days?: number | null;
+  on_critical_path?: boolean;
+  moves_if_late?: string[];
+  projected_date?: string | null;
+}
+
+export interface PlanEdgeData {
+  id: string;
+  blocker_id: string;
+  blocked_id: string;
+}
+
+export interface ProjectPlanData {
+  mission_id: string;
+  title: string;
+  description?: string;
+  status?: string;
+  version?: number;
+  target_date?: string | null;
+  members: PlanMemberData[];
+  milestones: PlanMilestoneData[];
+  steps: PlanStepData[];
+  edges: PlanEdgeData[];
+  health?: PlanHealth;
+  done_count?: number;
+  total?: number;
+  my_membership_id: string;
+  my_role?: string;
+  can_invite?: boolean;
+}
+
+/** A suggestion the viewer's assistant made for a project. Nothing changes until they approve it. */
+export interface ProjectProposal {
+  proposal_id: string;
+  mission_id: string;
+  project_title: string;
+  summary: string;
+  changes: string[];
+  touches_others: boolean;
+  from_project_text: boolean;
+  created_at?: string;
+}
+
+/** A private starter plan the viewer's assistant drafted. */
+export interface ProjectDraftSummary {
+  draft_id: string;
+  title: string;
+  goal: string;
+  step_count: number;
+}
+
+export interface ProjectDraftDetail {
+  draft_id: string;
+  payload: {
+    title?: string;
+    goal?: string;
+    milestones?: { key: string; title?: string; target_date?: string | null }[];
+    steps?: {
+      key: string;
+      title?: string;
+      start_date?: string | null;
+      due_date?: string | null;
+      milestone_key?: string | null;
+      owner?: string | null;
+      depends_on?: string[];
+    }[];
+  };
+}
+
+// GET /api/v1/datebook/agenda/?days=N — owner read-only projection of the
+// iPhone calendar mirror. `covered_days` are the only days that may say "Free".
+export type AgendaEventTime =
+  | { kind: "all_day"; start_date: string; end_date_exclusive: string }
+  | { kind: "zoned"; start_at: string; end_at: string; tz_id: string }
+  | { kind: "floating"; start_local: string; end_local: string };
+
+export type AgendaReminderDue =
+  | { kind: "all_day"; date: string }
+  | { kind: "zoned"; due_at: string; tz_id: string }
+  | { kind: "floating"; due_local: string };
+
+export type AgendaItem =
+  | { entity: "event"; id: string; day: string; time: AgendaEventTime; title: string; location?: string; calendar_title?: string }
+  | { entity: "reminder"; id: string; day: string; due: AgendaReminderDue; title: string; list_title?: string };
+
+export type DatebookAgenda =
+  | { state: "datebook_disabled" }
+  | { state: "consent_required" }
+  | {
+      state: "ok";
+      server_now: string;
+      timezone: string;
+      requested: { start_day: string; end_day_exclusive: string; start_at: string; end_at: string };
+      covered: { start_at: string; end_at: string } | null;
+      covered_days: string[];
+      freshness: {
+        events_last_complete_sync_at: string | null;
+        reminders_last_complete_sync_at: string | null;
+        events_authorization?: string | null;
+        gateway_status?: string | null;
+      };
+      items: AgendaItem[];
+      truncated: boolean;
+    };
+
+/** Owner typed task API (/journal/tasks/). */
+export interface JournalTask {
+  id: string;
+  title: string;
+  description: string;
+  pillar: string;
+  status: "open" | "done" | "archived";
+  due_date: string | null;
+  completed_at: string | null;
+  parent_goal_id: string | null;
+  related_ref: string;
+  created_at: string;
+  updated_at: string;
 }

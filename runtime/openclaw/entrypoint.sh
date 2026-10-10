@@ -4,13 +4,55 @@ set -eu
 OPENCLAW_HOME="${OPENCLAW_HOME:-/home/node/.openclaw}"
 OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_HOME/openclaw.json}"
 OPENCLAW_WORKSPACE_PATH="${OPENCLAW_WORKSPACE_PATH:-$OPENCLAW_HOME/workspace}"
+
+# OpenClaw 2026.9.4 relocated ALL runtime state (state/flows/tasks/plugin-state
+# SQLite, locks, caches, tmp) under its state dir and reads that SQLite via a
+# read-only snapshot *worker* that FAILS on the Azure Files (SMB) share
+# ("SQLite read-only worker returned invalid JSON" → the gateway refuses to
+# boot; confirmed 2026-09-16 demo canary). Keep the whole state dir OFF the
+# share on local disk, and pin config + workspace back to the share so the
+# user's memory is never dragged onto ephemeral storage. 9.4 reads
+# OPENCLAW_WORKSPACE_DIR (not the legacy OPENCLAW_WORKSPACE_PATH, which it
+# ignores). These are normally injected as container env vars (see
+# azure_client.py); the defaults below are a safety net so a container running
+# the 9.4 image still boots BEFORE the env retrofit lands — even a plain local
+# dir (no EmptyDir mount) is off-SMB and satisfies the worker. Unlike the
+# assignments above, these MUST be exported or the gateway/doctor children
+# never see them.
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/home/node/oc-state}"
+OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$OPENCLAW_WORKSPACE_PATH}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$OPENCLAW_STATE_DIR/cache}"
+export OPENCLAW_HOME OPENCLAW_CONFIG_PATH OPENCLAW_WORKSPACE_DIR OPENCLAW_STATE_DIR XDG_CACHE_HOME
+
+# OpenClaw 2026.9.4's fs-safe layer creates a directory, then VERIFIES its mode
+# equals (0o777 & ~umask) and throws "FsSafeError: directory final mode could
+# not be verified" if it doesn't. Our Azure volume mounts are root-owned, so
+# the node user's chmod is EPERM (swallowed by suppress-chmod-eperm.js) and the
+# mode never actually changes. With the default umask (022) fs-safe wants 0o755
+# but every dir is created 0o700, so the verify fails and doctor + the gateway
+# refuse to boot. Setting umask 077 makes the WANTED mode 0o700 — exactly what
+# mkdir/mkdtemp already produce — so no chmod is attempted and the verify
+# passes. This is the umask OpenClaw itself uses in its own prepare flows, and
+# it also matches fs-safe's 0o700 requirement for secret dirs. Must be set
+# before any directory is created below (and it is inherited by the doctor +
+# gateway children).
+umask 077
 NBHD_MANAGED_SKILLS_SRC="${NBHD_MANAGED_SKILLS_SRC:-/opt/nbhd/agent-skills}"
 NBHD_MANAGED_SKILLS_DST="${NBHD_MANAGED_SKILLS_DST:-$OPENCLAW_WORKSPACE_PATH/skills/nbhd-managed}"
 NBHD_MANAGED_AGENTS_TEMPLATE="${NBHD_MANAGED_AGENTS_TEMPLATE:-/opt/nbhd/templates/openclaw/AGENTS.md}"
 NBHD_MANAGED_AGENTS_DST="${NBHD_MANAGED_AGENTS_DST:-$OPENCLAW_WORKSPACE_PATH/AGENTS.md}"
 NBHD_MEMORY_DIR="${NBHD_MEMORY_DIR:-$OPENCLAW_WORKSPACE_PATH/memory}"
 
-mkdir -p "$OPENCLAW_HOME" "$OPENCLAW_WORKSPACE_PATH" "$NBHD_MEMORY_DIR"
+mkdir -p "$OPENCLAW_HOME" "$OPENCLAW_WORKSPACE_PATH" "$NBHD_MEMORY_DIR" "$OPENCLAW_STATE_DIR" "$XDG_CACHE_HOME"
+
+# Slowness diagnostic (9.4): OpenClaw forces rollback-journal mode (a journal
+# create+fsync+delete PER write) on mounts it classifies as network-like —
+# cifs/nfs/9p/virtiofs. If the oc-state EmptyDir is surfaced as virtiofs/9p by
+# Azure Container Apps, even our "local" SQLite runs in that slow mode. Log the
+# state-dir filesystem type so we can confirm the cause of the 9.4 slowness. The
+# [nbhd:*] prefix passes the stdout redactor. (Cheap, one line, no secrets.)
+echo "[nbhd:diag] state-dir fs=$(stat -f -c %T "$OPENCLAW_STATE_DIR" 2>/dev/null || echo unknown) at $OPENCLAW_STATE_DIR"
+echo "[nbhd:diag] brave=$([ -f /opt/nbhd/vendored/brave-project/node_modules/@openclaw/brave-plugin/package.json ] && echo present || echo MISSING) peer=$([ -e /opt/nbhd/vendored/brave-project/node_modules/openclaw/package.json ] && echo ok || echo MISSING)"
 
 # Skill templates.md is tenant-specific and authoritative on the file share
 # (rewritten by Django's update_tenant_config on every default-template edit).
@@ -227,6 +269,20 @@ fi
 # forwards them to this container via /v1/chat/completions.
 unset TELEGRAM_BOT_TOKEN
 
+# OpenClaw 2026.9.4 requires a one-time workspace-state migration on first boot
+# from a 2026.5.28 workspace — the gateway REFUSES to start otherwise:
+#   "[gateway] requires workspace setup state migration ... run openclaw doctor
+#    --fix, then start it again."
+# (Confirmed on the 2026-09-16 demo-tenant canary: proxy came up but the gateway
+# never started.) Run it here while the gateway is still down (which is what the
+# message asks for). `doctor --fix` is idempotent — a fast no-op once migrated —
+# so running it on every boot is safe. Non-fatal: if it returns non-zero the
+# gateway start below fails loudly with the actionable message and the platform
+# restarts the revision, rather than us masking a real migration failure.
+echo "[entrypoint] running 'openclaw doctor --fix' (workspace/state migration; no-op once migrated)"
+openclaw doctor --fix --non-interactive \
+    || echo "[entrypoint] WARNING: 'openclaw doctor --fix' returned non-zero" >&2
+
 # Start both processes in background
 # shellcheck disable=SC2086
 openclaw gateway --allow-unconfigured $GATEWAY_ARGS &
@@ -237,14 +293,19 @@ PROXY_PID=$!
 
 # Forward termination signals to both children, including while the gateway
 # readiness guard below is still waiting.
-trap 'kill $GATEWAY_PID $PROXY_PID 2>/dev/null; wait' SIGTERM SIGINT
+trap 'kill $GATEWAY_PID $PROXY_PID $CRON_SYNC_PID 2>/dev/null; wait' SIGTERM SIGINT
 
 # The proxy binds independently of the gateway, so its listening socket is not
 # proof that this container can serve traffic. Refuse to announce readiness (or
 # remain alive for TCP-only platform probes) unless the gateway's own health
 # endpoint becomes reachable.
+#
+# 90 x 2s = 3 minutes. A 5.28 tenant's first 9.4 boot on a 0.5-vCPU replica
+# with the workspace on Azure Files takes ~60-85 s after doctor (measured on
+# the 2026-09-26 fleet canary); the old 60 s budget restart-looped some of
+# them forever. Readiness probes still keep traffic away until it is up.
 GATEWAY_READY=0
-for _gateway_attempt in $(seq 1 30); do
+for _gateway_attempt in $(seq 1 90); do
     if curl -sS -f -m 2 "http://127.0.0.1:18789/healthz" >/dev/null 2>&1; then
         GATEWAY_READY=1
         break
@@ -253,10 +314,26 @@ for _gateway_attempt in $(seq 1 30); do
 done
 
 if [ "$GATEWAY_READY" -ne 1 ]; then
-    echo "[entrypoint] FATAL: gateway health check failed after 30 attempts; exiting for restart" >&2
+    echo "[entrypoint] FATAL: gateway health check failed after 90 attempts (3 min); exiting for restart" >&2
     kill "$GATEWAY_PID" "$PROXY_PID" 2>/dev/null || true
     wait || true
     exit 1
+fi
+
+# OpenClaw 2026.9.4 gates the agent-tool gateway cron.* RPC, so Django delivers
+# this tenant's crons via a signed nbhd-crons.json on the share instead. Apply it
+# with the ungated operator CLI — once now (gateway is ready), then on a poll loop
+# so crons the user creates mid-session land within ~25s. Inert until Django
+# writes the file (pre-9.4 images do not ship this script). Security: the script
+# verifies the file's HMAC signature and refuses any non-message payload. See
+# CONTINUITY_openclaw_9_4_cron_sync.md.
+CRON_SYNC_PID=""
+if [ -f /opt/nbhd/nbhd-cron-sync.mjs ]; then
+    node /opt/nbhd/nbhd-cron-sync.mjs --once \
+        || echo "[entrypoint] nbhd-cron-sync initial pass returned non-zero" >&2
+    node /opt/nbhd/nbhd-cron-sync.mjs &
+    CRON_SYNC_PID=$!
+    echo "[entrypoint] nbhd-cron-sync poll loop started (pid $CRON_SYNC_PID)"
 fi
 
 # Container-started hook — fire-and-forget POST to Django so the
@@ -266,13 +343,26 @@ fi
 (
     if [ -n "${NBHD_API_BASE_URL:-}" ] && [ -n "${NBHD_INTERNAL_API_KEY:-}" ] && [ -n "${NBHD_TENANT_ID:-}" ]; then
         URL="${NBHD_API_BASE_URL%/}/api/cron/runtime/${NBHD_TENANT_ID}/container-started/"
+        # Report which plugin dirs this image ships. Django only puts an
+        # image-dependent plugin in openclaw.json after the image reported it:
+        # 2026.9.4 never starts its gateway on a config naming a missing dir.
+        PLUGIN_IDS=""
+        for manifest in /opt/nbhd/plugins/*/openclaw.plugin.json; do
+            [ -f "$manifest" ] || continue
+            plugin_id="$(basename "$(dirname "$manifest")")"
+            case "$plugin_id" in
+                ""|*[!a-z0-9-]*) continue ;;
+            esac
+            PLUGIN_IDS="${PLUGIN_IDS:+$PLUGIN_IDS,}\"$plugin_id\""
+        done
         # -sS keeps curl quiet on success but still prints its error to stderr
         # (visible in container logs); we also capture the exit code so a silent
         # failure is impossible. Fire-and-forget + non-fatal by design.
         if curl -sS -X POST -m 10 \
             -H "X-NBHD-Internal-Key: ${NBHD_INTERNAL_API_KEY}" \
             -H "X-NBHD-Tenant-Id: ${NBHD_TENANT_ID}" \
-            -H "Content-Length: 0" \
+            -H "Content-Type: application/json" \
+            --data "{\"plugins\":[${PLUGIN_IDS}]}" \
             "$URL" \
             >/dev/null; then
             echo "[entrypoint] container-started hook OK"

@@ -772,7 +772,7 @@ class ParkByoMigrationTest(TestCase):
     def _migration_module():
         import importlib
 
-        return importlib.import_module("apps.tenants.migrations.0159_park_byo_models")
+        return importlib.import_module("apps.tenants.migrations.0182_park_byo_models")
 
     def test_forward_disables_only_non_deleted_tenants(self):
         self._migration_module().disable_byo_for_fleet(self._AppsStub(), schema_editor=None)

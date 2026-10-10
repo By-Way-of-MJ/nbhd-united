@@ -47,6 +47,7 @@ All scheduling goes through QStash (`apps/cron/publish.py`). Never add `django_c
 - Env var names in `config/settings/production.py` must match the Azure Container App env vars on `nbhd-django-westus2` — renaming in code alone breaks prod at next deploy (a hook reminds you on edit).
 - Key Vault `identityref:` uses the `mi-nbhd-` identity name, NOT the `oc-` container name.
 - Image before config: never push an OpenClaw config that requires a newer image than what's deployed (live-reload → last-good rollback wedge).
+- A plugin dir that older images lack is loaded only after the image reported it: gate it in `config_generator` with `apps/orchestrator/image_plugins.image_has_plugin` (the container-started hook records each image's dirs). A rollout flag alone is not proof — 2026.9.4 never starts its gateway on a config naming a missing plugin dir (2026-10-08: `PROJECTS_V2_TENANT_IDS=*` crash-looped every woken tenant on an image without `nbhd-project-tools`).
 
 ## 11. Secrets discipline
 
@@ -70,8 +71,23 @@ Plugin manifests (`openclaw.plugin.json`) declare `configSchema` with `additiona
 
 ## 16. AGENTS.md budget is chars-on-the-share; chat agents cannot read docs
 
-The bootstrap cap is 24,000 CHARS (not bytes; `BOOTSTRAP_MAX_CHARS`), the sentinel warns at 23k, and truncation is silent from the tail — always measure the rendered share file, never the template. Chat-context tool policy strips fs `read` (`tools.allow` = group:openclaw/group:plugins/pdf), so "read `docs/X.md` THIS TURN" gates can never fire in chat — that pattern is cron-only. Behavioral contracts for chat ride a TOOL RESPONSE (the Gravity `nbhd_insights_signals` pattern; tour-guide's `nbhd_tour_guide`): zero bootstrap budget, deterministic, verbatim.
+The bootstrap cap is 26,000 CHARS (not bytes; `BOOTSTRAP_MAX_CHARS`), the sentinel warns above 25,000, and truncation is silent from the tail — always measure the rendered share file, never the template. Chat-context tool policy strips fs `read` (`tools.allow` = group:openclaw/group:plugins/pdf), so "read `docs/X.md` THIS TURN" gates can never fire in chat — that pattern is cron-only. Behavioral contracts for chat ride a TOOL RESPONSE (the Gravity `nbhd_insights_signals` pattern; tour-guide's `nbhd_tour_guide`): zero bootstrap budget, deterministic, verbatim.
 
 ## 17. Every app-turn writer locks the ChatThread before newest/requeue decisions
 
 App chat ingress, local/offline turn insertion, and dropped-turn replay must take the same `ChatThread` row lock before checking newest-turn state or requeueing. The shared lock closes the insert-between-check-and-requeue race; a new app-turn writer that skips it can replay an older user message after a newer one has arrived.
+
+## 18. Congratulations require current completion evidence
+
+Workout congratulations store `workout_id` in the typed cron payload. The runtime
+send tool forwards its own cron session ID, independent of model `job_name`;
+Django resolves that tenant's canonical cron. A resolved `WORKOUT_CONGRATS` row
+requires its payload workout to still have `status="done"` immediately before
+delivery; reverted/deleted/missing workouts skip with `workout_not_done`. Legacy
+congrats rows may resolve the workout from their `_congrats-<uuid>` name.
+Resolved non-congrats patterns deliver normally. An unknown cron ID falls back
+to the legacy `job_name` check: deliver unless `_congrats-<uuid>` identifies a
+workout that is no longer done. Unknown IDs alone never suppress delivery;
+canonical rows normally lack `gateway_job_id` until add/list reconciliation.
+Keep the Python dispatch-time check too; copied cron facts and planned daily
+notes are never evidence of completion.

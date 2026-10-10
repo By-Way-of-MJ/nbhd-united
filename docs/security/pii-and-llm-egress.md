@@ -38,17 +38,26 @@ The disclosed limits are precise:
   guard is fail-open: an unknown value or redaction failure can pass through.
 - Channel transports (Telegram/LINE/Apple delivery) and connected-app tool
   calls are data egress, but are outside this *model-inference* posture.
+- **One named direct-provider exception:** profile-photo safety screening
+  (`apps/friends/photos.py`) sends the uploaded photo from the backend straight
+  to OpenAI's moderation endpoint. It is not an OpenRouter ZDR route. It is
+  allow-listed by name in `apps/common/test_model_egress_guard.py`, which fails
+  on any other direct provider call.
 - BYO Anthropic is a parked scaffold, not part of the active posture. It is
   non-ZDR, has zero adopted credentials as of 2026-08-26, defaults off, and the
   rollout disconnect command removes any credential before reconciling config.
 
-Newly provisioned tenant containers receive no OpenAI or Anthropic secret
-reference or environment binding: they bind only `openrouter-key` as
-`OPENROUTER_API_KEY`, the internal key, and Brave. Legacy containers provisioned
-before this change retain inert `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` bindings
-until the one-shot fleet scrub runs during rollout; afterward, no tenant
-container holds a platform provider key. If the parked BYO scaffold is ever
+No tenant container holds a platform OpenAI or Anthropic key. New containers
+bind only `openrouter-key` as `OPENROUTER_API_KEY`, the internal key, and Brave.
+Containers provisioned earlier had their `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+env and secret bindings removed by `scrub_platform_provider_keys` on 2026-10-09
+(all 57 containers, read back from Azure). If the parked BYO scaffold is ever
 re-enabled, it swaps in `CLAUDE_CODE_OAUTH_TOKEN` (non-ZDR) for that tenant only.
+
+Residual, as of 2026-10-09: each tenant identity still holds the per-secret
+Key Vault "Secrets User" grant on `openai-api-key` and `anthropic-api-key`, so a
+compromised container identity could still read them from the vault. Revoking
+those grants is blocked by the production CanNotDelete locks and is pending.
 
 Closed direct-provider paths in the 2026-08-26 sealing pass:
 
@@ -56,7 +65,7 @@ Closed direct-provider paths in the 2026-08-26 sealing pass:
 |---|---|
 | Embeddings and their six callers | OpenRouter embeddings; `provider.zdr=true` is attached per request and every caller supplies tenant context for known-value redaction |
 | Telegram voice and LINE voice | Shared `apps/router/transcription.py` OpenRouter STT seam; raw-audio exception disclosed above |
-| Container-native STT | `openrouter/openai/whisper-large-v3-turbo`; route check requires every eligible endpoint to be ZDR |
+| Container-native STT | `openrouter/openai/whisper-large-v3-turbo` (gate `CONTAINER_ZDR_TENANT_IDS`, `*` since 2026-10-09 — must stay `*` now that containers have no OpenAI key); route check requires every eligible endpoint to be ZDR |
 | Lessons cluster naming, copilot, tutoring, and `rewrite_lessons_actionable` | Shared `apps.common.openrouter.chat_completion`, with the mandatory per-request ZDR body |
 | `nbhd-image-gen` OpenAI plugin | Deleted from the runtime image and generated plugin allowlist |
 

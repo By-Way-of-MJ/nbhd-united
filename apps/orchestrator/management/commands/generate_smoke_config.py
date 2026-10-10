@@ -67,11 +67,30 @@ class Command(BaseCommand):
                 tenant.experimental_typed_crons = True
                 tenant.fuel_enabled = True
                 tenant.site_publishing_enabled = True
+                tenant.site_editor_enabled = True
+                tenant.site_editor_config = {
+                    "owner": "smoke-owner",
+                    "repo": "smoke-repo",
+                    "branch": "main",
+                    "allowPaths": ["web/src/pages/*.js", "web/public/index.html"],
+                    "denyPaths": [".github/**"],
+                    "maxTextBytes": 262144,
+                    "maxImageBytes": 2097152,
+                    "maxFiles": 20,
+                    "maxTotalBytes": 5242880,
+                    "deployMinutes": 6,
+                    "authorEmail": "nbhd-site-editor@users.noreply.github.com",
+                    "siteNotes": "Home page hero = web/public/hero.jpg.",
+                }
                 tenant.journal_shaping_enabled = True
                 tenant.document_ingestion_enabled = True
                 tenant.datebook_manifest_ok = True
                 tenant.datebook_enabled = True
                 tenant.datebook_events_consent_at = timezone.now()
+                # The smoke boots the image built from this commit, which ships
+                # every plugin dir; stand in for its container-started report.
+                tenant.image_plugin_ids = ["nbhd-project-tools"]
+                tenant.image_plugins_tag = tenant.container_image_tag
                 tenant.save()
 
             if options["maximal"]:
@@ -80,6 +99,10 @@ class Command(BaseCommand):
                 with override_settings(
                     SUBAGENT_TENANT_IDS=str(tenant.id),
                     USAGE_HOOKS_TENANT_IDS=str(tenant.id),
+                    PROJECTS_V2_TENANT_IDS=str(tenant.id),
+                    # Seal-egress PR-B: let the real `openclaw doctor` judge the ZDR provider
+                    # params + OpenRouter speech-to-text entry before any tenant gets them.
+                    CONTAINER_ZDR_TENANT_IDS=str(tenant.id),
                 ):
                     config_json = config_to_json(generate_openclaw_config(tenant))
             else:

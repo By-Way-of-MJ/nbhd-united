@@ -5,8 +5,11 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import OperationalError, connection
 from django.test import TestCase
 from django.utils import timezone
 
@@ -113,3 +116,66 @@ class PurgeToolEventsTests(TestCase):
             _event("old-tool", ToolContractEvent.Outcome.ACCEPTED, age_days=120)
         self._run(older_than_days=90, batch_size=2)
         self.assertEqual(ToolContractEvent.objects.count(), 0)
+
+    def test_max_batches_stops_after_two_batches_and_reports_remaining_work(self):
+        for _ in range(7):
+            _event("old-tool", ToolContractEvent.Outcome.ACCEPTED, age_days=120)
+        recent = _event("recent-tool", ToolContractEvent.Outcome.ACCEPTED)
+
+        output = self._run(batch_size=2, max_batches=2)
+
+        self.assertIn("deleted 4 tool events", output)
+        self.assertIn("Remaining: 3 (batch limit reached)", output)
+        self.assertEqual(ToolContractEvent.objects.count(), 4)
+        self.assertTrue(ToolContractEvent.objects.filter(id=recent.id).exists())
+
+    def test_max_batches_rejects_non_positive_values(self):
+        for max_batches in (0, -1):
+            with self.subTest(max_batches=max_batches), self.assertRaisesMessage(CommandError, "--max-batches"):
+                self._run(max_batches=max_batches)
+
+    def test_max_seconds_rejects_non_positive_values(self):
+        for max_seconds in (0, -1):
+            with self.subTest(max_seconds=max_seconds), self.assertRaisesMessage(CommandError, "--max-seconds"):
+                self._run(max_seconds=max_seconds)
+
+    def test_time_budget_stops_before_starting_another_batch(self):
+        for _ in range(7):
+            _event("old-tool", ToolContractEvent.Outcome.ACCEPTED, age_days=120)
+        # Initial count and first batch run before the deadline. It then expires.
+        with patch("apps.platform_logs.management.commands.purge_tool_events.monotonic") as timer:
+            timer.side_effect = [0, 0, 0, 0, 31]
+            output = self._run(batch_size=2, max_seconds=30)
+
+        self.assertIn("deleted 2 tool events", output)
+        self.assertIn("time limit reached", output)
+        self.assertEqual(ToolContractEvent.objects.count(), 5)
+
+    def test_time_bounded_run_restores_postgres_statement_timeout(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("Postgres statement timeout")
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW statement_timeout")
+            before = cursor.fetchone()[0]
+        _event("old-tool", ToolContractEvent.Outcome.ACCEPTED, age_days=120)
+
+        self._run(max_seconds=30)
+
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW statement_timeout")
+            self.assertEqual(cursor.fetchone()[0], before)
+
+    def test_time_budget_cancels_slow_sql_and_leaves_connection_usable(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("Postgres statement timeout")
+        from apps.platform_logs.management.commands.purge_tool_events import _query_budget, monotonic
+
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW statement_timeout")
+            before = cursor.fetchone()[0]
+        with self.assertRaises(OperationalError), _query_budget(monotonic() + 0.02), connection.cursor() as cursor:
+            cursor.execute("SELECT pg_sleep(0.1)")
+
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW statement_timeout")
+            self.assertEqual(cursor.fetchone()[0], before)

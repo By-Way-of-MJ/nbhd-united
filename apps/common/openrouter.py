@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from django.conf import settings
@@ -23,6 +24,38 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+OPENROUTER_TRANSCRIPTIONS_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
+
+_ZDR_PROVIDER = {"zdr": True, "data_collection": "deny"}
+
+
+class NoUsableChoicesError(RuntimeError):
+    """HTTP succeeded, but the provider returned no usable assistant answer."""
+
+
+def _response_diagnostics(data: object) -> dict:
+    """Only operational metadata; omit messages, reasoning and raw error bodies."""
+    if not isinstance(data, dict):
+        return {}
+    diagnostics = {}
+    sources = [data]
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        sources.extend(choice for choice in choices if isinstance(choice, dict))
+    for source in sources:
+        for field in ("finish_reason", "provider"):
+            value = source.get(field)
+            if isinstance(value, str):
+                diagnostics[field] = value[:120]
+        if source.get("error") is not None:
+            error = source["error"]
+            diagnostics["error"] = (
+                {key: str(error[key])[:120] for key in ("code", "type") if key in error}
+                if isinstance(error, dict)
+                else {"present": True}
+            )
+    return diagnostics
 
 
 def normalize_model_id(model_id: str) -> str:
@@ -36,6 +69,25 @@ def normalize_model_id(model_id: str) -> str:
     return model_id.removeprefix("openrouter/")
 
 
+def build_openrouter_body(
+    model: str,
+    messages: list[dict[str, Any]] | None = None,
+    **body_params: Any,
+) -> dict[str, Any]:
+    """Build an OpenRouter body with mandatory per-request ZDR routing.
+
+    ``messages`` is omitted for non-chat endpoints. The provider policy is
+    assigned after caller-supplied parameters so callers cannot weaken or
+    replace it.
+    """
+    body: dict[str, Any] = {"model": normalize_model_id(model)}
+    if messages is not None:
+        body["messages"] = messages
+    body.update(body_params)
+    body["provider"] = dict(_ZDR_PROVIDER)
+    return body
+
+
 def _looks_usable(data: dict) -> bool:
     """A 200 response is only usable if it carries assistant content. OpenRouter
     can return HTTP 200 with a top-level ``error`` (rate limit, upstream
@@ -45,10 +97,42 @@ def _looks_usable(data: dict) -> bool:
     if data.get("error"):
         return False
     choices = data.get("choices")
-    if not choices:
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return False
-    content = (choices[0] or {}).get("message", {}).get("content")
-    return bool(content)
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and bool(content.strip())
+
+
+def local_llm() -> tuple[str, str] | None:
+    """Local-test only: ``(chat_url, model)`` for basecamp's loopback Ollama, else ``None``.
+
+    Only ``config.settings.local_test`` defines ``LOCAL_TEST_LLM_URL`` / ``LOCAL_TEST_LLM_MODEL``, so
+    production and CI settings always return ``None`` and keep OpenRouter. A configured value that is
+    not plain-HTTP loopback with an explicit port (or has no model) fails loudly, never silently.
+    """
+    url = getattr(settings, "LOCAL_TEST_LLM_URL", "")
+    # Only a real string counts: tests that patch ``settings`` with a mock must keep the OpenRouter path.
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    parts = urlsplit(url)
+    model = getattr(settings, "LOCAL_TEST_LLM_MODEL", "")
+    model = model.strip() if isinstance(model, str) else ""
+    if (
+        parts.scheme != "http"
+        or parts.hostname not in {"127.0.0.1", "localhost"}
+        or not parts.port
+        or parts.username
+        or parts.password
+        or parts.query
+        or parts.fragment
+        or not model
+    ):
+        raise RuntimeError("LOCAL_TEST_LLM_URL must be http://127.0.0.1:<port>/... with LOCAL_TEST_LLM_MODEL set")
+    return url.rstrip("/") + "/chat/completions", model
 
 
 def chat_completion(
@@ -81,13 +165,29 @@ def chat_completion(
         Exception: the last error encountered if every candidate fails (so the
             caller's existing error handling still fires).
     """
+    local = local_llm()
     key = api_key if api_key is not None else getattr(settings, "OPENROUTER_API_KEY", "")
-    if not key:
+    if not key and local is None:
         raise RuntimeError("OPENROUTER_API_KEY not configured")
 
     candidates = [m for m in ([models] if isinstance(models, str) else list(models)) if m]
     if not candidates:
         raise ValueError("chat_completion requires at least one model")
+    if local is not None:
+        # Local test stack: one call to the loopback model; no cloud fallbacks, no key, no health rows.
+        url, local_model = local
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={"model": local_model, "messages": messages, **body_params},
+            # The local model is far slower than the cloud; the stack sets a generous floor.
+            timeout=max(timeout, int(getattr(settings, "LOCAL_TEST_LLM_TIMEOUT", 0) or 0)),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not _looks_usable(data):
+            raise NoUsableChoicesError(f"Local model returned no usable choices for {candidates[0]}")
+        return data, candidates[0]
 
     last_error: Exception | None = None
     for model_id in candidates:
@@ -95,17 +195,16 @@ def chat_completion(
             resp = requests.post(
                 OPENROUTER_CHAT_URL,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": normalize_model_id(model_id),
-                    "messages": messages,
-                    **body_params,
-                },
+                json=build_openrouter_body(model_id, messages, **body_params),
                 timeout=timeout,
             )
             resp.raise_for_status()
             data = resp.json()
             if not _looks_usable(data):
-                raise RuntimeError(f"OpenRouter returned no usable choices for {model_id}: {str(data)[:200]}")
+                logger.warning(
+                    "OpenRouter no usable choices model=%s metadata=%s", model_id, _response_diagnostics(data)
+                )
+                raise NoUsableChoicesError(f"OpenRouter returned no usable choices for {model_id}")
         except Exception as exc:  # noqa: BLE001 — record + try the next candidate
             last_error = exc
             if record_health:

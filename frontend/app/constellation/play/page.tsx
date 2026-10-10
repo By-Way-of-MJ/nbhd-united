@@ -17,6 +17,13 @@ const ConstellationGame = dynamic(
   { ssr: false, loading: () => <ChartingScreen /> },
 );
 
+// Open Sky tenants get "Chart your galaxy" — the plain-canvas flight that matches
+// the iPhone's Explore in flight. Same real galaxy data, no Phaser.
+const GalaxyFlight = dynamic(
+  () => import("@/components/galaxy-flight/galaxy-flight").then((m) => m.GalaxyFlight),
+  { ssr: false, loading: () => <ChartingScreen /> },
+);
+
 // How long a "still loading" state waits before it surfaces a way out. The
 // animated loader keeps the screen alive throughout, so we can afford to wait
 // out a cold-started backend before showing anything that reads as a problem.
@@ -306,15 +313,16 @@ export default function ConstellationPlayPage() {
   // Wormholes gate on BOTH the play flag and friends_enabled. The hook is
   // internally gated on friends_enabled, so this is empty for everyone else and
   // the game is byte-identical to the pre-Neighborhood experience.
-  const { data: tenant } = useTenantQuery();
+  const { data: tenant, isLoading: tenantLoading } = useTenantQuery();
   const { data: wormholes } = useWormholesQuery();
-  const friendsEnabled = !!tenant?.friends_enabled;
+  const friendsEnabled = !!tenant?.neighborhood_enabled;
+  const openSky = !!tenant?.web_redesign;
 
   // gating: render nothing while deciding / redirecting out
   if (allowed === null || !allowed) return null;
 
   let content: ReactNode;
-  if (isLoading) {
+  if (isLoading || tenantLoading) {
     content = <FetchingScreen onRetry={() => void refetch()} />;
   } else if (error) {
     content = (
@@ -338,6 +346,12 @@ export default function ConstellationPlayPage() {
           <BackLink />
         </ActionRow>
       </Screen>
+    );
+  } else if (openSky) {
+    content = (
+      <GameBoundary>
+        <GalaxyFlight galaxy={data} />
+      </GameBoundary>
     );
   } else {
     content = (

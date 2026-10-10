@@ -13,6 +13,18 @@ regex fallback) live in ``apps/pii/engine.py:get_pattern_recognizers``.
 # Liquid is retained only as an explicit, flag-gated option.
 DEFAULT_DETECTOR_ENGINE = "deberta"
 SUPPORTED_DETECTOR_ENGINES = frozenset({DEFAULT_DETECTOR_ENGINE, "liquid"})
+DEFAULT_DETECTOR_TRANSPORT = "local"
+SUPPORTED_DETECTOR_TRANSPORTS = frozenset({DEFAULT_DETECTOR_TRANSPORT, "shared"})
+
+
+def resolve_positive_int(value, *, name: str) -> int:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if resolved <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return resolved
 
 
 def resolve_detector_engine(requested: str | None) -> str:
@@ -21,6 +33,14 @@ def resolve_detector_engine(requested: str | None) -> str:
     if normalized in SUPPORTED_DETECTOR_ENGINES:
         return normalized
     return DEFAULT_DETECTOR_ENGINE
+
+
+def resolve_detector_transport(requested: str | None) -> str:
+    """Normalize a detector transport, falling back safely to local."""
+    normalized = (requested or "").strip().lower()
+    if normalized in SUPPORTED_DETECTOR_TRANSPORTS:
+        return normalized
+    return DEFAULT_DETECTOR_TRANSPORT
 
 
 # Map the underlying model's token-classification labels to our internal

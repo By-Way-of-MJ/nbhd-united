@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 
 import httpx
 from django.conf import settings
@@ -34,6 +35,15 @@ RATE_LIMIT_PER_HOUR = 20
 # In-memory rate tracking (reset on process restart, which is fine)
 _rate_counts: dict[str, list[float]] = {}
 
+# Transport calls time out after 10s and the 8,192-character payload can take a
+# few sequential Telegram calls, while Gunicorn kills the whole request at
+# 300s. Ten minutes clears that real worst case with a full worker-shutdown
+# margin, without leaving a crashed worker's claim stuck for an hour.
+_CLAIM_STALE = timedelta(minutes=10)
+_MAX_STALE_RECLAIMS = 3
+_RECLAIM_EXHAUSTED_REASON = "stale claim reclaim limit reached after 3 reclaims"
+_RECLAIM_COUNT_PREFIX = "stale claim reclaimed "
+
 
 def degraded_occurrence_key(*, tenant_id, job_name: str, fired_at: datetime) -> str:
     """Return the P0 receipt-hour identity for one proactive delivery."""
@@ -51,6 +61,55 @@ def _delivery_dedup_enabled(tenant) -> bool:
     if configured == "*":
         return True
     return str(tenant.id) in {value.strip() for value in configured.split(",") if value.strip()}
+
+
+def _stale_reclaim_count(response_excerpt: str) -> int:
+    """Read internal reclaim metadata without adding a schema field."""
+    if not response_excerpt.startswith(_RECLAIM_COUNT_PREFIX):
+        return 0
+    count_text = response_excerpt.removeprefix(_RECLAIM_COUNT_PREFIX).partition("/")[0]
+    try:
+        return int(count_text)
+    except ValueError:
+        return 0
+
+
+def _duplicate_response(*, channel: str, prior_state: str, status: str = "duplicate_suppressed") -> Response:
+    return Response(
+        {
+            "status": status,
+            "channel": channel,
+            "prior_state": prior_state,
+        }
+    )
+
+
+def _reclaim_stale_delivery_attempt(prior, *, now: datetime) -> tuple[str, int]:
+    """CAS one stale claim; return its transition and persisted reclaim count."""
+    from apps.router.models import DeliveryAttempt
+
+    reclaim_count = _stale_reclaim_count(prior.response_excerpt)
+    stale_claim = DeliveryAttempt.objects.filter(
+        pk=prior.pk,
+        state=DeliveryAttempt.State.CLAIMED,
+        resolved_at__isnull=True,
+        claimed_at=prior.claimed_at,
+        claimed_at__lt=now - _CLAIM_STALE,
+    )
+    if reclaim_count >= _MAX_STALE_RECLAIMS:
+        rows = stale_claim.update(
+            state=DeliveryAttempt.State.FAILED,
+            resolved_at=now,
+            response_excerpt=_RECLAIM_EXHAUSTED_REASON,
+        )
+        return ("exhausted" if rows == 1 else "lost"), reclaim_count
+
+    next_reclaim_count = reclaim_count + 1
+    rows = stale_claim.update(
+        claimed_at=now,
+        response_excerpt=f"{_RECLAIM_COUNT_PREFIX}{next_reclaim_count}/{_MAX_STALE_RECLAIMS}",
+    )
+    return ("reclaimed" if rows == 1 else "lost"), next_reclaim_count
 
 
 def _claim_delivery_attempt(*, tenant, occurrence_key: str, job_name: str, channel: str):
@@ -80,7 +139,53 @@ def _claim_delivery_attempt(*, tenant, occurrence_key: str, job_name: str, chann
                     # A failed claimant may have released the row between our
                     # unique violation and lookup. Retry the insert.
                     continue
+                if prior.state == DeliveryAttempt.State.FAILED and prior.response_excerpt == _RECLAIM_EXHAUSTED_REASON:
+                    logger.warning(
+                        "delivery_stale_claim_reclaim_exhausted tenant=%s occurrence=%s channel=%s",
+                        str(tenant.id)[:8],
+                        occurrence_key[:12],
+                        channel,
+                    )
+                    return None, _duplicate_response(
+                        channel=channel,
+                        prior_state=DeliveryAttempt.State.FAILED,
+                        status="reclaim_exhausted",
+                    )
                 if prior.state != DeliveryAttempt.State.FAILED:
+                    now = timezone.now()
+                    if (
+                        prior.state == DeliveryAttempt.State.CLAIMED
+                        and prior.resolved_at is None
+                        and prior.claimed_at < now - _CLAIM_STALE
+                    ):
+                        reclaim_result, reclaim_count = _reclaim_stale_delivery_attempt(prior, now=now)
+                        if reclaim_result == "exhausted":
+                            logger.warning(
+                                "delivery_stale_claim_reclaim_exhausted tenant=%s occurrence=%s channel=%s reclaims=%d",
+                                str(tenant.id)[:8],
+                                occurrence_key[:12],
+                                channel,
+                                reclaim_count,
+                            )
+                            return None, _duplicate_response(
+                                channel=channel,
+                                prior_state=DeliveryAttempt.State.FAILED,
+                                status="reclaim_exhausted",
+                            )
+                        if reclaim_result == "reclaimed":
+                            prior.claimed_at = now
+                            prior.response_excerpt = f"{_RECLAIM_COUNT_PREFIX}{reclaim_count}/{_MAX_STALE_RECLAIMS}"
+                            logger.warning(
+                                "delivery_stale_claim_reclaimed tenant=%s occurrence=%s channel=%s reclaim=%d/%d",
+                                str(tenant.id)[:8],
+                                occurrence_key[:12],
+                                channel,
+                                reclaim_count,
+                                _MAX_STALE_RECLAIMS,
+                            )
+                            return prior, None
+                        continue
+
                     logger.warning(
                         "delivery_duplicate_suppressed tenant=%s occurrence=%s channel=%s prior_state=%s",
                         str(tenant.id)[:8],
@@ -88,12 +193,9 @@ def _claim_delivery_attempt(*, tenant, occurrence_key: str, job_name: str, chann
                         channel,
                         prior.state,
                     )
-                    return None, Response(
-                        {
-                            "status": "duplicate_suppressed",
-                            "channel": channel,
-                            "prior_state": prior.state,
-                        }
+                    return None, _duplicate_response(
+                        channel=channel,
+                        prior_state=prior.state,
                     )
 
                 # A definitive failure is safe to retry. Delete and recreate
@@ -197,6 +299,11 @@ def _record_send(tenant_id: str) -> None:
     _rate_counts.setdefault(tenant_id, []).append(time.time())
 
 
+# ``[block: daily_briefing]`` / ``[block: task_hygiene]`` / ``[block: <render_block>]``
+# — see apps/cron/patterns. Takes the rest of a marker-only line with it.
+_BLOCK_MARKER_RE = re.compile(r"\[block:\s*[a-z][a-z0-9_]*\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
+
+
 def _is_morning_briefing_send(*, tenant, job_name: str) -> bool:
     try:
         normalized_job_name = str(job_name or "").strip()
@@ -255,91 +362,61 @@ def _is_morning_briefing_send(*, tenant, job_name: str) -> bool:
 
 
 def resolve_user_channel(user) -> str | None:
-    """Determine which channel to use for outbound / proactive messages to ``user``.
+    """Prefer eligible app devices, then linked Telegram/LINE, then the app feed.
 
-    Order (MJ direction — keep Telegram/LINE, but push toward the app when it's
-    installed):
-
-    0. explicit eval-sink tenant (``Tenant.is_eval_sink``) → ``"eval"``,
-       regardless of every other linked surface. No real transport — the
-       ``ProactiveOutbound`` evidence row IS the delivery (see
-       ``CronDeliveryView``).
-    1. iOS device token registered → ``"app"``. Proactive content lands in the
-       app feed as the PRIMARY surface: the APNs push + the ``?since=`` feed row
-       (both produced by ``record_proactive_outbound``) ARE the delivery, so the
-       same content no longer ALSO arrives in Telegram/LINE for token-holders.
-    2. else Telegram linked → ``"telegram"``.
-    3. else LINE linked → ``"line"``.
-    4. else ``None`` (no delivery surface at all).
-
-    Telegram-before-LINE in the messaging fallback (mirroring
-    ``_resolve_gate_channel``) preserves prior behavior for the only both-linked
-    cohort in production. The old resolver honoured ``preferred_channel``
-    (universally the "telegram" schema default), so a user with BOTH channels
-    linked has always received proactive/outbound messages on Telegram — a
-    line-first fallback would silently move their delivery surface to LINE and
-    split it from where their interactive gates land.
-
-    ``preferred_channel`` is deliberately NOT honoured. In production all rows
-    carry the schema default ``"telegram"`` (nobody ever chose it — the frontend
-    hook is dead code and iOS never shipped the control), so reading it would
-    honour noise, not intent. The column is left in place but vestigial; see the
-    PR description.
-
-    Linked Telegram/LINE users WITHOUT the app are unaffected — they keep full
-    two-way delivery via their linked channel. Only token-holders flip from
-    telegram/line to the app.
-
-    Module-level so backend proactive senders (e.g. Core notify-on-ready) route
-    identically to ``CronDeliveryView`` without duplicating the logic.
+    An active user always has an app feed, even without notification permission.
+    Eval sinks retain their explicit transport-free delivery mode. The legacy
+    preferred_channel default is not user intent; linked messaging fallbacks
+    retain Telegram-before-LINE ordering.
     """
-    # 0. Explicit eval-sink tenants FIRST — before the DeviceToken check, so a
-    # stale or accidentally registered real transport (an APNs token, a linked
-    # Telegram/LINE id) can never make an eval target emit. Eval-sink is an
-    # explicit operational mode, independent of the broader ``is_synthetic``
-    # business-aggregate flag.
+    # This selector also labels profiles during provisioning. Delivery callers
+    # enforce tenant/user entitlement; selecting a surface is not authorization.
     tenant = getattr(user, "tenant", None)
     if getattr(tenant, "is_eval_sink", False):
         return "eval"
 
-    # 1. Prefer the app whenever an iOS device is registered.
-    from apps.router.models import DeviceToken
+    from apps.router.push_views import eligible_device_tokens
 
-    if DeviceToken.objects.filter(user=user).exists():
+    if eligible_device_tokens(user).exists():
         return "app"
-
-    # 2/3. No device — fall back to whichever messaging channel is linked so
-    # linked users without the app keep working. Telegram before LINE so a
-    # both-linked user keeps the delivery surface they've always had (see
-    # docstring); line-only users still resolve to LINE.
-    line_user_id = getattr(user, "line_user_id", None)
-    telegram_chat_id = getattr(user, "telegram_chat_id", None)
-    if telegram_chat_id:
+    if getattr(user, "telegram_chat_id", None):
         return "telegram"
-    if line_user_id:
+    if getattr(user, "line_user_id", None):
         return "line"
-
-    # No linked surface and not an explicitly configured eval sink.
-    #
-    # A synthetic tenant has no phone and no chat account, so it used to fall
-    # through to None → HTTP 422 no_channel_linked → CronDeliveryView returned
-    # before record_proactive_outbound, and NOTHING was written. The consequence
-    # was green theater: the eval-behavior tenant has zero ProactiveOutbound rows
-    # ever recorded, and even its one PASSING reminder scenario delivered nothing —
-    # the cron fired, 422'd, and no assertion could have caught it.
-    #
-    # The journey probe worked around this by planting a FAKE APNs DeviceToken
-    # before every run so the "app" branch would resolve. That hack is
-    # self-destroying: a successful delivery pushes to the fabricated token, APNs
-    # rejects it as BadDeviceToken, and push_views PRUNES the row — so every pass
-    # destroyed the channel for the next fire (prod runs 8→9 alternated
-    # pass/fail forever). The sink removes the need for it entirely.
-    #
-    return None
+    return "app"
 
 
 class SendToUserSerializer(serializers.Serializer):
-    message = serializers.CharField(max_length=8192)
+    message = serializers.CharField(max_length=8192, allow_blank=True)
+    panels = serializers.JSONField(required=False, allow_null=True)
+
+    def validate_panels(self, value):
+        from apps.router.chat_gates import chat_panels_tool_enabled
+        from apps.router.panels import validate_panels
+
+        if not chat_panels_tool_enabled(self.context.get("tenant")):
+            logger.warning("panels_dropped reason=tenant_disabled")
+            return []
+        return validate_panels(value)
+
+    def validate(self, data):
+        from apps.router.chat_gates import chat_panels_tool_enabled
+        from apps.router.panels import extract_panels
+
+        # Strip on every channel and outside the rollout gate. Explicit panels
+        # (even empty/null/invalid) take precedence over the fallback block.
+        data["message"], fallback = extract_panels(data["message"])
+        if "panels" not in data:
+            if chat_panels_tool_enabled(self.context.get("tenant")):
+                data["panels"] = fallback
+            else:
+                if fallback:
+                    logger.warning("panels_dropped reason=tenant_disabled")
+                data["panels"] = []
+        if not data["message"] and not data["panels"]:
+            raise serializers.ValidationError("message or valid panels required")
+        return data
+
     thread_id = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=64)
     parse_mode = serializers.ChoiceField(
         choices=["Markdown", "HTML", "plain"],
@@ -360,6 +437,42 @@ class CronDeliveryView(APIView):
 
     authentication_classes = []
     permission_classes = []
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        data = getattr(response, "data", {})
+        blocked = isinstance(data, dict) and data.get("status") == "blocked"
+        if response.status_code != 200 or blocked:
+            reason = data.get("reason" if blocked else "error") if isinstance(data, dict) else None
+            allowed_reasons = {
+                "internal_auth_failed",
+                "tenant_not_found",
+                "tenant_not_active",
+                "user_inactive",
+                "no_channel_linked",
+                "rate_limited",
+                "app_delivery_not_recorded",
+                "eval_delivery_not_recorded",
+                "telegram_not_configured",
+                "telegram_send_failed",
+                "line_not_configured",
+                "line_send_failed",
+            }
+            if not isinstance(reason, str) or reason not in allowed_reasons:
+                reason = "invalid_payload" if response.status_code == 400 else "delivery_failed"
+            # The job header is agent-supplied. Only known scheduler names may
+            # appear as text; hash custom names so they cannot disclose content.
+            job = request.headers.get("X-NBHD-Job-Name", "")
+            known_jobs = {"morning-briefing", "evening-check-in", "weekly-reflection", "_subagent_result"}
+            safe_job = job if job in known_jobs else hashlib.sha256(job.encode()).hexdigest()[:8] if job else "-"
+            logger.warning(
+                "cron_delivery: rejected tenant=%s job=%s reason=%s status=%s",
+                str(kwargs.get("tenant_id", ""))[:8],
+                safe_job,
+                reason,
+                response.status_code,
+            )
+        return response
 
     def post(self, request, tenant_id):
         received_at = timezone.now()
@@ -382,30 +495,21 @@ class CronDeliveryView(APIView):
         if tenant is None:
             return Response({"error": "tenant_not_found"}, status=http_status.HTTP_404_NOT_FOUND)
 
-        # Block delivery for suspended/inactive tenants (trial expired, payment lapsed)
-        if tenant.status != Tenant.Status.ACTIVE:
-            logger.info(
-                "Cron delivery blocked: tenant %s status=%s (not active)",
-                tenant_id,
-                tenant.status,
-            )
-            # Return 200 to prevent QStash/cron retries — this is expected, not an error
+        # A feed exists without a linked transport, but requires an entitled user.
+        if tenant.status != Tenant.Status.ACTIVE or not tenant.user.is_active:
+            # Return 200 to prevent QStash/cron retries: expected non-delivery.
             return Response(
                 {
                     "status": "blocked",
-                    "reason": "tenant_not_active",
-                    "tenant_status": tenant.status,
-                }
+                    "reason": "tenant_not_active" if tenant.status != Tenant.Status.ACTIVE else "user_inactive",
+                },
+                status=http_status.HTTP_200_OK,
             )
 
-        # Determine channel
         channel = self._resolve_channel(tenant.user)
         if channel is None:
             return Response(
-                {
-                    "error": "no_channel_linked",
-                    "detail": "User has no Telegram/LINE link and no registered device.",
-                },
+                {"error": "no_channel_linked"},
                 status=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
@@ -418,7 +522,7 @@ class CronDeliveryView(APIView):
             )
 
         # Validate payload
-        serializer = SendToUserSerializer(data=request.data)
+        serializer = SendToUserSerializer(data=request.data, context={"tenant": tenant})
         if not serializer.is_valid():
             return Response(serializer.errors, status=http_status.HTTP_400_BAD_REQUEST)
 
@@ -429,6 +533,7 @@ class CronDeliveryView(APIView):
         # quote-reply excerpt) are stored placeholder-space; only the copy
         # actually sent to the user is rehydrated.
         placeholder_message_text = serializer.validated_data["message"]
+        panels = serializer.validated_data.get("panels", [])
         parse_mode = serializer.validated_data.get("parse_mode", "Markdown")
 
         from apps.router.models import ChatThread
@@ -452,7 +557,8 @@ class CronDeliveryView(APIView):
         # Strip the generic marker before every transport, but retain its labels
         # in placeholder space on ProactiveOutbound. The row is cross-channel:
         # even a Telegram/LINE delivery can later render pills in the iOS feed.
-        # Quick-replies parsing stays first to preserve its final-line contract;
+        # The serializer already stripped panel fences; quick-replies now runs
+        # first among the remaining markers to preserve its final-line contract;
         # journal-link extraction below is placement-tolerant on the remainder.
         from apps.router.journal_link import extract_journal_link
         from apps.router.quick_replies import extract_quick_replies
@@ -469,6 +575,18 @@ class CronDeliveryView(APIView):
         placeholder_message_text, journal_link = extract_journal_link(
             placeholder_message_text, tenant_id=tenant.id, channel=f"cron_{channel}"
         )
+        # ``[[insight:...]]`` markers are platform markup, never user-facing.
+        # Strip the tokens (the statement stays) before every transport and the
+        # at-rest row; the AssistantInsight write waits until the delivery has
+        # passed its skip and dedup gates below so a retried send records once.
+        from apps.insights.markers import INSIGHT_MARKER_RE
+
+        insight_source_text = placeholder_message_text
+        placeholder_message_text = INSIGHT_MARKER_RE.sub(lambda m: (m.group(2) or "").strip(), placeholder_message_text)
+        # ``[block: <pattern>]`` is the typed-cron render marker. The prompt asks
+        # for it and the runtime gate checks it BEFORE this send arrives; nothing
+        # downstream reads it, so it is spent by the time we get here.
+        placeholder_message_text = _BLOCK_MARKER_RE.sub("", placeholder_message_text).lstrip()
         if journal_link is None:
             try:
                 if _is_morning_briefing_send(
@@ -498,6 +616,12 @@ class CronDeliveryView(APIView):
                 # missing chip must never block the underlying delivery.
                 pass
 
+        # Panels have no external-channel representation. Persist through the
+        # app-feed branch even without devices; never send an empty text chunk.
+        # Keep eval evidence isolated from the owner feed and APNs.
+        if panels and not placeholder_message_text.strip() and channel != "eval":
+            channel = "app"
+
         # Final owner-facing integrity guard.
         entity_map = tenant.pii_entity_map
         from apps.router.reply_text import finalize_outbound_text
@@ -517,6 +641,14 @@ class CronDeliveryView(APIView):
         from apps.router.proactive_context import record_proactive_outbound
 
         job_name = request.headers.get("X-NBHD-Job-Name", "")
+        from apps.cron.patterns.workout_congrats import completion_still_valid
+
+        # Only identified workout congratulations require done evidence;
+        # unknown runtime cron IDs fall back to the legacy job_name check.
+        if not completion_still_valid(
+            tenant, job_name, gateway_job_id=request.headers.get("X-NBHD-Cron-Job-Id", "").strip()[:64]
+        ):
+            return Response({"delivered": False, "skipped": "workout_not_done"})
         delivery_attempt = None
         occurrence_key_header = request.headers.get("X-NBHD-Occurrence-Key", "").strip()[:64]
         explicit_occurrence_key = occurrence_key_header if job_name == "_subagent_result" else ""
@@ -542,6 +674,16 @@ class CronDeliveryView(APIView):
             )
             if duplicate_response is not None:
                 return duplicate_response
+
+        # Record insights from the placeholder-space copy, same as the live
+        # reply paths. Bookkeeping only — a failure must never block delivery.
+        if "[[insight:" in insight_source_text:
+            try:
+                from apps.insights.markers import extract_and_record_insights
+
+                extract_and_record_insights(insight_source_text, tenant=tenant)
+            except Exception:
+                logger.exception("insight marker extraction failed (cron delivery)")
 
         # The current runtime carries job_name but no full schedule occurrence
         # identity. P0's degraded receipt-hour claim above is intentionally
@@ -596,6 +738,7 @@ class CronDeliveryView(APIView):
                     # the send carried no marker.
                     journal_link=journal_link,
                     quick_replies=quick_replies,
+                    panels=panels,
                     artifact_dedup_key=artifact_dedup_key,
                     thread_id=thread_id,
                 )
@@ -622,7 +765,7 @@ class CronDeliveryView(APIView):
                 _resolve_delivery_attempt(delivery_attempt, state="failed", response=response)
                 return response
             _record_send(tid)
-            response = Response({"status": "sent", "channel": "app"})
+            response = Response({"status": "sent", "channel": "app", "delivered_to": ["app_feed"]})
             _resolve_delivery_attempt(delivery_attempt, state="sent", response=response)
             return response
         elif channel == "eval":
@@ -652,6 +795,7 @@ class CronDeliveryView(APIView):
                     job_name=job_name,
                     journal_link=journal_link,
                     quick_replies=quick_replies,
+                    panels=panels,
                     artifact_dedup_key=artifact_dedup_key,
                     thread_id=thread_id,
                 )
@@ -742,6 +886,7 @@ class CronDeliveryView(APIView):
                 # the send carried no marker.
                 journal_link=journal_link,
                 quick_replies=quick_replies,
+                panels=panels,
                 artifact_dedup_key=artifact_dedup_key,
                 thread_id=thread_id,
             )

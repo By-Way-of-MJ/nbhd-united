@@ -38,6 +38,7 @@ def _make_tenant():
         container_id="oc-test",
         container_fqdn="oc-test.internal.azurecontainerapps.io",
         postgres_cron_canonical=False,  # off → no QStash regen enqueue
+        openclaw_version="2026.5.28",  # gateway cron.add path; 9.4 publishes the signed file
     )
 
 
@@ -366,3 +367,47 @@ class TypedCronContractBakingTests(TestCase):
         self.assertEqual(job["description"], cron.data["description"])
         for stripped in ("id", "jobId", "createdAt", "state", "createdAtMs", "updatedAtMs"):
             self.assertNotIn(stripped, job)
+
+
+class Oc94ImmediateAtPushTests(TestCase):
+    """9.4 gates the gateway cron.add: a new one-shot publishes the signed crons file."""
+
+    def setUp(self):
+        user = User.objects.create_user(username="typedcron94", password="x")
+        self.tenant = Tenant.objects.create(
+            user=user,
+            status=Tenant.Status.ACTIVE,
+            container_id="oc-test94",
+            container_fqdn="oc-test94.internal.azurecontainerapps.io",
+            postgres_cron_canonical=False,
+            openclaw_version="2026.9.4",
+        )
+
+    def _create(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        at = (timezone.now() + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        return create_typed_cron(
+            tenant=self.tenant,
+            pattern=CronPattern.PURE_REMINDER,
+            typed_payload={"text": "Call Mom"},
+            name="Call Mom",
+            schedule={"kind": "at", "at": at},
+        )
+
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    @patch("apps.cron.share_cron_sync.write_tenant_crons_file", return_value=1)
+    def test_publishes_file_not_gateway(self, mock_write, mock_invoke):
+        row = self._create()
+        self.assertTrue(row.enabled)
+        mock_write.assert_called_once_with(self.tenant)
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.share_cron_sync.write_tenant_crons_file", side_effect=RuntimeError("share down"))
+    def test_publish_failure_raises_gateway_error(self, _mock_write):
+        from apps.cron.gateway_client import GatewayError
+
+        with self.assertRaises(GatewayError):
+            self._create()

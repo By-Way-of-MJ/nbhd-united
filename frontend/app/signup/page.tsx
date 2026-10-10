@@ -7,7 +7,19 @@ import { FormEvent, Suspense, useEffect, useState } from "react";
 import {
   AppleSignInButton,
   type AppleAuthenticationResult,
+  useAppleSignInEligible,
 } from "@/components/apple-sign-in-button";
+import {
+  AuthDivider,
+  AuthError,
+  AuthFrame,
+  AuthLegal,
+  authAppleCls,
+  authFieldCls,
+  authLabelCls,
+  authLinkCls,
+  authPrimaryCls,
+} from "@/components/auth/auth-frame";
 import { fetchMe, signup } from "@/lib/api";
 import {
   completeAuthentication,
@@ -15,13 +27,22 @@ import {
   getAuthenticationEpoch,
 } from "@/lib/auth";
 import { hasPendingAppAuthorize } from "@/lib/app-authorize";
+import { authPathForIntent } from "@/lib/authorize-decision";
 import { stashInviteToken } from "@/lib/invite-token";
-import { OnboardingShell } from "@/components/onboarding/onboarding-shell";
+import { decidePostAuthRoute } from "@/lib/post-auth-route";
 import { PasswordStrengthMeter } from "@/components/onboarding/password-strength-meter";
 
 function SignupPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const fromApp = searchParams.get("from") === "app";
+  const loginParams = new URLSearchParams();
+  for (const key of ["from", "invite"]) {
+    const value = searchParams.get(key);
+    if (value !== null) loginParams.set(key, value);
+  }
+  const loginQuery = loginParams.toString();
+  const loginHref = `${authPathForIntent("signin")}${loginQuery ? `?${loginQuery}` : ""}`;
 
   // Neighborhood invite handoff: stash `?invite=<token>` now — tenant
   // provisioning (and the invite claim) happens later, in PersonaScene
@@ -36,8 +57,42 @@ function SignupPageInner() {
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [emailExists, setEmailExists] = useState(false);
   const [loading, setLoading] = useState(false);
   const [appleBusy, setAppleBusy] = useState(false);
+  const appleEligible = useAppleSignInEligible();
+  const [returnToApp, setReturnToApp] = useState<{
+    created: boolean;
+    email: string;
+  } | null>(null);
+
+  const finishWebRouting = async (created: boolean) => {
+    if (created) {
+      const destination = decidePostAuthRoute({
+        hasPendingHandoff: false,
+        fromApp: false,
+        created,
+        needsOnboarding: false,
+      });
+      router.push(destination === "journal" ? "/journal" : "/onboarding");
+      return;
+    }
+
+    let needsOnboarding = true;
+    try {
+      const me = await fetchMe();
+      needsOnboarding = !me.tenant || me.tenant.status !== "active";
+    } catch {
+      // Preserve the existing safe fallback to onboarding.
+    }
+    const destination = decidePostAuthRoute({
+      hasPendingHandoff: false,
+      fromApp: false,
+      created,
+      needsOnboarding,
+    });
+    router.push(destination === "journal" ? "/journal" : "/onboarding");
+  };
 
   const finishAuthentication = async (
     result: AppleAuthenticationResult,
@@ -51,29 +106,29 @@ function SignupPageInner() {
       return;
     }
     completeAuthentication(result);
-    // Mid-flight iOS auth never offers Apple, but keep the handoff first so
-    // every successful authentication path preserves the routing contract.
-    if (hasPendingAppAuthorize()) {
+    const created = Boolean(result.created);
+    const destination = decidePostAuthRoute({
+      hasPendingHandoff: hasPendingAppAuthorize(),
+      fromApp,
+      created,
+      needsOnboarding: false,
+    });
+    if (destination === "app-authorize") {
       router.replace("/app/authorize");
       return;
     }
-    if (result.created) {
-      router.push("/onboarding");
+    if (destination === "return-to-app") {
+      setReturnToApp({ created, email });
       return;
     }
-    try {
-      const me = await fetchMe();
-      const isOnboardingNeeded = !me.tenant || me.tenant.status !== "active";
-      router.push(isOnboardingNeeded ? "/onboarding" : "/journal");
-    } catch {
-      router.push("/onboarding");
-    }
+    await finishWebRouting(created);
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (appleBusy) return;
     setError("");
+    setEmailExists(false);
 
     if (password !== confirmPassword) {
       setError("Passwords do not match.");
@@ -88,145 +143,120 @@ function SignupPageInner() {
     const attemptEpoch = getAuthenticationEpoch();
     const attemptAccessToken = getAccessToken();
     try {
-      const tokens = await signup(email, password, displayName || undefined);
+      const tokens = await signup(
+        email,
+        password,
+        displayName || undefined,
+        fromApp ? "ios_handoff" : undefined,
+      );
       await finishAuthentication(
         { ...tokens, created: true },
         attemptEpoch,
         attemptAccessToken,
       );
     } catch (err) {
+      setEmailExists(err instanceof Error && "status" in err && err.status === 409);
       setError(err instanceof Error ? err.message : "Signup failed.");
     } finally {
       setLoading(false);
     }
   };
 
-  const inputClass =
-    "mt-1 w-full rounded-xl border border-white/10 bg-white/[0.05] px-4 py-3 text-sm text-[#e0e3e8] outline-none placeholder:text-white/25 focus:border-[#5dd9d0]/50 focus:shadow-[0_0_8px_rgba(93,217,208,0.15)] transition";
+  if (returnToApp) {
+    return (
+      <AuthFrame
+        title="Your account is ready"
+        subtitle={
+          <>
+            Return to the NBHD app and tap &ldquo;Create my space&rdquo; again.{" "}
+            {returnToApp.email ? (
+              <>
+                You&apos;ll be offered &ldquo;Continue as {returnToApp.email}&rdquo; to finish signing in.
+              </>
+            ) : (
+              <>You&apos;ll be offered the option to continue with your account.</>
+            )}
+          </>
+        }
+      >
+        <button type="button" onClick={() => void finishWebRouting(returnToApp.created)} className={`${authLinkCls} min-h-[44px] self-start text-[0.9375rem]`}>
+          Continue on the web instead
+        </button>
+      </AuthFrame>
+    );
+  }
 
   return (
-    <OnboardingShell>
-      <div className="w-full max-w-[420px]">
-        {/* Glass card */}
-        <div className="rounded-[24px] bg-[#12161b]/60 backdrop-blur-xl border border-white/[0.06] p-7 sm:p-8 shadow-[0_20px_60px_rgba(0,0,0,0.4)]">
-          {/* Brand mark */}
-          <div className="flex justify-center mb-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-[#7C6BF0]/30 bg-[#7C6BF0]/20 shadow-[0_0_20px_rgba(124,107,240,0.3)]">
-              <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5 text-[#c7bfff]">
-                <path
-                  d="M12 2L13.09 8.26L18 4L14.74 9.91L21 10L14.74 12.09L18 18L13.09 13.74L12 20L10.91 13.74L6 18L9.26 12.09L3 10L9.26 9.91L6 4L10.91 8.26L12 2Z"
-                  fill="currentColor"
-                />
-              </svg>
-            </div>
+    <AuthFrame
+      title="Begin your journey"
+      subtitle={
+        <>
+          Your private AI companion, in the <span className="text-white">NBHD app</span>. 30-day free trial.
+        </>
+      }
+    >
+      <AppleSignInButton
+        flow="authenticate"
+        label="Sign up with Apple"
+        disabled={loading}
+        onAuthenticated={finishAuthentication}
+        onBusyChange={setAppleBusy}
+        buttonClassName={authAppleCls}
+      />
+      {appleEligible ? <AuthDivider label="or with email" /> : null}
+
+      <form onSubmit={handleSubmit} className="flex flex-col gap-7">
+        <div className="flex flex-col gap-5">
+          <label className="flex flex-col gap-1.5">
+            <span className={authLabelCls}>What should your assistant call you?</span>
+            <input id="displayName" type="text" autoComplete="given-name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} className={authFieldCls} placeholder="Your name" />
+          </label>
+          <label className="flex flex-col gap-1.5">
+            <span className={authLabelCls}>Email</span>
+            <input id="email" type="email" required autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} className={authFieldCls} placeholder="you@example.com" />
+          </label>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="password" className={authLabelCls}>
+              Password
+            </label>
+            <input id="password" type="password" required autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} className={authFieldCls} placeholder="Create a password" />
+            <PasswordStrengthMeter password={password} />
           </div>
-
-          <h2 className="text-center text-2xl font-bold text-[#e0e3e8] tracking-tight">
-            Begin your journey
-          </h2>
-          <p className="mt-2 text-center text-sm text-white/45 leading-relaxed">
-            Your private AI companion, in the{" "}
-            <span className="text-white/65">NBHD app</span>. 30-day free trial.
-          </p>
-
-          <form onSubmit={handleSubmit} className="mt-7 space-y-4">
-            <div>
-              <label htmlFor="displayName" className="block font-mono text-[10px] uppercase tracking-[0.14em] text-white/40">
-                What should your assistant call you?
-              </label>
-              <input
-                id="displayName"
-                type="text"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                className={inputClass}
-                placeholder="Your name"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="email" className="block font-mono text-[10px] uppercase tracking-[0.14em] text-white/40">
-                Email
-              </label>
-              <input
-                id="email"
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className={inputClass}
-                placeholder="you@example.com"
-              />
-            </div>
-
-            <div>
-              <label htmlFor="password" className="block font-mono text-[10px] uppercase tracking-[0.14em] text-white/40">
-                Password
-              </label>
-              <input
-                id="password"
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={inputClass}
-                placeholder="Create a password"
-              />
-              <PasswordStrengthMeter password={password} />
-            </div>
-
-            <div>
-              <label htmlFor="confirmPassword" className="block font-mono text-[10px] uppercase tracking-[0.14em] text-white/40">
-                Confirm Password
-              </label>
-              <input
-                id="confirmPassword"
-                type="password"
-                required
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                className={inputClass}
-                placeholder="Confirm your password"
-              />
-            </div>
-
-            {error && (
-              <p className="rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-2.5 text-sm text-rose-300">
-                {error}
-              </p>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading || appleBusy}
-              className="glow-purple w-full rounded-full bg-[#7C6BF0] px-4 py-3 text-sm font-semibold text-white transition-all hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {loading ? "Creating account..." : "Create account"}
-            </button>
-          </form>
-
-          <AppleSignInButton
-            flow="authenticate"
-            disabled={loading}
-            onAuthenticated={finishAuthentication}
-            onBusyChange={setAppleBusy}
-            showDivider
-          />
-
-          <p className="mt-5 text-center text-[11px] text-white/25 leading-relaxed">
-            By creating an account, you agree to our{" "}
-            <Link href="/legal/terms" className="underline hover:text-white/40">Terms of Service</Link>{" "}
-            and{" "}
-            <Link href="/legal/privacy" className="underline hover:text-white/40">Privacy Policy</Link>.
-          </p>
+          <label className="flex flex-col gap-1.5">
+            <span className={authLabelCls}>Confirm password</span>
+            <input id="confirmPassword" type="password" required autoComplete="new-password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} className={authFieldCls} placeholder="Type it again" />
+          </label>
         </div>
 
-        <p className="mt-6 text-center text-sm text-white/40">
-          Already have an account?{" "}
-          <Link href="/login" className="text-white/60 underline hover:text-white/80">Sign in</Link>
-        </p>
-      </div>
-    </OnboardingShell>
+        {error && (
+          <AuthError>
+            {emailExists ? (
+              <>
+                An account with this email already exists.{" "}
+                <Link href={loginHref} className="underline hover:text-white">
+                  Sign in
+                </Link>{" "}
+                to continue.
+              </>
+            ) : (
+              error
+            )}
+          </AuthError>
+        )}
+
+        <button type="submit" disabled={loading || appleBusy} className={`${authPrimaryCls} self-start`}>
+          {loading ? "Creating account…" : "Create account"}
+        </button>
+      </form>
+
+      <p className="text-[0.9375rem] text-os-muted">
+        Already have an account?{" "}
+        <Link href={loginHref} className={authLinkCls}>
+          Sign in
+        </Link>
+      </p>
+      <AuthLegal verb="creating an account" />
+    </AuthFrame>
   );
 }
 

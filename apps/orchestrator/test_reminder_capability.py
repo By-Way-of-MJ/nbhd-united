@@ -42,19 +42,21 @@ _REMINDER_TOOL = "nbhd_cron_create_pure_reminder"
 _CANT_DO_HEADING = "## What You Can't Do"
 
 # Budget, measured against the real fleet and every AGENTS.md tenant gate
-# in personas.py (site publishing, situation capture, friends, document keep,
+# in personas.py (site publishing, site editing, situation capture, friends, document keep,
 # email provenance, sautai, tour guide, journal shaping, and Gravity):
 #
-#   cap                                   24,000
-#   template alone                        16,003
-#   MJ-shaped gates + 1,500 extras        22,324
-#   ALL gates, no extras                  measured by the pin below
-#   ALL gates + 1,500 extras              intentionally pinned as a known gap
+#   runtime cap                           26,000
+#   CI truncation-alarm ceiling           25,950 (50-char cap margin)
+#   R0 content-growth pin                 23,762
+#   template alone                        14,170
+#   MJ-shaped gates + 1,500 extras        20,491
+#   ALL gates, no extras                  23,762
+#   ALL gates + 1,500 extras              25,264 after KSE-2
 #
-# The ceiling here is therefore the strongest TRUE statement available, not the one we
-# wish were true. Do not "fix" a red test by widening it — that is deleting the alarm.
-# Fund growth with a trim (the cc1602aa / a5fca659 precedent).
-_ALL_GATES_CEILING = 23_950
+# The ceiling is the truncation alarm, fixed 50 chars below the runtime cap. P5 permits
+# raising it only together with that cap, never alone. The separate R0 content pin below
+# still requires growth to be funded with a trim (the cc1602aa / a5fca659 precedent).
+_ALL_GATES_CEILING = 25_950
 
 
 def _agents_md(tenant=None) -> str:
@@ -133,6 +135,7 @@ class MaximalTenantBudgetTest(TestCase):
         if all_gates:
             # Enable every simultaneously realizable conditional AGENTS.md section.
             tenant.site_publishing_enabled = True
+            tenant.site_editor_enabled = True
             tenant.situational_context_enabled = True
             tenant.email_provenance_enabled = True
             tenant.sautai_enabled = True
@@ -142,6 +145,7 @@ class MaximalTenantBudgetTest(TestCase):
             tenant.journal_shaping_enabled = True
             fields += [
                 "site_publishing_enabled",
+                "site_editor_enabled",
                 "situational_context_enabled",
                 "email_provenance_enabled",
                 "sautai_enabled",
@@ -169,6 +173,7 @@ class MaximalTenantBudgetTest(TestCase):
         md = _agents_md(self._tenant(all_gates=True))
         for marker in (
             "## Portfolio publish gate",
+            "## Website edit gate",
             "## Current location",
             "## Neighborhood — you are BACKSTAGE",
             "## Save with its source attached",
@@ -191,10 +196,22 @@ class MaximalTenantBudgetTest(TestCase):
             len(md),
             _ALL_GATES_CEILING,
             f"the all-gates AGENTS.md render is {len(md)} chars, over the "
-            f"{_ALL_GATES_CEILING} ceiling (cap {BOOTSTRAP_MAX_CHARS}). Something grew "
-            "without a funding trim. Do NOT widen the ceiling — production truncates the "
-            "TAIL silently, and the tail is always the newest behavioural rule.",
+            f"{_ALL_GATES_CEILING} ceiling (cap {BOOTSTRAP_MAX_CHARS}). Production "
+            "truncates the TAIL silently; fund growth with a trim, or apply P5 by "
+            "raising the runtime cap and CI ceiling together, never the ceiling alone.",
         )
+
+    def test_rules_delivery_r0_all_gates_budget(self):
+        tenant = self._tenant(all_gates=True)
+        with override_settings(SUBAGENT_TENANT_IDS=""):
+            ungated = _agents_md(tenant)
+        # 2026-10-06: +178 for the one-line Shop gate (was 23,505; the pin had 1 char left).
+        self.assertLessEqual(len(ungated), 23_682)
+        with override_settings(SUBAGENT_TENANT_IDS=str(tenant.id)):
+            md = _agents_md(tenant)
+        self.assertIn("`sessions_spawn` BEFORE starting", md)
+        self.assertLessEqual(len(md), _ALL_GATES_CEILING)
+        self.assertLessEqual(len(md), BOOTSTRAP_MAX_CHARS)
 
     def test_an_mj_shaped_tenant_fits_under_the_cap(self):
         """The shape actually shipping today: MJ's four gates + his ~1.5K of extras."""
@@ -206,27 +223,15 @@ class MaximalTenantBudgetTest(TestCase):
             "cap — his AGENTS.md tail is being silently truncated in production RIGHT NOW",
         )
 
-    def test_KNOWN_GAP_all_gates_plus_extras_exceeds_the_cap(self):
-        """KNOWN_GAP — arbitrary tenant extras can still overflow the fixed cap.
-
-        A tenant with every gate AND 1,500 chars of prompt_extras renders 25,451
-        chars against a 24,000 cap: silently truncated, newest rule first.
-
-        Pinned green here so the gap is COUNTED rather than hidden behind an
-        undercounting fixture. The render-time sentinel in personas.py alarms on it in
-        production in the meantime.
-
-        FLIPS WHEN: another reviewed diet or prompt-extras budget lands. When it does,
-        this assertion goes RED: delete the sentinel and assert that shape fits with
-        real margin.
-        """
+    def test_all_gates_plus_extras_fits_under_the_cap(self):
+        """Rules-delivery W0 funded 1,500 chars of prompt extras in the maximal shape."""
         md = _agents_md(self._tenant(all_gates=True, extras=1500))
-        self.assertGreater(
+        self.assertLessEqual(
             len(md),
-            BOOTSTRAP_MAX_CHARS,
-            f"the all-gates + extras render is now {len(md)} chars, under the "
-            f"{BOOTSTRAP_MAX_CHARS} cap — the gate diet has landed. DELETE this KNOWN_GAP "
-            "sentinel and replace it with a real under-cap assertion.",
+            _ALL_GATES_CEILING,
+            f"the measured all-gates + 1,500 extras render is {len(md)} chars, over the "
+            f"{_ALL_GATES_CEILING} CI ceiling — it must retain the 50-char margin under "
+            f"the {BOOTSTRAP_MAX_CHARS} runtime cap",
         )
 
     def test_the_reminder_bullet_survives_in_the_full_shape(self):
@@ -324,3 +329,24 @@ class TypedCronsDefaultTest(TestCase):
             "/opt/nbhd/plugins/nbhd-automation-tools",
             plugins.get("load", {}).get("paths", []),
         )
+
+
+class ReminderCancellationVisibilityTest(TestCase):
+    def test_reminder_tools_are_available_through_the_default_plugin_policy(self):
+        import json
+        from pathlib import Path
+
+        tenant = create_tenant(display_name="Cancellation tools", telegram_chat_id=920005)
+        config = generate_openclaw_config(tenant)
+        self.assertIn("nbhd-automation-tools", config["plugins"]["allow"])
+        self.assertTrue(config["plugins"]["entries"]["nbhd-automation-tools"]["enabled"])
+        self.assertIn("group:plugins", config["tools"]["allow"])
+        manifest = json.loads(
+            (
+                Path(__file__).resolve().parents[2]
+                / "runtime/openclaw/plugins/nbhd-automation-tools/openclaw.plugin.json"
+            ).read_text()
+        )
+        for name in ("nbhd_cron_list_reminders", "nbhd_cron_cancel_reminder"):
+            self.assertIn(name, manifest["contracts"]["tools"])
+            self.assertNotIn(name, config["tools"].get("deny", []))

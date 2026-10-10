@@ -2,8 +2,10 @@
 
 from django.urls import path
 
+from . import project_views
 from .views import (
     AbsorbedListView,
+    AbsorbedPurgeGroupView,
     AbsorbedPurgeView,
     AdoptShareView,
     BlockedListView,
@@ -22,6 +24,7 @@ from .views import (
     InviteClaimView,
     InviteCreateView,
     InviteDetailView,
+    MissionDeclineView,
     MissionDetailView,
     MissionJoinView,
     MissionLeaveView,
@@ -30,7 +33,10 @@ from .views import (
     MissionUpdatesView,
     NeighborhoodHomeView,
     NeighborhoodView,
+    NetworkCapabilitiesView,
     PendingSharesView,
+    PhotoView,
+    ProfilePhotoView,
     ProfileView,
     ReportView,
     ShareApproveView,
@@ -52,10 +58,13 @@ from .views import (
 
 urlpatterns = [
     path("", NeighborhoodView.as_view(), name="friends-neighborhood"),
+    path("network/", NetworkCapabilitiesView.as_view(), name="friends-network-capabilities"),
     path("home/", NeighborhoodHomeView.as_view(), name="friends-home"),
     path("blocked/", BlockedListView.as_view(), name="friends-blocked"),
     path("consent/", ConsentView.as_view(), name="friends-consent"),
     path("profile/", ProfileView.as_view(), name="friends-profile"),
+    path("profile/photo/", ProfilePhotoView.as_view(), name="friends-profile-photo"),
+    path("photos/<uuid:profile_id>/", PhotoView.as_view(), name="friends-photo"),
     path("waves/", WaveCreateView.as_view(), name="friends-wave-create"),
     path(
         "waves/<uuid:friendship_id>/accept/",
@@ -78,6 +87,7 @@ urlpatterns = [
     path("shares/<uuid:pending_share_id>/reject/", ShareRejectView.as_view(), name="friends-share-reject"),
     path("shares/<uuid:shared_lesson_id>/adopt/", AdoptShareView.as_view(), name="friends-share-adopt"),
     path("absorbed/", AbsorbedListView.as_view(), name="friends-absorbed"),
+    path("absorbed/purge-group/", AbsorbedPurgeGroupView.as_view(), name="friends-absorbed-purge-group"),
     path("absorbed/<uuid:absorbed_item_id>/purge/", AbsorbedPurgeView.as_view(), name="friends-absorbed-purge"),
     # Friend chat (1:1)
     path("threads/", ThreadsView.as_view(), name="friends-threads"),
@@ -88,6 +98,7 @@ urlpatterns = [
     path("missions/", MissionsView.as_view(), name="friends-missions"),
     path("missions/<uuid:mission_id>/", MissionDetailView.as_view(), name="friends-mission-detail"),
     path("missions/<uuid:mission_id>/join/", MissionJoinView.as_view(), name="friends-mission-join"),
+    path("missions/<uuid:mission_id>/decline/", MissionDeclineView.as_view(), name="friends-mission-decline"),
     path("missions/<uuid:mission_id>/leave/", MissionLeaveView.as_view(), name="friends-mission-leave"),
     path("missions/<uuid:mission_id>/updates/", MissionUpdatesView.as_view(), name="friends-mission-updates"),
     path("missions/<uuid:mission_id>/tasks/", MissionTasksView.as_view(), name="friends-mission-tasks"),
@@ -125,3 +136,41 @@ urlpatterns = [
     path("invites/<str:token>/", InviteDetailView.as_view(), name="friends-invite-detail"),
     path("<uuid:friendship_id>/", UnfriendView.as_view(), name="friends-unfriend"),
 ]
+
+urlpatterns += [
+    path("missions/<uuid:mission_id>/plan/", project_views.PlanView.as_view()),
+    path("missions/<uuid:mission_id>/membership/", project_views.MembershipView.as_view()),
+    path("missions/<uuid:mission_id>/members/", project_views.MembersView.as_view()),
+    path("missions/<uuid:mission_id>/delete/", project_views.ProjectDeleteView.as_view()),
+    path("missions/<uuid:mission_id>/step-back/", project_views.StepBackView.as_view()),
+    path("missions/<uuid:mission_id>/owners/", project_views.OwnersView.as_view()),
+    path("projects/linked/", project_views.LinkedProjectsView.as_view()),
+    path("missions/<uuid:mission_id>/steps/", project_views.StepsView.as_view()),
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/", project_views.StepView.as_view()),
+    path("missions/<uuid:mission_id>/milestones/", project_views.MilestonesView.as_view()),
+    path("missions/<uuid:mission_id>/milestones/<uuid:milestone_id>/", project_views.MilestoneView.as_view()),
+    path("missions/<uuid:mission_id>/dependencies/", project_views.DependenciesView.as_view()),
+    path("missions/<uuid:mission_id>/dependencies/<uuid:dependency_id>/", project_views.DependencyView.as_view()),
+]
+urlpatterns += [
+    path("project-drafts/", project_views.DraftsView.as_view()),
+    path("project-drafts/<uuid:draft_id>/", project_views.DraftView.as_view()),
+    path("project-drafts/<uuid:draft_id>/publish/", project_views.DraftPublishView.as_view()),
+    path("project-proposals/", project_views.ProposalsView.as_view()),
+]
+for action in ("approve", "reject"):
+    urlpatterns.append(
+        path(
+            f"project-proposals/<uuid:proposal_id>/{action}/",
+            project_views.ProposalActionView.as_view(),
+            {"action": action},
+        )
+    )
+for action in ("ask", "respond", "complete", "reopen", "second-look", "confirm", "question", "keep"):
+    urlpatterns.append(
+        path(
+            f"missions/<uuid:mission_id>/steps/<uuid:step_id>/{action}/",
+            project_views.StepActionView.as_view(),
+            {"action": action},
+        )
+    )

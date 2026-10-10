@@ -11,6 +11,7 @@ export function WeeklySummary() {
   if (isPending) {
     return (
       <div
+        data-os-surface
         className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5 mb-6"
         role="status"
         aria-busy="true"
@@ -32,7 +33,7 @@ export function WeeklySummary() {
   if (data.totals.sessions === 0) return null;
 
   return (
-    <div className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5 mb-6">
+    <div data-os-surface className="rounded-panel border border-border bg-surface-elevated p-4 sm:p-5 mb-6">
       <div className="flex items-center justify-between mb-3">
         <div className="text-[9px] font-bold uppercase tracking-[0.2em] text-ink-faint">THIS WEEK</div>
         <div className="text-xs text-ink-faint font-mono">

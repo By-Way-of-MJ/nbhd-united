@@ -13,6 +13,7 @@ wave collides on the same row (see :func:`send_wave`).
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from collections import Counter
@@ -39,11 +40,11 @@ from .models import (
     NeighborProfile,
     PendingGoalAction,
     PendingShare,
-    SharedGoalMembership,
     SharedGoalUpdate,
     SharedLesson,
     compute_pair_key,
 )
+from .project_hygiene import UNTRUSTED_RULE, clean_payload, clean_text, fence
 from .scrub import _content_hash
 
 # Handles people can never claim (impersonation / support-desk confusion).
@@ -144,11 +145,13 @@ def _profile_entry(tenant, profiles_by_id: dict) -> dict:
             "display_name": profile.display_name,
             "handle": profile.handle,
             "avatar_hue": profile.avatar_hue,
+            "photo_url": access.photo_url(profile),
         }
     return {
         "display_name": (getattr(tenant.user, "display_name", None) or "Neighbor"),
         "handle": None,
         "avatar_hue": 210,
+        "photo_url": None,
     }
 
 
@@ -191,6 +194,7 @@ def list_neighborhood(tenant) -> dict:
             "display_name": me.display_name,
             "bio": me.bio,
             "avatar_hue": me.avatar_hue,
+            "photo_url": access.photo_url(me),
         },
         "neighbors": neighbors,
         "pending_incoming": pending_incoming,
@@ -478,6 +482,7 @@ def _profile_public(profile) -> dict:
         "handle": profile.handle if profile else None,
         "display_name": profile.display_name if profile else "Neighbor",
         "avatar_hue": profile.avatar_hue if profile else 210,
+        "photo_url": access.photo_url(profile),
     }
 
 
@@ -534,6 +539,10 @@ def neighborhood_home(tenant, since=None) -> dict:
     sky_ids = access.sky_friendship_ids(
         tenant
     )  # additive in_my_sky flag (Bounded Neighborhood; THE iOS flight contract)
+    # Web Neighborhood line thickness: a qualitative bucket, never a count.
+    bonds = access.bond_by_counterpart(tenant, edges)
+    # Friends-of-friends as nameless bucketed counts (null below 3 / hidden network).
+    reach, reach_total = access.reach_by_counterpart(tenant, edges)
 
     pending = list(
         Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.PENDING)
@@ -555,6 +564,9 @@ def neighborhood_home(tenant, since=None) -> dict:
                 **_profile_public(profiles.get(cid)),
                 "spark_count": spark_counts.get(cid, 0),
                 "in_my_sky": edge.id in sky_ids,
+                "bond": bonds.get(cid, access.BOND_LIGHT),
+                "friends_since": (edge.responded_at or edge.created_at).date().isoformat(),
+                "reach": reach.get(cid),
                 "has_unread_thread": state.get("has_unread", False),
                 "thread_id": state.get("thread_id"),
             }
@@ -576,11 +588,13 @@ def neighborhood_home(tenant, since=None) -> dict:
             "display_name": me.display_name,
             "bio": me.bio,
             "avatar_hue": me.avatar_hue,
+            "photo_url": access.photo_url(me),
             "accepted_terms_at": me.accepted_terms_at.isoformat() if me.accepted_terms_at else None,
             "accepted_terms_version": me.accepted_terms_version,
             "needs_consent": me.accepted_terms_version != FRIENDS_TERMS_VERSION,
         },
         "neighbors": neighbors,
+        "reach_total": reach_total,
         "pending_in": pending_in,
         "pending_out": pending_out,
         "moments": moments,
@@ -634,10 +648,51 @@ def _decision_moments(tenant, pending, profiles, *, since=None) -> list[dict]:
             }
         )
 
+    moments.extend(_project_ask_moments(tenant, since=since))
+
     moments.sort(key=lambda m: m["_sort"], reverse=True)
     for m in moments:
         m.pop("_sort", None)
     return moments
+
+
+def _project_ask_moments(tenant, *, since=None) -> list[dict]:
+    """Projects v2: steps someone asked ME to take and I haven't answered (a decision
+    for me, like a wave). Names + titles only. Flag-gated so older apps never see a
+    moment kind they can't render (they'd drop it anyway)."""
+    from .project_flags import projects_v2_enabled
+
+    if not projects_v2_enabled(tenant):
+        return []
+    rows = (
+        access.my_open_project_asks(tenant)
+        .select_related("step", "step__shared_goal")
+        .order_by(F("asked_at").desc(nulls_last=True))[:20]
+    )
+    out = []
+    for row in rows:
+        stamp = row.asked_at or row.responded_at or timezone.now()
+        if since is not None and stamp <= since:
+            continue
+        out.append(
+            {
+                "id": f"project_ask:{row.id}",
+                "kind": "project_ask",
+                "created_at": _iso_z(stamp),
+                "_sort": stamp,
+                "mission_id": str(row.step.shared_goal_id),
+                "step_id": str(row.step_id),
+                "project_title": row.step.shared_goal.title,
+                "step_title": row.step.title,
+                "asked_by_name": _project_member_name(row.asked_by_id),
+            }
+        )
+    return out
+
+
+def _project_member_name(tenant_id) -> str:
+    profile = NeighborProfile.objects.filter(tenant_id=tenant_id).only("display_name").first()
+    return profile.display_name if profile and profile.display_name else "A neighbor"
 
 
 def _share_audience_label(tenant, share) -> str:
@@ -967,6 +1022,7 @@ def list_wormholes(viewer_tenant, warpable=None) -> list[dict]:
                 "display_name": profile.display_name if profile else "Neighbor",
                 "handle": profile.handle if profile else None,
                 "avatar_hue": profile.avatar_hue if profile else 210,
+                "photo_url": access.photo_url(profile),
                 "spark_count": target["spark_count"],
                 "new_since_last_visit": target["new_since_last_visit"],
                 "in_my_sky": in_my_sky,
@@ -1277,18 +1333,23 @@ def neighborhood_context(tenant, since=None) -> dict:
             title,
             circle_id=grant.circle_id,  # tag circle-sourced sparks (cross-leak guard + scoped purge)
         )
+        # A neighbor wrote this. The scrub took names out, not instructions: hand it
+        # to the assistant as fenced data (the stored AbsorbedItem label stays plain —
+        # it is shown to the human, never to the model).
+        author = _handle_for(shared_lesson.owner_tenant_id)
         sparks.append(
             {
                 "shared_lesson_id": str(shared_lesson.id),
-                "from_handle": _handle_for(shared_lesson.owner_tenant_id),
-                "title": title,
-                "text": shared_lesson.redacted_text,
+                "from_handle": author,
+                "title": fence(title, author),
+                "text": fence(shared_lesson.redacted_text, author),
             }
         )
         if latest is None or grant.created_at > latest:
             latest = grant.created_at
 
     return {
+        "rule": UNTRUSTED_RULE,
         "neighbors": _accepted_neighbor_handles(tenant),
         "sparks": sparks,
         "chat": _absorb_chat(tenant),
@@ -1302,14 +1363,22 @@ def _absorb_chat(tenant) -> list[dict]:
     the per-thread cursor advanced (idempotent), and a NEUTRAL AbsorbedItem
     logged per message (label = "Chat with @handle" — a pointer, never the
     message text). Skipped for threads where agent_absorb_enabled is off."""
-    from apps.pii.redactor import redact_user_message
+    from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message_checked
 
     highlights: list[dict] = []
     for entry in access.absorb_pending_chat(tenant):
         circle_id = entry.get("circle_id")
         texts = []
         for message in entry["messages"]:
-            texts.append(redact_user_message(message.text, tenant))  # fresh redaction, ephemeral
+            # Fresh redaction that SAVES NOTHING: a neighbor's words must not add
+            # entries to MY hidden-names list (names I already hid keep their tag;
+            # anything else the detector flags becomes [REDACTED]). Then fenced:
+            # it is another person's text — data, never instructions.
+            # Fail closed: if redaction can't be confirmed, the assistant gets a pointer,
+            # not the neighbor's raw words.
+            outcome = redact_user_message_checked(message.text, tenant, mint=MINT_REDACT_ONLY)
+            redacted = outcome.text if outcome.confirmed else "[message not shown here — it is in the app]"
+            texts.append(fence(redacted, _handle_for(message.sender_tenant_id)))
             # from_tenant = the actual sender (works for 1:1 AND circle group chat);
             # label is a NEUTRAL pointer + circle tag, never message text.
             sender_handle = _handle_for(message.sender_tenant_id)
@@ -1345,21 +1414,40 @@ def _log_absorbed(tenant, source_kind, source_id, from_tenant_id, label, *, circ
         pass  # already absorbed
 
 
+_ABSORBED_KIND_LABELS = {
+    AbsorbedItem.SourceKind.SHARED_LESSON: "shared spark",
+    AbsorbedItem.SourceKind.FRIEND_MESSAGE: "chat message",
+}
+
+
+def _absorbed_group_key(tenant_id, source_kind, from_tenant_id, circle_id) -> str:
+    """Opaque, stable key grouping ledger rows by (kind, sender, circle). Chat is
+    logged one row per message under the same neutral label, so the UI groups
+    them by this key. Salted with the viewer's id and hashed so it never reveals
+    a neighbor's tenant id or matches across viewers."""
+    raw = f"{tenant_id}:{source_kind}:{from_tenant_id}:{circle_id or ''}"
+    return f"{source_kind}-{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
+
+
 def list_absorbed(tenant) -> list[dict]:
     """The transparency ledger — what the assistant absorbed (un-purged)."""
-    items = (
-        AbsorbedItem.objects.filter(tenant=tenant, purged_at__isnull=True)
-        .select_related("from_tenant")
-        .order_by("-absorbed_at")
+    items = list(AbsorbedItem.objects.filter(tenant=tenant, purged_at__isnull=True).order_by("-absorbed_at"))
+    handles = dict(
+        NeighborProfile.objects.filter(tenant_id__in={i.from_tenant_id for i in items}).values_list(
+            "tenant_id", "handle"
+        )
     )
     return [
         {
             "id": str(item.id),
             "source_kind": item.source_kind,
             "source_id": str(item.source_id),
-            "from_handle": _handle_for(item.from_tenant_id),
+            "from_handle": handles.get(item.from_tenant_id),
             "label": item.label,
             "absorbed_at": item.absorbed_at,
+            "created_at": item.absorbed_at,
+            "group_key": _absorbed_group_key(tenant.id, item.source_kind, item.from_tenant_id, item.circle_id),
+            "kind_label": _ABSORBED_KIND_LABELS.get(item.source_kind, item.source_kind),
         }
         for item in items
     ]
@@ -1375,6 +1463,23 @@ def purge_absorbed(tenant, absorbed_item_id) -> AbsorbedItem:
         item.purged_at = timezone.now()
         item.save(update_fields=["purged_at"])
     return item
+
+
+def purge_absorbed_group(tenant, group_key: str) -> int:
+    """Tombstone every un-purged item in one ``group_key`` (same per-item purge
+    semantics, applied to the group). Returns how many were purged; 0 is a no-op."""
+    ids = [
+        item_id
+        for item_id, kind, from_id, circle_id in AbsorbedItem.objects.filter(
+            tenant=tenant, purged_at__isnull=True
+        ).values_list("id", "source_kind", "from_tenant_id", "circle_id")
+        if _absorbed_group_key(tenant.id, kind, from_id, circle_id) == group_key
+    ]
+    if not ids:
+        return 0
+    return AbsorbedItem.objects.filter(id__in=ids, tenant=tenant, purged_at__isnull=True).update(
+        purged_at=timezone.now()
+    )
 
 
 def _handle_for(tenant_id) -> str | None:
@@ -1427,6 +1532,7 @@ def list_threads(tenant) -> list[dict]:
                 "display_name": profile.display_name if profile else "Neighbor",
                 "handle": profile.handle if profile else None,
                 "avatar_hue": profile.avatar_hue if profile else 210,
+                "photo_url": access.photo_url(profile),
                 "unread": access.unread_count(thread, membership.last_read_seq, tenant.id),
                 "last_message": (last.text[:80] if last else ""),
                 "last_message_at": thread.last_message_at,
@@ -1514,8 +1620,13 @@ _HUMAN_UPDATE_KINDS = frozenset({"note", "progress", "milestone"})
 
 
 def _append_update(mission, tenant, user, kind, *, text="", payload=None):
-    return SharedGoalUpdate.objects.create(
-        shared_goal=mission, tenant=tenant, user=user, kind=kind, text=text, payload=payload or {}
+    return access.mission_updates().create(
+        shared_goal=mission,
+        tenant=tenant,
+        user=user,
+        kind=kind,
+        text=clean_text(text),
+        payload=clean_payload(payload or {}),
     )
 
 
@@ -1524,18 +1635,20 @@ def _assert_mission_member(tenant, mission_id):
     mission = access.get_mission(mission_id)
     if mission is None:
         raise NotFound("No such mission.")
-    membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
+    membership = access.mission_memberships().filter(shared_goal=mission, tenant=tenant, status="active").first()
     if membership is None:
         raise NotFound("No such mission.")
     return mission, membership
 
 
-def _mint_member_task(tenant, mission, title, description, due_date):
+def _prepare_member_task(tenant, title, description):
     """The caller's OWN local journal Task, linked to the mission via related_ref
     (zero journal.Task schema change)."""
     from apps.journal.models import Task
     from apps.pii.authoring import author_text, truncate_placeholder_safe
 
+    title = clean_text(title, limit=120, required=True)
+    description = clean_text(description)
     authored_title = author_text(
         tenant,
         title,
@@ -1550,7 +1663,7 @@ def _mint_member_task(tenant, mission, title, description, due_date):
         writer="background",
         field="description",
     )
-    return Task.objects.create(
+    return dict(
         tenant=tenant,
         title=truncate_placeholder_safe(
             authored_title.text,
@@ -1561,123 +1674,248 @@ def _mint_member_task(tenant, mission, title, description, due_date):
             "title": authored_title.receipt,
             "description": authored_description.receipt,
         },
-        due_date=due_date,
-        related_ref={"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
     )
 
 
-def create_mission(tenant, user, friendship_id, *, title, description="", pillar="", target=None, target_date=None):
-    """Create a 1:1 Mission on an accepted friendship. Creator auto-joins as
-    owner; the friendship's other party is invited."""
-    edge = access.assert_neighbors(tenant, friendship_id)  # accepted party, else PermissionDenied
-    title = (title or "").strip()
-    if not title:
-        raise ValidationError("A mission title is required.")
+def _linked_goal_for(tenant, mission):
+    """Projects v2 §11.1: the caller's private Horizons goal for this project, if it
+    still exists in their own journal."""
+    from apps.journal.models import Goal
+
+    member = access.mission_memberships().filter(shared_goal=mission, tenant=tenant).only("linked_goal_id").first()
+    goal_id = getattr(member, "linked_goal_id", None)
+    if goal_id and Goal.objects.filter(id=goal_id, tenant=tenant).exists():
+        return goal_id
+    return None
+
+
+def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None, linked_goal_id=...):
+    """Author outside transactions, then persist only the caller's private Task."""
+    from apps.journal.models import Task
+
+    values = prepared if prepared is not None else _prepare_member_task(tenant, title, description)
+    return Task.objects.create(
+        **values,
+        due_date=due_date,
+        parent_goal_id=_linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id,
+        related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        if step
+        else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
+    )
+
+
+@transaction.atomic
+def create_mission(
+    tenant,
+    user,
+    friendship_id=None,
+    *,
+    member_friendship_ids=None,
+    title,
+    description="",
+    pillar="",
+    target=None,
+    target_date=None,
+):
+    from .project_hygiene import clean_text
+
+    ids = member_friendship_ids if member_friendship_ids is not None else [friendship_id]
+    if not isinstance(ids, list) or (friendship_id and member_friendship_ids is not None):
+        raise ValidationError("Supply member_friendship_ids or friendship_id.")
+    edges = [access.assert_neighbors(tenant, value) for value in ids]
+    title = clean_text(title, limit=120, required=True)
     mission = access.create_mission(
         tenant,
-        edge,
+        None,
         title=title,
-        description=description or "",
-        pillar=pillar or "",
-        target=target or {},
+        description=clean_text(description),
+        pillar=clean_text(pillar, limit=20),
+        target=clean_payload(target if isinstance(target, dict) else {}),
         target_date=target_date,
     )
-    SharedGoalMembership.objects.create(shared_goal=mission, tenant=tenant, user=user, role="owner", status="active")
-    other_id = edge.addressee_id if edge.requester_id == tenant.id else edge.requester_id
-    other = Tenant.objects.select_related("user").filter(id=other_id).first()
-    if other is not None:
-        SharedGoalMembership.objects.get_or_create(
-            shared_goal=mission,
-            tenant=other,
-            defaults={"user": other.user, "role": "member", "status": "invited"},
+    access.mission_memberships().create(shared_goal=mission, tenant=tenant, user=user, role="owner", status="active")
+    other_ids = {e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in edges}
+    for other in Tenant.objects.select_related("user").filter(id__in=other_ids):
+        access.mission_memberships().create(
+            shared_goal=mission, tenant=other, user=other.user, role="member", status="invited"
         )
     _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="created the mission")
+    if other_ids:
+        from .project_flags import projects_v2_enabled
+
+        if projects_v2_enabled(tenant):
+            from .project_notifications import notify_project_invite
+
+            notify_project_invite(mission, tenant)
     return mission
 
 
-def list_missions(tenant) -> list[dict]:
-    out: list[dict] = []
-    for mission in access.missions_for(tenant):
-        membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
-        out.append(
-            {
-                "mission_id": str(mission.id),
-                "title": mission.title,
-                "status": mission.status,
-                "target": mission.target,
-                "target_date": mission.target_date,
-                "my_commitment": membership.commitment if membership else "",
-                "version": mission.version,
-            }
-        )
-    return out
+def list_missions(tenant, *, include_invited=False) -> list[dict]:
+    missions = list(access.missions_for(tenant, include_invited=include_invited))
+    memberships = {
+        m.shared_goal_id: m for m in access.mission_memberships().filter(shared_goal__in=missions, tenant=tenant)
+    }
+    return [
+        {
+            "mission_id": str(mission.id),
+            "title": mission.title,
+            "status": mission.status,
+            "target": mission.target,
+            "target_date": mission.target_date,
+            "version": mission.version,
+            "my_commitment": memberships[mission.id].commitment,
+            "my_status": memberships[mission.id].status,
+            "my_role": memberships[mission.id].role,
+        }
+        for mission in missions
+        if mission.id in memberships
+        and memberships[mission.id].status in ({"active", "invited"} if include_invited else {"active"})
+    ]
 
 
 def get_mission_detail(tenant, mission_id) -> dict:
     from . import projection
 
-    mission, membership = _assert_mission_member(tenant, mission_id)
-    data = projection.build_mission_status(mission)
-    data["description"] = mission.description
-    data["version"] = mission.version
-    data["my_commitment"] = membership.commitment
-    data["my_role"] = membership.role
+    mission = access.get_mission(mission_id)
+    membership = (
+        access.mission_memberships()
+        .filter(shared_goal=mission, tenant=tenant, status__in=["active", "invited"])
+        .first()
+        if mission
+        else None
+    )
+    if membership is None:
+        raise NotFound("No such mission.")
+    if membership.status == "invited":
+        access.assert_project_invitee(tenant, mission)
+        # Consent preview only: shared activity stays behind active membership.
+        data = {
+            "mission_id": str(mission.id),
+            "title": mission.title,
+            "status": mission.status,
+            "target": mission.target,
+            "members": [],
+            "updates": [],
+        }
+    else:
+        data = projection.build_mission_status(mission)
+        updates = list(access.mission_updates().filter(shared_goal=mission).order_by("-created_at", "-id")[:50])
+        profiles = {
+            p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={u.tenant_id for u in updates})
+        }
+        data["updates"] = [
+            {
+                "id": str(u.id),
+                "kind": u.kind,
+                "text": u.text,
+                "created_at": u.created_at.isoformat(),
+                "author_name": profiles[u.tenant_id].display_name if u.tenant_id in profiles else "Neighbor",
+            }
+            for u in updates
+        ]
+    data.update(
+        description=mission.description,
+        version=mission.version,
+        my_commitment=membership.commitment,
+        my_role=membership.role,
+        my_status=membership.status,
+    )
     return data
 
 
+@transaction.atomic
+def decline_mission(tenant, mission_id) -> dict:
+    mission = access.get_mission(mission_id, lock=True)
+    membership = (
+        access.mission_memberships().select_for_update().filter(shared_goal=mission, tenant=tenant).first()
+        if mission
+        else None
+    )
+    if membership is None or membership.status not in {"invited", "declined"}:
+        raise NotFound("No such invitation.")
+    membership.status = "declined"
+    membership.save(update_fields=["status"])
+    return {"mission_id": str(mission.id), "status": "declined"}
+
+
+@transaction.atomic
 def join_mission(tenant, user, mission_id, commitment="") -> dict:
-    mission = access.get_mission(mission_id)
+    mission = access.get_mission(mission_id, lock=True)
     if mission is None:
         raise NotFound("No such mission.")
-    membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant).first()
-    if membership is None:
+    membership = access.mission_memberships().select_for_update().filter(shared_goal=mission, tenant=tenant).first()
+    if membership is None or membership.status == "declined":
         raise NotFound("No such mission.")  # only invited members (friendship party) can join
     if membership.status != "active":
+        access.assert_project_invitee(tenant, mission)
         membership.status = "active"
         membership.left_at = None
         if commitment:
-            membership.commitment = commitment.strip()[:200]
+            membership.commitment = clean_text(commitment, limit=200)
         membership.save(update_fields=["status", "left_at", "commitment"])
         _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="joined")
     return {"mission_id": str(mission.id), "status": "active"}
 
 
+@transaction.atomic
 def leave_mission(tenant, mission_id) -> dict:
-    mission, membership = _assert_mission_member(tenant, mission_id)
+    from . import project_notifications, project_services
+
+    mission, membership = access.lock_project(tenant, mission_id)
+    others = access.mission_memberships().filter(shared_goal=mission, status="active").exclude(id=membership.id)
+    heir = None
+    if membership.role == "owner" and not others.filter(role="owner").exists():
+        # The last owner leaving hands the project to whoever joined first.
+        heir = others.order_by("joined_at", "id").first()
+        if heir is not None:
+            heir.role = "owner"
+            heir.save(update_fields=["role"])
+    # Their open steps go back to "anyone" out loud instead of silently orphaning.
+    released, _declined = project_services._release(mission, membership)
+    for step in released:
+        _append_update(
+            mission,
+            tenant,
+            None,
+            "step_released",
+            payload={"step_id": str(step.id), "membership_id": str(membership.id)},
+        )
     membership.status = "left"
     membership.left_at = timezone.now()
     membership.save(update_fields=["status", "left_at"])
-    return {"mission_id": str(mission.id), "status": "left"}
+    _append_update(mission, tenant, None, "member_left", payload={"membership_id": str(membership.id)})
+    project_notifications.notify_member_left(
+        mission, tenant, released_count=len(released), heir_membership_id=heir.id if heir else None
+    )
+    return {"mission_id": str(mission.id), "status": "left", "released": len(released)}
 
 
 def add_mission_update(tenant, user, mission_id, kind, text) -> dict:
     mission, _membership = _assert_mission_member(tenant, mission_id)
     if kind not in _HUMAN_UPDATE_KINDS:
         raise ValidationError("kind must be note, progress, or milestone.")
-    update = _append_update(mission, tenant, user, kind, text=(text or "").strip())
+    update = _append_update(mission, tenant, user, kind, text=clean_text(text))
     return {"id": str(update.id), "kind": kind}
 
 
 def add_mission_task(tenant, user, mission_id, *, title, description="", due_date=None) -> dict:
-    mission, _membership = _assert_mission_member(tenant, mission_id)
-    title = (title or "").strip()
-    if not title:
-        raise ValidationError("A task title is required.")
-    task = _mint_member_task(tenant, mission, title, description, due_date)
-    _append_update(
-        mission,
-        tenant,
-        user,
-        SharedGoalUpdate.Kind.TASK_ADDED,
-        text=title,
-        payload={"title": title, "task_id": str(task.id)},
+    from . import project_services
+
+    step, task = project_services.add_owned_step(
+        tenant, user, mission_id, title=title, description=description, due_date=due_date
     )
-    return {"task_id": str(task.id), "title": title}
+    return {"task_id": str(task.id), "title": step.title}
 
 
 def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dict, int]:
     """Optimistic multi-writer edit → 409 on version/lock conflict."""
     mission, _membership = _assert_mission_member(tenant, mission_id)
+    if "title" in fields:
+        fields["title"] = clean_text(fields["title"], limit=120, required=True)
+    if "target" in fields:
+        if not isinstance(fields["target"], dict):
+            raise ValidationError("target must be an object.")
+        fields["target"] = clean_payload(fields["target"])
     updated, result = access.update_mission(
         mission, expected_version=expected_version, editor_owner=f"user:{tenant.id}", fields=fields
     )
@@ -1696,15 +1934,18 @@ def propose_mission_task(tenant, mission_id, *, title, description="", due_date=
     be an active member; the task is for THAT member only). Never writes another
     human's task. Idempotent per (member, mission, title)."""
     mission, _membership = _assert_mission_member(tenant, mission_id)
-    title = (title or "").strip()
+    title = clean_text(title, limit=120, required=True)
+    description = clean_text(description)
     if not title:
         raise ValidationError("A task title is required.")
-    existing = PendingGoalAction.objects.filter(
-        tenant=tenant, shared_goal=mission, status="pending", suggested__title=title
-    ).first()
+    existing = (
+        access.pending_goal_actions()
+        .filter(tenant=tenant, shared_goal=mission, status="pending", suggested__title=title)
+        .first()
+    )
     if existing is not None:
         return existing, False
-    action = PendingGoalAction.objects.create(
+    action = access.pending_goal_actions().create(
         tenant=tenant,
         shared_goal=mission,
         kind="add_task",
@@ -1721,7 +1962,8 @@ def propose_mission_task(tenant, mission_id, *, title, description="", due_date=
 
 def list_pending_goal_actions(tenant) -> list[dict]:
     actions = (
-        PendingGoalAction.objects.filter(tenant=tenant, status="pending")
+        access.pending_goal_actions()
+        .filter(tenant=tenant, status="pending")
         .select_related("shared_goal")
         .order_by("-created_at")
     )
@@ -1742,8 +1984,10 @@ def approve_goal_action(tenant, action_id) -> dict:
     from datetime import date
 
     try:
-        action = PendingGoalAction.objects.select_related("shared_goal").get(
-            id=action_id, tenant=tenant, status="pending"
+        action = (
+            access.pending_goal_actions()
+            .select_related("shared_goal")
+            .get(id=action_id, tenant=tenant, status="pending")
         )
     except (PendingGoalAction.DoesNotExist, ValueError, DjangoValidationError) as exc:
         raise NotFound("No such proposal.") from exc
@@ -1754,25 +1998,34 @@ def approve_goal_action(tenant, action_id) -> dict:
         due_date = date.fromisoformat(due_raw) if due_raw else None
     except (TypeError, ValueError):
         due_date = None
-    title = (suggested.get("title") or "Mission task").strip()
-    task = _mint_member_task(tenant, mission, title, suggested.get("description") or "", due_date)
-    _append_update(
-        mission,
-        tenant,
-        tenant.user,
-        SharedGoalUpdate.Kind.TASK_ADDED,
-        text=title,
-        payload={"title": title, "task_id": str(task.id)},
-    )
-    action.status = "approved"
-    action.task = task
-    action.resolved_at = timezone.now()
-    action.save(update_fields=["status", "task", "resolved_at"])
+    title = clean_text(suggested.get("title") or "Mission task", limit=120, required=True)
+    description = clean_text(suggested.get("description"))
+    _assert_mission_member(tenant, mission.id)
+    prepared = _prepare_member_task(tenant, title, description)
+    from . import project_services
+
+    with transaction.atomic():
+        access.lock_project(tenant, mission.id)
+        action = (
+            access.pending_goal_actions()
+            .select_for_update()
+            .filter(id=action.id, tenant=tenant, status="pending")
+            .first()
+        )
+        if action is None:
+            raise NotFound("No such proposal.")
+        _step, task = project_services.add_owned_step(
+            tenant, tenant.user, mission.id, title=title, description=description, due_date=due_date, prepared=prepared
+        )
+        action.status = "approved"
+        action.task = task
+        action.resolved_at = timezone.now()
+        action.save(update_fields=["status", "task", "resolved_at"])
     return {"action_id": str(action.id), "status": "approved", "task_id": str(task.id)}
 
 
 def reject_goal_action(tenant, action_id) -> dict:
-    action = PendingGoalAction.objects.filter(id=action_id, tenant=tenant, status="pending").first()
+    action = access.pending_goal_actions().filter(id=action_id, tenant=tenant, status="pending").first()
     if action is None:
         raise NotFound("No such proposal.")
     action.status = "rejected"
@@ -1787,8 +2040,40 @@ def runtime_missions(tenant) -> list[dict]:
 
     out: list[dict] = []
     for mission in access.missions_for(tenant):
-        membership = SharedGoalMembership.objects.filter(shared_goal=mission, tenant=tenant, status="active").first()
+        membership = access.mission_memberships().filter(shared_goal=mission, tenant=tenant, status="active").first()
         status = projection.build_mission_status(mission)
         status["my_commitment"] = membership.commitment if membership else ""
-        out.append(status)
+        out.append(_fence_mission_status(status, _handle_for(tenant.id), _handle_for(mission.created_by_id)))
     return out
+
+
+_MISSION_TARGET_KEYS = frozenset({"metric", "unit", "cadence", "value", "aid_kind"})
+
+
+def _fence_mission_status(status: dict, my_handle, creator_handle) -> dict:
+    """Everything in a mission another member wrote — or can edit — reaches the
+    assistant as fenced data. Any member can rename a mission, so the title is
+    fenced even for its creator; only my own member row stays plain."""
+    # Any member may have written these; name no author unless it is someone else's.
+    author = None if creator_handle == my_handle else creator_handle
+    status["title"] = fence(status.get("title", ""), None)
+    target = status.get("target")
+    # Only the keys the product defines, numbers kept, every string fenced; anything
+    # else (extra keys, nested objects, lists) is dropped — the key itself is free text.
+    status["target"] = (
+        {
+            key: fence(value, author) if isinstance(value, str) else value
+            for key, value in target.items()
+            if key in _MISSION_TARGET_KEYS and isinstance(value, (str, int, float, bool))
+        }
+        if isinstance(target, dict)
+        else {}
+    )
+    for member in status.get("members", []):
+        if my_handle and member.get("handle") == my_handle:
+            continue
+        for key in ("next_step", "commitment"):
+            if member.get(key):
+                member[key] = fence(member[key], member.get("handle"))
+    status["rule"] = UNTRUSTED_RULE
+    return status

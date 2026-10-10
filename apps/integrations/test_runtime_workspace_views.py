@@ -24,8 +24,8 @@ from apps.tenants.services import create_tenant
 from apps.tenants.test_utils import seed_internal_key
 
 
-def _fake_embedding(_text):
-    """Stand-in for OpenAI embedding calls in tests."""
+def _fake_embedding(_text, **_kwargs):
+    """Stand-in for the tenant-aware embedding seam in tests."""
     return [0.01] * 1536
 
 
@@ -67,11 +67,18 @@ class RuntimeWorkspaceViewsTest(TestCase):
             **self._headers(),
         )
 
-    def _delete(self, slug):
+    def _delete(self, slug, body=None):
         return self.client.delete(
             f"/api/v1/integrations/runtime/{self.tenant.id}/workspaces/{slug}/",
+            data=body or {},
+            content_type="application/json",
             **self._headers(),
         )
+
+    def _confirm_delete(self, slug):
+        preview = self._delete(slug)
+        self.assertEqual(preview.status_code, 200)
+        return self._delete(slug, {"confirm_token": preview.json()["confirm_token"]})
 
     def _switch(self, slug):
         return self.client.post(
@@ -244,13 +251,13 @@ class RuntimeWorkspaceViewsTest(TestCase):
 
     def test_delete_nondefault_workspace_succeeds(self, _embed_mock):
         self._create(name="Work")
-        response = self._delete("work")
+        response = self._confirm_delete("work")
         self.assertEqual(response.status_code, 200)
         self.assertFalse(Workspace.objects.filter(tenant=self.tenant, slug="work").exists())
 
     def test_delete_active_workspace_falls_back_to_default(self, _embed_mock):
         self._create(name="Work")  # Now active
-        response = self._delete("work")
+        response = self._confirm_delete("work")
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertTrue(body["fell_back_to_default"])

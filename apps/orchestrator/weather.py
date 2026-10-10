@@ -91,17 +91,32 @@ def get_coords_for_timezone(tz: str) -> tuple[float, float]:
     return region_defaults.get(region, (51.51, -0.13))
 
 
-def build_weather_url_from_coords(lat: float, lon: float, tz: str) -> str:
-    """Build an Open-Meteo forecast URL from explicit coordinates."""
-    params = {
+def build_weather_url_from_coords(
+    lat: float,
+    lon: float,
+    tz: str,
+    *,
+    forecast_days: int = 3,
+    temperature_unit: str | None = None,
+) -> str:
+    """Build an Open-Meteo forecast URL from explicit coordinates.
+
+    ``temperature_unit`` is Open-Meteo's own vocabulary (``"fahrenheit"``);
+    omitted means the API default (Celsius). The programmatic briefing
+    (``briefing_weather.fetch_briefing_weather``) is the only caller that
+    passes it.
+    """
+    params: dict[str, object] = {
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,weather_code,precipitation_probability,precipitation,wind_speed_10m",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
         "timezone": tz,
-        "forecast_days": 3,
+        "forecast_days": forecast_days,
     }
+    if temperature_unit:
+        params["temperature_unit"] = temperature_unit
     return f"https://api.open-meteo.com/v1/forecast?{urlencode(params)}"
 
 

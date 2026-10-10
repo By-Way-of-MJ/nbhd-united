@@ -96,8 +96,17 @@ class Command(BaseCommand):
         """Read gateway state (with snapshot fallback), augment with system seeds, upsert."""
         from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
         from apps.cron.postgres_canonical import upsert_from_gateway_jobs
+        from apps.cron.share_cron_sync import tenant_uses_file_cron_sync
         from apps.orchestrator.config_generator import build_cron_seed_jobs
         from apps.orchestrator.services import _extract_cron_jobs
+
+        # OpenClaw 9.4 on an already-canonical tenant: Postgres IS the truth and
+        # the container only runs what the signed file published from it. The
+        # gateway list is gated, and cron_jobs_snapshot is now metadata-only
+        # (no payloads), so the fallback below would overwrite or delete real
+        # rows. Refuse.
+        if tenant.postgres_cron_canonical and tenant_uses_file_cron_sync(tenant):
+            raise CommandError("already canonical on OpenClaw 9.4 — Postgres is the source of truth; nothing to import")
 
         # 1. Read current container state (truth-of-record today).
         gateway_jobs: list[dict] = []

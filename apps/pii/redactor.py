@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from apps.fuel import catalog as fuel_catalog
 from apps.pii.config import ADDRESS_CONTEXT_LABELS, DEBERTA_LABEL_MAP, LABEL_SCORE_OVERRIDES, TIER_POLICIES
 from apps.pii.entity_registry import (
     canonical_key as _canonical_key,
@@ -35,9 +39,20 @@ from apps.pii.entity_registry import (
 )
 
 if TYPE_CHECKING:
+    from apps.pii.provisional import PiiIngress
     from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
+
+# Data-only dependency: PII imports the pure ``apps.fuel.catalog`` module so
+# public exercise vocabulary follows the shipped iOS picture catalog. No Fuel
+# models, Django runtime views, or exercise names from tenant data are imported.
+_ALPHA_TOKEN_RE = re.compile(r"[^a-z]+")
+
+
+def _span_tokens(matched_lower: str) -> list[str]:
+    """Alphabetic tokens of a lowercased span (digits/punct are separators)."""
+    return [token for token in _ALPHA_TOKEN_RE.split(matched_lower) if token]
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,21 @@ class RedactionOutcome:
     text: str
     confirmed: bool
     reason: str
+
+
+class NeuralDetectorUnavailable(Exception):
+    """The neural detector did not complete, although deterministic checks may have."""
+
+
+_neural_detector_outcome = threading.local()
+
+
+def _reset_neural_detector_outcome() -> None:
+    _neural_detector_outcome.available = None
+
+
+def _neural_detector_available() -> bool | None:
+    return getattr(_neural_detector_outcome, "available", None)
 
 
 _CONFIRMED_REDACTION_TOKEN = object()
@@ -420,6 +450,17 @@ _FITNESS_TOKENS = frozenset(
         "skullcrusher",
         "skullcrushers",
         "preworkout",
+        # Catalog-safe anatomy/movement tokens. Deliberately excludes surnames
+        # and places such as arnold, pendlay, copenhagen, and meadows.
+        "tricep",
+        "triceps",
+        "bicep",
+        "biceps",
+        "calf",
+        "calves",
+        "pushdown",
+        "pushdowns",
+        "lateral",
     }
 )
 
@@ -427,10 +468,52 @@ _FITNESS_TOKENS = frozenset(
 # from ``_FITNESS_TOKENS`` for phrases whose only distinctive token is unsafe to
 # add bare — e.g. "glute bridge march" (the 'march' token collides with the
 # month, so we match the whole phrase instead of adding 'march').
-_FITNESS_PHRASES = frozenset(
+_CATALOG_FITNESS_PHRASES = frozenset(
+    " ".join(tokens) for raw in fuel_catalog.fitness_phrases() if len(tokens := _span_tokens(raw.casefold())) >= 2
+)
+_FITNESS_PHRASES = (
+    frozenset(
+        {
+            "glute bridge march",
+            "glute bridge marches",
+            # Required whole-span protections absent from catalog v2. They stay
+            # phrase-only because both distinctive tokens are real surnames.
+            "zercher squat",
+            "kroc row",
+        }
+    )
+    | _CATALOG_FITNESS_PHRASES
+)
+
+# Safe as exact bare-token retire targets. This is narrower than
+# ``_FITNESS_TOKENS`` so adding a partial-span suppression never silently makes
+# an old binding destructively eligible for retirement.
+_RETIRABLE_FITNESS_TOKENS = frozenset(
     {
-        "glute bridge march",
-        "glute bridge marches",
+        "tricep",
+        "triceps",
+        "bicep",
+        "biceps",
+        "calf",
+        "calves",
+        "pushdown",
+        "pushdowns",
+        "lateral",
+    }
+)
+_FITNESS_SURNAME_TOKENS = frozenset(
+    {
+        "arnold",
+        "farmer",
+        "jefferson",
+        "hindu",
+        "copenhagen",
+        "cossack",
+        "hack",
+        "meadows",
+        "pendlay",
+        "zercher",
+        "kroc",
     }
 )
 
@@ -615,6 +698,9 @@ _DEMONYM_STOPLIST = frozenset(
         "russian",
         "mexican",
         "brazilian",
+        "romanian",
+        "bulgarian",
+        "nordic",
     }
 )
 
@@ -634,10 +720,6 @@ _NAME_COLLISION_STOPLIST = frozenset(
         "joy",
     }
 )
-
-# Splits a lowercased span into alphabetic tokens for the fitness / common-word
-# guards ("pec deck flys" -> ['pec', 'deck', 'flys']).
-_ALPHA_TOKEN_RE = re.compile(r"[^a-z]+")
 
 # ISO date / ISO-week / slash-date spans the model tags as LOCATION (ZIPCODE
 # collapses to LOCATION too) — e.g. "2026-W25" @0.99, "2026-06-30". Anchored
@@ -688,12 +770,7 @@ def _has_birth_context(text: str, start: int, end: int) -> bool:
     return bool(_BIRTH_CONTEXT_RE.search(text[lo:hi]))
 
 
-def _span_tokens(matched_lower: str) -> list[str]:
-    """Alphabetic tokens of a lowercased span (digits/punct are separators)."""
-    return [t for t in _ALPHA_TOKEN_RE.split(matched_lower) if t]
-
-
-def _is_fitness_span(matched_lower: str) -> bool:
+def _is_fitness_span(matched_lower: str, *, full_text: str = "") -> bool:
     """True when a span is an exercise note, not PII.
 
     Whole-span exact match against the canonical vocab / phrase sets, plus a
@@ -701,7 +778,16 @@ def _is_fitness_span(matched_lower: str) -> bool:
     'inyasa flow') still suppress. Only tokens ≥3 chars count, to avoid a stray
     two-letter fragment tripping the guard.
     """
-    if matched_lower in _FITNESS_VOCAB or matched_lower in _FITNESS_PHRASES:
+    matched_phrase = " ".join(_span_tokens(matched_lower))
+    leaf_phrase = " ".join(_span_tokens(full_text.casefold())) if full_text else ""
+    if matched_lower in _FITNESS_VOCAB or matched_phrase in _FITNESS_PHRASES:
+        return True
+    # The detector may return only the surname-shaped token from an otherwise
+    # exact exercise leaf ("Arnold" from "Arnold press"). The recursive store
+    # authors each detail_json leaf alone, so exact whole-leaf membership is the
+    # narrow contextual guard: prose such as "Met Arnold for lunch" is not a
+    # catalog phrase and remains PII.
+    if leaf_phrase in _FITNESS_PHRASES:
         return True
     return any(len(t) >= 3 and t in _FITNESS_TOKENS for t in _span_tokens(matched_lower))
 
@@ -769,6 +855,15 @@ def is_never_a_name(text: str) -> bool:
         return False
     if any(token in _RETIRE_EXEMPT_TOKENS for token in tokens):
         return False
+    # Whole catalog phrases are safe to retire, but never a bare surname/place
+    # token even if that token happens to be a catalog alias (e.g. "Pendlay").
+    if len(tokens) == 1 and tokens[0] in _FITNESS_SURNAME_TOKENS:
+        return False
+    joined = " ".join(tokens)
+    if len(tokens) >= 2 and joined in _FITNESS_PHRASES:
+        return True
+    if len(tokens) == 1 and tokens[0] in _RETIRABLE_FITNESS_TOKENS:
+        return True
     return _is_fleet_stoplisted_span(tokens)
 
 
@@ -940,6 +1035,7 @@ class DetectedEntity:
     start: int
     end: int
     score: float
+    source: str = "neural"
 
 
 def redact_text(
@@ -1005,7 +1101,11 @@ def redact_text(
 MINT_ALL = "all"  # human-typed chat ingress — mint everything (legacy behavior)
 MINT_VALIDATED = "validated"  # tool responses — mint only validator-approved types
 MINT_NEVER = "never"  # agent-authored markdown (memory sync, co-pilot) — mint nothing
-_MINT_POLICIES = frozenset({MINT_ALL, MINT_VALIDATED, MINT_NEVER})
+# Read-only model context: detect unknown PII and mask it without allocating a
+# placeholder or touching the tenant registry/counters. Unlike NEVER, this does
+# not leave unfamiliar detected values in the output.
+MINT_REDACT_ONLY = "redact_only"
+_MINT_POLICIES = frozenset({MINT_ALL, MINT_VALIDATED, MINT_NEVER, MINT_REDACT_ONLY})
 
 
 def _structured_validator():
@@ -1060,7 +1160,7 @@ def _should_mint_new(mint: str, entity_type: str, text: str) -> bool:
     """
     if mint == MINT_ALL:
         return True
-    if mint == MINT_NEVER:
+    if mint in {MINT_NEVER, MINT_REDACT_ONLY}:
         return False
     validate = _structured_validator()
     if validate is None:
@@ -1088,6 +1188,21 @@ def _known_name_edge_anchor(edge_char: str) -> str:
     from apps.pii.hygiene import contains_cjk
 
     return "" if contains_cjk(edge_char) else r"\b"
+
+
+def known_name_pattern(original: str) -> re.Pattern:
+    """Compile the exact conditional-boundary matcher used for substitution."""
+    esc = re.escape(original)
+    left = _known_name_edge_anchor(original[:1])
+    right = _known_name_edge_anchor(original[-1:])
+    return re.compile(left + esc + right, re.IGNORECASE)
+
+
+def known_value_matches(text: str, original: str) -> bool:
+    """Whether raw text contains a value exactly where substitution would."""
+    if not text or not original or _is_degenerate_span(original):
+        return False
+    return bool(known_name_pattern(original).search(text))
 
 
 def _replace_known_only(
@@ -1122,10 +1237,7 @@ def _replace_known_only(
             continue
         if _is_degenerate_span(original):
             continue
-        esc = re.escape(original)
-        left = _known_name_edge_anchor(original[:1])
-        right = _known_name_edge_anchor(original[-1:])
-        pattern = re.compile(left + esc + right, re.IGNORECASE)
+        pattern = known_name_pattern(original)
         out = _sub_outside_placeholders(out, pattern, placeholder)
     return out
 
@@ -1392,6 +1504,7 @@ def redact_user_message(
     *,
     allow_user_name: bool = True,
     mint: str = MINT_ALL,
+    ingress: PiiIngress | None = None,
 ) -> str:
     """Redact PII in a user's message before forwarding to OpenClaw.
 
@@ -1418,6 +1531,7 @@ def redact_user_message(
         tenant,
         allow_user_name=allow_user_name,
         mint=mint,
+        ingress=ingress,
     ).text
 
 
@@ -1427,12 +1541,15 @@ def redact_user_message_checked(
     *,
     allow_user_name: bool = True,
     mint: str = MINT_ALL,
+    ingress: PiiIngress | None = None,
 ) -> RedactionOutcome:
     """Redact a user message and report whether the engine completed.
 
     Disabled-policy and exception paths retain the existing fail-open text
     behavior, but are explicitly unconfirmed so downstream persistence cannot
-    mistake the original string for placeholder-space text.
+    mistake the original string for placeholder-space text. ``MINT_REDACT_ONLY``
+    reuses known bindings and masks unknown detected spans as ``[REDACTED]``
+    without creating bindings. Model-context readers must require ``confirmed``.
     """
     if not text or not text.strip():
         return RedactionOutcome(text=text, confirmed=False, reason="empty-input")
@@ -1442,11 +1559,26 @@ def redact_user_message_checked(
     if not policy.get("enabled", False):
         return RedactionOutcome(text=text, confirmed=False, reason="redaction-disabled")
 
+    _reset_neural_detector_outcome()
     try:
-        redacted = _redact_user_message(text, tenant, policy, allow_user_name=allow_user_name, mint=mint)
-    except Exception:
-        logger.exception("User message PII redaction failed — returning original")
+        redacted = _redact_user_message(
+            text,
+            tenant,
+            policy,
+            allow_user_name=allow_user_name,
+            mint=mint,
+            ingress=ingress,
+        )
+    except Exception as exc:
+        if mint == MINT_REDACT_ONLY:
+            # Detector exceptions may contain the private input; context readers
+            # drop this unconfirmed result and need only the error class.
+            logger.warning("Read-only PII redaction failed: %s", type(exc).__name__)
+        else:
+            logger.exception("User message PII redaction failed — returning original")
         return RedactionOutcome(text=text, confirmed=False, reason="redaction-error")
+    if _neural_detector_available() is not True:
+        return RedactionOutcome(text=redacted, confirmed=False, reason="neural-unavailable")
     return RedactionOutcome(text=redacted, confirmed=True, reason="redacted")
 
 
@@ -1457,6 +1589,7 @@ def _redact_user_message(
     *,
     allow_user_name: bool = True,
     mint: str = MINT_ALL,
+    ingress: PiiIngress | None = None,
 ) -> str:
     """Internal: redact user message with known + new entity detection."""
     existing_map = getattr(tenant, "pii_entity_map", None) or {}
@@ -1475,6 +1608,20 @@ def _redact_user_message(
     # retire backfill would be cosmetic: Step 1 never consults ``_filter_results``,
     # so a retired "calendar" binding would keep masking the word forever.
     inverted_ci = _inverted_names_ci(existing_map, include_retired=False)
+    expired_ingress_ci: dict[str, tuple[str, str]] = {}
+    if ingress is not None:
+        from apps.pii.provisional import expired_placeholder_for_name
+
+        for raw in existing_map.values():
+            if not isinstance(raw, dict) or raw.get("retired_reason") != "provisional-expired":
+                continue
+            original = _entry_name(raw)
+            ci_key = _canonical_key(original)
+            if not ci_key or ci_key in expired_ingress_ci:
+                continue
+            placeholder = expired_placeholder_for_name(existing_map, denylist, original)
+            if placeholder:
+                expired_ingress_ci[ci_key] = (original.strip(), placeholder)
     out = text
     # Longest names first so "Jay Haughton" matches before "Jay".
     for original, placeholder in sorted(
@@ -1506,14 +1653,20 @@ def _redact_user_message(
         # punctuation as before. CJK edges also drop the anchor (unspaced
         # Japanese has no ``\b`` between "田中" and "です"), so a stored Japanese
         # name re-masks across turns without needing a fresh model detection.
-        esc = re.escape(original)
-        left = _known_name_edge_anchor(original[:1])
-        right = _known_name_edge_anchor(original[-1:])
-        pattern = re.compile(left + esc + right, re.IGNORECASE)
+        pattern = known_name_pattern(original)
         # Substitute only outside existing placeholders so a stored name that
         # contains a capital letter or ``_`` can never rewrite a placeholder's
         # interior (the Bug A nested-explosion class).
         out = _sub_outside_placeholders(out, pattern, placeholder)
+
+    # An eligible provisional-expired tombstone may mask THIS ingress with its
+    # historical placeholder, but redaction does not reactivate it. The raw
+    # post-redaction recorder performs the locked lifecycle transition/count.
+    # This pass also protects the returning event when neural detection misses.
+    for original, placeholder in sorted(expired_ingress_ci.values(), key=lambda x: -len(x[0])):
+        if not original or _is_degenerate_span(original):
+            continue
+        out = _sub_outside_placeholders(out, known_name_pattern(original), placeholder)
 
     # Step 2: Run detection on the (partially redacted) text for NEW entities.
     # Per-type counters for newly-minted placeholders are derived later from a
@@ -1579,6 +1732,10 @@ def _redact_user_message(
             known_replacements.append((result.start, result.end, inverted_ci[ci_key][1]))
             continue
 
+        if mint == MINT_REDACT_ONLY:
+            known_replacements.append((result.start, result.end, "[REDACTED]"))
+            continue
+
         # Mint-policy gate. Known entities were replaced above (always allowed);
         # a NEW binding is coined only when the policy vouches for this type/text.
         # Tool responses run ``validated`` — a neural PERSON/LOCATION span from an
@@ -1619,10 +1776,11 @@ def _redact_user_message(
             type(tenant)
             .objects.select_for_update()
             .filter(pk=tenant.pk)
-            .values("pii_entity_map", "pii_type_counters")
+            .values("pii_entity_map", "pii_denylist", "pii_type_counters")
             .first()
         ) or {}
         locked_map = locked_row.get("pii_entity_map") or {}
+        locked_denylist = locked_row.get("pii_denylist") or {}
         stored_counters = locked_row.get("pii_type_counters") or {}
 
         # Re-derive per-type counters from the LOCKED snapshot, not the stale one
@@ -1635,11 +1793,10 @@ def _redact_user_message(
 
         # Case-insensitive view of the locked map so a name already present
         # collapses onto its existing placeholder instead of minting a dup.
-        # Retired bindings are excluded: a tombstone is not a reuse target, so a
-        # name that genuinely comes back mints a FRESH placeholder rather than
-        # resurrecting the retired one (directive A9).
+        # Ordinary retired bindings are excluded. An eligible provisional-expired
+        # tombstone is handled separately below so ingress can borrow its old
+        # placeholder without mutating lifecycle state or minting a duplicate.
         locked_inverted_ci = _inverted_names_ci(locked_map, include_retired=False)
-
         merged = dict(locked_map)
         for start, end, etype, original, score in to_mint:
             ci_key = _canonical_key(original)
@@ -1675,11 +1832,51 @@ def _redact_user_message(
                 )
                 continue
 
+            # The tenant instance may have been stale when Step 1 ran. Recheck
+            # the complete locked map before minting so concurrent returns of an
+            # expired value both borrow the historical placeholder rather than
+            # creating duplicate bindings. Lifecycle mutation remains the raw
+            # sighting recorder's responsibility.
+            from apps.pii.provisional import expired_placeholder_for_name
+
+            expired_placeholder = expired_placeholder_for_name(
+                locked_map,
+                locked_denylist,
+                original,
+            )
+            if expired_placeholder:
+                replacements.append((start, end, expired_placeholder))
+                continue
+
+            # Reuse can be denied by a higher-precedence sibling (for example,
+            # an owner-retired binding without a denylist entry). In that case
+            # a fresh mint intentionally preserves pre-lane production
+            # semantics. Denylisted values never reach this branch because
+            # _filter_results drops their detections before locked arbitration.
             count = locked_counters.get(etype, 0) + 1
             locked_counters[etype] = count
             placeholder = f"[{etype}_{count}]"
             replacements.append((start, end, placeholder))
-            entry = _entry_storage(original)
+            from apps.pii.provisional import should_mint_provisional
+
+            if should_mint_provisional(tenant, etype, original, ingress):
+                seen_at = ingress.occurred_at.isoformat()
+                entry = _entry_storage(
+                    original,
+                    provisional=True,
+                    first_seen_at=seen_at,
+                    last_seen_at=seen_at,
+                    seen_events=[],
+                    seen_dates=[],
+                )
+            else:
+                entry = _entry_storage(original)
+            logger.info(
+                "pii_policy_mint tenant=%s type=%s outcome=%s",
+                getattr(tenant, "id", "?"),
+                etype,
+                "provisional" if entry.get("provisional") else "permanent",
+            )
             new_map_entries[placeholder] = entry
             merged[placeholder] = entry
             if ci_key:
@@ -1713,9 +1910,11 @@ def _redact_user_message(
             )
 
     # Update in-memory too, mirroring the persisted write.
-    if new_map_entries:
-        tenant.pii_entity_map = merged
-        tenant.pii_type_counters = locked_counters
+    # Install the locked snapshot even when every requested mint collapsed onto
+    # a concurrent writer's binding. The post-redaction ingress recorder must
+    # see that binding to close the first-appearance mint/count race.
+    tenant.pii_entity_map = merged
+    tenant.pii_type_counters = locked_counters
 
     # Apply replacements (after the lock — string slicing needs no DB). Numbers
     # baked here match the persisted map because they were assigned under lock.
@@ -1799,8 +1998,13 @@ def _redact_tool_value(
     tenant: Tenant,
     policy: dict,
     skip_keys: frozenset,
+    path: tuple = (),
 ) -> Any:
     """Recursively redact string values in a JSON structure."""
+    from apps.pii.store_registry import is_cardio_machine_path
+
+    if is_cardio_machine_path(path, value):
+        return value
     if isinstance(value, str):
         if not value.strip():
             return value
@@ -1812,25 +2016,30 @@ def _redact_tool_value(
         return redact_user_message(value, tenant, allow_user_name=False, mint=MINT_VALIDATED)
     elif isinstance(value, dict):
         return {
-            k: (v if k in skip_keys else _redact_tool_value(v, tenant, policy, skip_keys)) for k, v in value.items()
+            k: (v if k in skip_keys else _redact_tool_value(v, tenant, policy, skip_keys, (*path, k)))
+            for k, v in value.items()
         }
     elif isinstance(value, list):
-        return [_redact_tool_value(item, tenant, policy, skip_keys) for item in value]
+        return [_redact_tool_value(item, tenant, policy, skip_keys, (*path, index)) for index, item in enumerate(value)]
     else:
         return value
 
 
-def _annotate_model_value(value: Any, entity_map: dict[str, Any], skip_keys: frozenset) -> Any:
+def _annotate_model_value(value: Any, entity_map: dict[str, Any], skip_keys: frozenset, path: tuple = ()) -> Any:
     """Recursively annotate already-redacted tool data at its model boundary."""
+    from apps.pii.store_registry import is_cardio_machine_path
+
+    if is_cardio_machine_path(path, value):
+        return value
     if isinstance(value, str):
         return annotate_model_context(value, entity_map)
     if isinstance(value, dict):
         return {
-            key: (item if key in skip_keys else _annotate_model_value(item, entity_map, skip_keys))
+            key: (item if key in skip_keys else _annotate_model_value(item, entity_map, skip_keys, (*path, key)))
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_annotate_model_value(item, entity_map, skip_keys) for item in value]
+        return [_annotate_model_value(item, entity_map, skip_keys, (*path, index)) for index, item in enumerate(value)]
     return value
 
 
@@ -1852,10 +2061,32 @@ def _has_adjacent_address_label(ent: dict, model_results: list[dict], max_gap: i
     return False
 
 
+_detection_cache = ContextVar("pii_detection_cache", default=None)
+
+
+@contextmanager
+def reuse_detections():
+    """Reuse successful neural spans for identical text within one operation.
+
+    Cache only raw model output, never policy decisions, redacted text or receipts.
+    Each pass still applies its own thresholds, registry and pattern recognizers.
+    No failures or deadline-bound calls are cached. The cache is reset on exit
+    for synchronous callers. An async child created inside the scope inherits
+    the context and can retain its cache dictionary after the parent exits.
+    """
+    token = _detection_cache.set({})
+    try:
+        yield
+    finally:
+        _detection_cache.reset(token)
+
+
 def _detect_pii(
     text: str,
     entities: list[str],
     score_threshold: float,
+    *,
+    deadline: float | None = None,
 ) -> list[DetectedEntity]:
     """Detect PII using DeBERTa (contextual) + Presidio regex (financial).
 
@@ -1890,8 +2121,35 @@ def _detect_pii(
     # Pattern recognizers below still run, so financial PII stays redacted.
     try:
         pii_pipeline = get_pii_pipeline()
-        model_results = pii_pipeline(detect_text)
-    except Exception:
+        if deadline is None:
+            cached = _detection_cache.get()
+            key = (id(pii_pipeline), detect_text)
+            if cached is not None and key in cached:
+                model_results = cached[key]
+            else:
+                model_results = pii_pipeline(detect_text)
+                if cached is not None:
+                    cached[key] = model_results
+        else:
+            from time import monotonic
+
+            from apps.pii.shared_client import SharedPiiPipeline
+
+            if monotonic() >= deadline:
+                raise TimeoutError("Redaction deadline exceeded")
+            if isinstance(pii_pipeline, SharedPiiPipeline):
+                # Keep the process-wide client warm without charging short
+                # speculative deadlines to the normal chat circuit breaker.
+                model_results = pii_pipeline.detect_ephemeral(detect_text, deadline=deadline)
+            else:
+                model_results = pii_pipeline(detect_text)
+            if monotonic() >= deadline:
+                raise TimeoutError("Redaction deadline exceeded")
+        _neural_detector_outcome.available = True
+    except Exception as exc:
+        _neural_detector_outcome.available = False
+        if deadline is not None and (isinstance(exc, TimeoutError) or getattr(exc, "outcome", None) == "timeout"):
+            raise TimeoutError("Redaction deadline exceeded") from None
         model_results = []
 
     for ent in model_results:
@@ -1965,6 +2223,7 @@ def _detect_pii(
                             start=r.start,
                             end=r.end,
                             score=r.score,
+                            source="presidio",
                         )
                     )
 
@@ -2029,6 +2288,8 @@ def _merge_adjacent_spans(results: list[DetectedEntity], text: str = "") -> list
                 start=prev.start,
                 end=current.end,
                 score=min(prev.score, current.score),
+                # This merge precedes Presidio append, so sources are homogeneous; reordering it would mislabel provenance.
+                source=prev.source,
             )
         else:
             merged.append(current)
@@ -2113,6 +2374,10 @@ def _redact(
             if ci_key and ci_key in inverted_ci:
                 replacements.append((result.start, result.end, inverted_ci[ci_key][1]))
                 continue
+
+        if mint == MINT_REDACT_ONLY:
+            replacements.append((result.start, result.end, "[REDACTED]"))
+            continue
 
         # Mint-policy gate: known entities were reused above; a NEW binding is
         # coined only when the policy allows it for this type/text (agent-authored
@@ -2218,7 +2483,7 @@ def _filter_results(
             if _is_numeric_or_unit_span(matched_text):
                 _log_skip(tenant, result, "numeric", len(matched_text))
                 continue
-            if _is_fitness_span(matched_lower):
+            if _is_fitness_span(matched_lower, full_text=text):
                 _log_skip(tenant, result, "fitness_vocab", len(matched_text))
                 continue
             if _is_common_word_span(matched_lower, _at_sentence_start(text, result.start)):
@@ -2259,12 +2524,37 @@ def _filter_results(
     return filtered
 
 
+_PRESIDIO_STRUCTURED_TYPES = frozenset({"EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "IBAN_CODE"})
+
+
+def _is_validated_presidio_span(result: DetectedEntity) -> bool:
+    """Whether a post-filter span came from a structured Presidio recognizer."""
+    return result.source == "presidio" and result.entity_type in _PRESIDIO_STRUCTURED_TYPES
+
+
+def _apply_structured_precedence(structured: DetectedEntity, other: DetectedEntity) -> DetectedEntity:
+    """Keep structured provenance, unioning a same-type neural span's extent."""
+    if other.source == "neural" and other.entity_type == structured.entity_type:
+        return DetectedEntity(
+            entity_type=structured.entity_type,
+            start=min(structured.start, other.start),
+            end=max(structured.end, other.end),
+            score=structured.score,
+            source=structured.source,
+        )
+    return structured
+
+
 def _deduplicate_overlapping(results: list) -> list:
     """Remove overlapping entity spans, keeping the best match.
 
-    When two entities overlap (e.g. PERSON "Email bob@test.com" vs
-    EMAIL_ADDRESS "bob@test.com"), keep the one with the higher confidence
-    score. On ties, prefer the more specific (shorter) span.
+    A validated structured Presidio result always beats an overlapping neural
+    result, so score-less Liquid spans cannot outrank an email, phone, card, or
+    IBAN merely because the adapter emits ``score=1.0``. When both spans have the
+    same entity type, keep the structured provenance but union their boundaries
+    so precedence cannot expose a neural-only prefix or suffix. For spans from
+    the same source class, keep the higher confidence score; on ties, prefer the
+    more specific (shorter) span.
     """
     if not results:
         return results
@@ -2281,6 +2571,14 @@ def _deduplicate_overlapping(results: list) -> list:
         prev = deduplicated[-1]
         # Check for overlap: current starts before previous ends
         if result.start < prev.end:
+            prev_is_structured = _is_validated_presidio_span(prev)
+            result_is_structured = _is_validated_presidio_span(result)
+            if prev_is_structured != result_is_structured:
+                if result_is_structured:
+                    deduplicated[-1] = _apply_structured_precedence(result, prev)
+                else:
+                    deduplicated[-1] = _apply_structured_precedence(prev, result)
+                continue
             # Keep the higher-scoring one; on tie, prefer shorter (more specific)
             if result.score > prev.score or (
                 result.score == prev.score and (result.end - result.start) < (prev.end - prev.start)

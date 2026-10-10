@@ -30,7 +30,6 @@ from apps.tenants.models import Tenant
 from . import access
 from .models import (
     AbsorbedItem,
-    Circle,
     CircleMembership,
     FriendMessage,
     Friendship,
@@ -58,10 +57,11 @@ _MAX_SPARKS = 5
     order=63,
 )
 def render_neighborhood(tenant: Tenant) -> str:
-    """TIGHT (≤~1KB): accepted neighbor handles + up to 5 newest un-purged
-    absorbed sparks (title + @handle) + a chat POINTER (thread + @handle + count,
-    NEVER message text — USER.md is written to the share file, so raw friend text
-    must stay out; the agent pulls the redacted text at turn time). Never raises."""
+    """TIGHT (≤~1KB): accepted neighbor handles + POINTERS only — how many un-purged
+    sparks each neighbor shared and how many new chat messages wait. NEVER a spark's
+    label, a Circle's name or message text: USER.md is trusted on every turn and
+    never taints one, so nothing another person wrote (or can rename) may sit in it.
+    The agent pulls the fenced text with nbhd_neighborhood_context. Never raises."""
     try:
         edges = Friendship.objects.filter(
             Q(requester=tenant) | Q(addressee=tenant), status=Friendship.Status.ACCEPTED
@@ -93,23 +93,24 @@ def render_neighborhood(tenant: Tenant) -> str:
                     "tenant_id", "handle"
                 )
             )
-            # Tag circle-sourced sparks with their circle so the agent honors the
-            # no-cross-Circle-leakage rule (design §12 / AGENTS.md gate).
-            circle_ids = [s.circle_id for s in sparks if s.circle_id]
-            circle_name_by_id = (
-                dict(Circle.objects.filter(id__in=circle_ids).values_list("id", "name")) if circle_ids else {}
-            )
             lines.append(
-                "Sparks neighbors shared (hold until useful, then surface naturally; never claim you shared anything):"
+                "Sparks neighbors shared (call nbhd_neighborhood_context to read them; hold until useful, "
+                "then surface naturally; never claim you shared anything):"
             )
+            # Counts per neighbor only. A Circle-sourced spark keeps the
+            # no-cross-Circle-leakage rule (design §12 / AGENTS.md gate) without
+            # printing the Circle's name, which its creator chose.
+            per_neighbor: dict = {}
             for spark in sparks:
-                who = handle_by_id.get(spark.from_tenant_id)
-                title = (spark.label or "a shared spark").strip()[:100]
-                circle_name = circle_name_by_id.get(spark.circle_id)
-                suffix = f" — @{who}" if who else ""
-                if circle_name:
-                    suffix += f" (in {circle_name}; keep it in that Circle)"
-                lines.append(f"- {title}{suffix}")
+                entry = per_neighbor.setdefault(spark.from_tenant_id, {"count": 0, "circle": False})
+                entry["count"] += 1
+                entry["circle"] = entry["circle"] or bool(spark.circle_id)
+            for from_id, entry in per_neighbor.items():
+                who = handle_by_id.get(from_id)
+                line = f"- {entry['count']} from @{who}" if who else f"- {entry['count']} from a neighbor"
+                if entry["circle"]:
+                    line += " (shared in a Circle; keep it in that Circle)"
+                lines.append(line)
         if chat_counts:
             lines.append("New neighborhood messages (call nbhd_neighborhood_context to read them):")
             for entry in chat_counts:
@@ -137,10 +138,12 @@ def render_missions(tenant: Tenant) -> str:
     try:
         from . import projection
 
+        if _projects_enabled(tenant):
+            return ""  # the Projects v2 section replaces this one
         memberships = list(
-            SharedGoalMembership.objects.filter(
-                tenant=tenant, status="active", shared_goal__status="active"
-            ).select_related("shared_goal")[:3]
+            access.mission_memberships()
+            .filter(tenant=tenant, status="active", shared_goal__status="active")
+            .select_related("shared_goal")[:3]
         )
         if not memberships:
             return ""
@@ -149,10 +152,83 @@ def render_missions(tenant: Tenant) -> str:
             goal = membership.shared_goal
             pct = projection.build_mission_status(goal)["overall_pct"]
             commit = f"you: {membership.commitment}" if membership.commitment else "you: showing up"
-            lines.append(f"- {goal.title} — {commit}; crew {pct}% this window")
+            # Never the title: any member can rename a mission, and USER.md is trusted.
+            if str(goal.created_by_id) == str(tenant.id):
+                name = "a mission you started"
+            else:
+                creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
+                name = f"a mission with @{creator.handle}" if creator and creator.handle else "a shared mission"
+            lines.append(f"- {name} — {commit}; crew {pct}% this window")
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 — an envelope section must never break a turn
         logger.warning("render_missions failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
+        return ""
+
+
+def _projects_enabled(tenant) -> bool:
+    from .project_flags import projects_v2_enabled
+
+    return bool(getattr(tenant, "neighborhood_enabled", False)) and projects_v2_enabled(tenant)
+
+
+@register_section(
+    key="projects",
+    heading="## Shared projects",
+    enabled=_projects_enabled,
+    refresh_on=(SharedGoalMembership,),
+    order=65,
+)
+def render_projects(tenant: Tenant) -> str:
+    """Projects v2 pointer (≤3 projects). USER.md is written to the share file, so
+    only the user's OWN words and counts go here — never text another member wrote
+    (a project titled by someone else is named by its creator's @handle). The live
+    detail is one tool call away. Never raises."""
+    try:
+        from . import project_services
+
+        memberships = list(access.my_active_project_memberships(tenant)[:3])
+        if not memberships:
+            return ""
+        # Only name the tool when this tenant's image actually ships it.
+        from .project_flags import project_tools_ready
+
+        lines = (
+            ["Call nbhd_project_context for details before answering about a project."]
+            if project_tools_ready(tenant)
+            else []
+        )
+        for membership in memberships:
+            goal = membership.shared_goal
+            plan = project_services.get_plan(tenant, goal.id)
+            # Never the title: any member can rename a project, and USER.md is trusted.
+            if str(goal.created_by_id) == str(tenant.id):
+                name = "a project you started"
+            else:
+                creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
+                name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
+            mine = [s for s in plan["steps"] if any(o["id"] == str(membership.id) for o in s.get("owners", []))]
+            # in_review = I've ticked it off; it only waits for someone else's look.
+            open_mine = [s for s in mine if s["status"] not in ("done", "skipped", "in_review")]
+            asks = sum(
+                1
+                for s in plan["steps"]
+                for a in s.get("assignments", [])
+                if a["membership_id"] == str(membership.id) and a["status"] == "asked"
+            )
+            waiting = sum(1 for s in open_mine if s.get("blocked_by_open"))
+            bits = [f"{plan['done_count']}/{plan['total']} steps done"]
+            if open_mine:
+                nxt = sorted(open_mine, key=lambda s: s.get("start_date") or "9999")[0]
+                # Never the step's title: a project owner can edit a step someone else wrote.
+                bits.append("your next step" + (f" is due {nxt['due_date']}" if nxt.get("due_date") else " is open"))
+            if waiting:
+                bits.append(f"{waiting} of your steps waiting on others")
+            if asks:
+                bits.append(f"{asks} ask(s) for you to answer")
+            lines.append(f"- {name} — " + "; ".join(bits))
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 — an envelope section must never break a turn
+        logger.warning("render_projects failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
         return ""
 
 
@@ -164,10 +240,10 @@ def _schedule_recipient_push(tenant_id) -> None:
         return
 
     def _push() -> None:
-        from apps.orchestrator.workspace_envelope import push_user_md
+        from apps.orchestrator.workspace_envelope import TRIGGER_FRIENDS, push_user_md
 
         try:
-            push_user_md(str(tenant_id), debounce_seconds=0)
+            push_user_md(str(tenant_id), debounce_seconds=0, trigger=TRIGGER_FRIENDS)
         except Exception:
             logger.warning("friends recipient USER.md push failed for %s", str(tenant_id)[:8], exc_info=True)
 
@@ -224,10 +300,21 @@ def _refresh_mission_crew(sender, instance, **kwargs) -> None:
     """A crew member's activity changes everyone's crew line — refresh ALL active
     members' USER.md (the registry's tenant-FK receiver would only refresh the
     update's author). Defensive: never raises."""
+    from apps.orchestrator.envelope_registry import refresh_suppressed
+
+    if refresh_suppressed():
+        return
+    refresh_project_members(instance.shared_goal_id)
+
+
+def refresh_project_members(mission_id, *, include_invited=False):
+    """One final refresh per active member after a project batch commits."""
     try:
-        member_ids = SharedGoalMembership.objects.filter(
-            shared_goal_id=instance.shared_goal_id, status="active"
-        ).values_list("tenant_id", flat=True)
+        member_ids = (
+            access.mission_memberships()
+            .filter(shared_goal_id=mission_id, status__in=["active", "invited"] if include_invited else ["active"])
+            .values_list("tenant_id", flat=True)
+        )
         for tenant_id in member_ids:
             _schedule_recipient_push(tenant_id)
     except Exception:  # noqa: BLE001

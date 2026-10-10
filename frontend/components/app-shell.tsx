@@ -13,6 +13,7 @@ import { BrandLogo, BrandIcon } from "@/components/brand-logo";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { SiteFooter } from "@/components/site-footer";
 import { SynapseNetwork } from "@/components/landing/synapse-network";
+import { OpenSkyShell } from "@/components/open-sky/shell";
 import {
   IconJournal,
   IconConstellation,
@@ -53,6 +54,7 @@ function useNavItems(
     gravity_available?: boolean;
     fuel_enabled?: boolean;
     core_enabled?: boolean;
+    neighborhood_enabled?: boolean;
     friends_enabled?: boolean;
   } | null,
 ): NavItem[] {
@@ -74,7 +76,7 @@ function useNavItems(
   if (tenant?.core_enabled) {
     items.push({ href: "/core", label: "Core", icon: IconCore });
   }
-  if (tenant?.friends_enabled) {
+  if (tenant?.neighborhood_enabled) {
     items.push({ href: "/friends", label: "Neighborhood", icon: IconNeighborhood });
   }
   items.push({ href: "/settings", label: "Settings", icon: IconSettings });
@@ -269,9 +271,20 @@ export function AppShell({ children }: { children: ReactNode }) {
   const router = useRouter();
   const [headerBorder, setHeaderBorder] = useState(false);
 
-  const isPublicPage = publicPages.includes(pathname) || pathname.startsWith("/legal/");
-  const { data: tenant } = useTenantQuery();
+  const isInvitePage = pathname === "/friends/invite" || pathname.startsWith("/friends/invite/");
+  const isPublicPage = isInvitePage || publicPages.includes(pathname) || pathname.startsWith("/legal/");
+  const { data: tenant } = useTenantQuery(!isInvitePage);
   const navItems = useNavItems(tenant);
+  // Web redesign (Open Sky) — per-tenant gate; everyone else keeps this shell.
+  const openSky = !!tenant?.web_redesign && !isPublicPage;
+
+  // Scope the Open Sky token overrides (globals.css `html.open-sky`) to the
+  // logged-in app of gated tenants; public/marketing pages never get them.
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.toggle("open-sky", openSky);
+    return () => root.classList.remove("open-sky");
+  }, [openSky]);
 
   // Scroll listener for header blur/border transition (main is the scroll container)
   useEffect(() => {
@@ -318,12 +331,20 @@ export function AppShell({ children }: { children: ReactNode }) {
     "/onboarding",
     "/yardtalk",
   ];
-  if (fullBleedPages.includes(pathname) || pathname === "/constellation/play") {
+  if (isInvitePage || fullBleedPages.includes(pathname) || pathname === "/constellation/play") {
     return (
       <ErrorBoundary>
         <a href="#main-content" className="skip-link">Skip to main content</a>
         <main id="main-content">{children}</main>
       </ErrorBoundary>
+    );
+  }
+
+  if (openSky) {
+    return (
+      <OpenSkyShell tenant={tenant} onLogout={handleLogout}>
+        {children}
+      </OpenSkyShell>
     );
   }
 

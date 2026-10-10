@@ -249,22 +249,29 @@ class DisableRlsExemptionTest(TestCase):
 
         from django.core.management import call_command
 
+        from apps.tenants.management.commands.disable_rls import RLS_KEEP_ENABLED
+
+        from .management.commands.check_friends_rls import FRIENDS_TABLES
+
+        self.assertTrue(set(FRIENDS_TABLES).issubset(RLS_KEEP_ENABLED))
         call_command("disable_rls", stdout=StringIO())
         with connection.cursor() as cur:
             cur.execute(
                 """
-                SELECT tablename FROM pg_tables
-                WHERE schemaname = 'public'
-                  AND tablename = ANY(%s)
-                  AND rowsecurity = true
-                ORDER BY tablename
+                SELECT c.relname FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname = ANY(%s)
+                  AND c.relrowsecurity = true
+                  AND c.relforcerowsecurity = true
+                ORDER BY c.relname
                 """,
-                [["shared_lessons", "lesson_share_grants", "friend_messages", "friend_sky_memberships"]],
+                [list(FRIENDS_TABLES)],
             )
             still_enabled = {r[0] for r in cur.fetchall()}
         self.assertEqual(
             still_enabled,
-            {"shared_lessons", "lesson_share_grants", "friend_messages", "friend_sky_memberships"},
+            set(FRIENDS_TABLES),
         )
 
 

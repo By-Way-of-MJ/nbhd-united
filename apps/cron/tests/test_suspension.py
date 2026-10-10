@@ -22,6 +22,7 @@ class CronSuspensionTestBase(TestCase):
             status=Tenant.Status.ACTIVE,
             container_id="oc-test-container",
             container_fqdn="oc-test.internal",
+            openclaw_version="2026.5.28",  # gateway path; 9.4 skips (Oc94SuspensionTest)
         )
 
     MOCK_JOBS = [
@@ -250,3 +251,23 @@ class CronDeliveryBlockTest(CronSuspensionTestBase):
         # Should NOT be blocked — may fail on telegram/rate limit, but not "blocked"
         if hasattr(response, "data") and isinstance(response.data, dict):
             self.assertNotEqual(response.data.get("status"), "blocked")
+
+
+class Oc94SuspensionTest(TestCase):
+    """9.4 gates cron.update; suspend/resume skip cleanly instead of reporting errors."""
+
+    @patch("apps.cron.suspension.invoke_gateway_tool")
+    def test_skips_without_gateway_calls_or_errors(self, mock_invoke):
+        user = User.objects.create_user(username="susp94", password="x", telegram_chat_id=12394)
+        tenant = Tenant.objects.create(
+            user=user,
+            status=Tenant.Status.ACTIVE,
+            container_id="oc-susp94",
+            container_fqdn="oc-susp94.internal",
+            openclaw_version="2026.9.4",
+        )
+        suspended = suspend_tenant_crons(tenant)
+        resumed = resume_tenant_crons(tenant)
+        self.assertEqual((suspended["errors"], suspended["skipped"]), (0, "file_cron_sync"))
+        self.assertEqual((resumed["errors"], resumed["skipped"]), (0, "file_cron_sync"))
+        mock_invoke.assert_not_called()
