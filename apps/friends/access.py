@@ -9,14 +9,11 @@ module (or a friends runtime view) touches the cross-tenant model managers
 ``.objects`` outside this file, or references ``Lesson.objects`` anywhere
 under ``apps/friends/``.
 
-Why this is load-bearing: Django connects to Postgres as a **BYPASSRLS
-superuser** today, so the PR8 ``FORCE ROW LEVEL SECURITY`` policies on
-``shared_lessons`` / ``lesson_share_grants`` / ``friend_messages`` are INERT
-belt-and-suspenders — they start enforcing only if the app connects as a
-non-BYPASSRLS role (run ``manage.py check_friends_rls`` for the live verdict).
-Until then cross-tenant isolation is 100% the Python filters in this module. A
-single missing edge/tenant filter leaks another user's private data with no DB
-net. Containing that risk to one audited module is the entire point.
+The Python filters in this module are the primary cross-tenant boundary.
+Production also enforces FORCE ROW LEVEL SECURITY as app_user through a
+transaction pooler. Request context and protected queries must share a
+transaction; trusted background work uses backstop_service_context below.
+Run ``manage.py check_friends_rls`` to inspect the connected role and policies.
 
 Addressing is always by opaque ``friendship_id`` / ``thread_id`` /
 ``circle_id``, never a client-supplied ``tenant_id`` — those ids exist only
@@ -70,25 +67,26 @@ def backstop_service_context():
     FORCE-RLS policies those tables fail closed on an unset GUC, so without this
     a background read would see zero rows and the feature would break.
 
-    A no-op when ``FRIENDS_DB_BACKSTOP`` is off, and harmless (inert) while the
-    app role bypasses RLS. On exit it restores ONLY ``app.service_role`` (including a nested service context) — never
-    ``app.tenant_id`` / ``app.user_id`` — so a middleware-set tenant GUC on an
-    in-request caller survives untouched."""
+    Opens a transaction (a savepoint when nested) before reading or setting
+    the transaction-local service flag. On exit it restores ONLY service_role,
+    never tenant_id/user_id. Rollback restores it on errors. Keep slow external
+    work outside this scope. A no-op when FRIENDS_DB_BACKSTOP is off."""
     if not getattr(settings, "FRIENDS_DB_BACKSTOP", True):
         yield
         return
-    from apps.tenants.middleware import set_rls_context
-
-    with connection.cursor() as cur:
-        cur.execute("SELECT current_setting('app.service_role', true)")
-        previous = cur.fetchone()[0] or ""
-    set_rls_context(service_role=True)
-    try:
+    # Read the previous value only AFTER pinning a backend. A nested atomic
+    # savepoint also restores SET LOCAL on rollback, including database errors.
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute("SELECT current_setting('app.service_role', true)")
+            previous = cur.fetchone()[0] or ""
+            cur.execute("SELECT set_config('app.service_role', 'true', true)")
         yield
-    finally:
-        if connection.connection is not None:
+        # On an exception, atomic rolls back the GUC with the savepoint. Never
+        # issue restoration SQL on a broken transaction or mask the exception.
+        if not connection.needs_rollback:
             with connection.cursor() as cur:
-                cur.execute("SELECT set_config('app.service_role', %s, false)", [previous])
+                cur.execute("SELECT set_config('app.service_role', %s, true)", [previous])
 
 
 def are_neighbors(a: Tenant, b: Tenant) -> bool:
@@ -383,6 +381,15 @@ def mark_scrub_pending(shared_lesson) -> None:
     )
 
 
+def mark_scrub_publish_failed(shared_lesson_id) -> None:
+    """Make a failed commit-time enqueue retryable without undoing a worker result."""
+    with backstop_service_context():
+        SharedLesson.objects.filter(id=shared_lesson_id, scrub_status=SharedLesson.ScrubStatus.PENDING).update(
+            scrub_status=SharedLesson.ScrubStatus.FAILED,
+            scrub_error="Scrub publication failed; retry sharing to enqueue again.",
+        )
+
+
 class ScrubTerminalWriteError(RuntimeError):
     """A scrub terminal state could not be persisted to its existing row."""
 
@@ -398,7 +405,7 @@ def _update_scrub_terminal(shared_lesson_id, **fields) -> None:
     """
     from apps.tenants.middleware import set_rls_context
 
-    with transaction.atomic():
+    with transaction.atomic(), backstop_service_context():
         for _attempt in range(2):
             set_rls_context(service_role=True)
             updated = SharedLesson.objects.filter(id=shared_lesson_id).update(**fields)
@@ -501,8 +508,13 @@ def revoke_grant(grant: LessonShareGrant) -> None:
 
 
 def delete_shared_lesson_if_orphaned(shared_lesson) -> None:
-    if not LessonShareGrant.objects.filter(shared_lesson=shared_lesson, status=LessonShareGrant.Status.ACTIVE).exists():
-        SharedLesson.objects.filter(id=shared_lesson.id).delete()
+    # Callers authorize the owner first. Departed audiences can hide grants
+    # from that owner; both the orphan decision and cascade must see them all.
+    with backstop_service_context():
+        if not LessonShareGrant.objects.filter(
+            shared_lesson=shared_lesson, status=LessonShareGrant.Status.ACTIVE
+        ).exists():
+            SharedLesson.objects.filter(id=shared_lesson.id).delete()
 
 
 # ── Wormholes & warp (PR3) ────────────────────────────────────────────────────
@@ -883,10 +895,11 @@ def chat_absorb_pending_counts(viewer_tenant) -> list[dict]:
 
 
 def absorb_pending_chat(viewer_tenant) -> list[dict]:
-    """Collect un-absorbed messages per absorb-enabled thread from the OTHER
-    party, ADVANCE each membership's ``last_absorbed_seq`` (idempotent cursor),
-    and return raw messages for the caller to redact-fresh + log. FriendMessage
-    access is confined here."""
+    """Materialize authorized inputs without advancing cursors or holding locks.
+
+    The caller redacts outside the transaction, then claims these exact inputs
+    via ``claim_absorbed_chat`` in a fresh transaction before returning them.
+    """
     viewer_id = _tenant_id(viewer_tenant)
     blocked = blocked_counterpart_ids(viewer_id) | {viewer_id}  # PR10: never absorb a blocked counterpart
     result: list[dict] = []
@@ -904,9 +917,10 @@ def absorb_pending_chat(viewer_tenant) -> list[dict]:
         )
         if not messages:
             continue
-        FriendThreadMembership.objects.filter(id=membership.id).update(last_absorbed_seq=messages[-1].seq)
         result.append(
             {
+                "membership_id": membership.id,
+                "last_absorbed_seq": membership.last_absorbed_seq,
                 "thread_id": str(membership.thread_id),
                 "from_id": _thread_other_party_id(membership.thread, viewer_id),  # None for circle threads
                 "circle_id": membership.thread.circle_id,  # tag circle-sourced items for scoped purge
@@ -914,6 +928,31 @@ def absorb_pending_chat(viewer_tenant) -> list[dict]:
             }
         )
     return result
+
+
+def claim_absorbed_chat(viewer_tenant, entry) -> list[FriendMessage]:
+    """Recheck visibility and claim only this batch, never messages arriving later.
+
+    The conditional cursor update serializes competing absorbers without locks
+    across inference. A leave, opt-out, or another successful claim wins over
+    this stale batch. The caller logs the returned rows in the same transaction.
+    """
+    viewer_id = _tenant_id(viewer_tenant)
+    messages = list(
+        FriendMessage.objects.filter(seq__in=[message.seq for message in entry["messages"]], deleted_at__isnull=True)
+        .exclude(sender_tenant_id__in=blocked_counterpart_ids(viewer_id) | {viewer_id})
+        .order_by("seq")
+    )
+    if not messages:
+        return []
+    claimed = FriendThreadMembership.objects.filter(
+        id=entry["membership_id"],
+        tenant_id=viewer_id,
+        left_at__isnull=True,
+        agent_absorb_enabled=True,
+        last_absorbed_seq=entry["last_absorbed_seq"],
+    ).update(last_absorbed_seq=entry["messages"][-1].seq)
+    return messages if claimed else []
 
 
 # ── Missions (SharedGoal) data layer — SharedGoal.objects confined here ──────

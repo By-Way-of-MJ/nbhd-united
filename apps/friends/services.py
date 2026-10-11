@@ -14,6 +14,7 @@ wave collides on the same row (see :func:`send_wave`).
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import secrets
 from collections import Counter
@@ -46,6 +47,8 @@ from .models import (
 )
 from .project_hygiene import UNTRUSTED_RULE, clean_payload, clean_text, fence
 from .scrub import _content_hash
+
+logger = logging.getLogger(__name__)
 
 # Handles people can never claim (impersonation / support-desk confusion).
 RESERVED_HANDLES = frozenset({"admin", "nbhd", "neighborhood", "support", "mj"})
@@ -712,8 +715,8 @@ def _notify_wave_received(friendship: Friendship) -> None:
 
     from .notifications import notify_wave_app, notify_wave_received
 
-    notify_wave_received(friendship)  # Telegram/LINE inline accept/decline (existing)
-    notify_wave_app(friendship)  # typed APNs wake for the iOS moments dock (best-effort)
+    transaction.on_commit(lambda: notify_wave_received(friendship), robust=True)
+    transaction.on_commit(lambda: notify_wave_app(friendship), robust=True)
 
 
 # ── Share pipeline (propose → scrub → preview → approve → freeze → publish) ───
@@ -753,12 +756,21 @@ def _enqueue_scrub(shared_lesson, content_hash, pending_share_id=None) -> None:
     kwargs = {}
     if pending_share_id is not None:
         kwargs["pending_share_id"] = str(pending_share_id)
-    publish_task(
-        "scrub_shared_lesson",
-        str(shared_lesson.id),
-        idempotency_key=f"scrub-{shared_lesson.id}-{content_hash[:8]}",
-        **kwargs,
-    )
+    shared_lesson_id = str(shared_lesson.id)
+
+    def publish():
+        try:
+            publish_task(
+                "scrub_shared_lesson",
+                shared_lesson_id,
+                idempotency_key=f"scrub-{shared_lesson_id}-{content_hash[:8]}",
+                **kwargs,
+            )
+        except Exception:
+            logger.exception("Scrub publication failed for snapshot %s", shared_lesson_id)
+            access.mark_scrub_publish_failed(shared_lesson_id)
+
+    transaction.on_commit(publish, robust=True)
 
 
 def _scrub_needed(shared_lesson, current_hash) -> bool:
@@ -1234,14 +1246,14 @@ def propose_share(
         target_circle=circle,
         status=PendingShare.Status.PENDING,
     ).first()
-    if existing is not None:
-        return existing, False
-
     shared_lesson, created = access.ensure_shared_lesson(lesson, tenant)
     current_hash = _content_hash(lesson.text or "", lesson.context or "")
     if created or _scrub_needed(shared_lesson, current_hash):
         access.mark_scrub_pending(shared_lesson)
         _enqueue_scrub(shared_lesson, current_hash)
+
+    if existing is not None:
+        return existing, False
 
     pending, pending_created = PendingShare.objects.get_or_create(
         tenant=tenant,
@@ -1259,7 +1271,7 @@ def propose_share(
         return pending, False
     from .notifications import notify_share_proposal
 
-    notify_share_proposal(pending)  # typed APNs wake so the human sees the approval moment
+    transaction.on_commit(lambda: notify_share_proposal(pending), robust=True)
     return pending, pending_created
 
 
@@ -1304,6 +1316,32 @@ def _spark_title(text: str) -> str:
 
 
 def neighborhood_context(tenant, since=None) -> dict:
+    """Load authorized inputs, redact without a pinned backend, then claim/log.
+
+    Cursor claims and ledger inserts commit together. Failed inference leaves
+    cursors untouched; a concurrent absorb, departure, or opt-out discards the
+    stale batch. Sparks are read in the final phase so grants/purges changed
+    during inference are respected too.
+    """
+    from apps.tenants.middleware import set_rls_context
+
+    with access.backstop_service_context():
+        set_rls_context(tenant_id=tenant.id)
+        entries = access.absorb_pending_chat(tenant)
+        # Fully load the redactor's principal and all response labels here.
+        _ = tenant.user
+        for entry in entries:
+            entry["from_handle"] = _handle_for(entry["from_id"]) if entry.get("from_id") else None
+            entry["handles"] = {m.sender_tenant_id: _handle_for(m.sender_tenant_id) for m in entry["messages"]}
+    redacted = _redact_absorb_chat(tenant, entries)
+    with access.backstop_service_context():
+        set_rls_context(tenant_id=tenant.id)
+        context = _neighborhood_sparks_context(tenant, since=since)
+        context["chat"] = _finish_absorb_chat(tenant, entries, redacted)
+        return context
+
+
+def _neighborhood_sparks_context(tenant, since=None) -> dict:
     """The absorb READ side (design §5.4): accessor-approved scrubbed sparks
     shared TO ``tenant``. Each newly-seen spark is logged to ``AbsorbedItem``
     (idempotent via the unique constraint), and items the human has PURGED are
@@ -1352,36 +1390,37 @@ def neighborhood_context(tenant, since=None) -> dict:
         "rule": UNTRUSTED_RULE,
         "neighbors": _accepted_neighbor_handles(tenant),
         "sparks": sparks,
-        "chat": _absorb_chat(tenant),
         "cursor": _iso_z(latest),
     }
 
 
-def _absorb_chat(tenant) -> list[dict]:
-    """The chat absorb read (design §4.6/§6): raw friend-chat text redacted FRESH
-    in the RECIPIENT's session before the agent's LLM sees it (never persisted),
-    the per-thread cursor advanced (idempotent), and a NEUTRAL AbsorbedItem
-    logged per message (label = "Chat with @handle" — a pointer, never the
-    message text). Skipped for threads where agent_absorb_enabled is off."""
+def _redact_absorb_chat(tenant, entries) -> dict:
+    """Pure read-only redaction: no cursor locks, writes, or handle lookups."""
     from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message_checked
 
-    highlights: list[dict] = []
-    for entry in access.absorb_pending_chat(tenant):
-        circle_id = entry.get("circle_id")
-        texts = []
+    redacted = {}
+    for entry in entries:
         for message in entry["messages"]:
-            # Fresh redaction that SAVES NOTHING: a neighbor's words must not add
-            # entries to MY hidden-names list (names I already hid keep their tag;
-            # anything else the detector flags becomes [REDACTED]). Then fenced:
-            # it is another person's text — data, never instructions.
-            # Fail closed: if redaction can't be confirmed, the assistant gets a pointer,
-            # not the neighbor's raw words.
             outcome = redact_user_message_checked(message.text, tenant, mint=MINT_REDACT_ONLY)
-            redacted = outcome.text if outcome.confirmed else "[message not shown here — it is in the app]"
-            texts.append(fence(redacted, _handle_for(message.sender_tenant_id)))
-            # from_tenant = the actual sender (works for 1:1 AND circle group chat);
-            # label is a NEUTRAL pointer + circle tag, never message text.
-            sender_handle = _handle_for(message.sender_tenant_id)
+            text = outcome.text if outcome.confirmed else "[message not shown here — it is in the app]"
+            redacted[message.seq] = fence(text, entry["handles"][message.sender_tenant_id])
+    return redacted
+
+
+def _finish_absorb_chat(tenant, entries, redacted) -> list[dict]:
+    highlights = []
+    purged = set(
+        AbsorbedItem.objects.filter(
+            tenant=tenant, source_kind=AbsorbedItem.SourceKind.FRIEND_MESSAGE, purged_at__isnull=False
+        ).values_list("source_id", flat=True)
+    )
+    for entry in entries:
+        messages = access.claim_absorbed_chat(tenant, entry)
+        texts = []
+        for message in messages:
+            if message.public_id in purged:
+                continue
+            sender_handle = entry["handles"][message.sender_tenant_id]
             label = f"Chat with @{sender_handle}" if sender_handle else "Neighborhood chat"
             _log_absorbed(
                 tenant,
@@ -1389,10 +1428,11 @@ def _absorb_chat(tenant) -> list[dict]:
                 message.public_id,
                 message.sender_tenant_id,
                 label,
-                circle_id=circle_id,
+                circle_id=entry.get("circle_id"),
             )
-        from_handle = _handle_for(entry["from_id"]) if entry.get("from_id") else None
-        highlights.append({"thread_id": entry["thread_id"], "from_handle": from_handle, "messages": texts})
+            texts.append(redacted[message.seq])
+        if texts:
+            highlights.append({"thread_id": entry["thread_id"], "from_handle": entry["from_handle"], "messages": texts})
     return highlights
 
 

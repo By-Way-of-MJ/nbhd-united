@@ -60,7 +60,10 @@ class Command(BaseCommand):
 
         # ── Delete ALL existing lessons for a clean slate ──
         if not dry_run:
-            deleted_lessons, _ = Lesson.objects.filter(tenant=tenant).delete()
+            from apps.friends.access import backstop_service_context
+
+            with backstop_service_context():
+                deleted_lessons, _ = Lesson.objects.filter(tenant=tenant).delete()
             deleted_pending, _ = PendingExtraction.objects.filter(
                 tenant=tenant,
                 kind=PendingExtraction.Kind.LESSON,

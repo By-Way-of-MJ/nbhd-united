@@ -251,17 +251,17 @@ _ALLOWLISTED_ADMIN_SEARCH_FIELDS: set[tuple[str, int, str]] = {
     # insights.AssistantInsight — feat/enc-p3-journal-read
     ("apps/insights/admin.py", 31, "statement"),
     # lessons.Lesson — feat/enc-p3-journal-read
-    ("apps/lessons/admin.py", 19, "text"),
-    ("apps/lessons/admin.py", 19, "context"),
+    ("apps/lessons/admin.py", 33, "text"),
+    ("apps/lessons/admin.py", 33, "context"),
     # lessons.LessonConnection — search spans from_lesson/to_lesson → Lesson.text
-    ("apps/lessons/admin.py", 35, "from_lesson__text"),
-    ("apps/lessons/admin.py", 36, "to_lesson__text"),
+    ("apps/lessons/admin.py", 49, "from_lesson__text"),
+    ("apps/lessons/admin.py", 50, "to_lesson__text"),
     # lessons.TutoringSession — messages (own) + star → Lesson.text
-    ("apps/lessons/admin.py", 53, "star__text"),
-    ("apps/lessons/admin.py", 53, "messages"),
+    ("apps/lessons/admin.py", 67, "star__text"),
+    ("apps/lessons/admin.py", 67, "messages"),
     # lessons.StarJournalEntry — text (own) + star → Lesson.text
-    ("apps/lessons/admin.py", 68, "text"),
-    ("apps/lessons/admin.py", 68, "star__text"),
+    ("apps/lessons/admin.py", 82, "text"),
+    ("apps/lessons/admin.py", 82, "star__text"),
     # fuel.Workout / WorkoutTemplate / WorkoutPlan — feat/enc-p3-fuel-read
     ("apps/fuel/admin.py", 20, "activity"),
     ("apps/fuel/admin.py", 43, "name"),

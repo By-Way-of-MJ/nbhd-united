@@ -179,7 +179,9 @@ class ApprovalPerformanceTests(TestCase):
             proposal_id = self.proposal(self.changes(count))
             result, queries, detector, pushes, scheduled = self.measure(partial(self.approve, proposal_id))
             self.assertEqual(result["status"], "approved")
-            self.assertLessEqual(queries, 20 + 7 * count)
+            # The best-effort crew refresh now has a savepoint so a DB
+            # failure cannot abort the request transaction: two fixed queries.
+            self.assertLessEqual(queries, 22 + 7 * count)
             self.assertEqual(detector, count)
             self.assertEqual(pushes, 1)
             self.assertEqual(scheduled, 1)

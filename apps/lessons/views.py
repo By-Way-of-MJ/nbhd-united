@@ -12,6 +12,7 @@ from rest_framework.response import Response
 from apps.pii.authoring import resolve_receipt_values, truncate_placeholder_safe
 from apps.pii.redactor import rehydrate_for_tenant
 from apps.pii.store_authoring import author_store_fields
+from apps.tenants.rls import RLSRequestTransactionMixin
 
 from .models import Lesson, LessonConnection, StarJournalEntry, TutoringSession
 from .serializers import (
@@ -48,13 +49,29 @@ def _rehydrate_tutor_result(tenant, result: dict) -> dict:
     return represented
 
 
-class LessonViewSet(viewsets.ModelViewSet):
+class LessonViewSet(RLSRequestTransactionMixin, viewsets.ModelViewSet):
     """Tenant-scoped lesson CRUD, galaxy, tutoring, and star journaling."""
 
     permission_classes = [IsAuthenticated]
     queryset = Lesson.objects.none()
     serializer_class = LessonSerializer
     pagination_class = None
+
+    def dispatch(self, request, *args, **kwargs):
+        # Only sharing and the SharedLesson delete cascade need the RLS scope.
+        # Approval/refresh can run clustering and external model calls.
+        action = self.action_map.get(request.method.lower())
+        if action in {"share", "revoke_share", "destroy"}:
+            return super().dispatch(request, *args, **kwargs)
+        return viewsets.ModelViewSet.dispatch(self, request, *args, **kwargs)
+
+    def perform_destroy(self, instance):
+        from apps.friends.access import backstop_service_context
+
+        # get_object already owner-scoped the lesson. Its cascade also needs
+        # old/revoked grants which a tenant SELECT policy may hide.
+        with backstop_service_context():
+            instance.delete()
 
     def get_serializer_class(self):
         if self.action == "create":

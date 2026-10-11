@@ -118,7 +118,10 @@ class Command(BaseCommand):
             total_removed += len(duplicates)
 
         if not dry_run and ids_to_delete:
-            Lesson.objects.filter(id__in=ids_to_delete).delete()
+            from apps.friends.access import backstop_service_context
+
+            with backstop_service_context():
+                Lesson.objects.filter(id__in=ids_to_delete).delete()
 
             # Re-cluster
             from apps.lessons.clustering import refresh_constellation

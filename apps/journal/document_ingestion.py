@@ -144,7 +144,10 @@ def _remove_journal_task(tenant, object_id):
     from apps.journal.models import Task
 
     try:
-        Task.objects.filter(tenant=tenant, id=object_id).delete()
+        from apps.friends.access import backstop_service_context
+
+        with backstop_service_context():
+            Task.objects.filter(tenant=tenant, id=object_id).delete()
     except (ValueError, TypeError, DjangoValidationError):
         return
 

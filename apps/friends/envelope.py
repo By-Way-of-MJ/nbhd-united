@@ -186,47 +186,50 @@ def render_projects(tenant: Tenant) -> str:
     try:
         from . import project_services
 
-        memberships = list(access.my_active_project_memberships(tenant)[:3])
-        if not memberships:
-            return ""
-        # Only name the tool when this tenant's image actually ships it.
-        from .project_flags import project_tools_ready
+        with access.backstop_service_context():
+            memberships = list(access.my_active_project_memberships(tenant)[:3])
+            if not memberships:
+                return ""
+            # Only name the tool when this tenant's image actually ships it.
+            from .project_flags import project_tools_ready
 
-        lines = (
-            ["Call nbhd_project_context for details before answering about a project."]
-            if project_tools_ready(tenant)
-            else []
-        )
-        for membership in memberships:
-            goal = membership.shared_goal
-            plan = project_services.get_plan(tenant, goal.id)
-            # Never the title: any member can rename a project, and USER.md is trusted.
-            if str(goal.created_by_id) == str(tenant.id):
-                name = "a project you started"
-            else:
-                creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
-                name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
-            mine = [s for s in plan["steps"] if any(o["id"] == str(membership.id) for o in s.get("owners", []))]
-            # in_review = I've ticked it off; it only waits for someone else's look.
-            open_mine = [s for s in mine if s["status"] not in ("done", "skipped", "in_review")]
-            asks = sum(
-                1
-                for s in plan["steps"]
-                for a in s.get("assignments", [])
-                if a["membership_id"] == str(membership.id) and a["status"] == "asked"
+            lines = (
+                ["Call nbhd_project_context for details before answering about a project."]
+                if project_tools_ready(tenant)
+                else []
             )
-            waiting = sum(1 for s in open_mine if s.get("blocked_by_open"))
-            bits = [f"{plan['done_count']}/{plan['total']} steps done"]
-            if open_mine:
-                nxt = sorted(open_mine, key=lambda s: s.get("start_date") or "9999")[0]
-                # Never the step's title: a project owner can edit a step someone else wrote.
-                bits.append("your next step" + (f" is due {nxt['due_date']}" if nxt.get("due_date") else " is open"))
-            if waiting:
-                bits.append(f"{waiting} of your steps waiting on others")
-            if asks:
-                bits.append(f"{asks} ask(s) for you to answer")
-            lines.append(f"- {name} — " + "; ".join(bits))
-        return "\n".join(lines)
+            for membership in memberships:
+                goal = membership.shared_goal
+                plan = project_services.get_plan(tenant, goal.id)
+                # Never the title: any member can rename a project, and USER.md is trusted.
+                if str(goal.created_by_id) == str(tenant.id):
+                    name = "a project you started"
+                else:
+                    creator = NeighborProfile.objects.filter(tenant_id=goal.created_by_id).only("handle").first()
+                    name = f"a project with @{creator.handle}" if creator and creator.handle else "a shared project"
+                mine = [s for s in plan["steps"] if any(o["id"] == str(membership.id) for o in s.get("owners", []))]
+                # in_review = I've ticked it off; it only waits for someone else's look.
+                open_mine = [s for s in mine if s["status"] not in ("done", "skipped", "in_review")]
+                asks = sum(
+                    1
+                    for s in plan["steps"]
+                    for a in s.get("assignments", [])
+                    if a["membership_id"] == str(membership.id) and a["status"] == "asked"
+                )
+                waiting = sum(1 for s in open_mine if s.get("blocked_by_open"))
+                bits = [f"{plan['done_count']}/{plan['total']} steps done"]
+                if open_mine:
+                    nxt = sorted(open_mine, key=lambda s: s.get("start_date") or "9999")[0]
+                    # Never the step's title: a project owner can edit a step someone else wrote.
+                    bits.append(
+                        "your next step" + (f" is due {nxt['due_date']}" if nxt.get("due_date") else " is open")
+                    )
+                if waiting:
+                    bits.append(f"{waiting} of your steps waiting on others")
+                if asks:
+                    bits.append(f"{asks} ask(s) for you to answer")
+                lines.append(f"- {name} — " + "; ".join(bits))
+            return "\n".join(lines)
     except Exception:  # noqa: BLE001 — an envelope section must never break a turn
         logger.warning("render_projects failed for tenant %s", getattr(tenant, "id", "?"), exc_info=True)
         return ""
@@ -259,20 +262,21 @@ def _refresh_recipient_on_grant(sender, instance, **kwargs) -> None:
     OTHER active member (the grant owner already sees their own share). Defensive:
     never raises."""
     try:
-        owner_id = instance.shared_lesson.owner_tenant_id
-        if instance.circle_id is not None:
-            member_ids = CircleMembership.objects.filter(circle_id=instance.circle_id, status="active").values_list(
-                "tenant_id", flat=True
-            )
-            for recipient_id in member_ids:
-                if recipient_id != owner_id:
-                    _schedule_recipient_push(recipient_id)
-            return
-        friendship = instance.friendship
-        if friendship is None:
-            return
-        recipient_id = friendship.addressee_id if friendship.requester_id == owner_id else friendship.requester_id
-        _schedule_recipient_push(recipient_id)
+        with access.backstop_service_context():
+            owner_id = instance.shared_lesson.owner_tenant_id
+            if instance.circle_id is not None:
+                member_ids = CircleMembership.objects.filter(circle_id=instance.circle_id, status="active").values_list(
+                    "tenant_id", flat=True
+                )
+                for recipient_id in member_ids:
+                    if recipient_id != owner_id:
+                        _schedule_recipient_push(recipient_id)
+                return
+            friendship = instance.friendship
+            if friendship is None:
+                return
+            recipient_id = friendship.addressee_id if friendship.requester_id == owner_id else friendship.requester_id
+            _schedule_recipient_push(recipient_id)
     except Exception:  # noqa: BLE001
         logger.warning("grant recipient refresh receiver failed", exc_info=True)
 
@@ -283,15 +287,16 @@ def _refresh_on_friend_message(sender, instance, **kwargs) -> None:
     grants: FriendMessage has ``sender_tenant`` but the party who needs the
     refresh is the recipient. Defensive: never raises."""
     try:
-        from .models import FriendThreadMembership
+        with transaction.atomic():
+            from .models import FriendThreadMembership
 
-        recipient_ids = (
-            FriendThreadMembership.objects.filter(thread_id=instance.thread_id, left_at__isnull=True)
-            .exclude(tenant_id=instance.sender_tenant_id)
-            .values_list("tenant_id", flat=True)
-        )
-        for tenant_id in recipient_ids:
-            _schedule_recipient_push(tenant_id)
+            recipient_ids = (
+                FriendThreadMembership.objects.filter(thread_id=instance.thread_id, left_at__isnull=True)
+                .exclude(tenant_id=instance.sender_tenant_id)
+                .values_list("tenant_id", flat=True)
+            )
+            for tenant_id in recipient_ids:
+                _schedule_recipient_push(tenant_id)
     except Exception:  # noqa: BLE001
         logger.warning("friend message refresh receiver failed", exc_info=True)
 
@@ -310,13 +315,14 @@ def _refresh_mission_crew(sender, instance, **kwargs) -> None:
 def refresh_project_members(mission_id, *, include_invited=False):
     """One final refresh per active member after a project batch commits."""
     try:
-        member_ids = (
-            access.mission_memberships()
-            .filter(shared_goal_id=mission_id, status__in=["active", "invited"] if include_invited else ["active"])
-            .values_list("tenant_id", flat=True)
-        )
-        for tenant_id in member_ids:
-            _schedule_recipient_push(tenant_id)
+        with transaction.atomic():
+            member_ids = (
+                access.mission_memberships()
+                .filter(shared_goal_id=mission_id, status__in=["active", "invited"] if include_invited else ["active"])
+                .values_list("tenant_id", flat=True)
+            )
+            for tenant_id in member_ids:
+                _schedule_recipient_push(tenant_id)
     except Exception:  # noqa: BLE001
         logger.warning("mission crew refresh receiver failed", exc_info=True)
 

@@ -41,6 +41,7 @@ from apps.common.windows import Window, resolve_window
 from apps.integrations.internal_auth import InternalAuthError, validate_internal_runtime_request
 from apps.tenants.middleware import set_rls_context
 from apps.tenants.models import Tenant
+from apps.tenants.rls import RLSRequestTransactionMixin
 
 logger = logging.getLogger("nbhd.query")
 
@@ -111,7 +112,7 @@ def canonical_query_hash(
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-class BaseQueryView(APIView):
+class BaseQueryView(RLSRequestTransactionMixin, APIView):
     """Hoist the common dispatch path for per-domain ``query`` endpoints.
 
     Subclasses set ``query_model`` to their Pydantic request model and

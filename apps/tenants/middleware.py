@@ -20,26 +20,35 @@ def get_current_tenant():
     return getattr(_tenant_context, "tenant", None)
 
 
-def set_rls_context(*, tenant_id=None, user_id=None, service_role=False):
+def set_rls_context(*, tenant_id=None, user_id=None, service_role=False, as_tenant=False):
     """Set Postgres session variables for RLS policies.
 
-    Variables are session-scoped (persist for the connection lifetime).
-    Cleared by reset_rls_context() in middleware process_response.
+    Inside an atomic block variables are transaction-local, so they cannot
+    leak onto a pooled backend after commit. Legacy autocommit callers retain
+    session scope and middleware cleanup; protected queries must opt into a
+    transaction before calling this helper.
+
+    ``as_tenant`` is for tenant authentication boundaries: discard any stale
+    service privilege on the backend. Ordinary tenant changes within a service
+    scope deliberately preserve that scope's privilege.
 
     All variables are applied in a single round trip; with the database
     cross-region, each separate statement used to cost ~100-150ms of
     per-request latency.
     """
+    scope = "true" if connection.in_atomic_block else "false"
     selects = []
     params = []
     if tenant_id:
-        selects.append("set_config('app.tenant_id', %s, false)")
+        selects.append(f"set_config('app.tenant_id', %s, {scope})")
         params.append(str(tenant_id))
     if user_id:
-        selects.append("set_config('app.user_id', %s, false)")
+        selects.append(f"set_config('app.user_id', %s, {scope})")
         params.append(str(user_id))
-    if service_role:
-        selects.append("set_config('app.service_role', 'true', false)")
+    if as_tenant:
+        selects.append(f"set_config('app.service_role', '', {scope})")
+    elif service_role:
+        selects.append(f"set_config('app.service_role', 'true', {scope})")
     if not selects:
         return
     with connection.cursor() as cursor:

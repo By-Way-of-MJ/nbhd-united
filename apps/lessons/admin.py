@@ -1,10 +1,24 @@
 from django.contrib import admin
 
+from apps.friends.access import backstop_service_context
+
 from .models import Lesson, LessonConnection, StarJournalEntry, TutoringSession
 
 
 @admin.register(Lesson)
 class LessonAdmin(admin.ModelAdmin):
+    @backstop_service_context()
+    def get_deleted_objects(self, objs, request):
+        return super().get_deleted_objects(objs, request)
+
+    @backstop_service_context()
+    def delete_model(self, request, obj):
+        return super().delete_model(request, obj)
+
+    @backstop_service_context()
+    def delete_queryset(self, request, queryset):
+        return super().delete_queryset(request, queryset)
+
     list_display = (
         "id",
         "tenant",

@@ -286,7 +286,10 @@ class Command(BaseCommand):
             raise CommandError(f"Tenant {options['tenant']} not found")
 
         if options["clear"]:
-            deleted, _ = Lesson.objects.filter(tenant=tenant).delete()
+            from apps.friends.access import backstop_service_context
+
+            with backstop_service_context():
+                deleted, _ = Lesson.objects.filter(tenant=tenant).delete()
             self.stdout.write(f"Cleared {deleted} existing lessons")
 
         # Create lessons

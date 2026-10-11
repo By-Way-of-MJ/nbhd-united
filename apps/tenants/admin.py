@@ -6,11 +6,17 @@ from django.core.exceptions import PermissionDenied
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_protect
 
+from apps.friends.access import backstop_service_context
+
 from .models import Tenant, User
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
+    @backstop_service_context()
+    def get_deleted_objects(self, objs, request):
+        return super().get_deleted_objects(objs, request)
+
     list_display = ("username", "display_name", "telegram_chat_id", "is_active")
     fieldsets = BaseUserAdmin.fieldsets + (
         (
@@ -104,6 +110,18 @@ class UserAdmin(BaseUserAdmin):
 
 @admin.register(Tenant)
 class TenantAdmin(admin.ModelAdmin):
+    @backstop_service_context()
+    def get_deleted_objects(self, objs, request):
+        return super().get_deleted_objects(objs, request)
+
+    @backstop_service_context()
+    def delete_model(self, request, obj):
+        return super().delete_model(request, obj)
+
+    @backstop_service_context()
+    def delete_queryset(self, request, queryset):
+        return super().delete_queryset(request, queryset)
+
     exclude = ("openclaw_migration",)
 
     list_display = (

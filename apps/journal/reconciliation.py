@@ -437,7 +437,10 @@ def undo_task_action(pending: PendingTaskAction) -> bool:
             pending.status = PendingTaskAction.Status.UNDONE
             pending.resolved_at = _tz.now()
             pending.save(update_fields=["task", "status", "resolved_at"])
-            Task.objects.filter(id=task_id, tenant=pending.tenant).delete()
+            from apps.friends.access import backstop_service_context
+
+            with backstop_service_context():
+                Task.objects.filter(id=task_id, tenant=pending.tenant).delete()
         return True
 
     if pending.kind in (

@@ -361,6 +361,8 @@ class ProposeCircleShareTest(TestCase):
     def test_preview_audience_names_the_circle(self):
         lesson = _lesson(self.owner)
         services.share_lesson(self.owner, self.owner.user, lesson, circle_id=str(self.circle.id))
+        # Scrubbing is published after commit; preview this explicitly ready fixture.
+        _ready_shared_lesson(self.owner, lesson)
         payload, code = services.preview_share(self.owner, str(lesson.id), circle_id=str(self.circle.id))
         self.assertEqual(code, 200)
         # 2 members (owner + member) → "your 1 Nishi-ku neighbor".

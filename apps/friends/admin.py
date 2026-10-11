@@ -23,6 +23,17 @@ class ContentReportAdmin(admin.ModelAdmin):
     ordering = ("-created_at",)
     actions = ("mark_hidden", "mark_dismissed", "remove_reported_photo")
 
+    def changeform_view(self, request, object_id=None, form_url="", extra_context=None):
+        from .access import backstop_service_context
+
+        # Admin authorization runs before this method. Readonly related fields
+        # dereference protected messages/shares during template rendering.
+        with backstop_service_context():
+            response = super().changeform_view(request, object_id, form_url, extra_context)
+            if hasattr(response, "render"):
+                response.render()
+            return response
+
     def has_add_permission(self, request):
         return False
 

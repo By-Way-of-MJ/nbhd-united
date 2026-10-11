@@ -1,4 +1,4 @@
-"""Project requests run in one transaction (see ProjectView.dispatch)."""
+"""Project requests run in one transaction (inherited from FriendsView)."""
 
 from django.db import connection
 from django.test import RequestFactory, TransactionTestCase
