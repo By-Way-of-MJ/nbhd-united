@@ -994,6 +994,10 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
     # Load static reference docs
     for key, filename in _WORKSPACE_DOCS.items():
         content = _load_doc_template(filename)
+        if content and key == "NBHD_DOC_PLATFORM_GUIDE":
+            from apps.orchestrator.telegram_instructions import render_platform_guide
+
+            content = render_platform_guide(content)
         if content:
             result[key] = content
 

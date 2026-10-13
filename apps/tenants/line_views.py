@@ -14,7 +14,6 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.router import line_service as svc
-from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +98,14 @@ def line_set_preferred_channel(request):
 
     user = request.user
 
-    if channel == "telegram" and not telegram_inbound_enabled():
-        return Response({"code": "telegram_unavailable", "detail": TELEGRAM_UNAVAILABLE_DETAIL}, status=409)
+    from rest_framework.exceptions import ValidationError
+
+    from apps.tenants.serializers import UserSerializer
+
+    try:
+        UserSerializer().validate_preferred_channel(channel)
+    except ValidationError as exc:
+        return Response({"code": "telegram_unavailable", "detail": str(exc.detail[0])}, status=409)
 
     # Verify the chosen channel is actually linked
     if channel == "line" and not user.line_user_id:

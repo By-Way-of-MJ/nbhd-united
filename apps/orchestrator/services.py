@@ -1081,8 +1081,9 @@ def reassert_agents_md(tenant, *, only_if_changed: bool = True) -> bool:
 # "Telegram is the primary channel" line verbatim. Rather than overwrite the
 # file (its "## Notes" section invites user edits), converge SURGICALLY: swap
 # just the legacy channel line for the channel-agnostic body, preserving
-# everything else. Also replace the earlier unconditional support sentence.
-# Idempotent — files without either known obsolete sentence are left untouched.
+# everything else. The managed support sentence follows inbound availability,
+# reversibly; enabled tenants retain the original wording. Notes and fenced
+# examples are never rewritten.
 _TOOLS_MD_LEGACY_CHANNEL_LINE = "- **Telegram** is the primary channel. All messages come through Telegram DM."
 
 # The replacement Communication bullets. MUST stay byte-identical to the
@@ -1095,7 +1096,7 @@ _TOOLS_MD_CHANNEL_BODY = (
     "- Reply on the same surface the message arrived on. Each conversational turn is "
     "tagged with a `[chat via …]` marker naming the active channel; treat that marker "
     "as the source of truth for where the user is.\n"
-    "- Offer Telegram chat or linking only when the tenant API reports `telegram_available: true`. When it is `false` or unknown, use the NBHD app or LINE; existing Telegram links do not prove replies or callback buttons work. Never assume a message came from Telegram."
+    "- Telegram and LINE are fully supported. Never assume a message came from Telegram."
 )
 
 TOOLS_MD_EXTRAS_BEGIN_MARKER = (
@@ -1123,12 +1124,18 @@ def converge_tools_md_text(current: str | None) -> str | None:
     ``_put_share_file`` sanitize chokepoint."""
     if not current:
         return None
-    updated = current.replace(_TOOLS_MD_LEGACY_CHANNEL_LINE, _TOOLS_MD_CHANNEL_BODY)
-    # Earlier channel-agnostic seeds still promised unconditional Telegram support.
-    # Replace only this managed sentence; preserve all user-authored notes.
-    updated = updated.replace(
-        "- Telegram and LINE are fully supported. Never assume a message came from Telegram.",
-        "- Offer Telegram chat or linking only when the tenant API reports `telegram_available: true`. When it is `false` or unknown, use the NBHD app or LINE; existing Telegram links do not prove replies or callback buttons work. Never assume a message came from Telegram.",
+    from apps.orchestrator.telegram_instructions import RETIRED, SUPPORTED, replace_section_lines
+
+    sentence = SUPPORTED if telegram_inbound_enabled() else RETIRED
+    body = _TOOLS_MD_CHANNEL_BODY.replace(SUPPORTED, sentence)
+    updated = replace_section_lines(
+        current,
+        "## Communication",
+        {
+            _TOOLS_MD_LEGACY_CHANNEL_LINE: body,
+            SUPPORTED: sentence,
+            RETIRED: sentence,
+        },
     )
     return updated if updated != current else None
 

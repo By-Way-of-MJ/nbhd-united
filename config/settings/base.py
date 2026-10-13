@@ -443,7 +443,7 @@ YARDTALK_LICENSE_RECEIPT_SECRET = env(
 
 # Telegram (shared bot)
 # Match startup.sh: only explicit false values disable; unknown/unset stay on.
-TELEGRAM_INBOUND_ENABLED = env("TELEGRAM_POLLER_ENABLED", default="").lower() not in {"false", "0", "no", "off"}
+TELEGRAM_INBOUND_ENABLED = os.environ.get("TELEGRAM_POLLER_ENABLED", "").lower() not in {"false", "0", "no", "off"}
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", default="")
 TELEGRAM_BOT_USERNAME = env("TELEGRAM_BOT_USERNAME", default="NbhdUnitedBot")
 TELEGRAM_WEBHOOK_SECRET = env("TELEGRAM_WEBHOOK_SECRET", default="")

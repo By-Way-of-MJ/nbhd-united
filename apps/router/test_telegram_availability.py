@@ -408,9 +408,135 @@ class AvailabilityContracts:
         line.assert_not_called()
 
     def test_extraction_line_failure(self):
-        telegram, line, _ = self.extraction(force_line=True)
+        telegram, line, app = self.extraction(force_line=True)
         line.assert_called_once()
         self.assertEqual(telegram.call_count, int(self.enabled))
+        self.assertEqual(app.call_count, int(not self.enabled))
+
+    def test_profile_preference_write(self):
+        self.link()
+        self.user.preferred_channel = "line"
+        self.user.save(update_fields=["preferred_channel"])
+        response = self.client.patch("/api/v1/tenants/profile/", {"preferred_channel": "telegram"}, format="json")
+        self.assertEqual(response.status_code, 200 if self.enabled else 400)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.preferred_channel, "telegram" if self.enabled else "line")
+
+    def test_pending_queue_terminalizes_before_model(self):
+        from apps.router.models import PendingMessage
+        from apps.router.pending_queue import drain_pending_messages_for_tenant_task
+        from apps.router.test_pending_queue import _ok_chat_response
+
+        self.link()
+        self.tenant.container_fqdn = "test.invalid"
+        self.tenant.save(update_fields=["container_fqdn"])
+        rows = [
+            PendingMessage.objects.create(
+                tenant=self.tenant,
+                channel="telegram",
+                channel_user_id="12345",
+                user_text="hello",
+                payload={"message_text": "hello", "user_param": "12345"},
+            )
+            for _ in range(2)
+        ]
+        with patch("apps.router.pending_queue.httpx.post", return_value=_ok_chat_response("reply")) as post:
+            result = drain_pending_messages_for_tenant_task(str(self.tenant.id), "telegram", "12345")
+            drain_pending_messages_for_tenant_task(str(self.tenant.id), "telegram", "12345")
+        model_calls = [call for call in post.call_args_list if "/v1/chat/completions" in call.args[0]]
+        self.assertEqual(len(model_calls), int(self.enabled))
+        if self.enabled:
+            self.assertEqual(result["delivered"], 2)
+            self.assertFalse(PendingMessage.objects.filter(id__in=[r.id for r in rows]).exists())
+        else:
+            self.assertEqual(result["delivered"], 0)
+            for row in rows:
+                row.refresh_from_db()
+                self.assertEqual(row.delivery_status, PendingMessage.Status.FAILED)
+                self.assertEqual(row.delivery_attempts, 0)
+                self.assertIsNone(row.delivery_in_flight_until)
+            self.assertEqual(post.call_count, 2)
+            for call in post.call_args_list:
+                self.assertIn("unavailable", call.kwargs["json"]["text"])
+
+    def test_buffered_queue_terminalizes_before_model(self):
+        from apps.orchestrator.hibernation import deliver_buffered_messages_task
+        from apps.router.models import BufferedMessage
+        from apps.router.test_pending_queue import _ok_chat_response
+
+        self.link()
+        self.tenant.container_fqdn = "test.invalid"
+        self.tenant.save(update_fields=["container_fqdn"])
+        row = BufferedMessage.objects.create(tenant=self.tenant, channel="telegram", user_text="hello", payload={})
+        with (
+            patch("httpx.post", return_value=_ok_chat_response("reply")) as post,
+            patch("apps.router.services.send_telegram_message") as notice,
+            patch("apps.router.pending_queue.relay_ai_response_to_telegram", return_value=True) as relay,
+        ):
+            result = deliver_buffered_messages_task(str(self.tenant.id))
+            deliver_buffered_messages_task(str(self.tenant.id))
+        self.assertEqual(post.call_count, int(self.enabled))
+        self.assertEqual(relay.call_count, int(self.enabled))
+        self.assertEqual(notice.call_count, int(not self.enabled))
+        if self.enabled:
+            self.assertEqual(result["delivered"], 1)
+            self.assertFalse(BufferedMessage.objects.filter(pk=row.pk).exists())
+        else:
+            self.assertEqual(result["delivered"], 0)
+            row.refresh_from_db()
+            self.assertEqual(row.delivery_status, BufferedMessage.Status.FAILED)
+            self.assertEqual(row.delivery_attempts, 0)
+            self.assertIsNone(row.delivery_in_flight_until)
+            self.assertIn("unavailable", notice.call_args.args[1])
+
+    def test_cron_no_gateway_exposes_undeliverable(self):
+        from apps.actions.origin import OriginStamp
+        from apps.cron.gate import cron_action_state, request_cron_action
+        from apps.cron.models import CronJob
+
+        self.device()
+        for linked in (True, False):
+            with self.subTest(linked=linked):
+                self.user.telegram_chat_id = 12345 if linked else None
+                self.user.save(update_fields=["telegram_chat_id"])
+                with patch.dict(
+                    messaging._SENDERS, {"telegram": (Mock(return_value=messaging.GateSendResult(True, "123")), None)}
+                ):
+                    result = request_cron_action(
+                        self.tenant,
+                        cron_request_id=f"availability-{linked}",
+                        pattern="pure_reminder",
+                        name=f"Reminder {linked}",
+                        schedule={"kind": "cron", "expr": "0 8 * * 2", "tz": "UTC"},
+                        typed_payload={"text": "Take out trash"},
+                        reason="Requested",
+                        origin_stamp=OriginStamp(),
+                    )
+                action = PendingAction.objects.get(pk=result["action_id"])
+                delivered = self.enabled and linked
+                self.assertEqual(result["state"], "pending_approval" if delivered else "approval_undeliverable")
+                self.assertEqual(cron_action_state(action)["state"], result["state"])
+                self.assertEqual(action.status, ActionStatus.PENDING)
+                self.assertFalse(CronJob.objects.filter(tenant=self.tenant).exists())
+                if not delivered:
+                    self.assertEqual(result["delivery_state"], "no_channel")
+                    self.assertIn("not delivered", result["detail"])
+
+    def test_cron_failed_transport_is_not_a_sent_prompt(self):
+        from apps.cron.gate import cron_action_state
+
+        action = PendingAction.objects.create(
+            tenant=self.tenant,
+            action_type=ActionType.CRON_CREATE,
+            action_payload={},
+            display_summary="Reminder",
+            delivery_state="failed",
+            expires_at=timezone.now(),
+        )
+        result = cron_action_state(action)
+        self.assertEqual(result["state"], "approval_undeliverable")
+        self.assertEqual(result["delivery_state"], "failed")
+        self.assertEqual(action.status, ActionStatus.PENDING)
 
 
 class TelegramEnabledTests(AvailabilityContracts, TestCase):
@@ -435,6 +561,30 @@ class AvailabilityCacheTests(TestCase):
                     data = response.data.get("tenant", response.data)
                     self.assertIs(data["telegram_available"], enabled)
 
+    def test_tag_bump_invalidates_both_availability_variants(self):
+        from apps.common.cache import bump_tag
+
+        user = User.objects.create_user(username="tag-availability", display_name="Before")
+        tenant = Tenant.objects.create(user=user, status=Tenant.Status.ACTIVE)
+        client = APIClient()
+        cache.clear()
+        paths = ("/api/v1/auth/me/", "/api/v1/tenants/me/")
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                for path in paths:
+                    client.force_authenticate(User.objects.get(pk=user.pk))
+                    self.assertEqual(client.get(path).status_code, 200)
+        User.objects.filter(pk=user.pk).update(display_name="After")
+        bump_tag(tenant.id, "tenant")
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                for path in paths:
+                    client.force_authenticate(User.objects.get(pk=user.pk))
+                    data = client.get(path).data
+                    tenant_data = data.get("tenant", data)
+                    self.assertEqual(tenant_data["user"]["display_name"], "After")
+                    self.assertIs(tenant_data["telegram_available"], enabled)
+
 
 class AvailabilitySettingTests(SimpleTestCase):
     def test_poller_env_truthiness_contract(self):
@@ -449,27 +599,47 @@ class AvailabilitySettingTests(SimpleTestCase):
             and any(isinstance(target, ast.Name) and target.id == "TELEGRAM_INBOUND_ENABLED" for target in node.targets)
         )
         expression = compile(ast.Expression(assignment.value), "base.py", "eval")
+        import os
+        import re
+        import subprocess
+
+        import environ
+
+        root = Path(__file__).resolve().parents[2]
+        startup = subprocess.check_output(["git", "show", "origin/main:startup.sh"], cwd=root, text=True)
+        case = re.search(r'case "\$\{TELEGRAM_POLLER_ENABLED-true\}" in.*?\nesac', startup, re.S).group()
         for value in (
+            None,
+            "",
+            " ",
             "true",
             "1",
             "yes",
             "on",
-            "TRUE",
-            "Yes",
+            "tRuE",
+            "YeS",
             "false",
             "0",
             "no",
             "off",
-            "FALSE",
-            "Off",
-            "",
-            "unknown",
+            "FaLsE",
+            "oFf",
             " false ",
+            "\tOFF\n",
+            '"false"',
+            "'off'",
+            "$ALIAS",
+            "garbage",
         ):
-            with self.subTest(value=value):
-                env = Mock(return_value=value)
-                self.assertIs(eval(expression, {"env": env}), value.lower() not in {"false", "0", "no", "off"})
-                env.assert_called_once_with("TELEGRAM_POLLER_ENABLED", default="")
+            with self.subTest(value=value), patch.dict(os.environ, {"ALIAS": "false"}):
+                if value is None:
+                    os.environ.pop("TELEGRAM_POLLER_ENABLED", None)
+                else:
+                    os.environ["TELEGRAM_POLLER_ENABLED"] = value
+                shell = subprocess.run(
+                    ["bash", "-c", case + '\nprintf "%s" "$POLLER_ENABLED"'], text=True, capture_output=True, check=True
+                ).stdout
+                self.assertIs(eval(expression, {"env": environ.Env(), "os": os}), shell == "true")
 
     def test_helper_reads_overridden_setting_each_time(self):
         from apps.router.telegram_availability import telegram_inbound_enabled

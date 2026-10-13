@@ -1,39 +1,134 @@
-"""Static instructions must not promise an unavailable conversational channel."""
+"""Availability is rendered server-side; tenant instructions need no API lookup."""
 
+import ast
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
-from apps.orchestrator.services import converge_tools_md_text
+from apps.orchestrator.services import _TOOLS_MD_CHANNEL_BODY, converge_tools_md_text
+
+ROOT = Path(__file__).resolve().parents[2]
+SUPPORTED = "- Telegram and LINE are fully supported. Never assume a message came from Telegram."
+
+
+def main_text(path):
+    return subprocess.check_output(["git", "show", f"origin/main:{path}"], cwd=ROOT, text=True)
 
 
 class TelegramInstructionTests(SimpleTestCase):
-    def test_static_docs_require_current_availability(self):
-        root = Path(__file__).resolve().parents[2] / "templates/openclaw"
+    def test_enabled_templates_and_channel_body_match_main(self):
         for filename in ("TOOLS.md", "docs/platform-guide.md"):
-            with self.subTest(filename=filename):
-                text = (root / filename).read_text()
-                self.assertIn("telegram_available", text)
-                self.assertIn("false", text)
-                self.assertIn("true", text)
-                self.assertNotIn("Telegram and LINE are fully supported", text)
+            path = f"templates/openclaw/{filename}"
+            self.assertEqual((ROOT / path).read_text(), main_text(path))
+        tree = ast.parse(main_text("apps/orchestrator/services.py"))
+        body = next(
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_TOOLS_MD_CHANNEL_BODY" for t in node.targets)
+        )
+        self.assertEqual(_TOOLS_MD_CHANNEL_BODY, ast.literal_eval(body))
+        with override_settings(TELEGRAM_INBOUND_ENABLED=True):
+            self.assertIsNone(converge_tools_md_text(main_text("templates/openclaw/TOOLS.md")))
 
-    def test_converge_old_supported_claim_preserves_custom_notes(self):
-        current = "# Tools\n- Telegram and LINE are fully supported. Never assume a message came from Telegram.\n## Notes\nMy custom notes.\n"
-        result = converge_tools_md_text(current)
-        self.assertIsNotNone(result)
-        self.assertIn("telegram_available", result)
-        self.assertTrue(result.endswith("## Notes\nMy custom notes.\n"))
-        self.assertIsNone(converge_tools_md_text(result))
+    def test_tools_reversible_and_idempotent_without_changing_notes_or_fences(self):
+        original = (
+            "# Tools\n## Communication\n"
+            + SUPPORTED
+            + "\n```md\n"
+            + SUPPORTED
+            + "\n## Notes\n```\n## Notes\n"
+            + SUPPORTED
+            + "\nMy custom notes.\n```md\n"
+            + SUPPORTED
+            + "\n```\n"
+        )
+        with override_settings(TELEGRAM_INBOUND_ENABLED=False):
+            retired = converge_tools_md_text(original)
+            self.assertIsNotNone(retired)
+            self.assertIn("Telegram chat is not available", retired)
+            self.assertEqual(retired.count(SUPPORTED), 3)
+            self.assertIsNone(converge_tools_md_text(retired))
+        with override_settings(TELEGRAM_INBOUND_ENABLED=True):
+            self.assertEqual(converge_tools_md_text(retired), original)
+            self.assertIsNone(converge_tools_md_text(original))
+
+    def test_fenced_heading_does_not_start_managed_section(self):
+        text = "# Tools\n```md\n## Communication\n" + SUPPORTED + "\n```\n## Notes\n" + SUPPORTED
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                self.assertIsNone(converge_tools_md_text(text))
+
+    def test_legacy_convergence_uses_selected_state(self):
+        from apps.orchestrator.services import _TOOLS_MD_LEGACY_CHANNEL_LINE
+
+        original = "## Communication\n" + _TOOLS_MD_LEGACY_CHANNEL_LINE + "\n## Notes\nUntouched\n"
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                result = converge_tools_md_text(original)
+                self.assertEqual(SUPPORTED in result, enabled)
+                self.assertTrue(result.endswith("## Notes\nUntouched\n"))
+                self.assertIsNone(converge_tools_md_text(result))
+
+    def test_platform_guide_render_is_reversible_and_scoped(self):
+        from apps.orchestrator.telegram_instructions import render_platform_guide
+
+        original = main_text("templates/openclaw/docs/platform-guide.md").strip()
+        notes = "\n## Notes\n**What:** The user can connect both Telegram and LINE and choose a preferred channel\n"
+        original += notes
+        with override_settings(TELEGRAM_INBOUND_ENABLED=False):
+            retired = render_platform_guide(original)
+            self.assertIn("Telegram chat is not available", retired)
+            self.assertTrue(retired.endswith(notes))
+            self.assertEqual(render_platform_guide(retired), retired)
+        with override_settings(TELEGRAM_INBOUND_ENABLED=True):
+            self.assertEqual(render_platform_guide(retired), original)
+            self.assertEqual(render_platform_guide(original), original)
+
+    def test_rendered_workspace_guide_matches_flag(self):
+        from apps.orchestrator.personas import render_workspace_files
+
+        original = main_text("templates/openclaw/docs/platform-guide.md").strip()
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                result = render_workspace_files("neighbor")["NBHD_DOC_PLATFORM_GUIDE"]
+                if enabled:
+                    self.assertEqual(result, original)
+                else:
+                    self.assertIn("Telegram chat is not available", result)
+                    self.assertNotIn("user can connect both Telegram", result)
 
 
 class TelegramFormattingTests(SimpleTestCase):
+    @override_settings(TELEGRAM_INBOUND_ENABLED=True)
+    def test_enabled_formatting_is_byte_identical_to_main_for_all_surfaces(self):
+        from itertools import product
+
+        from apps.orchestrator.personas import _resolve_channel_formatting
+
+        tree = ast.parse(main_text("apps/orchestrator/personas.py"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_resolve_channel_formatting"
+        )
+        namespace = {"_load_doc_template": lambda filename: main_text(f"templates/openclaw/docs/{filename}").strip()}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "main_personas.py", "exec"), namespace)
+        for device, telegram, line in product((True, False), repeat=3):
+            tenant = SimpleNamespace(
+                user=SimpleNamespace(
+                    telegram_chat_id=12345 if telegram else None, line_user_id="line" if line else None
+                ),
+                device_tokens=Mock(),
+            )
+            tenant.device_tokens.exists.return_value = device
+            with self.subTest(device=device, telegram=telegram, line=line):
+                self.assertEqual(_resolve_channel_formatting(tenant), namespace["_resolve_channel_formatting"](tenant))
+
     def test_channel_formatting_respects_availability(self):
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-
-        from django.test import override_settings
-
         from apps.orchestrator.personas import _resolve_channel_formatting
 
         for enabled in (True, False):
@@ -51,3 +146,54 @@ class TelegramFormattingTests(SimpleTestCase):
                         self.assertIn("# LINE", content)
                     else:
                         self.assertIn("# NBHD App", content)
+
+    def test_retired_preference_disables_last_channel_heartbeat_and_commitments(self):
+        from apps.orchestrator.config_generator import _build_commitments_config, _build_heartbeat_defaults
+
+        tenant = SimpleNamespace(
+            user=SimpleNamespace(preferred_channel="telegram", timezone="UTC"),
+            experimental_built_in_heartbeat=True,
+            heartbeat_start_hour=8,
+            heartbeat_window_hours=12,
+        )
+        for enabled in (True, False):
+            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                self.assertEqual(_build_heartbeat_defaults(tenant)["every"], "1h" if enabled else "0m")
+                self.assertEqual(_build_commitments_config(tenant)["enabled"], enabled)
+
+
+class CronRuntimeRenderingTests(SimpleTestCase):
+    def test_existing_runtime_renders_undeliverable_as_truthful_backend_json(self):
+        import json
+
+        runtime = (ROOT / "runtime/openclaw/plugins/nbhd-automation-tools/index.js").read_text()
+        # Execute the existing, unchanged renderer. The pending_approval branch
+        # asserts delivery; all other states already preserve backend details.
+        functions = runtime[runtime.index("function renderPayload(") : runtime.index("function hiddenOrigin(")]
+        payload = {
+            "state": "approval_undeliverable",
+            "delivery_state": "no_channel",
+            "detail": "The approval prompt was not delivered. The request remains pending; no scheduled task was created.",
+        }
+        program = functions + "\nconsole.log(JSON.stringify(renderCronCreatePayload(" + json.dumps(payload) + ", {})));"
+        result = json.loads(subprocess.check_output(["node", "-e", program], text=True))
+        self.assertEqual(json.loads(result["content"][0]["text"]), payload)
+        self.assertNotIn("card in the app", result["content"][0]["text"])
+
+
+class ManagedPassageEdgeTests(SimpleTestCase):
+    @override_settings(TELEGRAM_INBOUND_ENABLED=False)
+    def test_indented_notes_heading_ends_communication(self):
+        current = "## Communication\nCustom text\n  ## Notes\n" + SUPPORTED + "\n"
+        self.assertIsNone(converge_tools_md_text(current))
+
+    def test_missing_optional_guide_keeps_workspace_render_fail_soft(self):
+        from unittest.mock import patch
+
+        from apps.orchestrator import personas
+
+        load = personas._load_doc_template
+        with patch.object(
+            personas, "_load_doc_template", side_effect=lambda name: None if name == "platform-guide.md" else load(name)
+        ):
+            self.assertNotIn("NBHD_DOC_PLATFORM_GUIDE", personas.render_workspace_files("neighbor"))

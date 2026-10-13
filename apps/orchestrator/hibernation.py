@@ -1394,7 +1394,10 @@ def _forward_buffered_telegram(tenant, msg, chat_timeout: float) -> _BufferedFor
     """
     from apps.cron.gateway_client import get_gateway_token_for_tenant
     from apps.router.buffer_envelope import envelope_media
-    from apps.router.pending_queue import _extract_ai_response, relay_ai_response_to_telegram
+    from apps.router.pending_queue import DeliveryState, SendResult, _extract_ai_response, relay_ai_response_to_telegram
+
+    if not telegram_inbound_enabled():
+        return _BufferedForwardResult("", SendResult(DeliveryState.FAILED, detail="telegram_unavailable"))
 
     chat_id = _buffered_telegram_chat_id(tenant, msg)
     if chat_id is None:
@@ -1436,7 +1439,6 @@ def _forward_buffered_telegram(tenant, msg, chat_timeout: float) -> _BufferedFor
     )
 
     ai_text = _extract_ai_response(result) or ""
-    from apps.router.pending_queue import DeliveryState, SendResult
 
     relay_result = SendResult(DeliveryState.SENT, detail="empty_ai_text")
     if ai_text:
@@ -1898,7 +1900,9 @@ def deliver_buffered_messages_task(tenant_id: str) -> dict:
 
             msg.delivered = True
             msg.delivered_at = timezone.now()
-            msg.delivery_status = BufferedMessage.Status.DELIVERED
+            msg.delivery_status = (
+                BufferedMessage.Status.DELIVERED if forward_result.relay_result else BufferedMessage.Status.FAILED
+            )
             msg.delivery_in_flight_until = None
             msg.save(
                 update_fields=[
@@ -1908,6 +1912,12 @@ def deliver_buffered_messages_task(tenant_id: str) -> dict:
                     "delivery_in_flight_until",
                 ]
             )
+            if not forward_result.relay_result:
+                # The turn either never ran (retired channel) or its reply failed.
+                # Terminalize once: rerunning the model cannot repair that reply.
+                _send_apology_for_dropped_message(tenant, msg)
+                dropped += 1
+                continue
             delivered += 1
 
             # Privacy hard-delete on confirmed forward — see the LINE batch

@@ -847,7 +847,9 @@ def run_extraction_for_tenant(tenant: Tenant) -> dict:
                     _deliver_summary_telegram(
                         bot_token, chat_id, added_items, task_actions=task_actions, entity_map=tenant.pii_entity_map
                     )
-        elif channel == "app":
+                elif not telegram_inbound_enabled():
+                    channel = "app"
+        if channel == "app":
             # iOS/web app: no inline buttons — deliver the same content as a
             # proactive message. record_proactive_outbound writes the ?since=
             # feed row AND fires the APNs wake-push (fail-soft, off-thread).
@@ -865,7 +867,7 @@ def run_extraction_for_tenant(tenant: Tenant) -> dict:
                 message_text=_build_summary_text(added_items, task_actions, entity_map=None),
                 job_name="nightly_extraction",
             )
-        else:  # channel "none" or explicit eval sink: work ran; no summary transport
+        elif channel not in {"telegram", "line"}:  # No delivery surface or explicit eval sink
             logger.info(
                 "extraction: tenant=%s extraction/reconciliation ran but no delivery surface — summary not sent",
                 str(tenant.id)[:8],

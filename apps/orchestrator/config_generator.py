@@ -1733,7 +1733,12 @@ def _build_heartbeat_defaults(tenant: Tenant) -> dict:
     # check-ins via the cron-based heartbeat path instead, which is far
     # less frequent and uses the same Push allowance more sparingly.
     # See apps/router/line_quota.py for the quota state machine.
-    if (getattr(tenant.user, "preferred_channel", "") or "") == "line":
+    from apps.router.telegram_availability import telegram_inbound_enabled
+
+    preferred_channel = getattr(tenant.user, "preferred_channel", "") or ""
+    # A legacy Telegram preference must not leave target="last" pointing at
+    # a retired chat. Keep the optional extractor off with its heartbeat.
+    if preferred_channel == "line" or (preferred_channel == "telegram" and not telegram_inbound_enabled()):
         return {"every": "0m"}
 
     user_tz = str(getattr(tenant.user, "timezone", "") or "UTC")
@@ -1770,7 +1775,12 @@ def _build_commitments_config(tenant: Tenant) -> dict:
     # _build_heartbeat_defaults) to preserve LINE Push quota. Commitments
     # only deliver via the heartbeat, so disable here too — otherwise the
     # extractor burns LLM tokens post-reply with nothing to surface.
-    if (getattr(tenant.user, "preferred_channel", "") or "") == "line":
+    from apps.router.telegram_availability import telegram_inbound_enabled
+
+    preferred_channel = getattr(tenant.user, "preferred_channel", "") or ""
+    # A legacy Telegram preference must not leave target="last" pointing at
+    # a retired chat. Keep the optional extractor off with its heartbeat.
+    if preferred_channel == "line" or (preferred_channel == "telegram" and not telegram_inbound_enabled()):
         return {"enabled": False}
     return {"enabled": True, "maxPerDay": 3}
 

@@ -51,6 +51,13 @@ class UserSerializer(serializers.ModelSerializer):
             "line_display_name",
         )
 
+    def validate_preferred_channel(self, value):
+        from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
+
+        if value == "telegram" and not telegram_inbound_enabled():
+            raise serializers.ValidationError(TELEGRAM_UNAVAILABLE_DETAIL, code="telegram_unavailable")
+        return value
+
     def validate_timezone(self, value):
         return _validate_timezone(value)
 

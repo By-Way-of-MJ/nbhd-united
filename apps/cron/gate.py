@@ -209,8 +209,17 @@ def _rehydrated_summary(action: PendingAction) -> str:
 
 def cron_action_state(action: PendingAction) -> dict:
     if action.status == ActionStatus.PENDING:
+        undeliverable = action.delivery_state in {"no_channel", "failed"}
         return {
-            "state": "pending_approval",
+            "state": "approval_undeliverable" if undeliverable else "pending_approval",
+            **(
+                {
+                    "delivery_state": action.delivery_state,
+                    "detail": "The approval prompt was not delivered. The request remains pending; no scheduled task was created.",
+                }
+                if undeliverable
+                else {}
+            ),
             "action_id": action.id,
             "expires_at": action.expires_at.isoformat(),
             "summary": _rehydrated_summary(action),

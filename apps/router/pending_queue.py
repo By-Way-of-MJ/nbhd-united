@@ -1817,7 +1817,7 @@ def drain_pending_messages_for_tenant_task(
                 channel=channel,
                 channel_user_id=channel_user_id or "",
                 error=outcome.reason,
-                send_apology=False,
+                send_apology=outcome.reason == "telegram_unavailable",
                 transcript_capture=transcript_capture,
             )
             return {
@@ -2642,6 +2642,14 @@ def _drain_telegram_batch(tenant: Tenant, batch: list[PendingMessage], timeout: 
             DeliveryState.FAILED,
             gateway_responded=False,
             reason="empty_batch",
+        )
+
+    if not telegram_inbound_enabled():
+        return DrainOutcome(
+            Disposition.TERMINAL,
+            DeliveryState.FAILED,
+            gateway_responded=False,
+            reason="telegram_unavailable",
         )
 
     chat_id_str = batch[0].channel_user_id
