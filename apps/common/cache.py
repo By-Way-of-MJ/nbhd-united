@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import wraps
 
 from django.core.cache import cache
@@ -91,13 +91,16 @@ def _view_qualname(view_self) -> str:
     return f"{cls.__module__}.{cls.__name__}"
 
 
-def tenant_cache(ttl: int = DEFAULT_TTL, tag: str = "default"):
+def tenant_cache(ttl: int = DEFAULT_TTL, tag: str = "default", *, key_extra: Callable[[], object] | None = None):
     """Cache GETs for the wrapped DRF view method, scoped to the request's tenant.
 
     Skipped when:
       - request method is not GET
       - request has no resolvable tenant (anon, no-tenant user)
       - upstream view returns a non-200 response (we don't memoize errors)
+
+    ``key_extra`` varies a view by current platform capability settings, independently
+    of tenant mutations. Existing callers retain their original keys.
 
     Cached payload is `(response.data, status_code, content_type)`. We re-wrap
     into a fresh DRF `Response` on hit so middleware (ETag, Cache-Control) can
@@ -123,6 +126,8 @@ def tenant_cache(ttl: int = DEFAULT_TTL, tag: str = "default"):
 
             sig = _request_signature(request, kwargs)
             key = f"nbhd:view:{_view_qualname(self)}:{tenant.id}:{tag}:{tag_v}:{sig}"
+            if key_extra is not None:
+                key += f":{key_extra()}"
 
             try:
                 cached = cache.get(key)

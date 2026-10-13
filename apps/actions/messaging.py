@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from django.conf import settings
 
 from apps.common.eval_sink import suppresses_real_transport
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .models import ActionStatus, PendingAction
@@ -392,10 +393,10 @@ _SENDERS = {
 def _resolve_gate_channel(user, *, originating_channel: str | None = None) -> str | None:
     """Resolve the channel for an INTERACTIVE gate confirmation.
 
-    An explicit originating channel is authoritative. ``ios`` normalizes to the
+    An available explicit originating channel is authoritative. ``ios`` normalizes to the
     app review surface; Telegram/LINE keep their established senders and button
     payloads. An invalid explicit value fails closed instead of crossing to a
-    linked channel.
+    linked channel. A disabled Telegram origin uses the existing fallback order.
 
     Deliberately NOT ``resolve_user_channel`` (which is app-first): gate buttons
     stay on linked messaging channels in their established Telegram-then-LINE
@@ -420,11 +421,13 @@ def _resolve_gate_channel(user, *, originating_channel: str | None = None) -> st
         normalized = originating_channel.strip().lower()
         if normalized in {"app", "ios"}:
             return "app"
-        if normalized in {"telegram", "line"}:
+        if normalized == "line" or (normalized == "telegram" and telegram_inbound_enabled()):
             return normalized
-        return None
+        if normalized != "telegram":
+            return None
+        # A retired origin cannot host a review; use the established fallback order.
 
-    if getattr(user, "telegram_chat_id", None):
+    if telegram_inbound_enabled() and getattr(user, "telegram_chat_id", None):
         return "telegram"
     if getattr(user, "line_user_id", None):
         return "line"

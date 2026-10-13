@@ -1,4 +1,4 @@
-LINE Messaging API Push quota is at {{ used }}/{{ limit }} ({{ used_pct }}%)
+{% if telegram_available %}LINE Messaging API Push quota is at {{ used }}/{{ limit }} ({{ used_pct }}%)
 for this billing cycle.
 
 When usage hits 100%, every Push message returns 429 until the cycle
@@ -9,4 +9,13 @@ Telegram (if linked) and emailed; LINE-only tenants will be emailed a
 To raise the cap, upgrade the LINE Messaging API plan in the Developers
 Console.
 
-— NBHD ops bot
+— NBHD ops bot{% else %}LINE Messaging API Push quota is at {{ used }}/{{ limit }} ({{ used_pct }}%)
+for this billing cycle.
+
+When usage hits 100%, Push messages return 429 until the cycle resets.
+Affected tenants will be emailed to use the NBHD app. Channel preferences
+will stay unchanged.
+
+To raise the cap, upgrade the LINE Messaging API plan in the Developers Console.
+
+— NBHD ops bot{% endif %}

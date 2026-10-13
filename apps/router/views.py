@@ -350,6 +350,12 @@ def telegram_webhook(request):
         logger.info("Telegram webhook: skipping duplicate update %s", update_id)
         return HttpResponse("ok")
 
+    from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
+
+    if not telegram_inbound_enabled():
+        # Acknowledge without routing messages or callbacks from a latent webhook.
+        return JsonResponse({"code": "telegram_unavailable", "detail": TELEGRAM_UNAVAILABLE_DETAIL})
+
     # Handle /start TOKEN for account linking (before routing)
     link_response = handle_start_command(update)
     if link_response:

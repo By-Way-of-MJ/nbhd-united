@@ -205,6 +205,9 @@ class GateRequestView(APIView):
         delivered = send_gate_confirmation(tenant, action)
 
         if not delivered:
+            from apps.router.telegram_availability import telegram_inbound_enabled
+
+            channels = "Telegram or LINE" if telegram_inbound_enabled() else "LINE"
             action.status = ActionStatus.EXPIRED
             action.save(update_fields=["status"])
             record_action_audit(action, ActionStatus.EXPIRED)
@@ -219,9 +222,9 @@ class GateRequestView(APIView):
                     "status": "undeliverable",
                     "reason": "no_channel",
                     "message": (
-                        "This action requires confirmation via Telegram or LINE, "
+                        f"This action requires confirmation via {channels}, "
                         "but no messaging channel is linked to your account. "
-                        "Please connect Telegram or LINE to perform this action."
+                        f"Please connect {channels} to perform this action."
                     ),
                 },
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,

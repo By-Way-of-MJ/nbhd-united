@@ -23,6 +23,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from apps.common.cache import tenant_cache
+from apps.router.telegram_availability import telegram_inbound_enabled
 
 from .models import Tenant
 from .serializers import EmailTokenObtainPairSerializer, TenantSerializer, UserSerializer
@@ -324,7 +325,7 @@ class LogoutView(APIView):
 class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @tenant_cache(ttl=60, tag="tenant")
+    @tenant_cache(ttl=60, tag="tenant", key_extra=telegram_inbound_enabled)
     def get(self, request):
         user = request.user
         user_data = UserSerializer(user).data

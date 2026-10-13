@@ -101,7 +101,7 @@ Tested width: 600px. Mobile breakpoint: 600px → full-width 24px gutter.
           <tr>
             <td class="px-page" align="left" style="padding: 0 48px 28px 48px;">
               <p style="margin: 0; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; font-size: 14px; line-height: 1.5; color: rgba(226,232,240,0.62); font-weight: 500;">
-                Chat in the NBHD app on your iPhone — or connect Telegram or LINE.
+                Chat in the NBHD app on your iPhone — or connect {% if telegram_available %}Telegram or {% endif %}LINE.
               </p>
             </td>
           </tr>
@@ -113,7 +113,7 @@ Tested width: 600px. Mobile breakpoint: 600px → full-width 24px gutter.
                 Hi {{ display_name|default:"there" }},
               </p>
               <p style="margin: 0 0 18px 0; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; font-size: 15px; line-height: 1.7; color: rgba(226,232,240,0.78);">
-                Your assistant is set up. If you signed up on your iPhone, just open the NBHD app — your assistant is already saying hello. Prefer messaging apps? Connect Telegram or LINE from your dashboard and chat there too.
+                Your assistant is set up. If you signed up on your iPhone, just open the NBHD app — your assistant is already saying hello. Prefer messaging apps? Connect {% if telegram_available %}Telegram or {% endif %}LINE from your dashboard and chat there too.
               </p>
             </td>
           </tr>
@@ -148,7 +148,7 @@ Tested width: 600px. Mobile breakpoint: 600px → full-width 24px gutter.
           <tr>
             <td class="px-page" align="left" style="padding: 16px 48px 0 48px;">
               <p style="margin: 0 0 18px 0; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; font-size: 13px; line-height: 1.6; color: rgba(226,232,240,0.55);">
-                <a href="{{ settings_url }}" target="_blank" rel="noopener" style="color: #4ECDC4; text-decoration: none; border-bottom: 1px solid rgba(78,205,196,0.45);">Connect Telegram or LINE</a>
+                <a href="{{ settings_url }}" target="_blank" rel="noopener" style="color: #4ECDC4; text-decoration: none; border-bottom: 1px solid rgba(78,205,196,0.45);">Connect {% if telegram_available %}Telegram or {% endif %}LINE</a>
               </p>
               <p style="margin: 0; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif; font-size: 15px; line-height: 1.7; color: rgba(226,232,240,0.78);">
                 Some things to try first:

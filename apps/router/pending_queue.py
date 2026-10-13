@@ -63,6 +63,7 @@ from apps.orchestrator.gateway_url import gateway_base_url
 from apps.pii.authoring import placeholder_redactions
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage, RuntimeWriteActivity
 from apps.router.reply_text import clamp_reply_text
+from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -2286,6 +2287,9 @@ def _send_apology_for_stale_pending_message(
     else:
         text = error_msg(lang, "stale_message", age=age_label)
 
+    if msg.channel == PendingMessage.Channel.TELEGRAM and not telegram_inbound_enabled():
+        text = f"Your queued message could not be delivered. {TELEGRAM_UNAVAILABLE_DETAIL}"
+
     if msg.channel == PendingMessage.Channel.LINE:
         line_user_id = msg.channel_user_id or getattr(tenant.user, "line_user_id", None)
         if not line_user_id:
@@ -2371,6 +2375,9 @@ def _send_apology_for_dropped_pending_message(tenant: Tenant, msg: PendingMessag
         text = error_msg(lang, "dropped_message_with_excerpt", excerpt=excerpt)
     else:
         text = error_msg(lang, "dropped_message")
+
+    if msg.channel == PendingMessage.Channel.TELEGRAM and not telegram_inbound_enabled():
+        text = f"Your queued message could not be delivered. {TELEGRAM_UNAVAILABLE_DETAIL}"
 
     if msg.channel == PendingMessage.Channel.LINE:
         line_user_id = msg.channel_user_id or getattr(tenant.user, "line_user_id", None)
@@ -3180,6 +3187,10 @@ def relay_ai_response_to_telegram(tenant: Tenant, chat_id: int, ai_text: str) ->
       - ``MEDIA:path`` image references (via ``_send_telegram_photo``)
       - Markdown chunking + Telegram parse_mode fallback to plain text
     """
+    # This relay has no alternate interactive surface. Keep the queue failure
+    # visible through its existing retry/drop outcome, including callback-only replies.
+    if not telegram_inbound_enabled():
+        return SendResult(DeliveryState.FAILED, detail="telegram_unavailable")
     if not ai_text or not chat_id:
         return SendResult(DeliveryState.FAILED, detail="no_text")
     if suppresses_real_transport(tenant):

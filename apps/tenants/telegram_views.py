@@ -13,6 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from apps.router.services import invalidate_cache
+from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 
 from . import telegram_service as svc
 
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 @permission_classes([IsAuthenticated])
 def telegram_generate_link(request):
     """Generate a one-time QR code + deep link for Telegram linking."""
+    if not telegram_inbound_enabled():
+        return _unavailable_response()
     user = request.user
 
     # If already linked, tell them
@@ -63,4 +66,10 @@ def telegram_unlink(request):
 @permission_classes([IsAuthenticated])
 def telegram_status(request):
     """Get the user's Telegram link status."""
+    if not request.user.telegram_user_id and not telegram_inbound_enabled():
+        return _unavailable_response()
     return Response(svc.get_telegram_status(request.user))
+
+
+def _unavailable_response():
+    return Response({"code": "telegram_unavailable", "detail": TELEGRAM_UNAVAILABLE_DETAIL}, status=409)

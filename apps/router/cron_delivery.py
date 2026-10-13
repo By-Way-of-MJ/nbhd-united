@@ -25,6 +25,7 @@ from rest_framework.views import APIView
 from apps.common.eval_sink import suppresses_real_transport
 from apps.integrations.internal_auth import InternalAuthError, validate_internal_runtime_request
 from apps.router.document_write_guard import record_runtime_write_activity
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -379,7 +380,7 @@ def resolve_user_channel(user) -> str | None:
 
     if eligible_device_tokens(user).exists():
         return "app"
-    if getattr(user, "telegram_chat_id", None):
+    if telegram_inbound_enabled() and getattr(user, "telegram_chat_id", None):
         return "telegram"
     if getattr(user, "line_user_id", None):
         return "line"

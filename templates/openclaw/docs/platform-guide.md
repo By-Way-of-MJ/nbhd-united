@@ -160,10 +160,13 @@ They can change per-task model preferences at `/settings/ai-provider`.
 
 ---
 
-## Multi-Channel (Telegram + LINE)
+## Messaging channels
 
-**What:** The user can connect both Telegram and LINE and choose a preferred channel
-for proactive messages. Managed at `/settings/integrations`.
+**What:** The NBHD app and LINE are conversational surfaces. Offer Telegram chat or
+linking only when the tenant API reports `telegram_available: true`. When it is
+`false` or unknown, direct users to the NBHD app or LINE. An existing Telegram
+link does not prove replies or callback buttons work. Connections are managed
+at `/settings/integrations`; proactive delivery uses the available surfaces.
 
 **Nudge:** Only if relevant: "I'm also available on LINE if you'd prefer that for some messages."
 

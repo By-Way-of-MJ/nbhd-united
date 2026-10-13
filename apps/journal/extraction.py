@@ -26,6 +26,7 @@ from apps.lessons.models import Lesson
 from apps.lessons.services import generate_embedding
 from apps.pii.redactor import rehydrate_text
 from apps.router.extraction_callbacks import _approve_goal, _approve_lesson, _approve_task
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -839,7 +840,7 @@ def run_extraction_for_tenant(tenant: Tenant) -> dict:
                 # Fallback to Telegram if LINE delivery fails
                 chat_id = getattr(tenant.user, "telegram_chat_id", None)
                 bot_token = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
-                if chat_id and bot_token:
+                if telegram_inbound_enabled() and chat_id and bot_token:
                     logger.warning(
                         "extraction: LINE failed, falling back to Telegram for tenant %s", str(tenant.id)[:8]
                     )

@@ -16,6 +16,7 @@ from apps.common.cache import tenant_cache
 from apps.cron.publish import publish_task
 from apps.orchestrator.config_generator import TIER_MODEL_CONFIGS
 from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
+from apps.router.telegram_availability import telegram_inbound_enabled
 
 from .models import Tenant
 from .serializers import HeartbeatConfigSerializer, TenantRegistrationSerializer, TenantSerializer, UserSerializer
@@ -36,7 +37,7 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         return Tenant.objects.none()
 
     @action(detail=False, methods=["get"])
-    @tenant_cache(ttl=60, tag="tenant")
+    @tenant_cache(ttl=60, tag="tenant", key_extra=telegram_inbound_enabled)
     def me(self, request):
         """Get current user's tenant."""
         try:

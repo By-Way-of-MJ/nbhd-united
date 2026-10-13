@@ -15,6 +15,7 @@ import logging
 from django.conf import settings
 
 from apps.common.eval_sink import suppresses_real_transport
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .models import Friendship, NeighborProfile
@@ -173,6 +174,8 @@ def notify_wave_received(friendship: Friendship) -> bool:
         preferred = getattr(addressee.user, "preferred_channel", "") or "telegram"
         fallback = "line" if preferred == "telegram" else "telegram"
         for channel in (preferred, fallback):
+            if channel == "telegram" and not telegram_inbound_enabled():
+                continue
             sender = _SENDERS.get(channel)
             if sender and sender(addressee, friendship):
                 return True

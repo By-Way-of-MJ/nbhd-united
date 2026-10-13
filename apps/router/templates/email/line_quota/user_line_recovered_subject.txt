@@ -1,1 +1,1 @@
-LINE is back — want to switch back from Telegram?
+{% if telegram_available %}LINE is back — want to switch back from Telegram?{% else %}LINE messaging is back{% endif %}

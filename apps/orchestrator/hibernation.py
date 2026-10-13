@@ -26,6 +26,7 @@ from django.db import InterfaceError, OperationalError, models
 from django.utils import timezone
 
 from apps.common.eval_sink import suppresses_real_transport
+from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -1189,6 +1190,9 @@ def _send_apology_for_dropped_message(tenant: Tenant, msg) -> None:
         text = error_msg(lang, "dropped_message_with_excerpt", excerpt=excerpt)
     else:
         text = error_msg(lang, "dropped_message")
+
+    if msg.channel == BufferedMessage.Channel.TELEGRAM and not telegram_inbound_enabled():
+        text = f"Your queued message could not be delivered. {TELEGRAM_UNAVAILABLE_DETAIL}"
 
     if msg.channel == BufferedMessage.Channel.LINE:
         line_user_id = getattr(tenant.user, "line_user_id", None)

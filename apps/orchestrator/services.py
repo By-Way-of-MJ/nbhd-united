@@ -21,6 +21,7 @@ from apps.cron.gateway_client import (
     is_container_unavailable_response,
 )
 from apps.orchestrator.gateway_url import gateway_base_url
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .azure_client import (
@@ -637,9 +638,10 @@ def provision_tenant(tenant_id: str, *, send_first_session_welcome: bool = True)
     # These run OUTSIDE the main try/except so failures here do NOT reset
     # the tenant to PENDING. The container metadata is already persisted.
 
-    # 4b. Send proactive welcome message via Telegram
+    # 4b. Send the conversational welcome only when Telegram can receive replies.
+    # The existing welcome email below covers users without that surface.
     chat_id = tenant.user.telegram_chat_id
-    if chat_id and not suppresses_real_transport(tenant):
+    if telegram_inbound_enabled() and chat_id and not suppresses_real_transport(tenant):
         try:
             from apps.router.onboarding import WELCOME_MESSAGE
             from apps.router.services import send_telegram_message
@@ -1079,8 +1081,8 @@ def reassert_agents_md(tenant, *, only_if_changed: bool = True) -> bool:
 # "Telegram is the primary channel" line verbatim. Rather than overwrite the
 # file (its "## Notes" section invites user edits), converge SURGICALLY: swap
 # just the legacy channel line for the channel-agnostic body, preserving
-# everything else. Idempotent — a file that no longer contains the legacy line
-# (already converged, or heavily customized) is left untouched.
+# everything else. Also replace the earlier unconditional support sentence.
+# Idempotent — files without either known obsolete sentence are left untouched.
 _TOOLS_MD_LEGACY_CHANNEL_LINE = "- **Telegram** is the primary channel. All messages come through Telegram DM."
 
 # The replacement Communication bullets. MUST stay byte-identical to the
@@ -1093,7 +1095,7 @@ _TOOLS_MD_CHANNEL_BODY = (
     "- Reply on the same surface the message arrived on. Each conversational turn is "
     "tagged with a `[chat via …]` marker naming the active channel; treat that marker "
     "as the source of truth for where the user is.\n"
-    "- Telegram and LINE are fully supported. Never assume a message came from Telegram."
+    "- Offer Telegram chat or linking only when the tenant API reports `telegram_available: true`. When it is `false` or unknown, use the NBHD app or LINE; existing Telegram links do not prove replies or callback buttons work. Never assume a message came from Telegram."
 )
 
 TOOLS_MD_EXTRAS_BEGIN_MARKER = (
@@ -1114,16 +1116,21 @@ def _tools_md_extras_markers_malformed(current: str) -> bool:
 
 
 def converge_tools_md_text(current: str | None) -> str | None:
-    """Return TOOLS.md with the legacy Telegram-primary line swapped for the
-    channel-agnostic body, or ``None`` when no rewrite is needed (empty file,
-    already converged, or the legacy line is absent). Pure string logic — the
+    """Replace known obsolete channel wording in TOOLS.md, or return ``None``
+    when no rewrite is needed (empty, already converged, or customized text).
+    Pure string logic — the
     caller owns the share read/write so every write still routes through the
     ``_put_share_file`` sanitize chokepoint."""
     if not current:
         return None
-    if _TOOLS_MD_LEGACY_CHANNEL_LINE not in current:
-        return None
-    return current.replace(_TOOLS_MD_LEGACY_CHANNEL_LINE, _TOOLS_MD_CHANNEL_BODY)
+    updated = current.replace(_TOOLS_MD_LEGACY_CHANNEL_LINE, _TOOLS_MD_CHANNEL_BODY)
+    # Earlier channel-agnostic seeds still promised unconditional Telegram support.
+    # Replace only this managed sentence; preserve all user-authored notes.
+    updated = updated.replace(
+        "- Telegram and LINE are fully supported. Never assume a message came from Telegram.",
+        "- Offer Telegram chat or linking only when the tenant API reports `telegram_available: true`. When it is `false` or unknown, use the NBHD app or LINE; existing Telegram links do not prove replies or callback buttons work. Never assume a message came from Telegram.",
+    )
+    return updated if updated != current else None
 
 
 def splice_tools_md_extras(current: str | None, extras: str | None) -> str | None:
@@ -1176,7 +1183,7 @@ def reassert_tools_md(tenant) -> bool:
 
     Mirrors :func:`reassert_agents_md`: share-only write (no revision, no
     restart — OpenClaw re-reads TOOLS.md per session). Reads the current copy,
-    runs :func:`converge_tools_md_text`, and writes back only when the legacy
+    runs :func:`converge_tools_md_text`, and writes back only when obsolete
     channel line is present. Fail-closed on read error (never write blind).
     Returns True iff it wrote a converged copy. Called from the container-started
     hook (hibernated tenants converge at wake) and the ``converge_tools_md``

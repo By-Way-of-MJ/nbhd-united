@@ -12,6 +12,8 @@ from django.core.mail import send_mail
 from django.template.loader import render_to_string
 from django.utils import timezone
 
+from apps.router.telegram_availability import telegram_inbound_enabled
+
 from .models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ def send_welcome_email(tenant: Tenant) -> bool:
         "app_store_url": NBHD_APP_STORE_URL,
         "settings_url": settings_url,
         "video_url": video_url,
+        "telegram_available": telegram_inbound_enabled(),
     }
 
     subject = render_to_string("email/welcome_subject.txt", context).strip()
