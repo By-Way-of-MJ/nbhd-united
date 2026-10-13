@@ -988,6 +988,63 @@ def hibernate_idle_tenants_task() -> dict:
     }
 
 
+def rehibernate_drifted_tenants_task() -> dict:
+    """Re-sleep active Azure revisions whose tenant row still says asleep.
+
+    Leave hibernated_at, gateway state, crons and QStash bookings untouched:
+    the row already says asleep, so wake-on-message and cron wakes retain
+    their existing claims and schedules. Use the normal idle cutoff as a
+    grace period (default 30 minutes), allowing recent deactivations to settle.
+
+    No transaction or row lock spans Azure calls. Refresh after the Azure
+    check so a wake's committed NULL claim or a new sleep supersedes this
+    snapshot; also defer to an in-flight auto-upgrade. These checks narrow,
+    but cannot atomically exclude, a wake starting during deactivation.
+    skipped_in_flight counts changed lifecycle state and auto-upgrades.
+    """
+    import logging
+    from datetime import timedelta
+
+    from django.conf import settings
+    from django.utils import timezone
+
+    from apps.orchestrator import openclaw_auto_upgrade
+    from apps.orchestrator.azure_client import container_app_has_active_revision, hibernate_container_app
+    from apps.tenants.models import Tenant
+
+    logger = logging.getLogger(__name__)
+    cutoff = timezone.now() - timedelta(minutes=settings.TENANT_IDLE_HIBERNATE_MINUTES)
+    candidates = Tenant.objects.filter(hibernated_at__lt=cutoff, container_id__gt="").only(
+        "id", "hibernated_at", "container_id"
+    )
+    counts = {"checked": 0, "awake_drifted": 0, "rehibernated": 0, "skipped_in_flight": 0, "failed": 0}
+    for tenant in candidates:
+        tid = str(tenant.id)[:8]
+        container_id = tenant.container_id
+        hibernated_at = tenant.hibernated_at
+        counts["checked"] += 1
+        try:
+            if not container_app_has_active_revision(container_id):
+                continue
+            counts["awake_drifted"] += 1
+            tenant.refresh_from_db(fields=["hibernated_at", "container_id"])
+            if (
+                tenant.hibernated_at is None
+                or tenant.hibernated_at != hibernated_at
+                or tenant.container_id != container_id
+                or openclaw_auto_upgrade.in_flight(tenant.id)
+            ):
+                counts["skipped_in_flight"] += 1
+                continue
+            hibernate_container_app(container_id)
+            counts["rehibernated"] += 1
+            logger.warning("rehibernate_drifted_tenants: re-slept tenant %s container %s", tid, container_id)
+        except Exception:
+            logger.exception("rehibernate_drifted_tenants: failed for tenant %s container %s", tid, container_id)
+            counts["failed"] += 1
+    return counts
+
+
 def _hibernate_idle_suspended_tenants(cutoff) -> tuple[int, int]:
     """Put idle, awake SUSPENDED tenants' containers back to sleep.
 

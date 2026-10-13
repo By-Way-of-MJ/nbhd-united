@@ -224,6 +224,24 @@ class SystemCronsWellFormednessTests(TestCase):
 
     TRIGGER_RE = re.compile(r"^/api/cron/trigger/(?P<name>[a-z0-9_]+)/$")
 
+    def test_rehibernate_drifted_tenants_is_scheduled_hourly(self):
+        from django.urls import resolve
+        from django.utils.module_loading import import_string
+
+        from apps.cron.views import TASK_MAP, trigger_task
+        from apps.orchestrator import tasks
+
+        entries = [e for e in reg_cmd.SYSTEM_CRONS if e[0] == "rehibernate-drifted-tenants"]
+        self.assertEqual(
+            entries,
+            [("rehibernate-drifted-tenants", "35 * * * *", "/api/cron/trigger/rehibernate_drifted_tenants/")],
+        )
+        match = resolve(entries[0][2])
+        self.assertIs(match.func, trigger_task)
+        self.assertEqual(match.kwargs, {"task_name": "rehibernate_drifted_tenants"})
+        self.assertIs(import_string(TASK_MAP[match.kwargs["task_name"]]), tasks.rehibernate_drifted_tenants_task)
+        self.assertEqual([e[0] for e in reg_cmd.SYSTEM_CRONS if e[1] == "35 * * * *"], [entries[0][0]])
+
     def test_every_trigger_path_resolves_to_a_task_map_entry(self):
         from apps.cron.views import TASK_MAP
 

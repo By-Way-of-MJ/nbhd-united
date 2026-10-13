@@ -76,6 +76,9 @@ SYSTEM_CRONS = [
     ("refresh-user-md-fleet", "25 * * * *", "/api/cron/trigger/refresh_user_md_fleet/"),
     # Every 10 min — hibernate tenants past the configured idle cutoff
     ("hibernate-idle-tenants", "*/10 * * * *", "/api/cron/trigger/hibernate_idle_tenants/"),
+    # Hourly at :35, free of other fixed hourly entries and the idle sweep.
+    # One Azure revision-list call per sleeping tenant; avoid a ten-minute scan.
+    ("rehibernate-drifted-tenants", "35 * * * *", "/api/cron/trigger/rehibernate_drifted_tenants/"),
     # Daily at 07:00 UTC — clean up delivered message buffers older than 7 days
     # (residual sweeper; delivered/undelivered BufferedMessage rows). Also
     # deletes undelivered raw webhooks older than 30 days (dead-tenant buffers).

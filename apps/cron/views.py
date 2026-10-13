@@ -318,6 +318,7 @@ TASK_MAP = {
     "refresh_user_md_fleet": "apps.orchestrator.tasks.refresh_user_md_fleet_task",
     # Idle hibernation — scale-to-zero for inactive tenants
     "hibernate_idle_tenants": "apps.orchestrator.tasks.hibernate_idle_tenants_task",
+    "rehibernate_drifted_tenants": "apps.orchestrator.tasks.rehibernate_drifted_tenants_task",
     "deliver_buffered_messages": "apps.orchestrator.hibernation.deliver_buffered_messages_task",
     "resume_hibernated_crons": "apps.orchestrator.hibernation.resume_hibernated_crons_task",
     # Cron-aware wake — wake hibernated containers for scheduled crons
