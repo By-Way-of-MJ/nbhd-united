@@ -2566,15 +2566,38 @@ def list_tenant_container_app_names() -> list[str]:
     return names
 
 
-def container_app_has_active_revision(container_name: str) -> bool:
+def container_app_has_active_revision(container_name: str, *, timeout_seconds: float | None = None) -> bool:
     """Return True if the container app has at least one active revision.
 
     An active revision means the container is awake (consuming compute). The
     orphan reaper uses this to report which orphans were awake before
     hibernating them. Returns False in mock mode.
+
+    timeout_seconds opts into an isolated client with bounded per-page socket
+    waits and no retries; it is not a hard wall-clock deadline for the iterator.
     """
     if _is_mock():
         return False
+
+    if timeout_seconds is not None:
+        # The default RequestsTransport is explicitly NOT thread-safe. Bounded
+        # concurrent reads own both SDK and credential transports, then close
+        # them. Leave cached-client behavior unchanged for existing callers.
+        from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+        from azure.mgmt.appcontainers import ContainerAppsAPIClient
+
+        options = dict(connection_timeout=timeout_seconds, read_timeout=timeout_seconds, retry_total=0)
+        client_id = str(getattr(settings, "AZURE_PROVISIONER_CLIENT_ID", "") or "").strip()
+        credential = (
+            ManagedIdentityCredential(client_id=client_id, **options)
+            if client_id
+            else DefaultAzureCredential(**options)
+        )
+        with credential, ContainerAppsAPIClient(credential, settings.AZURE_SUBSCRIPTION_ID) as client:
+            revisions = client.container_apps_revisions.list_revisions(
+                settings.AZURE_RESOURCE_GROUP, container_name, timeout=timeout_seconds, **options
+            )
+            return any(getattr(rev, "active", False) for rev in revisions)
 
     client = get_container_client()
     revisions = client.container_apps_revisions.list_revisions(

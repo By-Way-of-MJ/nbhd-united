@@ -1048,6 +1048,7 @@ def rehibernate_drifted_tenants_task() -> dict:
     skipped_in_flight counts changed lifecycle state and auto-upgrades.
     """
     import logging
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from datetime import timedelta
 
     from django.conf import settings
@@ -1058,35 +1059,99 @@ def rehibernate_drifted_tenants_task() -> dict:
     from apps.tenants.models import Tenant
 
     logger = logging.getLogger(__name__)
+    started = time.monotonic()
+    deadline = started + settings.REHIBERNATE_DRIFT_BUDGET_SECONDS
     cutoff = timezone.now() - timedelta(minutes=settings.TENANT_IDLE_HIBERNATE_MINUTES)
     candidates = Tenant.objects.filter(hibernated_at__lt=cutoff, container_id__gt="").only(
         "id", "hibernated_at", "container_id"
     )
-    counts = {"checked": 0, "awake_drifted": 0, "rehibernated": 0, "skipped_in_flight": 0, "failed": 0}
-    for tenant in candidates:
-        tid = str(tenant.id)[:8]
-        container_id = tenant.container_id
-        hibernated_at = tenant.hibernated_at
-        counts["checked"] += 1
-        try:
-            if not container_app_has_active_revision(container_id):
-                continue
-            counts["awake_drifted"] += 1
-            tenant.refresh_from_db(fields=["hibernated_at", "container_id"])
-            if (
-                tenant.hibernated_at is None
-                or tenant.hibernated_at != hibernated_at
-                or tenant.container_id != container_id
-                or openclaw_auto_upgrade.in_flight(tenant.id)
-            ):
-                counts["skipped_in_flight"] += 1
-                continue
-            hibernate_container_app(container_id)
-            counts["rehibernated"] += 1
-            logger.warning("rehibernate_drifted_tenants: re-slept tenant %s container %s", tid, container_id)
-        except Exception:
-            logger.exception("rehibernate_drifted_tenants: failed for tenant %s container %s", tid, container_id)
-            counts["failed"] += 1
+    counts = {
+        "checked": 0,
+        "awake_drifted": 0,
+        "rehibernated": 0,
+        "skipped_in_flight": 0,
+        "failed": 0,
+        "timed_out": False,
+    }
+    # Materialize on the caller: no queryset, ORM or DB connections in workers.
+    candidates = list(candidates)
+    # Eight concurrent reads keep the ~50-tenant sweep small without an
+    # unbounded Azure burst. Only replenish after processing completed reads.
+    pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="rehibernate-drift")
+    pending = {}
+    next_candidate = 0
+
+    def check_revision(container_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None  # Queued work must not start Azure after the budget.
+        return container_app_has_active_revision(container_id, timeout_seconds=min(15.0, remaining))
+
+    try:
+        while pending or next_candidate < len(candidates):
+            if time.monotonic() >= deadline:
+                counts["timed_out"] = True
+                break
+            while len(pending) < 8 and next_candidate < len(candidates) and time.monotonic() < deadline:
+                tenant = candidates[next_candidate]
+                pending[pool.submit(check_revision, tenant.container_id)] = tenant
+                next_candidate += 1
+            done, _ = wait(pending, timeout=max(0.0, deadline - time.monotonic()), return_when=FIRST_COMPLETED)
+            for future in done:
+                if time.monotonic() >= deadline:
+                    counts["timed_out"] = True
+                    break
+                tenant = pending.pop(future)
+                tid = str(tenant.id)[:8]
+                container_id = tenant.container_id
+                hibernated_at = tenant.hibernated_at
+                # checked counts consumed results, including read failures;
+                # timed_out signals that some work was left for the next run.
+                counts["checked"] += 1
+                try:
+                    if not future.result():
+                        continue
+                    counts["awake_drifted"] += 1
+                    tenant.refresh_from_db(fields=["hibernated_at", "container_id"])
+                    if (
+                        tenant.hibernated_at is None
+                        or tenant.hibernated_at != hibernated_at
+                        or tenant.container_id != container_id
+                        or openclaw_auto_upgrade.in_flight(tenant.id)
+                    ):
+                        counts["skipped_in_flight"] += 1
+                        continue
+                    if time.monotonic() >= deadline:
+                        counts["timed_out"] = True
+                        break
+                    # This existing synchronous mutation cannot be interrupted;
+                    # its transport timeout is outside the read-pool budget.
+                    hibernate_container_app(container_id)
+                    counts["rehibernated"] += 1
+                    logger.warning("rehibernate_drifted_tenants: re-slept tenant %s container %s", tid, container_id)
+                except Exception:
+                    logger.exception(
+                        "rehibernate_drifted_tenants: failed for tenant %s container %s", tid, container_id
+                    )
+                    counts["failed"] += 1
+            if counts["timed_out"]:
+                break
+    finally:
+        # Same deadline shutdown pattern as smoke_external_deps: a slow read
+        # must not hold the HTTP request open. Running reads cannot be killed;
+        # they own no DB connection and can never deactivate a container.
+        pool.shutdown(wait=False, cancel_futures=True)
+    logger.info(
+        "rehibernate_drifted_tenants: checked=%d awake_drifted=%d rehibernated=%d "
+        "skipped_in_flight=%d failed=%d timed_out=%s elapsed_seconds=%.2f",
+        counts["checked"],
+        counts["awake_drifted"],
+        counts["rehibernated"],
+        counts["skipped_in_flight"],
+        counts["failed"],
+        counts["timed_out"],
+        time.monotonic() - started,
+    )
     return counts
 
 
