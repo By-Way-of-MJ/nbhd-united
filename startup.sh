@@ -2,6 +2,14 @@
 set -e
 
 PII_TRANSPORT="${PII_DETECTOR_TRANSPORT:-local}"
+case "${TELEGRAM_POLLER_ENABLED-true}" in
+  [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn]) POLLER_ENABLED=true ;;
+  [Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]|[Oo][Ff][Ff]) POLLER_ENABLED=false ;;
+  *)
+    POLLER_ENABLED=true
+    echo "[startup] WARNING: unrecognised TELEGRAM_POLLER_ENABLED value; treating as enabled" >&2
+    ;;
+esac
 SIDECAR_PID=""
 POLLER_PID=""
 GUNICORN_PID=""
@@ -26,6 +34,10 @@ start_sidecar() {
 }
 
 start_poller() {
+  if [ "$POLLER_ENABLED" = "false" ]; then
+    echo "[startup] Telegram poller disabled (TELEGRAM_POLLER_ENABLED=false) — inbound Telegram messages will not be received"
+    return
+  fi
   echo "Starting central Telegram poller..."
   python manage.py poll_telegram &
   POLLER_PID=$!
@@ -100,11 +112,14 @@ start_poller
 start_gunicorn
 
 while true; do
+  set --
   if [ -n "$SIDECAR_PID" ]; then
-    wait_for_any_child "$SIDECAR_PID" "$POLLER_PID" "$GUNICORN_PID"
-  else
-    wait_for_any_child "$POLLER_PID" "$GUNICORN_PID"
+    set -- "$@" "$SIDECAR_PID"
   fi
+  if [ -n "$POLLER_PID" ]; then
+    set -- "$@" "$POLLER_PID"
+  fi
+  wait_for_any_child "$@" "$GUNICORN_PID"
 
   if ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
     echo "[startup] gunicorn exited ($WAIT_RC), shutting down"
@@ -120,7 +135,7 @@ while true; do
     fi
     continue
   fi
-  if ! kill -0 "$POLLER_PID" 2>/dev/null; then
+  if [ -n "$POLLER_PID" ] && ! kill -0 "$POLLER_PID" 2>/dev/null; then
     echo "[startup] poller exited ($WAIT_RC), restarting in 5s..."
     sleep 5
     start_poller
