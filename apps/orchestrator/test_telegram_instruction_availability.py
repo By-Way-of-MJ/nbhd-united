@@ -147,19 +147,52 @@ class TelegramFormattingTests(SimpleTestCase):
                     else:
                         self.assertIn("# NBHD App", content)
 
-    def test_retired_preference_disables_last_channel_heartbeat_and_commitments(self):
+    def test_default_preference_without_telegram_keeps_full_heartbeat_and_commitments(self):
+        from apps.orchestrator.config_generator import (
+            HEARTBEAT_MODEL,
+            _build_commitments_config,
+            _build_heartbeat_defaults,
+        )
+
+        tenant = SimpleNamespace(
+            user=SimpleNamespace(preferred_channel="telegram", telegram_chat_id=None, timezone="UTC"),
+            experimental_built_in_heartbeat=True,
+            heartbeat_start_hour=8,
+            heartbeat_window_hours=12,
+        )
+        expected_heartbeat = {
+            "every": "1h",
+            "target": "last",
+            "model": HEARTBEAT_MODEL,
+            "directPolicy": "allow",
+            "lightContext": True,
+            "isolatedSession": True,
+            "skipWhenBusy": True,
+            "activeHours": {"start": "08:00", "end": "20:00", "timezone": "UTC"},
+        }
+        results = []
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled), override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                heartbeat = _build_heartbeat_defaults(tenant)
+                commitments = _build_commitments_config(tenant)
+                results.append((heartbeat, commitments))
+                self.assertEqual(heartbeat, expected_heartbeat)
+                self.assertEqual(commitments, {"enabled": True, "maxPerDay": 3})
+        self.assertEqual(results[0], results[1])
+
+    def test_line_preference_keeps_heartbeat_and_commitments_disabled(self):
         from apps.orchestrator.config_generator import _build_commitments_config, _build_heartbeat_defaults
 
         tenant = SimpleNamespace(
-            user=SimpleNamespace(preferred_channel="telegram", timezone="UTC"),
+            user=SimpleNamespace(preferred_channel="line", telegram_chat_id=None, timezone="UTC"),
             experimental_built_in_heartbeat=True,
             heartbeat_start_hour=8,
             heartbeat_window_hours=12,
         )
         for enabled in (True, False):
-            with override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
-                self.assertEqual(_build_heartbeat_defaults(tenant)["every"], "1h" if enabled else "0m")
-                self.assertEqual(_build_commitments_config(tenant)["enabled"], enabled)
+            with self.subTest(enabled=enabled), override_settings(TELEGRAM_INBOUND_ENABLED=enabled):
+                self.assertEqual(_build_heartbeat_defaults(tenant), {"every": "0m"})
+                self.assertEqual(_build_commitments_config(tenant), {"enabled": False})
 
 
 class CronRuntimeRenderingTests(SimpleTestCase):
