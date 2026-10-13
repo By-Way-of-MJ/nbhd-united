@@ -2,7 +2,7 @@
 
 Uses either the production DeBERTa-v3 token-classification model
 (``lakshyakh93/deberta_finetuned_pii``) or the pinned LiquidAI detector,
-plus one engine-independent set of Presidio pattern recognizers.
+plus one engine-independent set of lightweight pattern recognizers.
 
 The DeBERTa model loads on first use (~554 MB on disk, ~600 MB RAM)
 via vanilla PyTorch on CPU. We deliberately do NOT route through
@@ -138,7 +138,7 @@ def get_pii_pipeline():
 
     Each implementation owns an independent lazy singleton and cached load
     error. A selected model failure is therefore re-raised until process
-    restart; callers can continue with the shared Presidio recognizers.
+    restart; callers can continue with the shared lightweight pattern recognizers.
     """
     if resolve_detector_transport(os.environ.get(_DETECTOR_TRANSPORT_ENV)) == "shared":
         from apps.pii.shared_client import get_shared_pii_pipeline
@@ -152,10 +152,9 @@ def get_pii_pipeline():
 
 
 def get_pattern_recognizers():
-    """Return Presidio pattern recognizers (no NLP engine needed).
+    """Return lightweight ports of Presidio's four pattern recognizers.
 
-    Called directly — bypasses AnalyzerEngine entirely so we
-    don't need a spaCy NLP engine or model installed.
+    Neither Presidio nor its transitive ML dependencies are imported.
 
     Returns a dict of {entity_type: recognizer} for:
     - CREDIT_CARD: Luhn checksum validation
@@ -167,7 +166,8 @@ def get_pattern_recognizers():
     global _pattern_recognizers
     if _pattern_recognizers is None:
         import regex
-        from presidio_analyzer.predefined_recognizers import (
+
+        from apps.pii.pattern_recognizers import (
             CreditCardRecognizer,
             EmailRecognizer,
             IbanRecognizer,
@@ -211,5 +211,5 @@ def get_pattern_recognizers():
             "EMAIL_ADDRESS": email_recognizer,
             "PHONE_NUMBER": phone_recognizer,
         }
-        logger.info("Presidio pattern recognizers initialized (credit card, IBAN, email, phone)")
+        logger.info("Lightweight pattern recognizers initialized (credit card, IBAN, email, phone)")
     return _pattern_recognizers
