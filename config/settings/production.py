@@ -159,6 +159,11 @@ USER_MD_SKIP_UNCHANGED_TENANT_IDS = env("USER_MD_SKIP_UNCHANGED_TENANT_IDS", def
 # tenant only once its running OpenClaw image ships the tool.
 BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
 
+# Brave "LLM Context" search mode (web_search returns page excerpts, not one-line
+# descriptions). Comma-separated tenant UUIDs or ``*``; EMPTY MEANS NOBODY. Only
+# applied to tenants on the 9.4 config shape. Container App env var name MUST match.
+BRAVE_LLM_CONTEXT_TENANT_IDS = env("BRAVE_LLM_CONTEXT_TENANT_IDS", default="")
+
 # OpenClaw image auto-roll allowlist. Container App env var name MUST match.
 # EMPTY MEANS NOBODY: a deploy bumps OPENCLAW_IMAGE_TAG but apply_pending_configs
 # + wake refresh only move a tenant onto it if listed here (comma-separated

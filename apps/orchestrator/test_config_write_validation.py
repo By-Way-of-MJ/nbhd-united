@@ -238,6 +238,9 @@ class GenerateSmokeConfigCommandTests(TestCase):
         self.assertTrue(entries["nbhd-journal-shaping"]["config"]["journalShapingEnabled"])
         self.assertIn("nbhd-document-keep", entries)
         self.assertTrue(entries["nbhd-document-keep"]["config"]["documentIngestionEnabled"])
+        # The image smoke must carry the brave mode key, or a rebuilt (unpinned)
+        # brave plugin that drops it would go unnoticed until a tenant boots on it.
+        self.assertEqual(entries["brave"]["config"], {"webSearch": {"mode": "llm-context"}})
         self.assertEqual(
             entries["nbhd-site-editor"]["config"],
             {
