@@ -243,6 +243,8 @@ QSTASH_CURRENT_SIGNING_KEY = env("QSTASH_CURRENT_SIGNING_KEY", default="")
 QSTASH_NEXT_SIGNING_KEY = env("QSTASH_NEXT_SIGNING_KEY", default="")
 QSTASH_TOKEN = env("QSTASH_TOKEN", default="")
 
+REHIBERNATE_DRIFT_BUDGET_SECONDS = env.float("REHIBERNATE_DRIFT_BUDGET_SECONDS", default=120)
+
 # Tenant runtime hibernation timing. All values are minutes so operators can
 # restore the previous behavior through environment variables without a deploy.
 TENANT_IDLE_HIBERNATE_MINUTES = env.int("TENANT_IDLE_HIBERNATE_MINUTES", default=30)

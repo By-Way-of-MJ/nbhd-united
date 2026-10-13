@@ -1,5 +1,7 @@
 """Offline interleavings of an image push, idle hibernation and delayed tasks."""
 
+import threading
+from concurrent.futures import wait
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -151,17 +153,32 @@ class ImagePushHibernateRaceTests(TestCase):
         old_sleep = self.now - timedelta(hours=1)
         Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=old_sleep)
 
-        def finish_image(_container):
-            # Replay the image task's awake start and intervening hibernation
-            # while the backstop holds its already-evaluated sleeping snapshot.
+        caller = threading.current_thread()
+
+        def finish_image_before_result(futures, **kwargs):
+            done, pending = wait(futures, **kwargs)
+            self.assertTrue(done)
+            self.assertIs(threading.current_thread(), caller)
+            # Simulate another writer after the sleeping snapshot and Azure
+            # read, but before the result is consumed and the row re-checked.
+            # Keep the image task's ORM work on the caller's TestCase connection.
             Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=None)
             self.image.side_effect = self.overlap
             self.run_image()
-            return True
+            return done, pending
 
-        with patch(f"{AZ}.container_app_has_active_revision", side_effect=finish_image):
+        with (
+            patch(f"{AZ}.container_app_has_active_revision", return_value=True) as active,
+            patch("concurrent.futures.wait", side_effect=finish_image_before_result) as wait_for_check,
+        ):
             counts = tasks.rehibernate_drifted_tenants_task()
-        self.assertEqual(counts, dict(checked=1, awake_drifted=1, rehibernated=0, skipped_in_flight=1, failed=0))
+        self.assertEqual(
+            counts,
+            dict(checked=1, awake_drifted=1, rehibernated=0, skipped_in_flight=1, failed=0, timed_out=False),
+        )
+        wait_for_check.assert_called_once()
+        active.assert_called_once()
+        self.image.assert_called_once_with(self.tenant.container_id, f"registry.test/nbhd-openclaw:{TAG}")
         self.sleep.assert_not_called()
         self.assertIsNone(self.tenant.hibernated_at)
 
