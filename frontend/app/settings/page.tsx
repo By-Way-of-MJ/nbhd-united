@@ -13,6 +13,7 @@ import {
   useCancelDeletionMutation,
   useDeleteAccountMutation,
   useMeQuery,
+  useTenantQuery,
   usePersonasQuery,
   usePreferencesQuery,
   useRefreshConfigMutation,
@@ -222,6 +223,7 @@ function timeAgo(dateStr: string): string {
 
 export default function SettingsPage() {
   const { data: me, isLoading } = useMeQuery();
+  const { data: tenant } = useTenantQuery();
   const { data: personas } = usePersonasQuery();
   const { data: prefs } = usePreferencesQuery();
   const { data: refreshConfigStatus, refetch: refetchRefreshConfigStatus } = useRefreshConfigStatusQuery();
@@ -670,12 +672,18 @@ export default function SettingsPage() {
             </div>
 
             {/* Telegram — read-only status; connect/unlink lives on Integrations */}
-            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+            {tenant && (tenant.telegram_available !== false || me.telegram_chat_id) ? <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
               <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">Telegram</dt>
               <dd className="mt-1">
                 {me.telegram_chat_id ? (
                   <span className="break-words text-base text-ink">
                     {me.telegram_username ? `@${me.telegram_username}` : "Connected"}
+                    {tenant?.telegram_available === false ? (
+                      <span className="mt-2 block text-sm text-ink-muted">
+                        Replies here are no longer available.{" "}
+                        <Link href="/settings/integrations" className="inline-flex min-h-[44px] items-center text-accent hover:text-accent-hover">Manage or unlink</Link>
+                      </span>
+                    ) : null}
                   </span>
                 ) : (
                   <div className="space-y-2">
@@ -689,10 +697,10 @@ export default function SettingsPage() {
                   </div>
                 )}
               </dd>
-            </div>
+            </div> : null}
 
             {/* LINE — read-only status; connect/unlink lives on Integrations */}
-            <div className="rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible">
+            <div className={`rounded-panel border border-border bg-surface-elevated p-4 min-w-0 overflow-visible ${tenant?.telegram_available === false && !me.telegram_chat_id ? "sm:col-span-2" : ""}`}>
               <dt className="font-mono text-[11px] uppercase tracking-[0.14em] text-ink-muted">LINE</dt>
               <dd className="mt-1">
                 {me.line_user_id ? (

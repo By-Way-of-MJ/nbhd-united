@@ -159,7 +159,7 @@ export function CreateProjectV2Panel({ neighbors, onClose, onCreated }: { neighb
 
         {start === "assistant" ? (
           <div className="flex flex-col gap-2">
-            <p className="text-[0.875rem] leading-relaxed text-os-muted">Send this to your assistant on iPhone, Telegram or LINE. Its draft shows up under Projects for you to review — nothing is shared until you start it.</p>
+            <p className="text-[0.875rem] leading-relaxed text-os-muted">Send this to your assistant on iPhone or LINE. Its draft shows up under Projects for you to review — nothing is shared until you start it.</p>
             <CopyRequest text={seed} />
           </div>
         ) : null}

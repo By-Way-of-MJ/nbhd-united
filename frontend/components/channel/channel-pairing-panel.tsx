@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { useTenantQuery } from "@/lib/queries";
+
 import type { MessagingChannel, PairingLink } from "@/components/channel/types";
 
 const MOBILE_QUERY = "(max-width: 639px)";
@@ -45,6 +47,7 @@ function formatRemainingTime(seconds: number): string {
 
 interface ChannelPairingPanelProps {
   channel: MessagingChannel;
+  unavailable?: boolean;
   panelId: string;
   link: PairingLink | null;
   isGenerating: boolean;
@@ -58,6 +61,7 @@ interface ChannelPairingPanelProps {
 
 export function ChannelPairingPanel({
   channel,
+  unavailable = false,
   panelId,
   link,
   isGenerating,
@@ -68,6 +72,8 @@ export function ChannelPairingPanel({
   onSwitch,
   onClose,
 }: ChannelPairingPanelProps) {
+  const { data: tenant } = useTenantQuery();
+  const telegramAvailable = Boolean(tenant) && tenant?.telegram_available !== false;
   const copy = channelCopy[channel];
   const isMobile = useSyncExternalStore(
     subscribeToMobileQuery,
@@ -82,16 +88,28 @@ export function ChannelPairingPanel({
   }, []);
 
   useEffect(() => {
-    if (!link) return;
+    if (!link || unavailable || (channel === "telegram" && !telegramAvailable)) return;
     const interval = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(interval);
-  }, [link]);
+  }, [link, unavailable, channel, telegramAvailable]);
 
   const expiry = link ? Date.parse(link.expires_at) : Number.NaN;
   const remainingSeconds = Number.isFinite(expiry)
     ? Math.max(0, Math.ceil((expiry - now) / 1000))
     : 0;
   const expired = Boolean(link) && remainingSeconds === 0;
+
+  if (!tenant || (channel === "telegram" && !telegramAvailable)) return null;
+  if (unavailable) {
+    return (
+      <div id={panelId} className="mt-4 rounded-panel border border-border bg-bg/35 p-4" role="status">
+        <p className="text-sm text-ink-muted">
+          {generationError || statusError || "Telegram replies are no longer available. Use the iPhone app or LINE."}
+        </p>
+        {onClose ? <button type="button" onClick={onClose} className="mt-2 min-h-[44px] text-sm text-ink-muted hover:text-ink">Close</button> : null}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -218,7 +236,7 @@ export function ChannelPairingPanel({
         >
           {isGenerating ? "Generating…" : "Generate a new link"}
         </button>
-        {onSwitch ? (
+        {onSwitch && (channel === "telegram" || telegramAvailable) ? (
           <button
             type="button"
             onClick={onSwitch}

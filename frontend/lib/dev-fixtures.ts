@@ -14,10 +14,17 @@
  * `?fixture=big` gives /constellation a real-account-sized sky (263 lessons, 53 clusters).
  * `?fixture=journal-long` adds afternoon/evening entries for phone scroll checks.
  * `?fixture=v1` is a tenant without Projects v2 (the older project panel).
+ * Telegram fixtures: `?fixture=tg-off`, `tg-on`, `tg-absent`, `tg-off-linked`,
+ * `tg-on-linked`, `tg-409` (first link works; regeneration returns 409), or
+ * `tg-status-409` (status returns 409 after a link is generated).
+ * These modes are offline-only: unmatched API routes fail locally.
+ * Use fresh browser storage when switching modes (the query cache persists).
  * Projects (plans, steps, milestones) live in `dev-fixtures-projects.ts`; cluster
  * conversations in `dev-fixtures-clusters.ts`. Their writes are in-memory too.
  * Journal/task writes are in-memory only and reset on a full reload.
  */
+
+import qrcode from "qrcode-generator";
 
 import { clusterFixture, clusterInviteCode, clusterLeft, clusterRemoved, clusterThreadRows } from "./dev-fixtures-clusters";
 import { hasProjectFixture, projectFixture, projectFixtureTitle } from "./dev-fixtures-projects";
@@ -582,11 +589,55 @@ function bigFixture(): boolean {
   return new URLSearchParams(window.location.search).get("fixture") === "big";
 }
 
+function fixturePairingLink(channel: "telegram" | "line") {
+  const deepLink = channel === "telegram" ? "https://t.me/fixture_only" : "https://line.me/fixture_only";
+  const qr = qrcode(0, "M");
+  qr.addData(deepLink);
+  qr.make();
+  return { deep_link: deepLink, qr_code: qr.createDataURL(4), expires_at: new Date(Date.now() + 900_000).toISOString() };
+}
+
+let fixtureTelegramUnlinked = false;
+let fixtureTelegramGenerations = 0;
+const telegramUnavailableError = () => Object.assign(
+  new Error(JSON.stringify({ code: "telegram_unavailable", detail: "Telegram replies are no longer available. Use the iPhone app or LINE." })),
+  { status: 409 },
+);
+
 export function fixtureResponse(path: string, init?: RequestInit): Json | undefined {
   const method = (init?.method ?? "GET").toUpperCase();
   const url = new URL(path, "http://fixture.local");
   const p = url.pathname;
   const isEmpty = empty();
+  const mode = fixtureMode();
+  const telegramFixture = mode?.startsWith("tg-");
+  const telegramLinked = Boolean(mode?.endsWith("-linked")) && !fixtureTelegramUnlinked;
+  if (telegramFixture) {
+    if (p === "/api/v1/auth/me/") return json({
+      ...me,
+      telegram_chat_id: telegramLinked ? 123456 : null,
+      telegram_username: telegramLinked ? "yuki_fixture" : "",
+      tenant: { ...tenant, ...(mode === "tg-absent" ? {} : { telegram_available: !mode?.startsWith("tg-off") }) },
+    });
+    if (p === "/api/v1/tenants/telegram/status/") {
+      if (mode === "tg-status-409" && fixtureTelegramGenerations > 0) throw telegramUnavailableError();
+      return json({ linked: telegramLinked, telegram_username: telegramLinked ? "yuki_fixture" : "" });
+    }
+    if (p === "/api/v1/tenants/telegram/unlink/") {
+      fixtureTelegramUnlinked = true;
+      return json({ success: true });
+    }
+    if (p === "/api/v1/tenants/telegram/generate-link/") {
+      if (mode?.startsWith("tg-off") || (mode === "tg-409" && fixtureTelegramGenerations > 0)) throw telegramUnavailableError();
+      fixtureTelegramGenerations++;
+      return json(fixturePairingLink("telegram"));
+    }
+    if (p === "/api/v1/tenants/line/status/") return json({ linked: false, quota: { exhausted: false } });
+    if (p === "/api/v1/tenants/line/generate-link/") return json(fixturePairingLink("line"));
+    if (p === "/api/v1/push/status/") return json({ registered: false });
+    if (p === "/api/v1/tenants/provisioning-status/") return json({ status: "active", ready: true, container_id: "oc-fixture", container_fqdn: "fixture.local" });
+    if (p === "/api/v1/integrations/") return json([]);
+  }
   if (p.startsWith("/api/v1/friends/")) {
     const body = bodyOf(init);
     if (fixtureMode() !== "v1") {
@@ -1068,5 +1119,6 @@ export function fixtureResponse(path: string, init?: RequestInit): Json | undefi
     return json({ can_refresh: true, last_refreshed: isoAt(-2, 10), cooldown_seconds: 0, status: "ok", has_pending_update: false, container_image_tag: "v1", latest_image_tag: "v1", image_outdated: false });
   }
   if (p === "/api/v1/fuel/goals/") return json([]);
+  if (telegramFixture) throw Object.assign(new Error(`No offline fixture for ${p}`), { status: 404 });
   return undefined;
 }

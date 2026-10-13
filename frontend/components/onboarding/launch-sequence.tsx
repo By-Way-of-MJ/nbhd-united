@@ -12,6 +12,7 @@ import {
   usePushStatusQuery,
   useRetryProvisioningMutation,
   useTelegramStatusQuery,
+  useTenantQuery,
 } from "@/lib/queries";
 
 import {
@@ -68,7 +69,9 @@ export function LaunchSequence({ outcome }: { outcome: ChannelOutcome }) {
     provisioningStatus?.status === "suspended" || retryUnavailable;
 
   const pushStatus = usePushStatusQuery();
-  const telegramStatus = useTelegramStatusQuery();
+  const { data: tenant } = useTenantQuery();
+  const telegramAvailable = Boolean(tenant) && tenant?.telegram_available !== false;
+  const telegramStatus = useTelegramStatusQuery(telegramAvailable);
   const lineStatus = useLineStatusQuery();
   const [elapsed, setElapsed] = useState(0);
   // The tick position the rule is currently creeping away from; null = holding.
@@ -119,14 +122,14 @@ export function LaunchSequence({ outcome }: { outcome: ChannelOutcome }) {
 
   const actualSurfaces: ConnectedSurface[] = [];
   if (pushStatus.data?.registered) actualSurfaces.push("ios");
-  if (telegramStatus.data?.linked) actualSurfaces.push("telegram");
+  if (telegramAvailable && telegramStatus.data?.linked) actualSurfaces.push("telegram");
   if (lineStatus.data?.linked) actualSurfaces.push("line");
 
   const statusesResolved = Boolean(
-    pushStatus.data && telegramStatus.data && lineStatus.data,
+    pushStatus.data && (!telegramAvailable || telegramStatus.data) && lineStatus.data,
   );
   const fallbackSurfaces: ConnectedSurface[] =
-    outcome === "skipped" ? [] : [outcome];
+    outcome === "skipped" || (outcome === "telegram" && !telegramAvailable) ? [] : [outcome];
   const connectedSurfaces =
     actualSurfaces.length > 0 || statusesResolved
       ? actualSurfaces
@@ -220,7 +223,7 @@ export function LaunchSequence({ outcome }: { outcome: ChannelOutcome }) {
 
         {isReady ? (
           <p className={s.note} data-settle style={settle(6)}>
-            {readyNote(connectedSurfaces)}
+            {tenant ? readyNote(connectedSurfaces) : "Checking your connected channels…"}
           </p>
         ) : stalled ? (
           <p
