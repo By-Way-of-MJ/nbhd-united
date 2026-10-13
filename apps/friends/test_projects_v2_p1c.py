@@ -359,8 +359,92 @@ class StepTimingTests(TestCase):
         self.assertIsNone(self.timing(self.WED, due=self.WED, status="in_review"))
 
 
+class GoneQuietTests(TestCase):
+    """The weekly pick: one of my steps that no dated mark is covering."""
+
+    WED = date(2026, 10, 14)
+
+    def step(self, sid, *, start=None, due=None, status="open", waits_on=(), today=None):
+        timing = assistant._step_timing({"status": status, "start_date": start, "due_date": due}, today or self.WED)
+        return {"id": sid, "status": status, "due_date": due, "timing": timing, "waits_on": list(waits_on)}
+
+    def flagged(self, steps, today=None):
+        assistant._mark_gone_quiet([{"my_steps": steps}], today or self.WED)
+        return [s["id"] for s in steps if s.get("gone_quiet")]
+
+    def test_one_step_is_picked_on_wednesday_only(self):
+        for day in range(12, 19):
+            today = date(2026, 10, day)
+            steps = [self.step("a", due=date(2026, 11, 20), today=today), self.step("b", today=today)]
+            self.assertEqual(len(self.flagged(steps, today)), 1 if day == 14 else 0, today)
+
+    def test_undated_and_long_overdue_steps_qualify(self):
+        self.assertEqual(self.flagged([self.step("a")]), ["a"])
+        self.assertEqual(self.flagged([self.step("a", due=date(2026, 9, 1))]), ["a"])
+
+    def test_steps_something_else_covers_are_left_alone(self):
+        blocker = {"id": "x", "title": "", "owner": "@kai", "status": "open"}
+        steps = [
+            self.step("soon", due=date(2026, 10, 20)),  # inside the ten-day marks
+            self.step("late", due=date(2026, 10, 13)),  # raised today as overdue
+            self.step("done", status="done"),
+            self.step("review", status="in_review"),
+            self.step("blocked", waits_on=[blocker]),
+        ]
+        self.assertEqual(self.flagged(steps), [])
+
+    def test_a_step_raised_by_a_mark_this_week_is_not_raised_again(self):
+        # Due Monday, raised as overdue on Tuesday: Wednesday must not push it again.
+        self.assertEqual(self.flagged([self.step("a", due=date(2026, 10, 12))]), [])
+        self.assertEqual(self.flagged([self.step("a", due=date(2026, 10, 6))]), [])  # 8 days late
+        self.assertEqual(self.flagged([self.step("a", due=date(2026, 10, 5))]), ["a"])  # 9 days late
+        # Start mark came up within the last week.
+        self.assertEqual(self.flagged([self.step("a", start=date(2026, 10, 9), due=date(2026, 12, 1))]), [])
+
+    def test_a_step_that_has_not_started_yet_is_not_called_quiet(self):
+        step = self.step("a", start=date(2026, 12, 1), due=date(2026, 12, 20))
+        self.assertEqual(self.flagged([step]), [])
+        started = self.step("a", start=date(2026, 10, 1), due=date(2026, 12, 20))
+        self.assertEqual(self.flagged([started]), ["a"])
+
+    def test_the_pick_keeps_rotating_across_new_year(self):
+        picks = []
+        for today in (date(2026, 12, 23), date(2026, 12, 30), date(2027, 1, 6), date(2027, 1, 13)):
+            steps = [self.step(sid, today=today) for sid in ("a", "b")]
+            picks += self.flagged(steps, today)
+        self.assertEqual(len(picks), 4)
+        self.assertTrue(all(x != y for x, y in zip(picks, picks[1:], strict=False)), picks)
+
+    def test_a_finished_blocker_does_not_hold_a_step_back(self):
+        blocker = {"id": "x", "title": "", "owner": "@kai", "status": "done"}
+        self.assertEqual(self.flagged([self.step("a", waits_on=[blocker])]), ["a"])
+
+    def test_the_pick_rotates_week_to_week(self):
+        picks = set()
+        for week in range(3):
+            today = date(2026, 12, 2 + 7 * week)
+            steps = [self.step(sid, today=today) for sid in ("a", "b", "c")]
+            picks.update(self.flagged(steps, today))
+        self.assertEqual(picks, {"a", "b", "c"})
+
+
 @override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
 class ContextTimingTests(TestCase):
+    def test_context_flags_a_gone_quiet_step_on_wednesday(self):
+        cache.clear()
+        tenant = _tenant("p1c_quiet")
+        _profile(tenant, "quietu")
+        goal = services.create_mission(tenant, tenant.user, member_friendship_ids=[], title="Passport")
+        me = SharedGoalMembership.objects.get(shared_goal=goal, tenant=tenant)
+        now = datetime(2026, 10, 14, 3, 0, tzinfo=UTC)  # a Wednesday
+        with patch("django.utils.timezone.now", return_value=now):
+            step = projects.create_step(tenant, tenant.user, goal.id, {"title": "Book photos"})
+            projects.ask(tenant, tenant.user, goal.id, step.id, [str(me.id)])
+            projects.respond(tenant, tenant.user, goal.id, step.id, {"answer": "yes"})
+            ctx = assistant.runtime_context(tenant)
+        [mine] = ctx["projects"][0]["my_steps"]
+        self.assertIs(mine["gone_quiet"], True)
+
     def test_context_carries_today_and_timing_in_the_users_time_zone(self):
         cache.clear()
         tenant = _tenant("p1c_tz")
