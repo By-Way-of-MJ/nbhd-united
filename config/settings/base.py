@@ -334,6 +334,11 @@ WEB_REDESIGN_TENANT_IDS = env("WEB_REDESIGN_TENANT_IDS", default="")
 # name MUST match.
 BRIEFING_WEATHER_TOOL_TENANT_IDS = env("BRIEFING_WEATHER_TOOL_TENANT_IDS", default="")
 
+# Brave "LLM Context" search mode (web_search returns page excerpts, not one-line
+# descriptions). Comma-separated tenant UUIDs or ``*``; EMPTY MEANS NOBODY. Only
+# applied to tenants on the 9.4 config shape. Container App env var name MUST match.
+BRAVE_LLM_CONTEXT_TENANT_IDS = env("BRAVE_LLM_CONTEXT_TENANT_IDS", default="")
+
 # Human-review gate for agent-authored scheduled tasks. Comma-separated tenant
 # UUIDs open individual tenants; the literal "*" opens the gate fleet-wide.
 # Empty/unset means nobody so every non-explicit configuration fails closed.

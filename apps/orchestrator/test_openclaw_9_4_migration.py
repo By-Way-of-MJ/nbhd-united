@@ -10,7 +10,7 @@ regenerates keeps the valid 5.28 shape). Transforms were verified against
 
 from __future__ import annotations
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from apps.orchestrator.config_generator import (
     _migrate_config_to_openclaw_9_4,
@@ -153,6 +153,32 @@ class OpenClaw94MigrationGateTest(TestCase):
         self.assertIn(
             "/opt/nbhd/vendored/brave-project/node_modules/@openclaw/brave-plugin", config["plugins"]["load"]["paths"]
         )
+
+    def test_brave_llm_context_is_off_unless_the_tenant_is_listed(self):
+        tenant = create_tenant(display_name="BraveOff", telegram_chat_id=740003)
+        tenant.openclaw_version = "2026.9.4"
+        with override_settings(BRAVE_LLM_CONTEXT_TENANT_IDS=""):
+            config = generate_openclaw_config(tenant)
+        self.assertEqual(config["plugins"]["entries"]["brave"], {"enabled": True})
+
+    def test_brave_llm_context_for_a_listed_9_4_tenant(self):
+        tenant = create_tenant(display_name="BraveOn", telegram_chat_id=740004)
+        tenant.openclaw_version = "2026.9.4"
+        with override_settings(BRAVE_LLM_CONTEXT_TENANT_IDS=str(tenant.id)):
+            config = generate_openclaw_config(tenant)
+        self.assertEqual(
+            config["plugins"]["entries"]["brave"],
+            {"enabled": True, "config": {"webSearch": {"mode": "llm-context"}}},
+        )
+        self.assertEqual(config["tools"]["web"]["search"]["provider"], "brave")
+
+    def test_brave_llm_context_never_reaches_a_5_28_config(self):
+        # 5.28 has no vendored brave entry; the key must not appear even when listed.
+        tenant = create_tenant(display_name="Brave528", telegram_chat_id=740005)
+        tenant.openclaw_version = "2026.5.28"
+        with override_settings(BRAVE_LLM_CONTEXT_TENANT_IDS="*"):
+            config = generate_openclaw_config(tenant)
+        self.assertNotIn("config", config.get("plugins", {}).get("entries", {}).get("brave", {}))
 
     def test_5_28_tenant_keeps_legacy_shape(self):
         tenant = create_tenant(display_name="Mig528", telegram_chat_id=740002)

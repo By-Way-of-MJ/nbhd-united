@@ -3461,6 +3461,14 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
     # rollout stays safe (a still-on-5.28 tenant keeps the 5.28 shape).
     if _parse_version(oc_version) >= (2026, 9, 4):
         _migrate_config_to_openclaw_9_4(config)
+        # Brave "LLM Context": web_search returns excerpts of the pages themselves.
+        # The key belongs to the brave plugin the 9.4 image vendors (its schema lists
+        # "web" | "llm-context"; checked in nbhd-openclaw:2026.9.4-8ceb89f), and 9.4
+        # refuses unknown keys — so it lives inside this branch and rolls per tenant.
+        from apps.router.chat_gates import brave_llm_context_enabled
+
+        if brave_llm_context_enabled(tenant):
+            config["plugins"]["entries"]["brave"]["config"] = {"webSearch": {"mode": "llm-context"}}
 
     from .local_test import configure_gateway
 

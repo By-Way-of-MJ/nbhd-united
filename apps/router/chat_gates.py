@@ -56,6 +56,14 @@ def briefing_weather_tool_enabled(tenant) -> bool:
     return _tenant_allowed(tenant, "BRIEFING_WEATHER_TOOL_TENANT_IDS")
 
 
+def brave_llm_context_enabled(tenant) -> bool:
+    """``web_search`` returns page excerpts (Brave "LLM Context") instead of one-line
+    descriptions. A config key on the image's vendored brave plugin, so it only
+    takes effect inside the 9.4 config shape (see ``generate_openclaw_config``).
+    """
+    return _tenant_allowed(tenant, "BRAVE_LLM_CONTEXT_TENANT_IDS")
+
+
 def web_redesign_enabled(tenant) -> bool:
     """Open Sky web console (read by the frontend via /tenants/me/)."""
     return _tenant_allowed(tenant, "WEB_REDESIGN_TENANT_IDS")
