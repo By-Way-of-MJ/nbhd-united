@@ -116,11 +116,13 @@ def _step_timing(step, today) -> dict | None:
 
 
 # Between marks a step can sit for weeks with nothing said, and an undated step is
-# never raised at all. So once a week the code picks ONE of my steps that nothing else
-# is covering and flags it ``gone_quiet``. Wednesday keeps it clear of Monday's
-# week-ahead review. The pick rotates by ISO week so the same step is not pushed every
-# week; like the marks it is stateless — a missed Wednesday skips that week.
+# never raised at all. So once a week the code picks ONE of my steps that no date is
+# pushing and flags it ``gone_quiet``. Wednesday keeps it clear of Monday's week-ahead
+# review. The pick rotates week to week (a running week count, so the turn of the year
+# does not repeat one). Like the marks it is stateless: a missed Wednesday skips that
+# week, and when the list of steps changes the same step can come up twice running.
 _GONE_QUIET_WEEKDAY = 2
+_GONE_QUIET_REST_DAYS = 7
 
 
 def _mark_gone_quiet(projects_out, today) -> None:
@@ -134,16 +136,21 @@ def _mark_gone_quiet(projects_out, today) -> None:
         # Waiting on someone's unfinished step: there is no move of mine to push.
         if any(b["status"] not in ("done", "skipped") for b in step["waits_on"]):
             return False
-        # Inside the last ten days the dated marks already speak for the step.
-        left = timing.get("days_until_due")
-        return left is None or not 0 <= left <= 10
+        # Not time to begin yet, or the start mark spoke for it within the last week.
+        to_start = timing.get("days_until_start")
+        if to_start is not None and to_start >= -_GONE_QUIET_REST_DAYS:
+            return False
+        # The dated marks speak for a step from ten days out until a day late; give
+        # it a week after that before bringing it up again.
+        to_due = timing.get("days_until_due")
+        return to_due is None or not -1 - _GONE_QUIET_REST_DAYS <= to_due <= 10
 
     candidates = sorted(
         (s for p in projects_out for s in p["my_steps"] if quiet(s)),
         key=lambda s: (str(s["due_date"] or "9999"), s["id"]),
     )
     if candidates:
-        candidates[today.isocalendar().week % len(candidates)]["gone_quiet"] = True
+        candidates[today.toordinal() // 7 % len(candidates)]["gone_quiet"] = True
 
 
 def _project_context(tenant, membership, today) -> dict:
