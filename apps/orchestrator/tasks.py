@@ -360,6 +360,35 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
     except Exception:
         logger.exception("apply_single_tenant_image failed for %s", tenant_id)
         return
+    finally:
+        # The idle sweep can finish after our initial awake check. A new
+        # single-mode revision auto-activates, even if the LRO later raises.
+        # Follow Azure conservatively: leave this tenant eligible for normal
+        # idle hibernation, and let a successful image prove readiness. No
+        # transaction/lock spans Azure; do not overwrite wake bookkeeping.
+        overlapped_hibernation = Tenant.objects.filter(pk=tenant.pk, hibernated_at__isnull=False).update(
+            hibernated_at=None
+        )
+        if overlapped_hibernation:
+            logger.warning(
+                "apply_single_tenant_image: tenant %s hibernated during image push — cleared hibernated_at",
+                tenant_id[:8],
+            )
+            # Hibernation disabled legacy gateway jobs. Snapshot restore alone
+            # skips existing names, so explicitly resume them after boot, also
+            # on partial Azure failure. File-sync tenants resume from their file.
+            from apps.cron.publish import publish_task as publish_qstash_task
+
+            try:
+                publish_qstash_task(
+                    "restore_crons_after_image_update",
+                    tenant_id,
+                    resume_hibernated_crons=True,
+                    delay_seconds=90,
+                    idempotency_key=f"post-image-restore-{tenant_id}-{desired_tag}",
+                )
+            except Exception:
+                logger.warning("Failed to schedule post-image cron resume for %s", tenant_id[:8], exc_info=True)
 
     # Now that the container is running the new image, (re)generate the
     # tenant's config against the new schema and write it to the file share.
@@ -409,6 +438,9 @@ def apply_single_tenant_image_task(tenant_id: str, desired_tag: str) -> None:
             )
         except Exception:
             logger.warning("Failed to schedule image health check for %s", tenant_id[:8], exc_info=True)
+
+    if overlapped_hibernation:
+        return  # The overlap path already scheduled the restore, including resume.
 
     try:
         publish_qstash_task(
@@ -615,12 +647,14 @@ def _fire_missed_crons_after_restore(*, tenant, snapshot: dict, snapshot_jobs: l
     return fired
 
 
-def restore_crons_after_image_update_task(tenant_id: str) -> None:
+def restore_crons_after_image_update_task(tenant_id: str, *, resume_hibernated_crons: bool = False) -> None:
     """Restore cron jobs from snapshot after a container image update.
 
     Called ~90s after apply_single_tenant_image_task to give the container
     time to start. Restores every job from the pre-image snapshot with full
     fidelity. Falls back to seed_cron_jobs if the snapshot is missing.
+    An image push overlapping hibernation also resumes disabled gateway jobs,
+    provided the tenant is still active and awake when this task arrives.
     """
     import logging
 
@@ -638,6 +672,13 @@ def restore_crons_after_image_update_task(tenant_id: str) -> None:
     tenant = Tenant.objects.filter(id=tenant_id).select_related("user").first()
     if not tenant or not tenant.container_id:
         return
+
+    if resume_hibernated_crons:
+        if tenant.hibernated_at or tenant.status != Tenant.Status.ACTIVE:
+            return
+        from apps.cron.suspension import resume_tenant_crons
+
+        resume_tenant_crons(tenant)
 
     # 9.4 gates every gateway cron.* call below. The new container rebuilds its
     # crons at boot from the signed file (Postgres rows + the Fuel set), so
@@ -717,6 +758,10 @@ def restore_crons_after_image_update_task(tenant_id: str) -> None:
     errors = 0
     for job in jobs_to_restore:
         clean_job = {k: v for k, v in job.items() if k not in _STRIP_FIELDS}
+        if resume_hibernated_crons:
+            # The pre-image snapshot may itself have raced cron suspension.
+            # Match resume_tenant_crons for jobs lost in the revision swap too.
+            clean_job["enabled"] = True
         try:
             invoke_gateway_tool(tenant, "cron.add", {"job": clean_job})
             restored += 1
