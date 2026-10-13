@@ -100,6 +100,9 @@ class Command(BaseCommand):
                     SUBAGENT_TENANT_IDS=str(tenant.id),
                     USAGE_HOOKS_TENANT_IDS=str(tenant.id),
                     PROJECTS_V2_TENANT_IDS=str(tenant.id),
+                    # So every image CI builds proves its vendored (unpinned) brave
+                    # plugin still accepts webSearch.mode before any tenant gets it.
+                    BRAVE_LLM_CONTEXT_TENANT_IDS=str(tenant.id),
                 ):
                     config_json = config_to_json(generate_openclaw_config(tenant))
             else:
