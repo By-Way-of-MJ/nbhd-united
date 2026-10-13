@@ -72,7 +72,7 @@ function AppCard() {
 }
 
 // ── Companion messaging channels ─────────────────────────────────────────────
-// Telegram and LINE stay supported as optional companion surfaces. The iOS app
+// Available messengers are optional companion surfaces. The iOS app
 // is the primary experience; these let a subscriber also reach their assistant
 // from a chat client they already keep open. Delivery preference is automatic
 // (app-first when installed), so there is deliberately no channel toggle here.
@@ -103,6 +103,7 @@ function TelegramCard({ pairingOpen, onPairingOpenChange }: SettingsChannelCardP
       link={connection.link}
       isGenerating={connection.isGenerating}
       generationError={connection.generationError}
+      unavailable={connection.unavailable}
       onConnect={async () => {
         onPairingOpenChange("telegram");
         if (!connection.link) await connection.generate();
@@ -429,6 +430,7 @@ function CoreCard() {
 function IntegrationsContent() {
   const searchParams = useSearchParams();
   const { data, isLoading, error } = useIntegrationsQuery();
+  const { data: tenant, isLoading: tenantLoading } = useTenantQuery();
   const disconnect = useDisconnectIntegrationMutation();
   const authorize = useOAuthAuthorizeMutation();
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
@@ -452,7 +454,7 @@ function IntegrationsContent() {
     }
   };
 
-  if (isLoading) {
+  if (isLoading || tenantLoading || !tenant) {
     return <SectionCardSkeleton lines={4} />;
   }
 

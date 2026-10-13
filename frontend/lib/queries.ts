@@ -621,14 +621,15 @@ export function useStripePortalMutation() {
 // needs the snappy 3s cadence to flip to "Connected" the moment the bot
 // confirms. Everywhere else 15s is plenty — and once linked there is nothing
 // to poll for at all, so the interval shuts off entirely.
-export function useTelegramStatusQuery(enabled = true, pairingActive = false) {
+export function useTelegramStatusQuery(enabled = true, pairingActive = false, pollingEnabled = enabled) {
   return useQuery({
     queryKey: ["telegram-status"],
     queryFn: fetchTelegramStatus,
+    retry: false,
     enabled: isLoggedIn() && enabled,
     staleTime: 0,
     refetchOnWindowFocus: "always",
-    refetchInterval: enabled
+    refetchInterval: enabled && pollingEnabled
       ? (query) => {
           if (query.state.status === "error") return false;
           if (query.state.data?.linked === true) return false;

@@ -175,7 +175,7 @@ function DesktopRail({ sections, pathname, onLogout }: { sections: Section[]; pa
       </nav>
       <div className="space-y-4 px-6 pb-6 pt-4">
         <p className="text-[0.8125rem] leading-relaxed text-os-faint">
-          Talk to your assistant on iPhone, Telegram or LINE. This page is for looking and tidying.
+          Talk to your assistant on iPhone or LINE. This page is for looking and tidying.
         </p>
         <Link href="/" className="os-focus flex min-h-[44px] items-center text-[0.8125rem] text-os-faint hover:text-os-accent">NBHD home page</Link>
         <AccountButton onLogout={onLogout} align="left-up" />

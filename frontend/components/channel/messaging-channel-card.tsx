@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { ChannelGlyph } from "@/components/channel/channel-glyphs";
 import { ChannelPairingPanel } from "@/components/channel/channel-pairing-panel";
 import type { MessagingChannel, PairingLink } from "@/components/channel/types";
+import { useTenantQuery } from "@/lib/queries";
 import { StatusPill } from "@/components/status-pill";
 
 const channelCopy = {
@@ -32,6 +33,7 @@ interface MessagingChannelCardProps {
   statusReady: boolean;
   statusError: string | null;
   quotaExhausted?: boolean;
+  unavailable?: boolean;
   pairingOpen: boolean;
   link: PairingLink | null;
   isGenerating: boolean;
@@ -55,6 +57,7 @@ export function MessagingChannelCard({
   statusReady,
   statusError,
   quotaExhausted = false,
+  unavailable = false,
   pairingOpen,
   link,
   isGenerating,
@@ -68,6 +71,8 @@ export function MessagingChannelCard({
   unlinkPending = false,
   className = "",
 }: MessagingChannelCardProps) {
+  const { data: tenant } = useTenantQuery();
+  const retired = channel === "telegram" && (tenant?.telegram_available === false || unavailable);
   const [confirmingUnlink, setConfirmingUnlink] = useState(false);
   const copy = channelCopy[channel];
   const connectedText = connectedIdentity
@@ -84,6 +89,8 @@ export function MessagingChannelCard({
     return () => window.clearTimeout(timeout);
   }, [confirmingUnlink]);
 
+  if (!tenant || (channel === "telegram" && tenant.telegram_available === false && !linked)) return null;
+
   return (
     <article
       className={`rounded-panel border border-border bg-surface-elevated p-4 transition-colors sm:p-5 ${className}`}
@@ -93,15 +100,15 @@ export function MessagingChannelCard({
           <ChannelGlyph channel={channel} />
           <h3 className="font-headline text-base font-semibold text-ink">{copy.label}</h3>
         </div>
-        {linked ? <StatusPill status="active" /> : null}
+        {linked ? <StatusPill status={retired ? "linked" : "active"} /> : null}
       </div>
 
-      <p className="mt-2 text-sm leading-relaxed text-ink-muted">{description}</p>
+      {!unavailable ? <p className="mt-2 text-sm leading-relaxed text-ink-muted">{retired ? "Replies here are no longer available. Use the iPhone app or LINE." : description}</p> : null}
 
       {linked ? (
         <>
           <div
-            className="mt-4 flex items-start gap-2 rounded-panel border border-emerald-text/20 bg-emerald-bg p-3 text-sm text-emerald-text"
+            className={`mt-4 flex items-start gap-2 rounded-panel border p-3 text-sm ${retired ? "border-border bg-bg/35 text-ink-muted" : "border-emerald-text/20 bg-emerald-bg text-emerald-text"}`}
             role="status"
             aria-live="polite"
           >
@@ -136,7 +143,7 @@ export function MessagingChannelCard({
                   Ready to unlink {copy.label}?
                 </p>
                 <p className="mt-1 text-sm leading-relaxed text-ink-muted">
-                  Messages through {copy.label} will stop until you connect it again.
+                  {retired ? "This removes your linked Telegram identity." : `Messages through ${copy.label} will stop until you connect it again.`}
                 </p>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   <button
@@ -188,9 +195,10 @@ export function MessagingChannelCard({
             Connect LINE
           </button>
         </>
-      ) : pairingOpen ? (
+      ) : pairingOpen || unavailable ? (
         <ChannelPairingPanel
           channel={channel}
+          unavailable={unavailable}
           panelId={panelId}
           link={link}
           isGenerating={isGenerating}
@@ -199,7 +207,7 @@ export function MessagingChannelCard({
           onRegenerate={onRegenerate}
           onRetryStatus={onRetryStatus}
           onSwitch={onSwitch}
-          onClose={onClose}
+          onClose={unavailable ? undefined : onClose}
         />
       ) : (
         <>

@@ -64,6 +64,13 @@ Only **one** poller runs fleet-wide — a single shared bot, single-revision Dja
 long-polls `getUpdates` with `allowed_updates=["message","callback_query","edited_message"]`
 (`:146`) and an in-memory offset.
 
+`startup.sh` reads `TELEGRAM_POLLER_ENABLED` (default `true`): `true/1/yes/on`
+enable the poller and `false/0/no/off` disable it, case-insensitively; unrecognised
+values warn and keep it enabled. Disabling it stops Telegram **inbound** messages
+without affecting outbound sends or enabling the latent webhook path. The web
+console and iOS app still offer Telegram linking; hide those entry points before
+turning the poller off.
+
 Three subtleties that were each a production incident:
 
 - **Offset advances only *after* handling** (`poller.py:671`). The read offset is
