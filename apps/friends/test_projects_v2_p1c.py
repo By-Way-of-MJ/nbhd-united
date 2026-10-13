@@ -333,6 +333,14 @@ class StepTimingTests(TestCase):
         # ...but not something that was already raised on Friday.
         self.assertIsNone(self.timing(self.MON, due=date(2026, 10, 12 + 6))["heads_up"])
 
+    def test_weekend_run_raises_nothing_so_monday_cannot_repeat_it(self):
+        # A late catch-up run on Saturday: three days out is today, but Monday owns it.
+        saturday = date(2026, 10, 10)
+        due = date(2026, 10, 13)
+        self.assertIsNone(self.timing(saturday, due=due)["heads_up"])
+        self.assertEqual(self.timing(saturday, due=due)["days_until_due"], 3)
+        self.assertEqual(self.timing(self.MON, due=due)["heads_up"], "three_days")
+
     def test_start_day_due_day_and_late(self):
         self.assertEqual(self.timing(self.WED, start=self.WED, due=date(2026, 11, 20))["heads_up"], "start")
         # Already under way: no "time to begin".
