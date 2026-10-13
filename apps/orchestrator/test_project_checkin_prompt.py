@@ -27,6 +27,12 @@ class ProjectCheckinPromptContractTest(SimpleTestCase):
         self.assertNotIn("asks_for_me", _PROJECT_CHECKIN_PROMPT)
         self.assertIn("ONLY when its `timing.heads_up` is set", _PROJECT_CHECKIN_PROMPT)
 
+    def test_weekly_gone_quiet_step_is_raised_without_guilt(self):
+        # The server flags at most one step a week; the script must not pick its own.
+        self.assertIn("`gone_quiet: true`", _PROJECT_CHECKIN_PROMPT)
+        self.assertIn("smallest next move", _PROJECT_CHECKIN_PROMPT)
+        self.assertIn("No guilt", _PROJECT_CHECKIN_PROMPT)
+
     def test_every_raised_step_is_covered(self):
         # A mark comes up once; a cap on items would drop the overflow for good.
         self.assertIn("covering EVERY raised step", _PROJECT_CHECKIN_PROMPT)

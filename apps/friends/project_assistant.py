@@ -68,6 +68,7 @@ def runtime_context(tenant) -> dict:
     # for the whole reply, so a read that straddles midnight cannot disagree with itself.
     today = tenant_today(tenant)
     out = [_project_context(tenant, m, today) for m in access.my_active_project_memberships(tenant)]
+    _mark_gone_quiet(out, today)
     cache.set(_taint_key(tenant), timezone.now().isoformat(), TAINT_WINDOW_SECONDS)
     return {"rule": UNTRUSTED_RULE, "today": today.isoformat(), "projects": out}
 
@@ -112,6 +113,37 @@ def _step_timing(step, today) -> dict | None:
         "overdue": bool(due and due < today),
         "heads_up": heads_up,
     }
+
+
+# Between marks a step can sit for weeks with nothing said, and an undated step is
+# never raised at all. So once a week the code picks ONE of my steps that nothing else
+# is covering and flags it ``gone_quiet``. Wednesday keeps it clear of Monday's
+# week-ahead review. The pick rotates by ISO week so the same step is not pushed every
+# week; like the marks it is stateless — a missed Wednesday skips that week.
+_GONE_QUIET_WEEKDAY = 2
+
+
+def _mark_gone_quiet(projects_out, today) -> None:
+    if today.weekday() != _GONE_QUIET_WEEKDAY:
+        return
+
+    def quiet(step):
+        timing = step.get("timing") or {}
+        if step["status"] not in ("open", "in_progress") or timing.get("heads_up"):
+            return False
+        # Waiting on someone's unfinished step: there is no move of mine to push.
+        if any(b["status"] not in ("done", "skipped") for b in step["waits_on"]):
+            return False
+        # Inside the last ten days the dated marks already speak for the step.
+        left = timing.get("days_until_due")
+        return left is None or not 0 <= left <= 10
+
+    candidates = sorted(
+        (s for p in projects_out for s in p["my_steps"] if quiet(s)),
+        key=lambda s: (str(s["due_date"] or "9999"), s["id"]),
+    )
+    if candidates:
+        candidates[today.isocalendar().week % len(candidates)]["gone_quiet"] = True
 
 
 def _project_context(tenant, membership, today) -> dict:
