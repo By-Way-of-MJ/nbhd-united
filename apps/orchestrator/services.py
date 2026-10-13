@@ -723,9 +723,10 @@ def bump_openclaw_version_for_tenant(
         old code restored stale config when only gateway.reload returned
         404, putting canary back into the same boot failure it was in.
       - DB ``tenant.openclaw_version`` is rolled back on any exception.
-      - ``container_image_tag`` and ``hibernated_at`` are only updated
-        after image push succeeds, so they reflect the actual deployed
-        state.
+      - ``container_image_tag`` is only updated after image push succeeds.
+        Claim hibernation before the push, like a normal wake, so the drift
+        reconcile does not deactivate the new revision before we record it.
+        Restore the claimed sleep marker if the image push fails.
 
     Hibernated tenants are NOT skipped — Container Apps single-revision
     mode means ``update_container_image`` creates a new active revision
@@ -776,6 +777,11 @@ def bump_openclaw_version_for_tenant(
         # 3. Update container image (creates new revision; in single-revision
         #    mode this auto-activates and wakes hibernated containers).
         image = f"{registry}/nbhd-openclaw:{image_tag}"
+        claimed_sleep = False
+        if was_hibernated:
+            claimed_sleep = Tenant.objects.filter(pk=tenant.pk, hibernated_at=tenant.hibernated_at).update(
+                hibernated_at=None
+            )
         try:
             update_container_image(tenant.container_id, image)
         except Exception:
@@ -796,6 +802,13 @@ def bump_openclaw_version_for_tenant(
                         "Failed to restore prior openclaw.json for tenant %s — manual file-share fix may be needed",
                         str(tenant.id)[:8],
                     )
+            if claimed_sleep:
+                # Restore config first: a DB reconnect failure must not prevent
+                # that recovery. Preserve a newer sleep; partial Azure success
+                # with this restored marker is eligible for drift reconciliation.
+                Tenant.objects.filter(pk=tenant.pk, hibernated_at__isnull=True).update(
+                    hibernated_at=tenant.hibernated_at
+                )
             raise
 
         # 4. Record image tag and clear hibernation flag if applicable.
