@@ -1,4 +1,4 @@
-Hi {{ display_name }},
+{% if telegram_available %}Hi {{ display_name }},
 
 Heads-up: our LINE messaging allowance for this month is used up. That
 means scheduled check-ins and proactive messages from your assistant
@@ -12,4 +12,12 @@ Settings page:
 If you'd rather wait, no action needed — LINE will resume on its own
 once the cycle resets.
 
-— NBHD United
+— NBHD United{% else %}Hi {{ display_name }},
+
+Our LINE messaging allowance for this month is used up. Scheduled check-ins
+and proactive messages cannot reach you on LINE until the cycle resets.
+Open the NBHD app to continue chatting and review your updates.
+
+LINE will resume once the cycle resets.
+
+— NBHD United{% endif %}

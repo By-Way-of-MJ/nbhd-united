@@ -51,6 +51,13 @@ class UserSerializer(serializers.ModelSerializer):
             "line_display_name",
         )
 
+    def validate_preferred_channel(self, value):
+        from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
+
+        if value == "telegram" and not telegram_inbound_enabled():
+            raise serializers.ValidationError(TELEGRAM_UNAVAILABLE_DETAIL, code="telegram_unavailable")
+        return value
+
     def validate_timezone(self, value):
         return _validate_timezone(value)
 
@@ -73,6 +80,7 @@ class TenantSerializer(serializers.ModelSerializer):
     has_active_subscription = serializers.SerializerMethodField()
     trial_days_remaining = serializers.SerializerMethodField()
     platform_budget_exceeded = serializers.SerializerMethodField()
+    telegram_available = serializers.SerializerMethodField()
     gravity_available = serializers.SerializerMethodField()
     effective_model = serializers.SerializerMethodField()
     free_model_offer = serializers.SerializerMethodField()
@@ -121,6 +129,7 @@ class TenantSerializer(serializers.ModelSerializer):
             "task_model_preferences",
             "platform_budget_exceeded",
             "finance_enabled",
+            "telegram_available",
             "gravity_available",
             "fuel_enabled",
             "datebook_enabled",
@@ -151,6 +160,11 @@ class TenantSerializer(serializers.ModelSerializer):
         getattr so this serializer is correct whether or not the PR9 model field
         has landed yet (default False = absorb-only)."""
         return bool(getattr(obj, "friends_agent_propose_enabled", False))
+
+    def get_telegram_available(self, obj):
+        from apps.router.telegram_availability import telegram_inbound_enabled
+
+        return telegram_inbound_enabled()
 
     def get_gravity_available(self, obj):
         """Platform-level availability of the Gravity (finance) module. When

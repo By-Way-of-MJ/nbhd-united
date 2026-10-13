@@ -12,6 +12,7 @@ import logging
 from django.conf import settings
 
 from apps.common.eval_sink import suppresses_real_transport
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .models import Lesson
@@ -215,6 +216,8 @@ def send_lesson_approval_buttons(tenant: Tenant, lesson: Lesson) -> bool:
     fallback = "line" if preferred == "telegram" else "telegram"
 
     for channel in (preferred, fallback):
+        if channel == "telegram" and not telegram_inbound_enabled():
+            continue
         sender = _SENDERS.get(channel)
         if sender and sender(tenant, lesson):
             return True

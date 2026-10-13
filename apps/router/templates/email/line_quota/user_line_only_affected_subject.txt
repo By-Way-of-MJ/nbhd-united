@@ -1,1 +1,1 @@
-Your NBHD assistant needs Telegram to keep messaging you
+{% if telegram_available %}Your NBHD assistant needs Telegram to keep messaging you{% else %}Your NBHD LINE notifications are paused{% endif %}

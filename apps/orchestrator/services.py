@@ -21,6 +21,7 @@ from apps.cron.gateway_client import (
     is_container_unavailable_response,
 )
 from apps.orchestrator.gateway_url import gateway_base_url
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .azure_client import (
@@ -637,9 +638,10 @@ def provision_tenant(tenant_id: str, *, send_first_session_welcome: bool = True)
     # These run OUTSIDE the main try/except so failures here do NOT reset
     # the tenant to PENDING. The container metadata is already persisted.
 
-    # 4b. Send proactive welcome message via Telegram
+    # 4b. Send the conversational welcome only when Telegram can receive replies.
+    # The existing welcome email below covers users without that surface.
     chat_id = tenant.user.telegram_chat_id
-    if chat_id and not suppresses_real_transport(tenant):
+    if telegram_inbound_enabled() and chat_id and not suppresses_real_transport(tenant):
         try:
             from apps.router.onboarding import WELCOME_MESSAGE
             from apps.router.services import send_telegram_message
@@ -1079,8 +1081,9 @@ def reassert_agents_md(tenant, *, only_if_changed: bool = True) -> bool:
 # "Telegram is the primary channel" line verbatim. Rather than overwrite the
 # file (its "## Notes" section invites user edits), converge SURGICALLY: swap
 # just the legacy channel line for the channel-agnostic body, preserving
-# everything else. Idempotent — a file that no longer contains the legacy line
-# (already converged, or heavily customized) is left untouched.
+# everything else. The managed support sentence follows inbound availability,
+# reversibly; enabled tenants retain the original wording. Notes and fenced
+# examples are never rewritten.
 _TOOLS_MD_LEGACY_CHANNEL_LINE = "- **Telegram** is the primary channel. All messages come through Telegram DM."
 
 # The replacement Communication bullets. MUST stay byte-identical to the
@@ -1114,16 +1117,27 @@ def _tools_md_extras_markers_malformed(current: str) -> bool:
 
 
 def converge_tools_md_text(current: str | None) -> str | None:
-    """Return TOOLS.md with the legacy Telegram-primary line swapped for the
-    channel-agnostic body, or ``None`` when no rewrite is needed (empty file,
-    already converged, or the legacy line is absent). Pure string logic — the
+    """Replace known obsolete channel wording in TOOLS.md, or return ``None``
+    when no rewrite is needed (empty, already converged, or customized text).
+    Pure string logic — the
     caller owns the share read/write so every write still routes through the
     ``_put_share_file`` sanitize chokepoint."""
     if not current:
         return None
-    if _TOOLS_MD_LEGACY_CHANNEL_LINE not in current:
-        return None
-    return current.replace(_TOOLS_MD_LEGACY_CHANNEL_LINE, _TOOLS_MD_CHANNEL_BODY)
+    from apps.orchestrator.telegram_instructions import RETIRED, SUPPORTED, replace_section_lines
+
+    sentence = SUPPORTED if telegram_inbound_enabled() else RETIRED
+    body = _TOOLS_MD_CHANNEL_BODY.replace(SUPPORTED, sentence)
+    updated = replace_section_lines(
+        current,
+        "## Communication",
+        {
+            _TOOLS_MD_LEGACY_CHANNEL_LINE: body,
+            SUPPORTED: sentence,
+            RETIRED: sentence,
+        },
+    )
+    return updated if updated != current else None
 
 
 def splice_tools_md_extras(current: str | None, extras: str | None) -> str | None:
@@ -1176,7 +1190,7 @@ def reassert_tools_md(tenant) -> bool:
 
     Mirrors :func:`reassert_agents_md`: share-only write (no revision, no
     restart — OpenClaw re-reads TOOLS.md per session). Reads the current copy,
-    runs :func:`converge_tools_md_text`, and writes back only when the legacy
+    runs :func:`converge_tools_md_text`, and writes back only when obsolete
     channel line is present. Fail-closed on read error (never write blind).
     Returns True iff it wrote a converged copy. Called from the container-started
     hook (hibernated tenants converge at wake) and the ``converge_tools_md``

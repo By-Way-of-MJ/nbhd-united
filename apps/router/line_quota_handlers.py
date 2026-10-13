@@ -28,6 +28,7 @@ from apps.router.line_quota import (
     was_user_flipped_by_quota,
 )
 from apps.router.models import LineQuotaState
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant, User
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,7 @@ def handle_pre_warn() -> bool:
 
     used_pct = int(round(state.line_quota_used / state.line_quota_limit * 100))
     ctx = {
+        "telegram_available": telegram_inbound_enabled(),
         "used": state.line_quota_used,
         "limit": state.line_quota_limit,
         "used_pct": used_pct,
@@ -92,11 +94,11 @@ def handle_pre_warn() -> bool:
 def handle_exhausted() -> dict:
     """For each tenant with ``preferred_channel='line'``:
 
-      - If ``telegram_chat_id`` is set: flip ``preferred_channel`` to
+      - If Telegram inbound is enabled and ``telegram_chat_id`` is set: flip ``preferred_channel`` to
         ``telegram``, mark ``preferences.channel_flipped_by_quota=True``,
         send the "moved to Telegram" email.
       - Otherwise: send the "connect Telegram to keep getting messages"
-        email; leave preference alone.
+        email when available, otherwise direct users to the app; leave preference alone.
 
     Idempotent: bails if ``line_quota_exhausted_notified_at >=
     line_quota_exhausted_at``. Per-tenant errors are logged and skipped
@@ -134,8 +136,12 @@ def handle_exhausted() -> dict:
             # time they open the dashboard.
             continue
         try:
-            ctx = {"display_name": user.display_name or "there", "settings_url": settings_url}
-            if user.telegram_chat_id:
+            ctx = {
+                "display_name": user.display_name or "there",
+                "settings_url": settings_url,
+                "telegram_available": telegram_inbound_enabled(),
+            }
+            if telegram_inbound_enabled() and user.telegram_chat_id:
                 # Flip first so any subsequent proactive send routes to
                 # Telegram even if the email send fails partway.
                 user.preferred_channel = "telegram"
@@ -246,7 +252,11 @@ def handle_recovered() -> dict:
             # Race: flag cleared between query + save. Skip.
             continue
         try:
-            ctx = {"display_name": user.display_name or "there", "settings_url": settings_url}
+            ctx = {
+                "display_name": user.display_name or "there",
+                "settings_url": settings_url,
+                "telegram_available": telegram_inbound_enabled(),
+            }
             subject = render_to_string("email/line_quota/user_line_recovered_subject.txt", ctx).strip()
             body = render_to_string("email/line_quota/user_line_recovered_body.txt", ctx)
             send_mail(

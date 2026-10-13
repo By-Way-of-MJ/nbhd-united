@@ -87,6 +87,11 @@ def process_start_token(
     Returns:
         (success: bool, message: str)
     """
+    from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
+
+    if not telegram_inbound_enabled():
+        return False, TELEGRAM_UNAVAILABLE_DETAIL
+
     # Find the token
     try:
         link_token = TelegramLinkToken.objects.select_related("user").get(token=token)

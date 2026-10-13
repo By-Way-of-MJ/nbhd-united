@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from apps.orchestrator.tour_guide import places_search_delivery_ready, tour_guide_delivery_ready
+from apps.router.telegram_availability import telegram_inbound_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -625,7 +626,7 @@ def _resolve_channel_formatting(tenant=None) -> str | None:
       * an iOS device token registered  → ``app-formatting.md`` (the app is the
         delivery surface; prefer it even when a channel is also linked, to match
         the delivery direction);
-      * else Telegram linked (``telegram_chat_id``) → ``telegram-formatting.md``;
+      * else Telegram enabled and linked (``telegram_chat_id``) → ``telegram-formatting.md``;
       * else LINE linked (``line_user_id``)         → ``line-formatting.md``;
       * else nothing linked                         → ``app-formatting.md``
         (the neutral default — standard Markdown; NEVER telegram).
@@ -640,7 +641,7 @@ def _resolve_channel_formatting(tenant=None) -> str | None:
             user = tenant.user
             if tenant.device_tokens.exists():
                 doc = "app"
-            elif getattr(user, "telegram_chat_id", None):
+            elif telegram_inbound_enabled() and getattr(user, "telegram_chat_id", None):
                 doc = "telegram"
             elif getattr(user, "line_user_id", None):
                 doc = "line"
@@ -993,6 +994,10 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
     # Load static reference docs
     for key, filename in _WORKSPACE_DOCS.items():
         content = _load_doc_template(filename)
+        if content and key == "NBHD_DOC_PLATFORM_GUIDE":
+            from apps.orchestrator.telegram_instructions import render_platform_guide
+
+            content = render_platform_guide(content)
         if content:
             result[key] = content
 

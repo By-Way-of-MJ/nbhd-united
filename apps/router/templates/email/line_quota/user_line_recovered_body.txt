@@ -1,4 +1,4 @@
-Hi {{ display_name }},
+{% if telegram_available %}Hi {{ display_name }},
 
 LINE messaging is back for the new cycle. You're currently set to
 Telegram (we moved you there when LINE hit its cap last month).
@@ -11,4 +11,12 @@ it from your Settings page:
 If you'd rather stay on Telegram, no action needed — that's where your
 assistant will keep reaching you.
 
-— NBHD United
+— NBHD United{% else %}Hi {{ display_name }},
+
+LINE messaging is back for the new cycle. You can use LINE or the NBHD app
+to chat with your assistant and review your updates.
+
+Manage your connected channels:
+{{ settings_url }}
+
+— NBHD United{% endif %}

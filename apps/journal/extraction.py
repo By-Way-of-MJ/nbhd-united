@@ -26,6 +26,7 @@ from apps.lessons.models import Lesson
 from apps.lessons.services import generate_embedding
 from apps.pii.redactor import rehydrate_text
 from apps.router.extraction_callbacks import _approve_goal, _approve_lesson, _approve_task
+from apps.router.telegram_availability import telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
@@ -839,14 +840,16 @@ def run_extraction_for_tenant(tenant: Tenant) -> dict:
                 # Fallback to Telegram if LINE delivery fails
                 chat_id = getattr(tenant.user, "telegram_chat_id", None)
                 bot_token = getattr(settings, "TELEGRAM_BOT_TOKEN", "").strip()
-                if chat_id and bot_token:
+                if telegram_inbound_enabled() and chat_id and bot_token:
                     logger.warning(
                         "extraction: LINE failed, falling back to Telegram for tenant %s", str(tenant.id)[:8]
                     )
                     _deliver_summary_telegram(
                         bot_token, chat_id, added_items, task_actions=task_actions, entity_map=tenant.pii_entity_map
                     )
-        elif channel == "app":
+                elif not telegram_inbound_enabled():
+                    channel = "app"
+        if channel == "app":
             # iOS/web app: no inline buttons — deliver the same content as a
             # proactive message. record_proactive_outbound writes the ?since=
             # feed row AND fires the APNs wake-push (fail-soft, off-thread).
@@ -864,7 +867,7 @@ def run_extraction_for_tenant(tenant: Tenant) -> dict:
                 message_text=_build_summary_text(added_items, task_actions, entity_map=None),
                 job_name="nightly_extraction",
             )
-        else:  # channel "none" or explicit eval sink: work ran; no summary transport
+        elif channel not in {"telegram", "line"}:  # No delivery surface or explicit eval sink
             logger.info(
                 "extraction: tenant=%s extraction/reconciliation ran but no delivery surface — summary not sent",
                 str(tenant.id)[:8],

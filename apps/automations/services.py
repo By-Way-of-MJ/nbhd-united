@@ -13,6 +13,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.router.services import forward_to_openclaw
+from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
 from .models import Automation, AutomationRun
@@ -211,6 +212,11 @@ def _dispatch_to_openclaw(automation: Automation, run_id: uuid.UUID) -> tuple[di
         raise AutomationExecutionError(f"tenant is not active: {tenant.status}")
     if not tenant.container_fqdn:
         raise AutomationExecutionError("tenant does not have an active container endpoint")
+
+    # Legacy automations only support Telegram; preserve the explicit failed-run
+    # path rather than starting an approval conversation the user cannot answer.
+    if not telegram_inbound_enabled():
+        raise AutomationExecutionError(TELEGRAM_UNAVAILABLE_DETAIL)
 
     synthetic_update = _build_synthetic_telegram_update(automation, run_id)
 

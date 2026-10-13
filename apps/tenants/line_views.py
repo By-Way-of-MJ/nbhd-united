@@ -98,6 +98,15 @@ def line_set_preferred_channel(request):
 
     user = request.user
 
+    from rest_framework.exceptions import ValidationError
+
+    from apps.tenants.serializers import UserSerializer
+
+    try:
+        UserSerializer().validate_preferred_channel(channel)
+    except ValidationError as exc:
+        return Response({"code": "telegram_unavailable", "detail": str(exc.detail[0])}, status=409)
+
     # Verify the chosen channel is actually linked
     if channel == "line" and not user.line_user_id:
         return Response(
