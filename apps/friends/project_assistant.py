@@ -17,7 +17,7 @@ The assistant can never approve, publish, ask, respond or complete directly.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 from itertools import groupby
 
 from django.core.cache import cache
@@ -26,6 +26,7 @@ from django.utils import timezone
 from pydantic import ValidationError as PydanticValidationError
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
+from apps.common.tenant_tz import tenant_today
 from apps.orchestrator.envelope_registry import suppress_refresh
 from apps.pii.redactor import reuse_detections
 
@@ -62,12 +63,58 @@ def runtime_context(tenant) -> dict:
     notes counted, never returned. Reading it taints proposals for 15 minutes."""
     if not projects_v2_enabled(tenant):
         return {"projects": [], "note": "Shared projects aren't enabled for this account yet."}
-    out = [_project_context(tenant, m) for m in access.my_active_project_memberships(tenant)]
+    # ``today`` + each step's ``timing`` are worked out here, in the user's own time
+    # zone, so the assistant relays day counts instead of doing date math. One date
+    # for the whole reply, so a read that straddles midnight cannot disagree with itself.
+    today = tenant_today(tenant)
+    out = [_project_context(tenant, m, today) for m in access.my_active_project_memberships(tenant)]
     cache.set(_taint_key(tenant), timezone.now().isoformat(), TAINT_WINDOW_SECONDS)
-    return {"rule": UNTRUSTED_RULE, "projects": out}
+    return {"rule": UNTRUSTED_RULE, "today": today.isoformat(), "projects": out}
 
 
-def _project_context(tenant, membership) -> dict:
+# The daily check-in runs on weekdays only, so Monday also looks back over the weekend
+# and a weekend day raises nothing (a late catch-up run on Saturday must not use up a
+# mark that Monday will raise). The marks are stateless: a check-in that misses its
+# day misses that mark — the "due tomorrow" push is the backstop — but never repeats.
+_HEADS_UP_DUE_MARKS = (("overdue", -1), ("due_today", 0), ("three_days", 3), ("ten_days", 10))
+
+
+def _step_timing(step, today) -> dict | None:
+    """Day counts for one of my open steps: whole days from ``today`` (the user's
+    local date) to its start and due dates; negative means that day has passed.
+    ``heads_up`` names the mark the step reached since the last weekday check-in
+    (start day, 10 days out, 3 days out, due day, a day late) — each mark comes up
+    on one weekday, so a daily reader can speak up without repeating itself. None
+    for a finished step or one with no dates."""
+    if step["status"] in ("done", "skipped", "in_review"):
+        return None
+    # The plan hands dates over as ISO strings.
+    start, due = (
+        date.fromisoformat(v) if isinstance(v, str) else v for v in (step.get("start_date"), step.get("due_date"))
+    )
+    if not (start or due):
+        return None
+    to_start = (start - today).days if start else None
+    to_due = (due - today).days if due else None
+    lookback = {0: 3, 5: 0, 6: 0}.get(today.weekday(), 1)
+
+    def reached(days_left, mark):
+        return days_left is not None and days_left <= mark < days_left + lookback
+
+    heads_up = next((name for name, mark in _HEADS_UP_DUE_MARKS[:3] if reached(to_due, mark)), None)
+    if heads_up is None and step["status"] == "open" and reached(to_start, 0):
+        heads_up = "start"
+    if heads_up is None and reached(to_due, 10):
+        heads_up = "ten_days"
+    return {
+        "days_until_start": to_start,
+        "days_until_due": to_due,
+        "overdue": bool(due and due < today),
+        "heads_up": heads_up,
+    }
+
+
+def _project_context(tenant, membership, today) -> dict:
     from .models import NeighborProfile, SharedGoalUpdate
 
     goal = membership.shared_goal
@@ -130,6 +177,7 @@ def _project_context(tenant, membership) -> dict:
                 b for b in (brief(e["blocked_id"]) for e in plan["edges"] if e["blocker_id"] == step["id"]) if b
             ]
             entry["slack_days"] = step.get("slack_days")
+            entry["timing"] = _step_timing(step, today)
             mine.append(entry)
         else:
             entry["owner"] = owner_label(step)
@@ -433,8 +481,6 @@ def _describe(goal, change: dict, plan_steps: dict, milestones: dict) -> str:
         return f"“{plan_steps.get(step_id, {}).get('title', 'a step')}”"
 
     def day(value):
-        from datetime import date
-
         try:
             d = date.fromisoformat(value)
         except (TypeError, ValueError):
