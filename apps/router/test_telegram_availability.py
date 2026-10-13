@@ -606,7 +606,7 @@ class AvailabilitySettingTests(SimpleTestCase):
         import environ
 
         root = Path(__file__).resolve().parents[2]
-        startup = subprocess.check_output(["git", "show", "origin/main:startup.sh"], cwd=root, text=True)
+        startup = (root / "startup.sh").read_text()
         case = re.search(r'case "\$\{TELEGRAM_POLLER_ENABLED-true\}" in.*?\nesac', startup, re.S).group()
         for value in (
             None,
@@ -637,7 +637,10 @@ class AvailabilitySettingTests(SimpleTestCase):
                 else:
                     os.environ["TELEGRAM_POLLER_ENABLED"] = value
                 shell = subprocess.run(
-                    ["bash", "-c", case + '\nprintf "%s" "$POLLER_ENABLED"'], text=True, capture_output=True, check=True
+                    ["/bin/bash", "-c", case + '\nprintf "%s" "$POLLER_ENABLED"'],
+                    text=True,
+                    capture_output=True,
+                    check=True,
                 ).stdout
                 self.assertIs(eval(expression, {"env": environ.Env(), "os": os}), shell == "true")
 
