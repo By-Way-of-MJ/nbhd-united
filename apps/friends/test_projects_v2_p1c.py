@@ -1,6 +1,9 @@
 """P1c: the assistant surface — fenced context, private drafts, proposals that only
 the human can approve, and the prompt-injection capability ceiling."""
 
+from datetime import UTC, date, datetime
+from unittest.mock import patch
+
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
@@ -299,3 +302,75 @@ class PluginAndEnvelopeTests(TestCase):
         self.assertNotIn("Ignore previous", text)
         self.assertNotIn("secret", text)
         self.assertIn("nbhd_project_context", text)
+
+
+class StepTimingTests(TestCase):
+    """Day counts and the once-only heads-up mark the daily check-in relays."""
+
+    WED = date(2026, 10, 7)
+    MON = date(2026, 10, 12)
+
+    def timing(self, today, *, start=None, due=None, status="open"):
+        return assistant._step_timing({"status": status, "start_date": start, "due_date": due}, today)
+
+    def test_counts_days_and_flags_ten_days_out(self):
+        timing = self.timing(self.WED, start=date(2026, 10, 9), due=date(2026, 10, 17))
+        self.assertEqual(
+            timing, {"days_until_start": 2, "days_until_due": 10, "overdue": False, "heads_up": "ten_days"}
+        )
+
+    def test_each_mark_comes_up_on_one_day_only(self):
+        due = date(2026, 10, 16)
+        marks = {
+            day: self.timing(date(2026, 10, day), due=due)["heads_up"]
+            for day in (5, 6, 7, 8, 9)  # Monday..Friday of one week: 11..7 days out
+        }
+        self.assertEqual(marks, {5: None, 6: "ten_days", 7: None, 8: None, 9: None})
+
+    def test_monday_catches_marks_reached_over_the_weekend(self):
+        # Three days out fell on Saturday; the weekday-only check-in raises it Monday.
+        self.assertEqual(self.timing(self.MON, due=date(2026, 10, 13))["heads_up"], "three_days")
+        # ...but not something that was already raised on Friday.
+        self.assertIsNone(self.timing(self.MON, due=date(2026, 10, 12 + 6))["heads_up"])
+
+    def test_start_day_due_day_and_late(self):
+        self.assertEqual(self.timing(self.WED, start=self.WED, due=date(2026, 11, 20))["heads_up"], "start")
+        # Already under way: no "time to begin".
+        self.assertIsNone(
+            self.timing(self.WED, start=self.WED, due=date(2026, 11, 20), status="in_progress")["heads_up"]
+        )
+        self.assertEqual(self.timing(self.WED, due=self.WED)["heads_up"], "due_today")
+        late = self.timing(self.WED, due=date(2026, 10, 6))
+        self.assertEqual((late["heads_up"], late["overdue"], late["days_until_due"]), ("overdue", True, -1))
+        # A week late is no longer news here (the "still yours?" push owns that).
+        self.assertIsNone(self.timing(self.WED, due=date(2026, 9, 30))["heads_up"])
+
+    def test_nothing_for_finished_or_undated_steps(self):
+        self.assertIsNone(self.timing(self.WED))
+        self.assertIsNone(self.timing(self.WED, due=self.WED, status="done"))
+        self.assertIsNone(self.timing(self.WED, due=self.WED, status="in_review"))
+
+
+@override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
+class ContextTimingTests(TestCase):
+    def test_context_carries_today_and_timing_in_the_users_time_zone(self):
+        cache.clear()
+        tenant = _tenant("p1c_tz")
+        _profile(tenant, "tzu")
+        tenant.user.timezone = "Asia/Tokyo"
+        tenant.user.save(update_fields=["timezone"])
+        goal = services.create_mission(tenant, tenant.user, member_friendship_ids=[], title="Passport")
+        me = SharedGoalMembership.objects.get(shared_goal=goal, tenant=tenant)
+        # 2026-10-07 16:00 UTC is already 2026-10-08 in Tokyo.
+        now = datetime(2026, 10, 7, 16, 0, tzinfo=UTC)
+        with patch("django.utils.timezone.now", return_value=now):
+            step = projects.create_step(
+                tenant, tenant.user, goal.id, {"title": "Contact the embassy", "due_date": "2026-10-18"}
+            )
+            projects.ask(tenant, tenant.user, goal.id, step.id, [str(me.id)])
+            projects.respond(tenant, tenant.user, goal.id, step.id, {"answer": "yes"})
+            ctx = assistant.runtime_context(tenant)
+        self.assertEqual(ctx["today"], "2026-10-08")
+        [mine] = ctx["projects"][0]["my_steps"]
+        self.assertEqual(mine["timing"]["days_until_due"], 10)
+        self.assertEqual(mine["timing"]["heads_up"], "ten_days")
