@@ -9,7 +9,7 @@ import {
 } from "react";
 
 import { APP_STORE_URL } from "@/components/app-store-badge";
-import { useWelcomeMessageQuery } from "@/lib/queries";
+import { useTenantQuery, useWelcomeMessageQuery } from "@/lib/queries";
 
 const DISMISS_KEY = "nbhd_welcome_card_dismissed_v1";
 
@@ -49,6 +49,7 @@ class SilentWelcomeBoundary extends Component<
 }
 
 function WelcomeMessageCardContent() {
+  const { data: tenant } = useTenantQuery();
   const { data: greeting } = useWelcomeMessageQuery();
   const storedDismissal = useSyncExternalStore(
     subscribeToDismissal,
@@ -103,12 +104,12 @@ function WelcomeMessageCardContent() {
         >
           Open the iOS app
         </a>
-        <Link
+        {tenant ? <Link
           href="/settings/integrations"
           className="inline-flex min-h-[44px] items-center justify-center rounded-full border border-border-strong px-4 py-2 text-center text-sm font-medium text-ink-muted transition hover:bg-surface-hover hover:text-ink motion-safe:active:scale-[0.98]"
         >
-          Connect Telegram or LINE
-        </Link>
+          {tenant && tenant.telegram_available !== false ? "Connect Telegram or LINE" : "Connect LINE"}
+        </Link> : null}
       </div>
     </section>
   );

@@ -34,6 +34,8 @@ export interface FreeModelOffer {
 }
 
 export interface Tenant {
+  /** Omitted by older servers; only false disables Telegram offers. */
+  telegram_available?: boolean;
   id: string;
   user: TenantUser;
   status: TenantStatus;

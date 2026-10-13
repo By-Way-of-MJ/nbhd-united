@@ -9,6 +9,7 @@ import {
   useGenerateTelegramLinkMutation,
   useLineStatusQuery,
   useTelegramStatusQuery,
+  useTenantQuery,
 } from "@/lib/queries";
 
 function hasErrorCode(error: unknown, code: string): boolean {
@@ -24,20 +25,34 @@ function hasErrorCode(error: unknown, code: string): boolean {
 export function useTelegramConnection(pairingOpen: boolean) {
   const [link, setLink] = useState<TelegramLinkResponse | null>(null);
   const [generationError, setGenerationError] = useState<string | null>(null);
-  const statusQuery = useTelegramStatusQuery(true, pairingOpen && Boolean(link));
+  const { data: tenant } = useTenantQuery();
+  const [unavailable, setUnavailable] = useState(false);
+  const available = Boolean(tenant) && tenant?.telegram_available !== false;
+  const statusQuery = useTelegramStatusQuery(
+    Boolean(tenant) && !unavailable,
+    pairingOpen && Boolean(link),
+    available,
+  );
+  const statusUnavailable = hasErrorCode(statusQuery.error, "telegram_unavailable");
   const generateMutation = useGenerateTelegramLinkMutation();
 
   const generate = async () => {
+    if (!available || unavailable || statusUnavailable) return;
     setGenerationError(null);
     generateMutation.reset();
     try {
       setLink(await generateMutation.mutateAsync());
     } catch (error) {
       setGenerationError(getErrorMessage(error));
+      if (hasErrorCode(error, "telegram_unavailable")) {
+        setLink(null);
+        setUnavailable(true);
+      }
     }
   };
 
   return {
+    unavailable: unavailable || statusUnavailable,
     link,
     generationError,
     generate,

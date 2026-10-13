@@ -13,23 +13,26 @@ import {
 import type { ChannelOutcome } from "@/components/onboarding/channel-outcome";
 import { StatusPill } from "@/components/status-pill";
 import { getErrorMessage } from "@/lib/errors";
-import { usePushStatusQuery } from "@/lib/queries";
+import { SectionCardSkeleton } from "@/components/skeleton";
+import { usePushStatusQuery, useTenantQuery } from "@/lib/queries";
 
 export function ChannelScene({
   onContinue,
 }: {
   onContinue: (outcome: ChannelOutcome) => void;
 }) {
+  const { data: tenant, isLoading } = useTenantQuery();
+  const telegramAvailable = Boolean(tenant) && tenant?.telegram_available !== false;
   const [activeChannel, setActiveChannel] = useState<MessagingChannel | null>(null);
   const telegram = useTelegramConnection(activeChannel === "telegram");
   const line = useLineConnection(activeChannel === "line");
   const pushStatus = usePushStatusQuery();
 
-  const telegramLinked = telegram.status?.linked ?? false;
+  const telegramLinked = telegramAvailable && (telegram.status?.linked ?? false);
   const lineLinked = line.status?.linked ?? false;
   const iosLinked = pushStatus.data?.registered ?? false;
   const effectiveActiveChannel =
-    activeChannel === "telegram" && !telegramLinked
+    activeChannel === "telegram" && telegramAvailable && !telegramLinked
       ? "telegram"
       : activeChannel === "line" && !lineLinked
         ? "line"
@@ -63,6 +66,8 @@ export function ChannelScene({
     if (!line.link && !line.status?.quota?.exhausted) void line.generate();
   };
 
+  if (isLoading || !tenant) return <SectionCardSkeleton lines={6} />;
+
   return (
     <div className="flex w-full max-w-[580px] flex-col items-center text-center">
       <span className="mb-4 font-mono text-[11px] uppercase tracking-[0.2em] text-signal-text">
@@ -74,8 +79,10 @@ export function ChannelScene({
       </h1>
 
       <p className="mb-8 max-w-[470px] text-[15px] leading-relaxed text-ink-muted">
-        The iPhone app gives you voice, photos, and check-ins. Telegram and LINE
-        are fully supported if you prefer a messenger.
+        The iPhone app gives you voice, photos, and check-ins.{" "}
+        {telegramAvailable
+          ? "Telegram and LINE are fully supported if you prefer a messenger."
+          : "You can also talk with your assistant in LINE."}
       </p>
 
       <article className="w-full rounded-panel border border-accent/40 bg-accent/5 p-5 text-left shadow-panel backdrop-blur-md sm:p-6">
@@ -147,8 +154,8 @@ export function ChannelScene({
         <span className="h-px flex-1 bg-border" />
       </div>
 
-      <div className="grid w-full gap-3 text-left sm:grid-cols-2">
-        <MessagingChannelCard
+      <div className={`grid w-full gap-3 text-left ${telegramAvailable ? "sm:grid-cols-2" : ""}`}>
+        {telegramAvailable ? <MessagingChannelCard
           channel="telegram"
           description="Chat with your assistant in Telegram."
           panelId="onboarding-telegram-pairing"
@@ -164,13 +171,14 @@ export function ChannelScene({
           link={telegram.link}
           isGenerating={telegram.isGenerating}
           generationError={telegram.generationError}
+          unavailable={telegram.unavailable}
           onConnect={openTelegram}
           onRegenerate={telegram.generate}
           onRetryStatus={telegram.retryStatus}
           onSwitch={line.statusReady ? switchToLine : undefined}
           onClose={() => setActiveChannel(null)}
-          className={effectiveActiveChannel ? "sm:col-span-2" : ""}
-        />
+          className={telegramAvailable && effectiveActiveChannel ? "sm:col-span-2" : ""}
+        /> : null}
 
         <MessagingChannelCard
           channel="line"
@@ -188,9 +196,9 @@ export function ChannelScene({
           onConnect={openLine}
           onRegenerate={line.generate}
           onRetryStatus={line.retryStatus}
-          onSwitch={telegram.statusReady ? switchToTelegram : undefined}
+          onSwitch={telegramAvailable && telegram.statusReady ? switchToTelegram : undefined}
           onClose={() => setActiveChannel(null)}
-          className={effectiveActiveChannel ? "sm:col-span-2" : ""}
+          className={telegramAvailable && effectiveActiveChannel ? "sm:col-span-2" : ""}
         />
       </div>
 

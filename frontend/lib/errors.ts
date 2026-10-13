@@ -11,6 +11,7 @@ const FRIENDLY_BY_CODE: Record<string, string> = {
   no_tenant: "No active tenant for this session.",
   no_profile: "No fitness profile yet — set one up in the Fuel tab.",
   no_container: "Your assistant isn't running right now — try again in a moment.",
+  telegram_unavailable: "Telegram replies are no longer available. Use the iPhone app or LINE.",
   line_quota_exhausted:
     "LINE’s monthly messaging allowance is used up across the platform. You’ll be able to connect LINE again at the start of next month.",
 };
