@@ -14,6 +14,7 @@ import stat
 import struct
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from errno import ECONNREFUSED, ENOENT
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from apps.pii.config import DEFAULT_DETECTOR_ENGINE, resolve_detector_engine
+from apps.pii.liquid_engine import REPLY_MARGIN_S, _LiquidPiiPipeline
 from apps.pii.shared_client import (
     DEFAULT_SOCKET_PATH,
     MAX_REQUEST_BYTES,
@@ -50,10 +52,27 @@ class _Job:
     queued_at: float
     received_at: float
     queue_depth: int
+    background: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     response: dict[str, Any] | None = None
     cancelled: bool = False
     cancel_reason: str | None = None
+
+
+class _PriorityJobs(queue.Queue):
+    """One bounded queue; Queue's mutex preserves arrival order in each class."""
+
+    def _init(self, maxsize):
+        self.queue = (deque(), deque())
+
+    def _qsize(self):
+        return sum(len(q) for q in self.queue)
+
+    def _put(self, job):
+        self.queue[1 if job is not None and job.background else 0].append(job)
+
+    def _get(self):
+        return (self.queue[0] or self.queue[1]).popleft()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -175,7 +194,7 @@ class SharedDetectorServer:
         self.configure_runtime = configure_runtime
         self.ready = threading.Event()
         self.stopped = threading.Event()
-        self._jobs: queue.Queue[_Job | None] = queue.Queue(maxsize=self.queue_max)
+        self._jobs: queue.Queue[_Job | None] = _PriorityJobs(maxsize=self.queue_max)
         self._listener: socket.socket | None = None
         self._bound = False
         self._pipeline: Callable[[str], list[dict[str, Any]]] | None = None
@@ -348,7 +367,19 @@ class SharedDetectorServer:
             exception_name = None
             try:
                 assert self._pipeline is not None
-                raw_spans = list(self._pipeline(job.text))
+                if isinstance(self._pipeline, _LiquidPiiPipeline):
+                    raw_spans = list(
+                        self._pipeline(
+                            job.text,
+                            # Leave transport headroom in addition to Liquid's
+                            # per-window merge/reply reserve. Keep the handler's
+                            # hard TTL for an already-running baseline inference.
+                            deadline=job.deadline - REPLY_MARGIN_S,
+                            on_window_deadline=self._log_window_deadline,
+                        )
+                    )
+                else:
+                    raw_spans = list(self._pipeline(job.text))
                 if len(raw_spans) > MAX_SPANS:
                     raise ValueError("span cap exceeded")
                 spans = [self._normalize_span(span, len(job.text)) for span in raw_spans]
@@ -377,6 +408,14 @@ class SharedDetectorServer:
                     exception_name=exception_name,
                 )
                 job.done.set()
+
+    @staticmethod
+    def _log_window_deadline(completed: int, total: int) -> None:
+        logger.info(
+            "pii_detector_server window_deadline windows_completed=%d windows_total=%d",
+            completed,
+            total,
+        )
 
     @staticmethod
     def _normalize_span(span: Any, text_length: int) -> dict[str, Any]:
@@ -453,7 +492,9 @@ class SharedDetectorServer:
                     total_ms=(time.monotonic() - received_at) * 1000,
                 )
                 return
-            deadline = time.monotonic() + request["ttl_ms"] / 1000
+            # The client sampled TTL before encoding/sending the frame. Reading
+            # and validating it must consume that budget, never extend it.
+            deadline = received_at + request["ttl_ms"] / 1000
             if deadline <= time.monotonic():
                 self._send(connection, {"v": PROTOCOL_VERSION, "error": "expired"})
                 self._log_event(
@@ -470,6 +511,7 @@ class SharedDetectorServer:
                 queued_at=queued_at,
                 received_at=received_at,
                 queue_depth=self._jobs.qsize(),
+                background=request.get("priority", "foreground") == "background",
             )
             try:
                 self._jobs.put_nowait(job)
@@ -503,7 +545,9 @@ class SharedDetectorServer:
     def _validate_request(self, request: dict[str, Any]) -> str | None:
         if type(request.get("v")) is not int or request["v"] != PROTOCOL_VERSION:
             return "bad_request"
-        if set(request) != {"v", "engine", "text", "ttl_ms"}:
+        if set(request) not in ({"v", "engine", "text", "ttl_ms"}, {"v", "engine", "text", "ttl_ms", "priority"}):
+            return "bad_request"
+        if request.get("priority", "foreground") not in ("foreground", "background"):
             return "bad_request"
         if request["engine"] != self.engine:
             return "engine_mismatch"

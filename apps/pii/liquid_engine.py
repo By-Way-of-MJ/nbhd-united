@@ -6,6 +6,8 @@ import importlib.util
 import logging
 import os
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,80 @@ _pipeline: object | None = None
 _pipeline_load_error: Exception | None = None
 
 
+MODEL_TOKEN_LIMIT = 2048
+WINDOW_OVERLAP_TOKENS = 256
+WINDOW_DURATION_FACTOR = 1.25
+REPLY_MARGIN_S = 0.25
+
+
+class _PreparedTokenizer:
+    """Serve the pinned decoder an already-tokenized original-string window."""
+
+    def __init__(self, text, encoding):
+        self.text = text
+        self.encoding = encoding
+
+    def __call__(self, text, **kwargs):
+        # This contract is pinned with the decoder revision. Never silently
+        # ignore a changed tokenizer request after a future model upgrade.
+        if text != self.text or kwargs != {
+            "return_offsets_mapping": True,
+            "return_tensors": "pt",
+            "truncation": True,
+            "max_length": MODEL_TOKEN_LIMIT,
+        }:
+            raise ValueError("Unexpected pinned Liquid tokenizer request")
+        import torch
+
+        return {key: torch.tensor([value]) for key, value in self.encoding.items()}
+
+
+def _token_windows(text, encoded, *, overlap=WINDOW_OVERLAP_TOKENS):
+    """Reuse real token IDs and offsets; never decode or re-tokenize a slice."""
+    mask = encoded["special_tokens_mask"]
+    offsets = encoded["offset_mapping"]
+    content = [i for i, special in enumerate(mask) if not special]
+    prefix = [i for i, special in enumerate(mask) if special and i < content[0]]
+    suffix = [i for i, special in enumerate(mask) if special and i > content[-1]]
+    if len(prefix) + len(suffix) != sum(mask):
+        raise ValueError("Unexpected Liquid special-token layout")
+    capacity = MODEL_TOKEN_LIMIT - len(prefix) - len(suffix)
+    if not 0 <= overlap < capacity:
+        raise ValueError("Invalid Liquid token overlap")
+    begin = 0
+    while begin < len(content):
+        end = min(begin + capacity, len(content))
+        # Byte-level tokens can share a Unicode character. Keep all pieces of
+        # that character in one window, including at the overlapping start.
+        while end < len(content) and offsets[content[end]][0] < offsets[content[end - 1]][1]:
+            end -= 1
+        if end <= begin:
+            raise ValueError("Liquid character exceeds token window")
+        start_char = 0 if begin == 0 else offsets[content[begin]][0]
+        end_char = len(text) if end == len(content) else offsets[content[end - 1]][1]
+        indices = prefix + content[begin:end] + suffix
+        window = {key: [value[i] for i in indices] for key, value in encoded.items() if key != "special_tokens_mask"}
+        window["offset_mapping"] = [
+            (0, 0) if mask[i] else (offsets[i][0] - start_char, offsets[i][1] - start_char) for i in indices
+        ]
+        yield start_char, text[start_char:end_char], window
+        if end == len(content):
+            break
+        next_begin = max(begin + 1, end - overlap)
+        while next_begin > begin and offsets[content[next_begin]][0] < offsets[content[next_begin - 1]][1]:
+            next_begin -= 1
+        if next_begin <= begin:
+            next_begin = end
+        begin = next_begin
+
+
+def _check_window_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        from apps.pii.shared_client import SharedPiiError
+
+        raise SharedPiiError("Liquid window deadline exceeded", outcome="timeout")
+
+
 class _LiquidPiiPipeline:
     """Adapt Liquid's hybrid decoder to the existing HF-pipeline span shape."""
 
@@ -32,20 +108,79 @@ class _LiquidPiiPipeline:
         self._model = model
         self._decoder = decoder
 
-    def __call__(self, text: str) -> list[dict[str, Any]]:
-        spans = self._decoder.predict(
+    def __call__(
+        self,
+        text: str,
+        *,
+        deadline: float | None = None,
+        on_window_deadline: Callable[[int, int], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        encoded = self._tokenizer(
             text,
-            self._tokenizer,
-            self._model,
-            hybrid=True,
+            return_offsets_mapping=True,
+            return_special_tokens_mask=True,
+            truncation=False,
         )
+        if len(encoded["input_ids"]) <= MODEL_TOKEN_LIMIT:
+            # Exactly the original model IDs, masks, offsets and full-context
+            # hybrid decoder, with no span assembly on fitting input.
+            return self._predict(text, {k: v for k, v in encoded.items() if k != "special_tokens_mask"})
+        from apps.pii.span_merge import _preserve_baseline
+
+        _check_window_deadline(deadline)
+        # Origin truncates the neural encoding, NOT the text passed to hybrid
+        # rules. Preserve its exact first 2048 IDs (including a partial Unicode
+        # character), and run full-text hybrid rules in this same inference.
+        # The pinned tokenizer adds only a leading BOS, no trailing special.
+        if encoded["special_tokens_mask"] != [1] + [0] * (len(encoded["input_ids"]) - 1):
+            raise ValueError("Unexpected pinned Liquid special-token layout")
+        first = {k: v[:MODEL_TOKEN_LIMIT] for k, v in encoded.items() if k != "special_tokens_mask"}
+        window_started = time.monotonic()
+        baseline = self._predict(text, first)
+        max_window_s = time.monotonic() - window_started
+        spans = []
+        windows = list(_token_windows(text, encoded))
+        completed = 1  # The origin prefix was already computed exactly once.
+        exhausted = False
+        for start, part, window in windows[1:]:
+            # Budget for another inference using the slowest observation, plus
+            # merge/serialization headroom. Equality is sufficient for admission.
+            if deadline is not None and deadline - time.monotonic() < (
+                WINDOW_DURATION_FACTOR * max_window_s + REPLY_MARGIN_S
+            ):
+                exhausted = True
+                break
+            window_started = time.monotonic()
+            window_spans = self._predict(part, window)
+            max_window_s = max(max_window_s, time.monotonic() - window_started)
+            for span in window_spans:
+                if not 0 <= span["start"] < span["end"] <= len(part):
+                    raise ValueError("Invalid Liquid window span")
+                spans.append(
+                    {
+                        **span,
+                        "start": start + span["start"],
+                        "end": start + span["end"],
+                        "_window": start,
+                        "_context": min(span["start"], len(part) - span["end"]),
+                    }
+                )
+            completed += 1
+        # Once origin's result exists, budget exhaustion must never discard it.
+        # Only completed windows contribute; no new inference starts on expiry.
+        result = _preserve_baseline(baseline, spans, text)
+        if exhausted or (deadline is not None and time.monotonic() >= deadline):
+            if on_window_deadline is not None:
+                on_window_deadline(completed, len(windows))
+        return result
+
+    def _predict(self, text, encoded):
+        spans = self._decoder.predict(text, _PreparedTokenizer(text, encoded), self._model, hybrid=True)
         return [
             {
                 "entity_group": str(span["type"]),
                 "word": text[int(span["start"]) : int(span["end"])],
-                # The shipped hybrid decoder combines neural and deterministic
-                # spans but does not expose confidences. A returned span is an
-                # accepted detection, so it clears the downstream score gate.
+                # The pinned hybrid decoder exposes accepted spans, no scores.
                 "score": 1.0,
                 "start": int(span["start"]),
                 "end": int(span["end"]),

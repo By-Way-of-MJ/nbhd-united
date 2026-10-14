@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 from dataclasses import dataclass
 from itertools import chain, islice
 from typing import Any
@@ -50,9 +51,12 @@ class _DetectorWorkBudget:
 
     limit: int
     used: int = 0
+    deadline: float | None = None
 
     @property
     def remaining(self) -> int:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            return 0
         return max(0, self.limit - self.used)
 
     def reserve_text(self) -> bool:
@@ -352,6 +356,7 @@ def repair_tenant(
     max_texts: int = DEFAULT_TEXT_BUDGET,
     alert: bool = True,
     store_offset: int = 0,
+    deadline: float | None = None,
 ) -> dict[str, int]:
     """Repair one tenant under both row and checked-text work budgets.
 
@@ -360,7 +365,9 @@ def repair_tenant(
     pre-detector snapshot, so a concurrent request write always wins.
     """
     totals = _empty_totals()
-    budget = _DetectorWorkBudget(limit=min(DEFAULT_TEXT_BUDGET, max(0, max_texts)))
+    if deadline is None:
+        deadline = time.monotonic() + settings.PII_REPAIR_BUDGET_SECONDS
+    budget = _DetectorWorkBudget(limit=min(DEFAULT_TEXT_BUDGET, max(0, max_texts)), deadline=deadline)
     if max_rows <= 0 or budget.remaining <= 0 or not getattr(tenant, "layer1_placeholder_writes", False):
         return totals
 
@@ -404,9 +411,10 @@ def repair_tenant(
                 old_state = old_receipt.get("state") if isinstance(old_receipt, dict) else None
                 if old_state not in REPAIR_STATES:
                     continue
+                if not budget.reserve_text():
+                    break
                 totals["fields_attempted"] += 1
                 attempted_fields.append(field)
-                budget.reserve_text()
                 try:
                     authored = author_text(
                         tenant,
@@ -454,8 +462,6 @@ def repair_tenant(
                 old_state = old_receipt.get("state") if isinstance(old_receipt, dict) else None
                 if old_state not in REPAIR_STATES:
                     continue
-                totals["fields_attempted"] += 1
-                attempted_fields.append(field)
                 source_value = getattr(row, field)
                 cursor, previous_aggregate = _json_progress(old_receipt, source_value)
                 try:
@@ -470,6 +476,8 @@ def repair_tenant(
                         budget=budget,
                     )
                 except Exception:
+                    totals["fields_attempted"] += 1
+                    attempted_fields.append(field)
                     totals["errors"] += 1
                     receipts[field], terminal = _fruitless_receipt(old_receipt)
                     row_terminal += int(terminal)
@@ -482,6 +490,10 @@ def repair_tenant(
                     )
                     continue
 
+                if not chunk.texts_authored and not chunk.complete:
+                    continue
+                totals["fields_attempted"] += 1
+                attempted_fields.append(field)
                 if chunk.value != source_value:
                     setattr(row, field, chunk.value)
                     changed_fields.append(field)
@@ -648,6 +660,7 @@ def sweep_placeholder_repairs(
     """Repair a bounded, rotating fleet window with tenant-level telemetry."""
     from apps.tenants.models import Tenant
 
+    deadline = time.monotonic() + settings.PII_REPAIR_BUDGET_SECONDS
     totals = {"tenants_seen": 0, **_empty_totals()}
     remaining_rows = min(DEFAULT_BATCH_SIZE, max(0, batch_size))
     effective_text_budget = min(DEFAULT_TEXT_BUDGET, max(0, text_budget))
@@ -681,7 +694,7 @@ def sweep_placeholder_repairs(
     store_round = tick // fleet_cycle_hours
 
     for tenant_index, tenant_id in enumerate(islice(rotated_tenant_ids, expected_tenant_slots)):
-        if remaining_rows <= 0 or remaining_texts <= 0:
+        if remaining_rows <= 0 or remaining_texts <= 0 or time.monotonic() >= deadline:
             break
         tenant = (
             Tenant.objects.filter(
@@ -706,6 +719,7 @@ def sweep_placeholder_repairs(
             max_rows=min(remaining_rows, per_tenant_rows),
             max_texts=min(remaining_texts, per_tenant_texts),
             store_offset=store_round + tenant_index,
+            deadline=deadline,
         )
         if not result["rows_seen"]:
             continue

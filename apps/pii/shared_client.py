@@ -204,7 +204,7 @@ class SharedPiiPipeline:
             span_count,
         )
 
-    def __call__(self, text: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
+    def __call__(self, text: str, *, deadline: float | None = None, background: bool = False) -> list[dict[str, Any]]:
         started = time.monotonic()
         text_length = len(text) if isinstance(text, str) else 0
         if not isinstance(text, str):
@@ -213,13 +213,18 @@ class SharedPiiPipeline:
         generation = 0
         half_open = False
         try:
-            generation, half_open = self._before_call()
-            spans = self._call(text) if deadline is None else self._call(text, deadline=deadline)
+            if background:
+                spans = self._call(text, deadline=deadline, background=True)
+            else:
+                generation, half_open = self._before_call()
+                spans = self._call(text) if deadline is None else self._call(text, deadline=deadline)
         except SharedPiiError as exc:
-            self._record_failure(exc.outcome, generation, half_open)
+            if not background:
+                self._record_failure(exc.outcome, generation, half_open)
             self._log_call(outcome=exc.outcome, started=started, text_length=text_length, span_count=0)
             raise
-        self._record_success(generation, half_open)
+        if not background:
+            self._record_success(generation, half_open)
         self._log_call(outcome="ok", started=started, text_length=text_length, span_count=len(spans))
         return spans
 
@@ -243,10 +248,11 @@ class SharedPiiPipeline:
         self._log_call(outcome="ok", started=started, text_length=text_length, span_count=len(spans))
         return spans
 
-    def _call(self, text: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
+    def _call(self, text: str, *, deadline: float | None = None, background: bool = False) -> list[dict[str, Any]]:
         if len(text.encode("utf-8")) + 128 > MAX_REQUEST_BYTES:
             raise SharedPiiError("shared detector request exceeds byte cap", outcome="too_large")
-        own_deadline = time.monotonic() + self.deadline_s
+        request_budget = _env_float("PII_BACKGROUND_DEADLINE_S", 30.0) if background else self.deadline_s
+        own_deadline = time.monotonic() + request_budget
         deadline = own_deadline if deadline is None else min(deadline, own_deadline)
         connection: socket.socket | None = None
         try:
@@ -261,7 +267,13 @@ class SharedPiiPipeline:
 
             ttl_ms = max(1, int(_remaining(deadline) * 1000))
             frame = _encode_frame(
-                {"v": PROTOCOL_VERSION, "engine": self.engine, "text": text, "ttl_ms": ttl_ms},
+                {
+                    "v": PROTOCOL_VERSION,
+                    "engine": self.engine,
+                    "text": text,
+                    "ttl_ms": ttl_ms,
+                    **({"priority": "background"} if background else {}),
+                },
                 cap=MAX_REQUEST_BYTES,
             )
             connection.settimeout(_remaining(deadline))
