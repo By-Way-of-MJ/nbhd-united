@@ -194,7 +194,11 @@ def render_projects(tenant: Tenant) -> str:
             from .project_flags import project_tools_ready
 
             lines = (
-                ["Call nbhd_project_context for details before answering about a project."]
+                [
+                    "Call nbhd_project_context for details before answering about a project — and "
+                    "whenever the user tells you anything about a project step, so you can save it "
+                    "on that step (the reply says how)."
+                ]
                 if project_tools_ready(tenant)
                 else []
             )
