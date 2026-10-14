@@ -36,6 +36,12 @@ class ProjectCheckinPromptContractTest(SimpleTestCase):
         self.assertIn("do not say it is stalled or overdue unless `timing` says so", _PROJECT_CHECKIN_PROMPT)
         self.assertNotIn("has been sitting", _PROJECT_CHECKIN_PROMPT)
 
+    def test_reads_what_the_user_already_said_about_a_step(self):
+        self.assertIn("`my_notes`", _PROJECT_CHECKIN_PROMPT)
+        self.assertIn("never ask for or suggest something the notes already cover", _PROJECT_CHECKIN_PROMPT)
+        # A reply about a step is saved on the step and proposed — not completed directly.
+        self.assertIn("never complete or skip a step's own task directly", _PROJECT_CHECKIN_PROMPT)
+
     def test_every_raised_step_is_covered(self):
         # A mark comes up once; a cap on items would drop the overflow for good.
         self.assertIn("covering EVERY raised step", _PROJECT_CHECKIN_PROMPT)

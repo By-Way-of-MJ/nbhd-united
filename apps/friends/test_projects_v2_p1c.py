@@ -9,7 +9,8 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.journal.models import Goal
+from apps.journal.models import Goal, Task
+from apps.tenants.test_utils import seed_internal_key
 
 from . import project_assistant as assistant
 from . import project_services as projects
@@ -426,6 +427,113 @@ class GoneQuietTests(TestCase):
             steps = [self.step(sid, today=today) for sid in ("a", "b", "c")]
             picks.update(self.flagged(steps, today))
         self.assertEqual(picks, {"a", "b", "c"})
+
+
+@override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True, NBHD_INTERNAL_API_KEY="k")
+class StepNotesTests(TestCase):
+    """What I tell my assistant about a step is kept ON the step and read back."""
+
+    def setUp(self):
+        cache.clear()
+        self.tenant = _tenant("p1c_notes")
+        _profile(self.tenant, "notesu")
+        seed_internal_key(self.tenant, key="k")
+        goal = services.create_mission(self.tenant, self.tenant.user, member_friendship_ids=[], title="Passport")
+        me = SharedGoalMembership.objects.get(shared_goal=goal, tenant=self.tenant)
+        step = projects.create_step(self.tenant, self.tenant.user, goal.id, {"title": "Contact the embassy"})
+        projects.ask(self.tenant, self.tenant.user, goal.id, step.id, [str(me.id)])
+        projects.respond(self.tenant, self.tenant.user, goal.id, step.id, {"answer": "yes"})
+
+    def my_step(self):
+        [mine] = assistant.runtime_context(self.tenant)["projects"][0]["my_steps"]
+        return mine
+
+    def save(self, task_id, text):
+        response = APIClient().patch(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/tasks/{task_id}/",
+            {"description": text},
+            format="json",
+            HTTP_X_NBHD_INTERNAL_KEY="k",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def test_context_hands_over_the_task_and_the_rule(self):
+        ctx = assistant.runtime_context(self.tenant)
+        self.assertIn("`nbhd_task_update`", ctx["notes_rule"])
+        mine = ctx["projects"][0]["my_steps"][0]
+        self.assertTrue(Task.objects.filter(id=mine["task_id"], tenant=self.tenant).exists())
+        self.assertEqual(mine["my_notes"], "")
+
+    def test_a_new_fact_is_added_with_the_date_and_read_back(self):
+        task_id = self.my_step()["task_id"]
+        today = assistant.tenant_today(self.tenant).isoformat()
+        self.save(task_id, "Photos taken at the station booth")
+        self.assertEqual(self.my_step()["my_notes"], f"[{today}] Photos taken at the station booth")
+        # A model that sends only the next fact must not wipe the first one.
+        self.save(task_id, "Embassy opens 9-12 on weekdays")
+        self.assertEqual(
+            self.my_step()["my_notes"],
+            f"[{today}] Photos taken at the station booth\n[{today}] Embassy opens 9-12 on weekdays",
+        )
+
+    def test_sending_the_notes_back_adds_only_the_new_part(self):
+        task_id = self.my_step()["task_id"]
+        today = assistant.tenant_today(self.tenant).isoformat()
+        self.save(task_id, "Photos taken")
+        first = self.my_step()["my_notes"]
+        # Echoed with Windows line ends and more on the end.
+        self.save(task_id, first.replace("\n", "\r\n") + "\r\nForm downloaded")
+        self.assertEqual(self.my_step()["my_notes"], f"{first}\n[{today}] Form downloaded")
+        # A pure echo, or nothing at all, changes nothing.
+        for text in (self.my_step()["my_notes"], "   "):
+            self.save(task_id, text)
+        self.assertEqual(self.my_step()["my_notes"], f"{first}\n[{today}] Form downloaded")
+
+    def test_a_note_that_landed_in_between_is_not_lost(self):
+        task_id = self.my_step()["task_id"]
+        real = assistant.keep_step_notes
+        raced = []
+
+        def racing(tenant, tid, incoming):
+            out = real(tenant, tid, incoming)
+            if not raced:  # another request saves a note after our snapshot was read
+                raced.append(1)
+                Task.objects.filter(id=tid).update(description="[2026-10-01] From the other request")
+            return out
+
+        with patch.object(assistant, "keep_step_notes", racing):
+            self.save(task_id, "Mine")
+        notes = self.my_step()["my_notes"]
+        self.assertIn("From the other request", notes)
+        self.assertTrue(notes.endswith("Mine"), notes)
+
+    def test_only_the_newest_notes_are_shown(self):
+        task_id = self.my_step()["task_id"]
+        lines = "\n".join(f"[2026-09-01] note {n} " + "x" * 90 for n in range(80))
+        Task.objects.filter(id=task_id).update(description=lines)
+        shown = self.my_step()["my_notes"]
+        self.assertLessEqual(len(shown), assistant.NOTES_SHOWN_MAX + 40)
+        self.assertTrue(shown.startswith("(earlier notes not shown)\n[2026-09-01] note "), shown[:60])
+        self.assertTrue(shown.endswith("note 79 " + "x" * 90))
+
+    def test_the_http_reply_masks_notes_like_other_project_text(self):
+        from apps.integrations.runtime_views import _PROJECT_EGRESS_TEXT_FIELDS
+
+        self.assertIn("my_notes", _PROJECT_EGRESS_TEXT_FIELDS)
+        response = APIClient().get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/projects/",
+            HTTP_X_NBHD_INTERNAL_KEY="k",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn("my_notes", response.json()["projects"][0]["my_steps"][0])
+
+    def test_an_ordinary_task_is_still_replaced(self):
+        task = Task.objects.create(tenant=self.tenant, title="Buy milk", description="old")
+        self.save(task.id, "new")
+        task.refresh_from_db()
+        self.assertEqual(task.description, "new")
 
 
 @override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)

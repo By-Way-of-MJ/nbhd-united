@@ -1464,27 +1464,41 @@ class RuntimeTaskDetailView(APIView):
         # the other request's text would survive while its receipt was replaced
         # by ours, and a receipt that disagrees with its text rehydrates the
         # wrong binding — the user sees someone else's name.
-        authored_data, authored_receipts = _author_runtime_lifecycle_input(
-            tenant,
-            request.data,
-            seam="journal.runtime.task.patch",
-            model_label="journal.Task",
-        )
-        with transaction.atomic():
-            task = Task.objects.select_for_update().filter(tenant=tenant, id=task_id).first()
-            if task is None:
-                return Response({"error": "task_not_found"}, status=status.HTTP_404_NOT_FOUND)
-            # Merge onto the CURRENT row, read under the lock — untouched fields
-            # keep whatever receipt they have now, not whatever they had when
-            # this request started.
-            receipts = {**(task.pii_receipts or {}), **authored_receipts}
-            serializer = TaskSerializer(task, data=authored_data, partial=True, context={"tenant": tenant})
-            serializer.is_valid(raise_exception=True)
-            serializer.save(pii_receipts=receipts)
-        return Response(
-            {"tenant_id": str(tenant.id), "task": TaskSerializer(task).data},
-            status=status.HTTP_200_OK,
-        )
+        from apps.friends.project_assistant import keep_step_notes
+
+        # A project step's notes are add-only for the assistant. The new text is
+        # built on a snapshot read before the lock (authoring must stay outside the
+        # transaction), so the save goes through only if the row still holds that
+        # snapshot; otherwise another note landed first and we rebuild on top of it.
+        for _attempt in range(3):
+            data, notes_snapshot = request.data, None
+            if isinstance(data.get("description"), str):
+                data = data.dict() if hasattr(data, "dict") else dict(data)
+                data["description"], notes_snapshot = keep_step_notes(tenant, task_id, data["description"])
+            authored_data, authored_receipts = _author_runtime_lifecycle_input(
+                tenant,
+                data,
+                seam="journal.runtime.task.patch",
+                model_label="journal.Task",
+            )
+            with transaction.atomic():
+                task = Task.objects.select_for_update().filter(tenant=tenant, id=task_id).first()
+                if task is None:
+                    return Response({"error": "task_not_found"}, status=status.HTTP_404_NOT_FOUND)
+                if notes_snapshot is not None and task.description != notes_snapshot:
+                    continue
+                # Merge onto the CURRENT row, read under the lock — untouched fields
+                # keep whatever receipt they have now, not whatever they had when
+                # this request started.
+                receipts = {**(task.pii_receipts or {}), **authored_receipts}
+                serializer = TaskSerializer(task, data=authored_data, partial=True, context={"tenant": tenant})
+                serializer.is_valid(raise_exception=True)
+                serializer.save(pii_receipts=receipts)
+            return Response(
+                {"tenant_id": str(tenant.id), "task": TaskSerializer(task).data},
+                status=status.HTTP_200_OK,
+            )
+        return Response({"error": "task_busy", "hint": "Try again."}, status=status.HTTP_409_CONFLICT)
 
     @staticmethod
     def _delete_preview_payload(task, *, subtask_count: int, pending_action_count: int) -> dict:
@@ -6157,7 +6171,7 @@ class RuntimeProposeMissionTaskView(RLSRequestTransactionMixin, APIView):
         )
 
 
-_PROJECT_EGRESS_TEXT_FIELDS = frozenset({"title", "goal", "name", "owner", "my_linked_goal"})
+_PROJECT_EGRESS_TEXT_FIELDS = frozenset({"title", "goal", "name", "owner", "my_linked_goal", "my_notes"})
 
 
 class RuntimeProjectsContextView(RLSRequestTransactionMixin, KnownValueResponseGuardMixin, APIView):
