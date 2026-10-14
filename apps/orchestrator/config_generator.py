@@ -2063,6 +2063,19 @@ def _build_heartbeat_cron(tenant: Tenant) -> dict | None:
     }
 
 
+# Generic user-facing system crons left out for ``tenant.scheduled_messages_opt_in``.
+OPT_IN_SKIPPED_SEED_JOBS = frozenset(
+    {
+        "Morning Briefing",
+        "Evening Check-in",
+        "Personal Question",
+        "Weekly Reflection",
+        "Week Ahead Review",
+        "Project Check-in",
+    }
+)
+
+
 def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
     """Build cron job definitions for seeding via the Gateway API.
 
@@ -2208,6 +2221,13 @@ def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
         # Django endpoint (/api/v1/journal/extract/) triggered via QStash.
         # See apps/journal/extraction_views.py.
     ]
+
+    # Opt-in tenants choose their own scheduled messages, so none of the
+    # generic user-facing ones are seeded (and the reaper never re-creates
+    # them). Background Tasks stays; feature-gated jobs below follow their
+    # own switches.
+    if getattr(tenant, "scheduled_messages_opt_in", False):
+        jobs = [job for job in jobs if job["name"] not in OPT_IN_SKIPPED_SEED_JOBS]
 
     # Gravity Weekly Check-in — Sunday 19:00 user TZ when finance is enabled.
     # Different hour from Weekly Reflection (20:00) so they don't collide.

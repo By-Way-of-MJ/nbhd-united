@@ -553,6 +553,14 @@ class ProfileView(APIView):
 
         applied_state = "ok"
 
+        if serializer.validated_data.get("onboarding_interests"):
+            # The app's "About you" card covers what the Telegram/LINE intro
+            # asks, so mark it done; the messaging gate re-runs it while
+            # ``onboarding_step == 0`` even when ``onboarding_complete`` is set.
+            Tenant.objects.filter(user=request.user).exclude(onboarding_complete=True, onboarding_step__gte=5).update(
+                onboarding_complete=True, onboarding_step=5, updated_at=timezone.now()
+            )
+
         location_changed = any(
             k in serializer.validated_data for k in ("location_city", "location_lat", "location_lon")
         )

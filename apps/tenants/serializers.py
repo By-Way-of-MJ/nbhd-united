@@ -11,6 +11,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import Tenant, User
 
 _VALID_TIMEZONES = available_timezones()
+ONBOARDING_INTERESTS_MAX_CHARS = 400
 
 
 def _validate_timezone(value: str) -> str:
@@ -21,6 +22,9 @@ def _validate_timezone(value: str) -> str:
 
 class UserSerializer(serializers.ModelSerializer):
     apple_linked = serializers.SerializerMethodField()
+    # Stored in ``preferences["onboarding_interests"]`` (shared with the
+    # Telegram/LINE onboarding flow) and rendered into USER.md's Profile block.
+    onboarding_interests = serializers.CharField(required=False, allow_blank=True, write_only=True)
 
     class Meta:
         model = User
@@ -40,6 +44,7 @@ class UserSerializer(serializers.ModelSerializer):
             "location_lat",
             "location_lon",
             "apple_linked",
+            "onboarding_interests",
         )
         read_only_fields = (
             "id",
@@ -60,6 +65,30 @@ class UserSerializer(serializers.ModelSerializer):
 
     def validate_timezone(self, value):
         return _validate_timezone(value)
+
+    def validate_onboarding_interests(self, value):
+        from apps.friends.project_hygiene import clean_text
+
+        return clean_text(value, limit=ONBOARDING_INTERESTS_MAX_CHARS)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        interests = (instance.preferences or {}).get("onboarding_interests", "")
+        if isinstance(interests, list):
+            interests = ", ".join(str(item).strip() for item in interests if str(item).strip())
+        data["onboarding_interests"] = interests if isinstance(interests, str) else ""
+        return data
+
+    def update(self, instance, validated_data):
+        if "onboarding_interests" in validated_data:
+            interests = validated_data.pop("onboarding_interests")
+            preferences = dict(instance.preferences or {})
+            if interests:
+                preferences["onboarding_interests"] = interests
+            else:
+                preferences.pop("onboarding_interests", None)
+            instance.preferences = preferences
+        return super().update(instance, validated_data)
 
     def get_apple_linked(self, obj):
         return obj.external_identities.filter(provider="apple").exists()
