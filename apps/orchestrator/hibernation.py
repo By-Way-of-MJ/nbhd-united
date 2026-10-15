@@ -70,6 +70,16 @@ def _cron_wake_idle_seconds() -> int:
     return settings.TENANT_CRON_WAKE_IDLE_MINUTES * 60
 
 
+def hibernation_exempt_ids() -> set[str]:
+    """Tenant UUIDs (lower-case) that must stay awake — ``HIBERNATION_EXEMPT_TENANT_IDS``."""
+    raw = str(getattr(settings, "HIBERNATION_EXEMPT_TENANT_IDS", "") or "")
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def is_hibernation_exempt(tenant: Tenant) -> bool:
+    return str(tenant.id).lower() in hibernation_exempt_ids()
+
+
 def hibernate_idle_tenant(tenant: Tenant) -> bool:
     """Hibernate a single idle tenant's container.
 
@@ -82,6 +92,11 @@ def hibernate_idle_tenant(tenant: Tenant) -> bool:
     Returns True on success.
     """
     tid = str(tenant.id)[:8]
+
+    # One gate for every sleep path (idle sweep, cron-wake recheck, auto-upgrade).
+    if is_hibernation_exempt(tenant):
+        logger.info("idle_hibernate: tenant %s is on HIBERNATION_EXEMPT_TENANT_IDS — staying awake", tid)
+        return False
 
     # 1. Capture cron schedules before suspending (for cron-aware wake)
     cron_jobs = _capture_tenant_cron_schedules(tenant)

@@ -918,7 +918,7 @@ def hibernate_idle_tenants_task() -> dict:
     from django.db.models import Q
     from django.utils import timezone
 
-    from apps.orchestrator.hibernation import hibernate_idle_tenant
+    from apps.orchestrator.hibernation import hibernate_idle_tenant, hibernation_exempt_ids, wake_hibernated_tenant
     from apps.tenants.models import Tenant
 
     logger = logging.getLogger(__name__)
@@ -926,6 +926,25 @@ def hibernate_idle_tenants_task() -> dict:
     from django.db import transaction
 
     cutoff = timezone.now() - timedelta(minutes=settings.TENANT_IDLE_HIBERNATE_MINUTES)
+
+    # Keep-awake list (App Review demo account): never put these to sleep, and
+    # wake any that are already asleep so the list takes effect within a sweep.
+    exempt_ids = hibernation_exempt_ids()
+    exempt_woken = 0
+    sleeping_exempt = (
+        Tenant.objects.filter(
+            id__in=exempt_ids, status=Tenant.Status.ACTIVE, container_id__gt="", hibernated_at__isnull=False
+        )
+        if exempt_ids
+        else []
+    )
+    for sleeping in sleeping_exempt:
+        try:
+            if wake_hibernated_tenant(sleeping):
+                exempt_woken += 1
+                logger.info("hibernate_idle_tenants: woke keep-awake tenant %s", str(sleeping.id)[:8])
+        except Exception:
+            logger.exception("hibernate_idle_tenants: failed to wake keep-awake tenant %s", str(sleeping.id)[:8])
 
     hibernated = 0
     failed = 0
@@ -962,6 +981,8 @@ def hibernate_idle_tenants_task() -> dict:
         openclaw_auto_upgrade.reap_stale_run()
     except Exception:
         logger.exception("hibernate_idle_tenants: auto-upgrade recovery check failed")
+
+    idle_tenants = [t for t in idle_tenants if str(t.id).lower() not in exempt_ids]
 
     for tenant in idle_tenants:
         # Re-check last_message_at + cron_wake_at to avoid TOCTOU race
@@ -1030,6 +1051,7 @@ def hibernate_idle_tenants_task() -> dict:
         "auto_upgrading": auto_upgrading,
         "suspended_hibernated": suspended_hibernated,
         "suspended_failed": suspended_failed,
+        "exempt_woken": exempt_woken,
     }
 
 
