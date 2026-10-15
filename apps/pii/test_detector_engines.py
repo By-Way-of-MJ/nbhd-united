@@ -369,7 +369,9 @@ class LiquidEngineSingletonTests(SimpleTestCase):
                 ]
             )
         )
-        tokenizer = object()
+        from apps.pii.test_liquid_windows import FakeTokenizer
+
+        tokenizer = FakeTokenizer()
         model = object()
         pipeline = liquid_engine._LiquidPiiPipeline(tokenizer, model, decoder)
 
@@ -387,15 +389,20 @@ class LiquidEngineSingletonTests(SimpleTestCase):
                 }
             ],
         )
+        prepared = decoder.predict.call_args.args[1]
+        self.assertIsInstance(prepared, liquid_engine._PreparedTokenizer)
+        self.assertEqual(tokenizer.calls, 1)
+        self.assertNotIn("special_tokens_mask", prepared.encoding)
         decoder.predict.assert_called_once_with(
             "明日は田中さんとtaro@example.jpに連絡",
-            tokenizer,
+            prepared,
             model,
             hybrid=True,
         )
 
     def test_remote_model_load_is_revision_pinned_cpu_fp32(self):
         import torch
+        from transformers import AutoModelForTokenClassification, AutoTokenizer
 
         tokenizer = object()
         model = Mock()
@@ -405,12 +412,14 @@ class LiquidEngineSingletonTests(SimpleTestCase):
         with (
             patch.object(liquid_engine.os.path, "isdir", return_value=False),
             patch.object(liquid_engine, "_load_decoder", return_value=decoder),
-            patch(
-                "transformers.AutoTokenizer.from_pretrained",
+            patch.object(
+                AutoTokenizer,
+                "from_pretrained",
                 return_value=tokenizer,
             ) as load_tokenizer,
-            patch(
-                "transformers.AutoModelForTokenClassification.from_pretrained",
+            patch.object(
+                AutoModelForTokenClassification,
+                "from_pretrained",
                 return_value=model,
             ) as load_model,
         ):

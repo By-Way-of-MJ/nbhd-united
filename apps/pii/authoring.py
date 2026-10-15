@@ -176,6 +176,7 @@ def _residual_summary(
     text: str,
     *,
     kinds_to_count: frozenset[str] | None = _RESIDUAL_KINDS,
+    background: bool = False,
 ) -> dict[str, Any]:
     """Count unknown detections without retaining their values.
 
@@ -194,6 +195,7 @@ def _residual_summary(
         text,
         policy.get("entities", []),
         policy.get("score_threshold", 0.7),
+        **({"background": True} if background else {}),
     )
     if _neural_detector_available() is not True:
         raise NeuralDetectorUnavailable
@@ -417,12 +419,14 @@ def author_text(
         max_length = _registered_field_max_length(field, model_label) if model_label is not None else None
         if max_length is not None and len(text) <= max_length:
             authoring_input = truncate_placeholder_safe(authoring_input, max_length)
+    detector_kwargs = {"background": True} if writer == "background" else {}
     try:
         outcome = redact_user_message_checked(
             authoring_input,
             tenant,
             allow_user_name=allow_user_name,
             mint=mint,
+            **detector_kwargs,
         )
     except Exception:
         logger.exception(
@@ -499,7 +503,7 @@ def author_text(
     }
     if _require_no_residual:
         try:
-            residual_spans = _residual_summary(tenant, stored, kinds_to_count=None)
+            residual_spans = _residual_summary(tenant, stored, kinds_to_count=None, **detector_kwargs)
         except NeuralDetectorUnavailable:
             receipt = {
                 "state": "unconfirmed",
@@ -528,7 +532,7 @@ def author_text(
         # migration fence trusts `placeholder` and the repair sweep only revisits
         # unconfirmed/residual.
         try:
-            residual_spans = _residual_summary(tenant, stored)
+            residual_spans = _residual_summary(tenant, stored, **detector_kwargs)
         except NeuralDetectorUnavailable:
             stored = _redact_active_known_values(tenant, stored, seam=f"{seam}:known-fallback")
             receipt = {

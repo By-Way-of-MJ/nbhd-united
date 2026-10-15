@@ -1542,6 +1542,7 @@ def redact_user_message_checked(
     allow_user_name: bool = True,
     mint: str = MINT_ALL,
     ingress: PiiIngress | None = None,
+    background: bool = False,
 ) -> RedactionOutcome:
     """Redact a user message and report whether the engine completed.
 
@@ -1568,6 +1569,7 @@ def redact_user_message_checked(
             allow_user_name=allow_user_name,
             mint=mint,
             ingress=ingress,
+            **({"background": True} if background else {}),
         )
     except Exception as exc:
         if mint == MINT_REDACT_ONLY:
@@ -1590,6 +1592,7 @@ def _redact_user_message(
     allow_user_name: bool = True,
     mint: str = MINT_ALL,
     ingress: PiiIngress | None = None,
+    background: bool = False,
 ) -> str:
     """Internal: redact user message with known + new entity detection."""
     existing_map = getattr(tenant, "pii_entity_map", None) or {}
@@ -1693,7 +1696,7 @@ def _redact_user_message(
                 elif parts:
                     allow_names.add(parts[0])
 
-    results = _detect_pii(out, entities, score_threshold)
+    results = _detect_pii(out, entities, score_threshold, **({"background": True} if background else {}))
     results = _filter_results(results, out, allow_names, denylist=denylist, tenant=tenant)
 
     # Drop NER hits that fall inside an existing placeholder. Some models
@@ -2087,6 +2090,7 @@ def _detect_pii(
     score_threshold: float,
     *,
     deadline: float | None = None,
+    background: bool = False,
 ) -> list[DetectedEntity]:
     """Detect PII using DeBERTa (contextual) + Presidio regex (financial).
 
@@ -2123,11 +2127,16 @@ def _detect_pii(
         pii_pipeline = get_pii_pipeline()
         if deadline is None:
             cached = _detection_cache.get()
-            key = (id(pii_pipeline), detect_text)
+            key = (id(pii_pipeline), detect_text, background)
             if cached is not None and key in cached:
                 model_results = cached[key]
             else:
-                model_results = pii_pipeline(detect_text)
+                from apps.pii.shared_client import SharedPiiPipeline
+
+                if background and isinstance(pii_pipeline, SharedPiiPipeline):
+                    model_results = pii_pipeline(detect_text, background=True)
+                else:
+                    model_results = pii_pipeline(detect_text)
                 if cached is not None:
                     cached[key] = model_results
         else:
@@ -2137,7 +2146,9 @@ def _detect_pii(
 
             if monotonic() >= deadline:
                 raise TimeoutError("Redaction deadline exceeded")
-            if isinstance(pii_pipeline, SharedPiiPipeline):
+            if background and isinstance(pii_pipeline, SharedPiiPipeline):
+                model_results = pii_pipeline(detect_text, deadline=deadline, background=True)
+            elif isinstance(pii_pipeline, SharedPiiPipeline):
                 # Keep the process-wide client warm without charging short
                 # speculative deadlines to the normal chat circuit breaker.
                 model_results = pii_pipeline.detect_ephemeral(detect_text, deadline=deadline)

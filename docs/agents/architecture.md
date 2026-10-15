@@ -59,3 +59,119 @@ If the container is hibernated, drain triggers wake; wake/hibernate revision ops
 ## Cost shape (so you don't "optimize" the wrong thing)
 
 ~$130/mo for nbhd: Django ~$35 always-on, one active tenant ~$31, hibernated tenants $0. Django **cannot** be right-sized down (Consumption plan fixes 1 vCPU : 2 GiB; live memory working set ~1.07 GiB needs the 2 GiB). Registry churn is handled by the nightly purge task.
+
+## PII detector requests
+
+Clients send one complete text per detector request. There is no character or
+estimated-token chunker, and web workers using the shared transport do not import
+torch, transformers or tokenizers. `engine.py` retains its original transport
+selection. Ephemeral batching retains its original 384-byte windows and refusal
+on ambiguous overlap; DeBERTa's ordinary pipeline is unchanged.
+
+The model-owning Liquid adapter tokenizes once with real offsets and special-token
+masks. Inputs at or below 2048 tokens use the original full-context hybrid decoder
+and span conversion, without merging. A request-local tokenizer adapter supplies
+exactly those precomputed tensors to the pinned decoder instead of tokenizing
+again. Over-length inputs use at most 2048 tokens including special tokens, with
+256 real-token overlap. Later windows keep all byte tokens of each Unicode
+character together. The FIRST inference deliberately uses exactly origin/main's
+2048-token prefix, including its original truncation inside a multi-token Unicode
+character if applicable. It passes the FULL original text to the hybrid decoder:
+origin/main's regex/context rules also inspect the tail. This computes the exact
+baseline once, without an extra model run. Later windows retain original token
+IDs and slice the ORIGINAL string; no decoded text or tokenizer enters the client.
+
+`span_merge.py` unions same-label ranges and retains native same-window overlaps.
+Safe cross-window label conflicts choose the original observation farther from
+its window edge, then higher score, extending the range over the whole union.
+Unsafe canonical-type/filter switches and invalid structured unions retain BOTH
+labels in the low-level merger; they never raise a conflict error.
+
+Returning both is insufficient: `redactor._filter_results` applies label-specific
+allowlists, hygiene and structured validation, then `_deduplicate_overlapping`
+can pick a SHORTER span on equal scores (or a structured pattern of another type).
+For overflow input, `_preserve_baseline` therefore keeps origin/main's exact spans
+and adds only independent later detections. Later spans touching an unsafe
+conflict are omitted. All additions must also be isolated from baseline spans
+and every lightweight pattern-recognizer span. The guard includes trimmed and
+snapped word boundaries plus a two-character gap, covering adjacent-span merging
+and BUILDINGNUMBER address context. Even safe same-label extensions cannot alter
+an original span's label, extent, score, allowlist or validation outcome. Original
+downstream overlap groups remain intact for every entity tier/threshold. This is
+a conservative fallback: it can forgo a new detection near a protected group.
+The original spans also reserve space under the shared 4096-span response cap;
+only additions are capped, so they cannot trigger a new whole-call wire rejection.
+Fitting inputs bypass all of this and retain byte-identical decoder output.
+Actual inference errors retain the existing failure path. For over-length input,
+a deadline hit before the baseline inference raises timeout. After the baseline
+exists, expiry returns it plus safe additions from completed windows, through the
+same baseline-preserving merge; unfinished windows contribute nothing.
+
+The sidecar still has ONE inference worker and the same `PII_SHARED_QUEUE_MAX`
+capacity. Requests may include `priority="foreground"` or `"background"`; omitted
+priority means foreground for old clients. At each dequeue, the oldest foreground
+request wins over every queued background request. Both classes remain FIFO.
+Background work runs whenever foreground is empty. Running inference is never
+preempted. Over-length Liquid requests measure the baseline and every completed
+window's `_predict` duration. A later window starts only when remaining time is
+at least `1.25 * max(completed window durations) + 0.25 seconds`. Otherwise the
+R7 baseline-preserving return runs immediately, with one count-only
+`window_deadline` log (`windows_completed`, `windows_total`). Actual expiry still
+returns completed coverage; no running inference is preempted.
+
+The server anchors TTL at connection receipt, so reading/validating the frame
+cannot add time to the client's budget. It passes Liquid a deadline 0.25 seconds
+earlier, in addition to the admission rule's 0.25-second merge/reply reserve.
+The handler keeps its full hard TTL, avoiding early cancellation of an already
+running baseline merely to reserve time for optional windows. Client limits remain
+5 seconds foreground and 30 seconds background. These are local-socket margins,
+not an absolute guarantee against scheduling delays or unusually slow inference.
+
+Expected production consequence (not measured in production): at roughly
+2.7–5.3 seconds per full window, a foreground over-length message will almost
+always return exactly origin/main's baseline in about the same inference time;
+window 2 will not fit. A background request with 30 seconds can usually complete
+all 3–4 windows. Queue time and latency outliers can still exhaust either budget.
+An unexpired long request retains the worker across admitted windows.
+
+Shared foreground/ephemeral requests retain the 5-second client limit and caller
+deadline clamp. `PII_BACKGROUND_DEADLINE_S=30` sets a separate per-request limit
+for background calls, still clamped by any shorter caller deadline. Background
+calls neither consult nor mutate the foreground breaker (including on success).
+This prevents expected background queue/long-text timeouts from disabling chat.
+`author_text(writer="background")` passes this flag through checked detection and
+all residual checks. Repair scalar and JSON-leaf authoring already use that writer.
+Owner/runtime authoring, chat and ephemeral callers keep foreground defaults.
+
+The 30-second default allows roughly 3–4 windows for a 6000-token text: using the
+prior production CPU-scaling estimate of 2.7–5.3 seconds/window suggests 8–21 seconds
+of inference plus some queue headroom. This is an estimate, not a production SLA;
+local inference is synchronous and cannot be forcibly interrupted by the client.
+The former estimated-chunk settings and 60-second client whole-text budget are gone.
+
+The repair sweep retains `PII_REPAIR_BUDGET_SECONDS=120`, checked before each new
+string/JSON leaf and shared across tenants. Unstarted work is untouched and incurs
+no attempt. An admitted field may finish after that budget, potentially requiring
+two 30-second background detector requests plus database work. No orchestrator
+code or automatic-path fixture pin is changed.
+
+R1–R5 evidence stays in `scratch/pii-chunking/`; historical measurement scripts
+and compact result artifacts are retained. R5's 100-document benchmark reduced
+raw exposed reference characters from 92683/280389 (33.06%) to 49758/280389
+(17.75%), but 16 unsafe-conflict failures made those documents worse than origin.
+R6 removes that failure policy: all 100 documents improve, none tie or worsen,
+and none fail. Exposure is 16094/280389 (5.74%), with 9551 extra-redacted characters
+(3.41% of reference coverage). Every origin-covered character is preserved.
+The same documents also pass 1400 actual `_detect_pii` / `_filter_results`
+coverage checks, across each entity type and the combined tier. The real-tokenizer
+audit verifies exact origin truncation for all 6603 corpus/document inputs,
+including 103 overlength cases. Results and fitting-input parity are in
+`verification-r6.txt`.
+These synthetic/public comparisons use disjoint reference windows, not ground
+truth PII recall or production latency measurements. No real-user data is used.
+
+R6 exact fitting-input parity is 6500/6500: eval117, golden54, ai4privacy6000,
+dense26, Unicode stress3 and the 300 fitting long documents. A fresh final-code
+replay of 14 long documents under 30-second deadlines matches the recorded spans;
+golden retains the same three expected misses (51/54). No baseline-covered
+character is lost in any of the 100 long documents.

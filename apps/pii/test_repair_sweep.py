@@ -750,3 +750,96 @@ class RepairSweepTests(TestCase):
         entry = next(item for item in SYSTEM_CRONS if item[0] == "placeholder-repair-sweep")
         self.assertEqual(entry[1], "13 * * * *")
         self.assertEqual(entry[2], "/api/cron/trigger/placeholder_repair_sweep/")
+
+
+class RepairWallBudgetTests(TestCase):
+    setUp = RepairSweepTests.setUp
+
+    def test_wall_budget_leaves_remaining_rows_and_attempts_untouched(self):
+        rows = [
+            Task.objects.create(
+                tenant=self.tenant,
+                title=f"item {i}",
+                pii_receipts={"title": {"state": "unconfirmed", "repair_attempts": 1}},
+            )
+            for i in range(3)
+        ]
+        now = [0.0]
+
+        def author(_tenant, text, **kwargs):
+            now[0] = 121
+            return AuthoredText(text=text, receipt={"state": "placeholder", "redactions": []})
+
+        with (
+            patch("apps.pii.repair_sweep.time.monotonic", side_effect=lambda: now[0]),
+            patch("apps.pii.repair_sweep.author_text", side_effect=author) as call,
+        ):
+            result = repair_tenant(self.tenant, alert=False)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(result["texts_authored"], 1)
+        untouched = 0
+        for row in rows:
+            row.refresh_from_db()
+            if row.pii_receipts["title"]["state"] == "unconfirmed":
+                untouched += 1
+                self.assertEqual(row.pii_receipts["title"]["repair_attempts"], 1)
+        self.assertEqual(untouched, 2)
+
+    def test_json_budget_stops_between_leaves_without_charging_attempt(self):
+        entry = JournalEntry.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 8, 8),
+            mood="steady",
+            energy=JournalEntry.Energy.MEDIUM,
+            wins=["first", "second", "third"],
+            pii_receipts={"wins": {"state": "unconfirmed", "repair_attempts": 1}},
+        )
+        now = [0.0]
+
+        def author(_tenant, text, **kwargs):
+            now[0] = 121
+            return AuthoredText(text="checked", receipt={"state": "placeholder", "redactions": []})
+
+        with (
+            patch("apps.pii.repair_sweep.time.monotonic", side_effect=lambda: now[0]),
+            patch("apps.pii.repair_sweep.author_text", side_effect=author) as call,
+        ):
+            repair_tenant(self.tenant, alert=False)
+        entry.refresh_from_db()
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(entry.wins, ["checked", "second", "third"])
+        self.assertEqual(entry.pii_receipts["wins"]["repair_attempts"], 1)
+        self.assertEqual(entry.pii_receipts["wins"]["state"], "unconfirmed")
+
+    def test_fleet_shares_one_deadline_across_tenants(self):
+        user = User.objects.create_user(username="second-budget", password="x")
+        Tenant.objects.create(user=user, status=Tenant.Status.ACTIVE, layer1_placeholder_writes=True)
+        now = [0.0]
+        from apps.pii.repair_sweep import _empty_totals
+
+        def repair(_tenant, **kwargs):
+            self.assertEqual(kwargs["deadline"], 120)
+            now[0] = 121
+            return {**_empty_totals(), "rows_seen": 1, "texts_authored": 1}
+
+        with (
+            patch("apps.pii.repair_sweep.time.monotonic", side_effect=lambda: now[0]),
+            patch("apps.pii.repair_sweep.repair_tenant", side_effect=repair) as call,
+        ):
+            sweep_placeholder_repairs(fairness_tick=0)
+        self.assertEqual(call.call_count, 1)
+
+    def test_already_expired_budget_does_not_touch_row(self):
+        row = Task.objects.create(
+            tenant=self.tenant, title="unchanged", pii_receipts={"title": {"state": "unconfirmed"}}
+        )
+        with (
+            patch("apps.pii.repair_sweep.time.monotonic", return_value=5),
+            patch("apps.pii.repair_sweep.author_text") as call,
+        ):
+            result = repair_tenant(self.tenant, deadline=4, alert=False)
+        row.refresh_from_db()
+        self.assertEqual(row.title, "unchanged")
+        self.assertEqual(row.pii_receipts, {"title": {"state": "unconfirmed"}})
+        self.assertEqual(result["fields_attempted"], 0)
+        call.assert_not_called()

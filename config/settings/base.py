@@ -33,6 +33,12 @@ PII_DETECTOR_TRANSPORT = resolve_detector_transport(
 )
 
 
+# Background detector requests may include multiple full model windows.
+PII_BACKGROUND_DEADLINE_S = env.float("PII_BACKGROUND_DEADLINE_S", default=30)
+# Admission budget: finish the current string, defer all unstarted strings.
+PII_REPAIR_BUDGET_SECONDS = env.float("PII_REPAIR_BUDGET_SECONDS", default=120)
+
+
 def _positive_int_env(name: str, default: int) -> int:
     try:
         return resolve_positive_int(env(name, default=default), name=name)

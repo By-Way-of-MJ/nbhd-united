@@ -35,6 +35,47 @@ class AuthorTextTests(TestCase):
             pii_entity_map={"[PERSON_1]": {"name": "Alice"}},
         )
 
+    def test_both_authoring_passes_use_background_only_for_background_writer(self):
+        from apps.pii.shared_client import SharedPiiPipeline
+
+        self.tenant.layer1_placeholder_writes = True
+        client = SharedPiiPipeline(engine="liquid")
+        for writer, expected in (("background", 2), ("runtime", 2), ("owner", 1)):
+            with (
+                self.subTest(writer=writer),
+                patch("apps.pii.engine.get_pii_pipeline", return_value=client),
+                patch("apps.pii.engine.get_pattern_recognizers", return_value={}),
+                patch.object(client, "_call", return_value=[]) as detect,
+            ):
+                author_text(
+                    self.tenant, "A quiet afternoon.", seam="test.priority", writer=writer, field="title", live=False
+                )
+                self.assertEqual(detect.call_count, expected)
+                self.assertTrue(
+                    all(
+                        call.kwargs.get("background", False) == (writer == "background")
+                        for call in detect.call_args_list
+                    )
+                )
+
+    def test_background_detector_failure_is_unconfirmed_without_charging_chat(self):
+        from apps.pii.shared_client import SharedPiiError, SharedPiiPipeline
+
+        self.tenant.layer1_placeholder_writes = True
+        client = SharedPiiPipeline(engine="liquid")
+        client._consecutive_failures = 2
+        with (
+            patch("apps.pii.engine.get_pii_pipeline", return_value=client),
+            patch("apps.pii.engine.get_pattern_recognizers", return_value={}),
+            patch.object(client, "_call", side_effect=SharedPiiError("synthetic", outcome="timeout")),
+        ):
+            result = author_text(
+                self.tenant, "A quiet afternoon.", seam="test.priority", writer="background", field="title", live=False
+            )
+        self.assertEqual(result.receipt["state"], "unconfirmed")
+        self.assertEqual(result.receipt["reason"], "neural-unavailable")
+        self.assertEqual(client._consecutive_failures, 2)
+
     def test_flag_off_owner_preserves_legacy_redaction_without_checked_receipt(self):
         original = "  Alice\n[PERSON_999]  "
         before_map = dict(self.tenant.pii_entity_map)
