@@ -276,6 +276,14 @@ STEWARD_OPENROUTER_CANARY_TENANT_ID = env(
 # Fleet-go is a deliberate follow-up, not a side effect of deploying this code.
 TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 
+# Tenants whose containers must never idle-hibernate (comma-separated UUIDs).
+# Used for the App Store review demo account while a build waits for review —
+# a sleeping container made App Review see endless loading (2.2.3, 2026-10-14).
+# Set it when submitting to App Review, clear it once the review is decided.
+# Empty = everyone hibernates as usual. The idle sweep also wakes a listed
+# tenant that is already asleep, so setting it takes effect within one sweep.
+HIBERNATION_EXEMPT_TENANT_IDS = env("HIBERNATION_EXEMPT_TENANT_IDS", default="")
+
 # Storage key cache canary gate. Container App env var names MUST match;
 # empty keeps the existing per-operation listKeys behavior.
 AZURE_STORAGE_KEY_CACHE_TENANT_IDS = env("AZURE_STORAGE_KEY_CACHE_TENANT_IDS", default="")
