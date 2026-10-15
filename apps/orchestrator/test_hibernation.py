@@ -39,6 +39,8 @@ def _apply_config_published(mock_publish) -> bool:
 @override_settings(OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*")
 class WakeHibernatedTenantImageRefreshTest(TestCase):
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(
             display_name="Wake Refresh",
             telegram_chat_id=987654321,
@@ -393,6 +395,8 @@ class WakeConfigSchemaSyncTest(TestCase):
     """
 
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(display_name="Wake Schema", telegram_chat_id=55512345)
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-schema-test"
@@ -659,6 +663,8 @@ class WakeImageRefreshSafetyTest(TestCase):
     OLD_IMAGE = "test.azurecr.io/nbhd-openclaw:2026.9.4-oldsha1"
 
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(display_name="Wake Safety", telegram_chat_id=55599911)
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-safety"

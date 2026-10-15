@@ -665,6 +665,8 @@ class RuntimeGuardTests(SimpleTestCase):
 
 class LifecycleAndDispatchTests(TestCase):
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = tenant_fixture()
         readiness = patch.object(migration, "report_tenant", return_value={"status": "READY", "reasons": {}})
         readiness.start()

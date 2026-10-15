@@ -40,6 +40,8 @@ class HibernateIdleCronWakeRaceTests(TestCase):
     """Pin: hibernate_idle_tenants must not race with wake_for_cron."""
 
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         # Successful idle cases require a known-empty live cron list.
         self.enterContext(patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []}))
 
