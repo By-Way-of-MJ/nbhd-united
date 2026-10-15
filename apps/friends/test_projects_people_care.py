@@ -540,6 +540,10 @@ class QuietStepTests(_Base):
         self.nine = datetime(2026, 10, 18, 9, 5, tzinfo=ZoneInfo("Asia/Tokyo"))  # due + 3
         self.step_ = self.step(due_date="2026-10-15")
         self.give(self.step_, self.b)
+        # give() stamps responded_at with the real clock. Pin it well before the fixed
+        # "now" above, or the "not within three days of taking the step" rule hides the
+        # nudge whenever the suite runs on or after 2026-10-15.
+        SharedGoalStepAssignment.objects.filter(step=self.step_).update(responded_at=self.nine - timedelta(days=10))
 
     def test_one_still_yours_three_days_past_due_and_keep_quiets_the_flag(self):
         with _PushCapture(self) as cap:
