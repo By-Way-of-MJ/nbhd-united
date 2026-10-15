@@ -21,6 +21,8 @@ PREVIOUS = "registry.test/nbhd-openclaw:2026.5.28-old"
 @override_settings(AZURE_ACR_SERVER="registry.test", TENANT_IDLE_HIBERNATE_MINUTES=30)
 class ImagePushHibernateRaceTests(TestCase):
     def setUp(self):
+        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
+        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.publish = self.enterContext(patch("apps.cron.publish.publish_task"))
         self.gateway = self.enterContext(
             patch("apps.cron.gateway_client.invoke_gateway_tool", return_value={"jobs": []})

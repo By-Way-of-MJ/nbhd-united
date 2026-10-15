@@ -1,10 +1,10 @@
 {
-  "image": "nbhd-openclaw:2026.9.4-pluginreport-local",
+  "image": "nbhd-openclaw:2026.9.4-proxyfirst-local",
   "baseImage": "nbhdunited.azurecr.io/nbhd-openclaw:2026.9.4-8ceb89f",
   "manifest": "sha256:c244ff686863c1e9e4fc9fc55d1fac3b6a746e76039a9632db8ae082a0f21ddc",
-  "imageId": "sha256:57c9d0d41228325ceee7ca931e6553a5a4e08f29f89e17beaa46f3aef6f72489",
+  "imageId": "sha256:2f82b167ceaae431a2fee052168c92904584fc3dfcdf30ecbc969855ba1ae18e",
   "sources": {
-    "runtime/openclaw/entrypoint.sh": "83485f7ee1e8f9441c15f63d2de591cb9dd3ba13a3573e9a409a3a5ccbdc22f2",
+    "runtime/openclaw/entrypoint.sh": "473589de68944e14f9b0e0f75ccbc66acfbae72e7d83f85b7ed8fba265c1504b",
     "runtime/openclaw/nbhd-cron-sync.mjs": "0016b14fcc0e5a69cac7df64f6ea39a567b37148f49009ef6825635fa4f2c216"
   },
   "isolation": "network none; no ports/mounts; synthetic token; cron firing/plugins disabled",
@@ -47,17 +47,17 @@
     {
       "jobs": [
         {
-          "id": "577d8023-e7e7-448b-943c-98c3c1c355b3",
+          "id": "c691a838-e747-4790-8eae-4b1022577194",
           "declarationKey": "heartbeat:main",
           "displayName": "Heartbeat (main)",
           "agentId": "main",
           "name": "heartbeat-main",
           "enabled": true,
-          "createdAtMs": 1791440266962,
+          "createdAtMs": 1792037273814,
           "schedule": {
             "kind": "every",
             "everyMs": 1800000,
-            "anchorMs": 1597458
+            "anchorMs": 814223
           },
           "sessionTarget": "main",
           "wakeMode": "next-heartbeat",
@@ -65,20 +65,20 @@
             "kind": "heartbeat"
           },
           "state": {
-            "nextRunAtMs": 1791440797458
+            "nextRunAtMs": 1792037614223
           },
-          "updatedAtMs": 1791440266962,
-          "configRevision": "sha256:JyXB3EyUF1Tg1q-759TTo7Gekxg8eO7-8AqiWyTQDzM",
-          "nextRunAtMs": 1791440797458,
+          "updatedAtMs": 1792037273814,
+          "configRevision": "sha256:KfS8GNtUWnrg_kwhnX4FyuOIlTnee84WA-W-eY_qMqg",
+          "nextRunAtMs": 1792037614223,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "aff7c72e-f543-4ea8-95ea-b0a1add96b66",
+          "id": "9c94f120-3b21-4691-a414-0e8c974a3f3b",
           "declarationKey": "nbhd:700",
           "name": "cron-tz",
           "enabled": true,
-          "createdAtMs": 1791440342603,
+          "createdAtMs": 1792037292404,
           "schedule": {
             "kind": "cron",
             "expr": "17 9 * * *",
@@ -102,26 +102,26 @@
             "mode": "trusted"
           },
           "state": {
-            "nextRunAtMs": 1791505020000
+            "nextRunAtMs": 1792109820000
           },
-          "updatedAtMs": 1791440342603,
-          "configRevision": "sha256:llnz4mp_Bo-yVpqax1sLKp6x-IDTW6FNLn2t5ZT-_rk",
-          "nextRunAtMs": 1791505020000,
+          "updatedAtMs": 1792037292404,
+          "configRevision": "sha256:EqSPzxJJXuBrm8Eip2rggaZ32BpQMDzzUXeVeoHjQF8",
+          "nextRunAtMs": 1792109820000,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "abe28c9b-1f12-473a-8532-3a8fc99249b2",
+          "id": "56a36c46-4229-479c-862d-a3040d26d409",
           "declarationKey": "skill-collection-review:main",
           "displayName": "Skill collection review (main)",
           "agentId": "main",
           "name": "skill-collection-review-main",
           "enabled": true,
-          "createdAtMs": 1791440319152,
+          "createdAtMs": 1792037287648,
           "schedule": {
             "kind": "every",
             "everyMs": 604800000,
-            "anchorMs": 464197458
+            "anchorMs": 159214223
           },
           "sessionTarget": "isolated",
           "wakeMode": "next-heartbeat",
@@ -146,21 +146,21 @@
             "mode": "trusted"
           },
           "state": {
-            "nextRunAtMs": 1791881797458
+            "nextRunAtMs": 1792181614223
           },
-          "updatedAtMs": 1791440319152,
-          "configRevision": "sha256:IgyUVNoL3yNoBJHNqxfpZRo4hn5vLS8GlY8T0bBVUt8",
-          "nextRunAtMs": 1791881797458,
+          "updatedAtMs": 1792037287648,
+          "configRevision": "sha256:qWOkAbgfx7lauqvNv0N0y2nOowhBrZ-3tn9K_l3O2vw",
+          "nextRunAtMs": 1792181614223,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "4146ced5-6071-44b9-bb49-7315456a0f04",
+          "id": "55e27aa1-ca74-45db-a0a6-a8774496cbc2",
           "declarationKey": "nbhd:701",
           "name": "at-utc-stable",
           "enabled": true,
           "deleteAfterRun": true,
-          "createdAtMs": 1791440352267,
+          "createdAtMs": 1792037294029,
           "schedule": {
             "kind": "at",
             "at": "2027-01-01T00:00:00.000Z"
@@ -185,33 +185,33 @@
           "state": {
             "nextRunAtMs": 1798761600000
           },
-          "updatedAtMs": 1791440352267,
-          "configRevision": "sha256:IJCjWXfm4Np4zSOThTgMBWoa19c_WdZyzu5GBKbjVVE",
+          "updatedAtMs": 1792037294029,
+          "configRevision": "sha256:Y1OmOuWRqY6OfAm3UYOS1i5Y79pkvros_f-jZPrJtBc",
           "nextRunAtMs": 1798761600000,
           "effectiveAgentId": "main",
           "status": "idle"
         }
       ],
-      "snapshotRevision": "sha256:sQCLXOY_Jewfnap4eya3H8JqsSmPXvA1lf4XmAhwI0o",
+      "snapshotRevision": "sha256:2_2wjveoPtQ2CkRVcozuB5XLAMNyXwFPcD_VYTVs1ao",
       "total": 4,
       "offset": 0,
       "limit": 200,
       "hasMore": false,
       "nextOffset": null,
       "deliveryPreviews": {
-        "577d8023-e7e7-448b-943c-98c3c1c355b3": {
+        "c691a838-e747-4790-8eae-4b1022577194": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "aff7c72e-f543-4ea8-95ea-b0a1add96b66": {
+        "9c94f120-3b21-4691-a414-0e8c974a3f3b": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "abe28c9b-1f12-473a-8532-3a8fc99249b2": {
+        "56a36c46-4229-479c-862d-a3040d26d409": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "4146ced5-6071-44b9-bb49-7315456a0f04": {
+        "55e27aa1-ca74-45db-a0a6-a8774496cbc2": {
           "label": "not requested",
           "detail": "not requested"
         }
@@ -220,17 +220,17 @@
     {
       "jobs": [
         {
-          "id": "577d8023-e7e7-448b-943c-98c3c1c355b3",
+          "id": "c691a838-e747-4790-8eae-4b1022577194",
           "declarationKey": "heartbeat:main",
           "displayName": "Heartbeat (main)",
           "agentId": "main",
           "name": "heartbeat-main",
           "enabled": true,
-          "createdAtMs": 1791440266962,
+          "createdAtMs": 1792037273814,
           "schedule": {
             "kind": "every",
             "everyMs": 1800000,
-            "anchorMs": 1597458
+            "anchorMs": 814223
           },
           "sessionTarget": "main",
           "wakeMode": "next-heartbeat",
@@ -238,20 +238,20 @@
             "kind": "heartbeat"
           },
           "state": {
-            "nextRunAtMs": 1791440797458
+            "nextRunAtMs": 1792037614223
           },
-          "updatedAtMs": 1791440266962,
-          "configRevision": "sha256:JyXB3EyUF1Tg1q-759TTo7Gekxg8eO7-8AqiWyTQDzM",
-          "nextRunAtMs": 1791440797458,
+          "updatedAtMs": 1792037273814,
+          "configRevision": "sha256:KfS8GNtUWnrg_kwhnX4FyuOIlTnee84WA-W-eY_qMqg",
+          "nextRunAtMs": 1792037614223,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "aff7c72e-f543-4ea8-95ea-b0a1add96b66",
+          "id": "9c94f120-3b21-4691-a414-0e8c974a3f3b",
           "declarationKey": "nbhd:700",
           "name": "cron-tz",
           "enabled": true,
-          "createdAtMs": 1791440342603,
+          "createdAtMs": 1792037292404,
           "schedule": {
             "kind": "cron",
             "expr": "17 9 * * *",
@@ -275,26 +275,26 @@
             "mode": "trusted"
           },
           "state": {
-            "nextRunAtMs": 1791505020000
+            "nextRunAtMs": 1792109820000
           },
-          "updatedAtMs": 1791440342603,
-          "configRevision": "sha256:llnz4mp_Bo-yVpqax1sLKp6x-IDTW6FNLn2t5ZT-_rk",
-          "nextRunAtMs": 1791505020000,
+          "updatedAtMs": 1792037292404,
+          "configRevision": "sha256:EqSPzxJJXuBrm8Eip2rggaZ32BpQMDzzUXeVeoHjQF8",
+          "nextRunAtMs": 1792109820000,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "abe28c9b-1f12-473a-8532-3a8fc99249b2",
+          "id": "56a36c46-4229-479c-862d-a3040d26d409",
           "declarationKey": "skill-collection-review:main",
           "displayName": "Skill collection review (main)",
           "agentId": "main",
           "name": "skill-collection-review-main",
           "enabled": true,
-          "createdAtMs": 1791440319152,
+          "createdAtMs": 1792037287648,
           "schedule": {
             "kind": "every",
             "everyMs": 604800000,
-            "anchorMs": 464197458
+            "anchorMs": 159214223
           },
           "sessionTarget": "isolated",
           "wakeMode": "next-heartbeat",
@@ -319,21 +319,21 @@
             "mode": "trusted"
           },
           "state": {
-            "nextRunAtMs": 1791881797458
+            "nextRunAtMs": 1792181614223
           },
-          "updatedAtMs": 1791440319152,
-          "configRevision": "sha256:IgyUVNoL3yNoBJHNqxfpZRo4hn5vLS8GlY8T0bBVUt8",
-          "nextRunAtMs": 1791881797458,
+          "updatedAtMs": 1792037287648,
+          "configRevision": "sha256:qWOkAbgfx7lauqvNv0N0y2nOowhBrZ-3tn9K_l3O2vw",
+          "nextRunAtMs": 1792181614223,
           "effectiveAgentId": "main",
           "status": "idle"
         },
         {
-          "id": "4146ced5-6071-44b9-bb49-7315456a0f04",
+          "id": "55e27aa1-ca74-45db-a0a6-a8774496cbc2",
           "declarationKey": "nbhd:701",
           "name": "at-utc-stable",
           "enabled": true,
           "deleteAfterRun": true,
-          "createdAtMs": 1791440352267,
+          "createdAtMs": 1792037294029,
           "schedule": {
             "kind": "at",
             "at": "2027-01-01T00:00:00.000Z"
@@ -358,33 +358,33 @@
           "state": {
             "nextRunAtMs": 1798761600000
           },
-          "updatedAtMs": 1791440352267,
-          "configRevision": "sha256:IJCjWXfm4Np4zSOThTgMBWoa19c_WdZyzu5GBKbjVVE",
+          "updatedAtMs": 1792037294029,
+          "configRevision": "sha256:Y1OmOuWRqY6OfAm3UYOS1i5Y79pkvros_f-jZPrJtBc",
           "nextRunAtMs": 1798761600000,
           "effectiveAgentId": "main",
           "status": "idle"
         }
       ],
-      "snapshotRevision": "sha256:sQCLXOY_Jewfnap4eya3H8JqsSmPXvA1lf4XmAhwI0o",
+      "snapshotRevision": "sha256:2_2wjveoPtQ2CkRVcozuB5XLAMNyXwFPcD_VYTVs1ao",
       "total": 4,
       "offset": 0,
       "limit": 200,
       "hasMore": false,
       "nextOffset": null,
       "deliveryPreviews": {
-        "577d8023-e7e7-448b-943c-98c3c1c355b3": {
+        "c691a838-e747-4790-8eae-4b1022577194": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "aff7c72e-f543-4ea8-95ea-b0a1add96b66": {
+        "9c94f120-3b21-4691-a414-0e8c974a3f3b": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "abe28c9b-1f12-473a-8532-3a8fc99249b2": {
+        "56a36c46-4229-479c-862d-a3040d26d409": {
           "label": "not requested",
           "detail": "not requested"
         },
-        "4146ced5-6071-44b9-bb49-7315456a0f04": {
+        "55e27aa1-ca74-45db-a0a6-a8774496cbc2": {
           "label": "not requested",
           "detail": "not requested"
         }
@@ -392,15 +392,15 @@
     }
   ],
   "stableIds": {
-    "nbhd:700": "aff7c72e-f543-4ea8-95ea-b0a1add96b66",
-    "nbhd:701": "4146ced5-6071-44b9-bb49-7315456a0f04"
+    "nbhd:700": "9c94f120-3b21-4691-a414-0e8c974a3f3b",
+    "nbhd:701": "55e27aa1-ca74-45db-a0a6-a8774496cbc2"
   },
   "stateReadback": {
     "v": 1,
-    "writtenAtMs": 1791440383437,
+    "writtenAtMs": 1792037299132,
     "jobs": [
       {
-        "id": "577d8023-e7e7-448b-943c-98c3c1c355b3",
+        "id": "c691a838-e747-4790-8eae-4b1022577194",
         "name": "heartbeat-main",
         "enabled": true,
         "schedule": {
@@ -408,12 +408,12 @@
           "everyMs": 1800000
         },
         "state": {
-          "nextRunAtMs": 1791440797458
+          "nextRunAtMs": 1792037614223
         },
         "declarationKey": "heartbeat:main"
       },
       {
-        "id": "aff7c72e-f543-4ea8-95ea-b0a1add96b66",
+        "id": "9c94f120-3b21-4691-a414-0e8c974a3f3b",
         "name": "cron-tz",
         "enabled": true,
         "schedule": {
@@ -422,12 +422,12 @@
           "tz": "Asia/Tokyo"
         },
         "state": {
-          "nextRunAtMs": 1791505020000
+          "nextRunAtMs": 1792109820000
         },
         "declarationKey": "nbhd:700"
       },
       {
-        "id": "abe28c9b-1f12-473a-8532-3a8fc99249b2",
+        "id": "56a36c46-4229-479c-862d-a3040d26d409",
         "name": "skill-collection-review-main",
         "enabled": true,
         "schedule": {
@@ -435,12 +435,12 @@
           "everyMs": 604800000
         },
         "state": {
-          "nextRunAtMs": 1791881797458
+          "nextRunAtMs": 1792181614223
         },
         "declarationKey": "skill-collection-review:main"
       },
       {
-        "id": "4146ced5-6071-44b9-bb49-7315456a0f04",
+        "id": "55e27aa1-ca74-45db-a0a6-a8774496cbc2",
         "name": "at-utc-stable",
         "enabled": true,
         "schedule": {
