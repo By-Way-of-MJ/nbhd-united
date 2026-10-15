@@ -410,6 +410,14 @@ class Tenant(models.Model):
         default=0,
         help_text="Current onboarding question index (0 = not started)",
     )
+    scheduled_messages_opt_in = models.BooleanField(
+        default=False,
+        help_text=(
+            "Tenant picks its own scheduled messages: the generic user-facing "
+            "system crons (Morning Briefing, Evening Check-in, ...) are not seeded. "
+            "Set for app/web sign-ups at creation; existing tenants stay False."
+        ),
+    )
 
     # Heartbeat window ("On the Clock")
     heartbeat_enabled = models.BooleanField(

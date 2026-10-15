@@ -28,7 +28,8 @@ def sanitize_display_name(display_name: object) -> str:
 def compose_first_session_welcome(display_name: object) -> str:
     """Interpolate the orchestrator-authored greeting without rewriting it."""
     cleaned_name = sanitize_display_name(display_name)
-    if cleaned_name:
+    # "Friend" is the User.display_name default, not a name the person gave.
+    if cleaned_name and cleaned_name != "Friend":
         return FIRST_SESSION_WELCOME_TEMPLATE.format(display_name=cleaned_name)
 
     unnamed = FIRST_SESSION_WELCOME_TEMPLATE.format(display_name="").removeprefix("Hey  — ")

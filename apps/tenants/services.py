@@ -43,6 +43,9 @@ def prepare_tenant_provisioning(user: User) -> tuple[Tenant, bool]:
                 trial_ends_at=now + timedelta(days=TRIAL_DAYS),
                 model_tier=Tenant.ModelTier.STARTER,
                 status=Tenant.Status.PROVISIONING,
+                # New sign-ups switch on their own scheduled messages during
+                # onboarding; nothing generic is seeded for them.
+                scheduled_messages_opt_in=True,
             )
     except IntegrityError:
         # A concurrent caller won the OneToOne(user) race — return their row.
