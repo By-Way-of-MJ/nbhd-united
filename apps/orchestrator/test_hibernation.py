@@ -39,8 +39,6 @@ def _apply_config_published(mock_publish) -> bool:
 @override_settings(OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS="*")
 class WakeHibernatedTenantImageRefreshTest(TestCase):
     def setUp(self):
-        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
-        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(
             display_name="Wake Refresh",
             telegram_chat_id=987654321,
@@ -314,35 +312,6 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         mock_update_image.assert_not_called()
 
     @override_settings(
-        OPENCLAW_IMAGE_TAG="samesha",
-        AZURE_ACR_SERVER="test.azurecr.io",
-    )
-    @patch("apps.cron.publish.publish_task")
-    @patch("apps.orchestrator.azure_client.wake_container_app")
-    @patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=True)
-    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
-    @patch("apps.orchestrator.azure_client.update_container_image")
-    def test_wake_applies_gateway_probes_instead_of_plain_wake(
-        self,
-        mock_update_image,
-        _mock_ensure_mount,
-        mock_ensure_probes,
-        mock_wake,
-        _mock_publish,
-    ):
-        """A sleeping tenant still on Azure's default probes gets the boot budget
-        before it boots; that new revision is the wake, so no second restart."""
-        self.tenant.container_image_tag = "samesha"
-        self.tenant.save(update_fields=["container_image_tag"])
-
-        result = wake_hibernated_tenant(self.tenant)
-
-        self.assertTrue(result)
-        mock_ensure_probes.assert_called_once_with("oc-wake-test")
-        mock_wake.assert_not_called()
-        mock_update_image.assert_not_called()
-
-    @override_settings(
         OPENCLAW_IMAGE_TAG="latest",
         AZURE_ACR_SERVER="test.azurecr.io",
     )
@@ -395,8 +364,6 @@ class WakeConfigSchemaSyncTest(TestCase):
     """
 
     def setUp(self):
-        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
-        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(display_name="Wake Schema", telegram_chat_id=55512345)
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-schema-test"
@@ -663,8 +630,6 @@ class WakeImageRefreshSafetyTest(TestCase):
     OLD_IMAGE = "test.azurecr.io/nbhd-openclaw:2026.9.4-oldsha1"
 
     def setUp(self):
-        # Wake retrofits real Azure probes unless faked (CI runs without AZURE_MOCK).
-        self.enterContext(patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=False))
         self.tenant = create_tenant(display_name="Wake Safety", telegram_chat_id=55599911)
         self.tenant.status = Tenant.Status.ACTIVE
         self.tenant.container_id = "oc-safety"
