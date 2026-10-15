@@ -2319,9 +2319,11 @@ def ensure_gateway_probes(container_name: str) -> bool:
     """Idempotently apply the orchestrator-owned probes to an existing
     Container App (see ``_ensure_gateway_probes_in_template``).
 
-    Called on wake so sleeping tenants pick up the boot budget before they
-    boot. Returns True if a new revision was created (which activates it,
-    i.e. wakes the container), False if the probes were already current.
+    Deliberately NOT called on wake: a tenant marked asleep can still be running
+    (DB/Azure drift), and a probe retrofit then boots a second revision beside the
+    live one (oc-5b0fdefe, 2026-10-15). Sleeping tenants get the probes at their
+    next image bump instead. Returns True if a new revision was created (which
+    activates it), False if the probes were already current.
     """
     if _is_mock():
         logger.info("[MOCK] Ensured gateway probes on %s", container_name)
