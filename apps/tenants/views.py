@@ -530,7 +530,14 @@ class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        return Response(UserSerializer(request.user).data)
+        data = UserSerializer(request.user).data
+        # The iOS app polls this after a new sign-up and waits for status == "active"
+        # before leaving "Setting up your space…" (AccountViewModel.isProvisioningComplete).
+        # Without it every new account sat on that screen until the app's timeout
+        # (App Review rejection of 2.2.3, 2026-10-14).
+        tenant = Tenant.objects.filter(user=request.user).only("status").first()
+        data["status"] = tenant.status if tenant else ""
+        return Response(data)
 
     def patch(self, request):
         if (
