@@ -312,6 +312,35 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
         mock_update_image.assert_not_called()
 
     @override_settings(
+        OPENCLAW_IMAGE_TAG="samesha",
+        AZURE_ACR_SERVER="test.azurecr.io",
+    )
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_gateway_probes", return_value=True)
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    @patch("apps.orchestrator.azure_client.update_container_image")
+    def test_wake_applies_gateway_probes_instead_of_plain_wake(
+        self,
+        mock_update_image,
+        _mock_ensure_mount,
+        mock_ensure_probes,
+        mock_wake,
+        _mock_publish,
+    ):
+        """A sleeping tenant still on Azure's default probes gets the boot budget
+        before it boots; that new revision is the wake, so no second restart."""
+        self.tenant.container_image_tag = "samesha"
+        self.tenant.save(update_fields=["container_image_tag"])
+
+        result = wake_hibernated_tenant(self.tenant)
+
+        self.assertTrue(result)
+        mock_ensure_probes.assert_called_once_with("oc-wake-test")
+        mock_wake.assert_not_called()
+        mock_update_image.assert_not_called()
+
+    @override_settings(
         OPENCLAW_IMAGE_TAG="latest",
         AZURE_ACR_SERVER="test.azurecr.io",
     )

@@ -14,6 +14,7 @@ from apps.orchestrator.azure_client import (
     create_container_app,
     create_tenant_file_share,
     delete_workspace_file,
+    ensure_gateway_probes,
     ensure_oc_state_dir_mount,
     ensure_plugin_runtime_deps_mount,
     register_environment_storage,
@@ -782,6 +783,40 @@ class PluginRuntimeDepsMountTest(SimpleTestCase):
         mount_names = {m.volume_name for m in container.volume_mounts}
         self.assertIn("plugin-runtime-deps", mount_names)
         mock_client.container_apps.begin_create_or_update.assert_called_once()
+
+    @override_settings(AZURE_RESOURCE_GROUP="rg-test")
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_ensure_gateway_probes_adds_then_is_idempotent(self, mock_get_container_client, _mock_is_mock):
+        from azure.mgmt.appcontainers.models import ContainerAppProbe
+
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+        readiness = ContainerAppProbe.deserialize(
+            {
+                "type": "Readiness",
+                "httpGet": {"path": "/proxy-health", "port": 8080, "scheme": "HTTP"},
+                "initialDelaySeconds": 3,
+                "periodSeconds": 5,
+                "timeoutSeconds": 2,
+                "failureThreshold": 3,
+                "successThreshold": 1,
+            }
+        )
+        container = SimpleNamespace(name="openclaw", probes=[readiness])
+        app = MagicMock()
+        app.template.containers = [container]
+        mock_client.container_apps.get.return_value = app
+
+        # Readiness-only (Azure default startup/liveness) -> retrofit creates a revision.
+        self.assertTrue(ensure_gateway_probes("oc-tenant"))
+        self.assertEqual(sorted(p.type for p in container.probes), ["Liveness", "Readiness", "Startup"])
+        mock_client.container_apps.begin_create_or_update.assert_called_once()
+
+        # Already current -> no new revision (no restart, no wake).
+        mock_client.container_apps.begin_create_or_update.reset_mock()
+        self.assertFalse(ensure_gateway_probes("oc-tenant"))
+        mock_client.container_apps.begin_create_or_update.assert_not_called()
 
     @override_settings(AZURE_RESOURCE_GROUP="rg-test")
     @patch("apps.orchestrator.azure_client._is_mock", return_value=False)

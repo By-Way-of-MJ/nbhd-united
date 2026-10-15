@@ -521,6 +521,7 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
             from django.conf import settings as django_settings
 
             from apps.orchestrator.azure_client import (
+                ensure_gateway_probes,
                 ensure_plugin_runtime_deps_mount,
                 update_container_image,
                 wake_container_app,
@@ -593,6 +594,11 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
                 # which auto-activates — that wakes the container too. No separate
                 # wake call needed.
                 logger.info("idle_wake: added plugin-runtime-deps mount and woke %s", tid)
+            elif ensure_gateway_probes(tenant.container_id):
+                # Same single-revision auto-activate: the probe retrofit wakes it.
+                # Applied before boot so Azure's default liveness can't kill a
+                # slow first boot (oc-13fa39df crash loop, 2026-10-14).
+                logger.info("idle_wake: applied gateway probes and woke %s", tid)
             else:
                 wake_container_app(tenant.container_id)
 

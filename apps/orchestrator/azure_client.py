@@ -1506,7 +1506,7 @@ def create_container_app(
                         # creating a restart loop. Startup + liveness are plain
                         # TCP checks on the proxy port with a boot budget long
                         # enough for a slow first boot.
-                        "probes": [_gateway_readiness_probe_payload(), *_gateway_tcp_probe_payloads()],
+                        "probes": _gateway_probe_payloads(),
                         "env": [
                             {"name": "NBHD_INTERNAL_API_KEY", "secretRef": "nbhd-internal-api-key"},
                             {"name": "OPENCLAW_GATEWAY_TOKEN", "secretRef": "nbhd-internal-api-key"},
@@ -2283,48 +2283,66 @@ def ensure_oc_state_dir_mount(container_name: str) -> bool:
     return True
 
 
-def _ensure_gateway_probes_in_template(app) -> None:
-    """Put the gateway readiness check and the TCP startup/liveness boot budget
-    on the template during fleet image bumps."""
-    from azure.mgmt.appcontainers.models import ContainerAppProbe, ContainerAppProbeHttpGet, ContainerAppProbeTcpSocket
+def _gateway_probe_payloads() -> list[dict[str, Any]]:
+    """Return every probe the orchestrator owns on the openclaw container."""
+    return [_gateway_readiness_probe_payload(), *_gateway_tcp_probe_payloads()]
 
-    managed = {"readiness", "startup", "liveness"}
+
+def _ensure_gateway_probes_in_template(app) -> bool:
+    """Put the gateway readiness check and the TCP startup/liveness boot budget
+    on the openclaw container, replacing any readiness/startup/liveness probes
+    already there. Returns True if the template changed."""
+    from azure.mgmt.appcontainers.models import ContainerAppProbe
+
+    desired = [ContainerAppProbe.deserialize(payload) for payload in _gateway_probe_payloads()]
+    managed = {probe.type.lower() for probe in desired}
+
+    def _kind(probe) -> str:
+        return str(getattr(probe, "type", "")).lower().rsplit(".", 1)[-1]
+
     for container in app.template.containers:
         if container.name != "openclaw":
             continue
 
-        probes = list(getattr(container, "probes", None) or [])
-        probes = [
-            probe for probe in probes if str(getattr(probe, "type", "")).lower().rsplit(".", 1)[-1] not in managed
-        ]
-        probes.append(
-            ContainerAppProbe(
-                type="Readiness",
-                http_get=ContainerAppProbeHttpGet(
-                    path=_OPENCLAW_READINESS_PATH,
-                    port=_OPENCLAW_PROXY_PORT,
-                    scheme="HTTP",
-                ),
-                initial_delay_seconds=3,
-                period_seconds=5,
-                timeout_seconds=2,
-                failure_threshold=3,
-                success_threshold=1,
-            )
+        current = list(getattr(container, "probes", None) or [])
+        current_managed = sorted(
+            (probe.serialize() for probe in current if _kind(probe) in managed), key=lambda p: p["type"]
         )
-        for probe_type, timings in _OPENCLAW_TCP_PROBE_SETTINGS.items():
-            probes.append(
-                ContainerAppProbe(
-                    type=probe_type,
-                    tcp_socket=ContainerAppProbeTcpSocket(port=_OPENCLAW_PROXY_PORT),
-                    initial_delay_seconds=timings["initialDelaySeconds"],
-                    period_seconds=timings["periodSeconds"],
-                    timeout_seconds=timings["timeoutSeconds"],
-                    failure_threshold=timings["failureThreshold"],
-                )
-            )
-        container.probes = probes
-        break
+        if current_managed == sorted((probe.serialize() for probe in desired), key=lambda p: p["type"]):
+            return False
+        container.probes = [probe for probe in current if _kind(probe) not in managed] + desired
+        return True
+    return False
+
+
+def ensure_gateway_probes(container_name: str) -> bool:
+    """Idempotently apply the orchestrator-owned probes to an existing
+    Container App (see ``_ensure_gateway_probes_in_template``).
+
+    Called on wake so sleeping tenants pick up the boot budget before they
+    boot. Returns True if a new revision was created (which activates it,
+    i.e. wakes the container), False if the probes were already current.
+    """
+    if _is_mock():
+        logger.info("[MOCK] Ensured gateway probes on %s", container_name)
+        return False
+
+    client = get_container_client()
+    app = client.container_apps.get(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+    )
+
+    if not _ensure_gateway_probes_in_template(app):
+        return False
+
+    client.container_apps.begin_create_or_update(
+        settings.AZURE_RESOURCE_GROUP,
+        container_name,
+        app,
+    ).result()
+    logger.info("Applied gateway startup/liveness/readiness probes to %s", container_name)
+    return True
 
 
 def ensure_plugin_runtime_deps_mount(container_name: str) -> bool:
