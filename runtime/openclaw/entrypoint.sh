@@ -279,17 +279,24 @@ unset TELEGRAM_BOT_TOKEN
 # so running it on every boot is safe. Non-fatal: if it returns non-zero the
 # gateway start below fails loudly with the actionable message and the platform
 # restarts the revision, rather than us masking a real migration failure.
+# Bind the proxy BEFORE doctor. Azure's TCP startup/liveness probes target :8080;
+# when doctor ran first, a slow doctor (~20 s on a cold replica) left :8080 closed
+# past Azure's default liveness budget and the platform killed the container
+# before the gateway could start — a permanent CrashLoopBackOff (oc-13fa39df,
+# 2026-10-14, 283 restarts). Binding early is safe: /proxy-health still answers
+# 503 until the gateway is reachable, so readiness stays honest.
+node /opt/nbhd/proxy.js &
+PROXY_PID=$!
+trap 'kill $PROXY_PID 2>/dev/null; wait' SIGTERM SIGINT
+
 echo "[entrypoint] running 'openclaw doctor --fix' (workspace/state migration; no-op once migrated)"
 openclaw doctor --fix --non-interactive \
     || echo "[entrypoint] WARNING: 'openclaw doctor --fix' returned non-zero" >&2
 
-# Start both processes in background
+# Start the gateway in background (the proxy is already up, see above)
 # shellcheck disable=SC2086
 openclaw gateway --allow-unconfigured $GATEWAY_ARGS &
 GATEWAY_PID=$!
-
-node /opt/nbhd/proxy.js &
-PROXY_PID=$!
 
 # Forward termination signals to both children, including while the gateway
 # readiness guard below is still waiting.

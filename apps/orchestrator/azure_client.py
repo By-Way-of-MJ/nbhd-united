@@ -61,6 +61,26 @@ def _gateway_readiness_probe_payload() -> dict[str, Any]:
     }
 
 
+# Explicit TCP startup + liveness probes on the proxy port. Without them Azure
+# supplies defaults whose liveness budget (~20 s) is shorter than a cold boot's
+# pre-proxy work, so a slow `openclaw doctor --fix` got the container killed
+# forever (oc-13fa39df, 2026-10-14). The startup probe allows 5 s + 48 x 5 s
+# (~4 min) before liveness takes over, covering the entrypoint's own 3-minute
+# gateway guard.
+_OPENCLAW_TCP_PROBE_SETTINGS: dict[str, dict[str, int]] = {
+    "Startup": {"initialDelaySeconds": 5, "periodSeconds": 5, "timeoutSeconds": 3, "failureThreshold": 48},
+    "Liveness": {"initialDelaySeconds": 5, "periodSeconds": 10, "timeoutSeconds": 5, "failureThreshold": 3},
+}
+
+
+def _gateway_tcp_probe_payloads() -> list[dict[str, Any]]:
+    """Return the explicit TCP startup + liveness probes for tenant containers."""
+    return [
+        {"type": probe_type, "tcpSocket": {"port": _OPENCLAW_PROXY_PORT}, **timings}
+        for probe_type, timings in _OPENCLAW_TCP_PROBE_SETTINGS.items()
+    ]
+
+
 def _get_provisioner_credential():
     """Get credential for the provisioning identity (elevated permissions).
 
@@ -1483,10 +1503,10 @@ def create_container_app(
                         "resources": {"cpu": 0.5, "memory": "1.0Gi"},
                         # Gateway reachability affects readiness, not liveness:
                         # transient listener outages must drain traffic without
-                        # creating a restart loop. Azure continues to supply its
-                        # default TCP startup and liveness probes for the two
-                        # probe types omitted here.
-                        "probes": [_gateway_readiness_probe_payload()],
+                        # creating a restart loop. Startup + liveness are plain
+                        # TCP checks on the proxy port with a boot budget long
+                        # enough for a slow first boot.
+                        "probes": [_gateway_readiness_probe_payload(), *_gateway_tcp_probe_payloads()],
                         "env": [
                             {"name": "NBHD_INTERNAL_API_KEY", "secretRef": "nbhd-internal-api-key"},
                             {"name": "OPENCLAW_GATEWAY_TOKEN", "secretRef": "nbhd-internal-api-key"},
@@ -2263,17 +2283,19 @@ def ensure_oc_state_dir_mount(container_name: str) -> bool:
     return True
 
 
-def _ensure_gateway_readiness_probe_in_template(app) -> None:
-    """Put the strict gateway check on readiness during fleet image bumps."""
-    from azure.mgmt.appcontainers.models import ContainerAppProbe, ContainerAppProbeHttpGet
+def _ensure_gateway_probes_in_template(app) -> None:
+    """Put the gateway readiness check and the TCP startup/liveness boot budget
+    on the template during fleet image bumps."""
+    from azure.mgmt.appcontainers.models import ContainerAppProbe, ContainerAppProbeHttpGet, ContainerAppProbeTcpSocket
 
+    managed = {"readiness", "startup", "liveness"}
     for container in app.template.containers:
         if container.name != "openclaw":
             continue
 
         probes = list(getattr(container, "probes", None) or [])
         probes = [
-            probe for probe in probes if str(getattr(probe, "type", "")).lower().rsplit(".", 1)[-1] != "readiness"
+            probe for probe in probes if str(getattr(probe, "type", "")).lower().rsplit(".", 1)[-1] not in managed
         ]
         probes.append(
             ContainerAppProbe(
@@ -2290,6 +2312,17 @@ def _ensure_gateway_readiness_probe_in_template(app) -> None:
                 success_threshold=1,
             )
         )
+        for probe_type, timings in _OPENCLAW_TCP_PROBE_SETTINGS.items():
+            probes.append(
+                ContainerAppProbe(
+                    type=probe_type,
+                    tcp_socket=ContainerAppProbeTcpSocket(port=_OPENCLAW_PROXY_PORT),
+                    initial_delay_seconds=timings["initialDelaySeconds"],
+                    period_seconds=timings["periodSeconds"],
+                    timeout_seconds=timings["timeoutSeconds"],
+                    failure_threshold=timings["failureThreshold"],
+                )
+            )
         container.probes = probes
         break
 
@@ -2357,7 +2390,7 @@ def update_container_image(
     """Update the container image of an existing Container App.
 
     This triggers a new revision, effectively restarting the container.
-    Also ensures the EmptyDir mounts and gateway readiness probe are present
+    Also ensures the EmptyDir mounts and gateway probes are present
     so fleet image bumps roll out the template fixes in the same revision.
     """
     if _is_mock():
@@ -2377,7 +2410,7 @@ def update_container_image(
 
     _ensure_plugin_runtime_deps_in_template(app)
     _ensure_index_cache_in_template(app)
-    _ensure_gateway_readiness_probe_in_template(app)
+    _ensure_gateway_probes_in_template(app)
     # Explicit migration only; ordinary image updates preserve main behavior.
     if retrofit_storage:
         _ensure_oc_state_dir_in_template(app)

@@ -107,7 +107,25 @@ class AzureClientTest(SimpleTestCase):
                     "timeoutSeconds": 2,
                     "failureThreshold": 3,
                     "successThreshold": 1,
-                }
+                },
+                # Explicit boot budget: Azure's default liveness killed a slow
+                # first boot forever (oc-13fa39df, 2026-10-14).
+                {
+                    "type": "Startup",
+                    "tcpSocket": {"port": 8080},
+                    "initialDelaySeconds": 5,
+                    "periodSeconds": 5,
+                    "timeoutSeconds": 3,
+                    "failureThreshold": 48,
+                },
+                {
+                    "type": "Liveness",
+                    "tcpSocket": {"port": 8080},
+                    "initialDelaySeconds": 5,
+                    "periodSeconds": 10,
+                    "timeoutSeconds": 5,
+                    "failureThreshold": 3,
+                },
             ],
         )
 
@@ -533,13 +551,18 @@ class UpdateContainerImageTest(SimpleTestCase):
         )
 
         self.assertEqual(container.image, "nbhdunited.azurecr.io/nbhd-openclaw:abc123")
-        self.assertEqual(len(container.probes), 1)
-        readiness = container.probes[0]
-        self.assertEqual(readiness.type, "Readiness")
+        self.assertEqual([p.type for p in container.probes], ["Readiness", "Startup", "Liveness"])
+        readiness, startup, liveness = container.probes
         self.assertEqual(readiness.http_get.path, "/proxy-health")
         self.assertEqual(readiness.http_get.port, 8080)
         self.assertEqual(readiness.timeout_seconds, 2)
         self.assertEqual(readiness.failure_threshold, 3)
+        # TCP boot budget on the proxy port: ~4 min before liveness takes over.
+        self.assertEqual(startup.tcp_socket.port, 8080)
+        self.assertEqual(startup.period_seconds, 5)
+        self.assertEqual(startup.failure_threshold, 48)
+        self.assertEqual(liveness.tcp_socket.port, 8080)
+        self.assertEqual(liveness.failure_threshold, 3)
         mock_client.container_apps.get.assert_called_once_with("rg-test", "oc-tenant")
         mock_client.container_apps.begin_create_or_update.assert_called_once_with(
             "rg-test",
@@ -547,6 +570,32 @@ class UpdateContainerImageTest(SimpleTestCase):
             app,
         )
         poller.result.assert_called_once()
+
+    @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
+    @patch("apps.orchestrator.azure_client.get_container_client")
+    def test_image_bump_replaces_existing_probes_without_duplicates(self, mock_get_container_client, _mock_is_mock):
+        """A tenant hand-patched (or defaulted) with its own startup/liveness
+        probes ends up with exactly one of each managed type after a bump."""
+        from azure.mgmt.appcontainers.models import ContainerAppProbe, ContainerAppProbeTcpSocket
+
+        mock_client = MagicMock()
+        mock_get_container_client.return_value = mock_client
+
+        container = MagicMock()
+        container.name = "openclaw"
+        container.probes = [
+            ContainerAppProbe(type="Liveness", tcp_socket=ContainerAppProbeTcpSocket(port=8080), failure_threshold=1),
+            ContainerAppProbe(type="Startup", tcp_socket=ContainerAppProbeTcpSocket(port=8080), failure_threshold=2),
+        ]
+        app = MagicMock()
+        app.template.containers = [container]
+        mock_client.container_apps.get.return_value = app
+
+        update_container_image("oc-tenant", "nbhdunited.azurecr.io/nbhd-openclaw:abc123")
+
+        self.assertEqual([p.type for p in container.probes], ["Readiness", "Startup", "Liveness"])
+        self.assertEqual(container.probes[1].failure_threshold, 48)
+        self.assertEqual(container.probes[2].failure_threshold, 3)
 
     @patch("time.time_ns", side_effect=[1, 2])
     @patch("apps.orchestrator.azure_client._is_mock", return_value=False)
