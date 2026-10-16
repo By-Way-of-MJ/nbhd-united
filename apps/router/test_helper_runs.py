@@ -1,0 +1,270 @@
+"""Closure survives missing hooks, retries, and simultaneous result/watchdog sends."""
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from threading import Barrier
+from unittest.mock import patch
+
+from django.contrib.auth import get_user_model
+from django.db import close_old_connections, transaction
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from apps.orchestrator.tasks import close_expired_helpers
+from apps.router.cron_delivery import _rate_counts
+from apps.router.helper_runs import FAILURE_MESSAGE, deliver_helper
+from apps.router.models import ChatThread, HelperRun, ProactiveOutbound
+from apps.tenants.models import Tenant
+from apps.tenants.test_utils import seed_internal_key
+
+
+def seed(test):
+    user = get_user_model().objects.create_user(username="helper-owner")
+    test.tenant = Tenant.objects.create(user=user, status=Tenant.Status.ACTIVE)
+    seed_internal_key(test.tenant, "helper-key")
+    test.thread = ChatThread.objects.create(tenant=test.tenant, user=user)
+    test.key = "helper:" + "a" * 48
+    test.row = HelperRun.objects.create(
+        tenant=test.tenant, thread=test.thread, occurrence_key=test.key, deadline=timezone.now() - timedelta(seconds=1)
+    )
+
+
+@override_settings(SUBAGENT_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HelperClosureTests(TestCase):
+    def setUp(self):
+        seed(self)
+        _rate_counts.clear()
+        self.client = APIClient()
+        self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="helper-key", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
+        self.base = f"/api/v1/integrations/runtime/{self.tenant.id}/"
+
+    def send(self, message="A useful result.", **kwargs):
+        return self.client.post(
+            self.base + "send-to-user/",
+            {"message": message, "thread_id": str(self.thread.id), **kwargs},
+            format="json",
+            HTTP_X_NBHD_JOB_NAME="_subagent_result",
+            HTTP_X_NBHD_OCCURRENCE_KEY=self.key,
+        )
+
+    def admit(self, **kwargs):
+        return self.client.post(
+            self.base + "helpers/admit/",
+            {"occurrence_key": "helper:" + "b" * 48, "thread_id": str(self.thread.id), **kwargs},
+            format="json",
+        )
+
+    def test_admission_is_durable_and_retries_do_not_extend_deadline(self):
+        self.assertEqual(self.admit().status_code, 200)
+        row = HelperRun.objects.exclude(pk=self.row.pk).get()
+        self.assertAlmostEqual((row.deadline - row.created_at).total_seconds(), 480, delta=2)
+        self.assertEqual(self.admit().status_code, 200)
+        self.assertEqual(HelperRun.objects.get(pk=row.pk).deadline, row.deadline)
+        self.assertEqual(HelperRun.objects.count(), 2)
+
+    def test_admission_refuses_closed_and_expired_keys(self):
+        self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
+        self.row.closed_at = timezone.now()
+        self.row.save()
+        self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
+
+    def test_admission_auth_gate_and_thread_ownership(self):
+        with override_settings(SUBAGENT_TENANT_IDS=""):
+            self.assertEqual(self.admit().status_code, 403)
+        self.assertEqual(self.admit(thread_id="00000000-0000-4000-8000-000000000001").status_code, 404)
+        self.assertEqual(self.admit(occurrence_key="bad").status_code, 400)
+        self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="wrong", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
+        self.assertEqual(self.admit().status_code, 401)
+
+    def test_restart_without_any_runtime_completion_delivers_failure_once(self):
+        # Only Postgres state exists: no hook, parent announce, process timer,
+        # runtime container, or in-memory child mapping is required.
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        outbound = ProactiveOutbound.objects.get()
+        self.assertEqual(outbound.message_text, FAILURE_MESSAGE)
+        self.assertEqual(outbound.thread_id, self.thread.id)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
+
+    def test_result_then_watchdog_and_repeated_parent_runs_send_once(self):
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.assertEqual(self.send("Repeated parent completion.").data["status"], "duplicate")
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, "A useful result.")
+
+    def test_late_result_after_watchdog_failure_is_delivered(self):
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertCountEqual(
+            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
+        )
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
+    def test_second_late_result_is_duplicate(self):
+        close_expired_helpers()
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(self.send("Repeated late completion.").data["status"], "duplicate")
+        self.assertCountEqual(
+            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
+        )
+
+    def test_failure_after_result_sends_nothing(self):
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, "A useful result.")
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
+    def test_late_result_after_ended_hook_failure_is_delivered_once(self):
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "sent")
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(self.send().data["status"], "duplicate")
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
+        self.assertCountEqual(
+            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
+        )
+
+    def test_failed_late_result_write_preserves_failure_closure_for_retry(self):
+        close_expired_helpers()
+        with patch.object(HelperRun, "save", side_effect=RuntimeError("worker crash")), self.assertRaises(RuntimeError):
+            self.send()
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(ProactiveOutbound.objects.count(), 2)
+
+    def test_live_helpers_are_not_closed_early(self):
+        self.row.deadline = timezone.now() + timedelta(minutes=8)
+        self.row.save()
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.assertFalse(ProactiveOutbound.objects.exists())
+
+    def test_failed_feed_write_is_retried_by_watchdog(self):
+        with patch("apps.router.proactive_context.record_proactive_outbound", return_value=None):
+            self.assertEqual(self.send().status_code, 503)
+            self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.row.refresh_from_db()
+        self.assertIsNone(self.row.closed_at)
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+
+    def test_crash_between_feed_write_and_closure_rolls_back_both(self):
+        with patch.object(HelperRun, "save", side_effect=RuntimeError("worker crash")), self.assertRaises(RuntimeError):
+            self.send()
+        self.assertFalse(ProactiveOutbound.objects.exists())
+        self.row.refresh_from_db()
+        self.assertIsNone(self.row.closed_at)
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+
+    def test_push_is_only_dispatched_after_commit(self):
+        with (
+            patch("apps.router.push_views.eligible_device_tokens") as devices,
+            patch("apps.router.proactive_context._dispatch_ios_push") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            devices.return_value.exists.return_value = True
+            self.assertEqual(self.send().data["status"], "sent")
+            push.assert_not_called()
+        push.assert_called_once()
+
+    def test_rollback_never_dispatches_push(self):
+        with (
+            patch("apps.router.push_views.eligible_device_tokens") as devices,
+            patch("apps.router.proactive_context._dispatch_ios_push") as push,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            devices.return_value.exists.return_value = True
+            with transaction.atomic():
+                self.send()
+                transaction.set_rollback(True)
+        push.assert_not_called()
+        self.assertFalse(ProactiveOutbound.objects.exists())
+
+    def test_missing_or_wrong_tenant_key_and_wrong_thread_never_send(self):
+        self.key = "helper:" + "c" * 48
+        self.assertEqual(self.send().status_code, 404)
+        self.key = self.row.occurrence_key
+        self.assertEqual(self.send(thread_id="00000000-0000-4000-8000-000000000001").status_code, 400)
+        other_user = get_user_model().objects.create_user(username="other-helper-owner")
+        other = Tenant.objects.create(user=other_user, status=Tenant.Status.ACTIVE)
+        self.assertEqual(deliver_helper(tenant=other, occurrence_key=self.key, message_text="wrong").status_code, 404)
+        self.assertFalse(ProactiveOutbound.objects.exists())
+
+    def test_sweep_isolation_one_failure_does_not_starve_other_helpers(self):
+        HelperRun.objects.create(
+            tenant=self.tenant, thread=self.thread, occurrence_key="helper:" + "b" * 48, deadline=self.row.deadline
+        )
+        from apps.router.proactive_context import record_proactive_outbound
+
+        calls = 0
+
+        def fail_once(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary write failure")
+            return record_proactive_outbound(**kwargs)
+
+        with patch("apps.router.proactive_context.record_proactive_outbound", side_effect=fail_once):
+            self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(ProactiveOutbound.objects.count(), 2)
+
+    def test_watchdog_runs_after_rollout_gate_is_disabled(self):
+        with override_settings(SUBAGENT_TENANT_IDS=""):
+            self.assertEqual(close_expired_helpers(), {"sent": 1})
+
+    def test_watchdog_is_registered_every_minute(self):
+        from apps.cron.management.commands.register_system_crons import SYSTEM_CRONS
+        from apps.cron.views import TASK_MAP
+
+        self.assertIn(("close-expired-helpers", "* * * * *", "/api/cron/trigger/close_expired_helpers/"), SYSTEM_CRONS)
+        self.assertEqual(TASK_MAP["close_expired_helpers"], "apps.orchestrator.tasks.close_expired_helpers")
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HelperRaceTests(TransactionTestCase):
+    def setUp(self):
+        seed(self)
+
+    def send_concurrently(self, messages):
+        barrier = Barrier(2)
+
+        def send(message):
+            close_old_connections()
+            try:
+                tenant = Tenant.objects.select_related("user").get(pk=self.tenant.pk)
+                barrier.wait(timeout=10)
+                return deliver_helper(tenant=tenant, occurrence_key=self.key, message_text=message).data["status"]
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            return list(pool.map(send, messages))
+
+    def test_simultaneous_result_and_failure_always_deliver_result(self):
+        result_status, failure_status = self.send_concurrently(["Result", FAILURE_MESSAGE])
+        self.assertEqual(result_status, "sent")
+        self.assertIn(failure_status, ["sent", "duplicate"])
+        expected = ["Result", FAILURE_MESSAGE] if failure_status == "sent" else ["Result"]
+        self.assertCountEqual(ProactiveOutbound.objects.values_list("message_text", flat=True), expected)
+        self.row.refresh_from_db()
+        self.assertIsNotNone(self.row.closed_at)
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
+    def test_simultaneous_late_results_deliver_once(self):
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        statuses = self.send_concurrently(["Result", "Result"])
+        self.assertCountEqual(statuses, ["sent", "duplicate"])
+        self.assertCountEqual(
+            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "Result"]
+        )
+        self.row.refresh_from_db()
+        self.assertIsNotNone(self.row.closed_at)
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)

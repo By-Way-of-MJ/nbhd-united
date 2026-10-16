@@ -15,6 +15,13 @@ from .services import (
 )
 
 
+def close_expired_helpers() -> dict:
+    """Recover undelivered helpers even when their runtime container is gone."""
+    from apps.router.helper_runs import close_expired_helpers as sweep
+
+    return sweep()
+
+
 def provision_tenant_task(tenant_id: str) -> None:
     """Provision an OpenClaw instance for a tenant."""
     provision_tenant(tenant_id)

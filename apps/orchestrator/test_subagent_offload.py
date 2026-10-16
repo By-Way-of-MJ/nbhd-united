@@ -1,5 +1,6 @@
 """Canary-gated OpenClaw sub-agent config and validation coverage."""
 
+import json
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -58,6 +59,17 @@ class SubagentCanaryConfigTests(TestCase):
         with override_settings(SUBAGENT_TENANT_IDS=f" {str(self.tenant.id).upper()} "):
             config = generate_openclaw_config(self.tenant)
 
+        from apps.router.helper_runs import HELPER_TIMEOUT_SECONDS
+
+        self.assertEqual(config["agents"]["defaults"]["subagents"]["runTimeoutSeconds"], HELPER_TIMEOUT_SECONDS)
+        self.assertEqual(config["tools"]["loopDetection"], {"enabled": True})
+        evidence = json.loads(Path(__file__).with_name("fixtures").joinpath("helper_runtime_94.json").read_text())
+        self.assertEqual(evidence["version"], "2026.9.4")
+        self.assertEqual(
+            evidence["files"]["dist/zod-schema.agent-runtime-Ca6cjqf9.mjs"]["excerpts"][0]["text"],
+            "const ToolLoopDetectionSchema = object({ enabled: boolean().optional() }).strict().optional();",
+        )
+
         baseline_deny = generate_tool_config("starter", version=self.tenant.openclaw_version)["deny"]
         self.assertEqual(
             config["tools"]["deny"],
@@ -94,7 +106,7 @@ class SubagentCanaryConfigTests(TestCase):
                 "maxConcurrent": 2,
                 "maxChildrenPerAgent": 2,
                 "maxSpawnDepth": 1,
-                "runTimeoutSeconds": 600,
+                "runTimeoutSeconds": 300,
                 "announceTimeoutMs": 120000,
                 "archiveAfterMinutes": 60,
                 "model": config["agents"]["defaults"]["model"]["primary"],
