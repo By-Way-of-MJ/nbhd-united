@@ -6,9 +6,9 @@ from pathlib import Path
 
 from django.test import TestCase, override_settings
 
+from apps.billing.constants import DEEPSEEK_MODEL, GEMMA_MODEL
 from apps.orchestrator.config_generator import (
     SUBAGENT_READ_ONLY_TOOLS,
-    TIER_TASK_DEFAULTS,
     generate_openclaw_config,
     subagents_enabled,
 )
@@ -97,7 +97,7 @@ class SubagentCanaryConfigTests(TestCase):
                 "runTimeoutSeconds": 600,
                 "announceTimeoutMs": 120000,
                 "archiveAfterMinutes": 60,
-                "model": TIER_TASK_DEFAULTS["starter"]["background_tasks"],
+                "model": config["agents"]["defaults"]["model"]["primary"],
                 "delegationMode": "suggest",
             },
         )
@@ -125,6 +125,15 @@ class SubagentCanaryConfigTests(TestCase):
                 "config": {"meterScopes": ["helper"]},
             },
         )
+
+    def test_enabled_helpers_follow_tenant_chat_model_preference(self):
+        for primary in (DEEPSEEK_MODEL, GEMMA_MODEL):
+            with self.subTest(primary=primary), override_settings(SUBAGENT_TENANT_IDS=str(self.tenant.id)):
+                self.tenant.preferred_model = primary
+                config = generate_openclaw_config(self.tenant)
+                defaults = config["agents"]["defaults"]
+                self.assertEqual(defaults["model"]["primary"], primary)
+                self.assertEqual(defaults["subagents"]["model"], primary)
 
     def test_gate_helper_is_fail_closed_and_case_insensitive(self):
         with override_settings(SUBAGENT_TENANT_IDS=""):
