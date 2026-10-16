@@ -98,6 +98,14 @@ copied to the stopped local container before its first start. Two declarations
 (recurring and one-shot) install without manual add/reconcile calls and retain
 IDs/digests across two polls. Source hashes pin the unchanged entrypoint/writer.
 
+On 2026-10-16, the boot fixture's writer source pin was refreshed for the optional
+`payload.thinking` → `--thinking` mapping. Neither captured declaration sets
+`thinking`; both produce identical CLI arguments with the parent and updated
+writer. The recorded boot observations were retained, not re-captured.
+The older `runtime-metadata.json` and `round_six/runtime-metadata.json` source
+and `writerHash` values describe their original image captures, not current-file
+parity pins, and remain unchanged.
+
 Reproduce with `PYTHONPATH=. <project-python> scripts/capture_openclaw_94_prestaged_boot.py`.
 The script requires the existing exact local image (never pulls or contacts Azure),
 uses `--network none`, no ports/mounts, and a synthetic token. Scheduled firing and

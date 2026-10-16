@@ -111,12 +111,13 @@ class PanelToolConfigTests(SimpleTestCase):
         # Re-captured 2026-10-11 when the seal-egress canary gate was removed: OpenRouter
         # speech-to-text and the ZDR provider params are now emitted for every tenant
         # (byte-identical to the previous code with the gate set to ``*``).
+        # Re-captured 2026-10-16: the only byte change is agents_wait in tools.deny.
         for gate in ("", "00000000-0000-4000-8000-000000000222", str(self.tenant.id)):
             with self.subTest(gate=gate), override_settings(CHAT_SHAPE_TENANT_IDS=gate):
                 config = generate_openclaw_config(self.tenant)
             self.assertEqual(
                 hashlib.sha256(self.config_bytes(config)).hexdigest(),
-                "1cf55b5eef93a836ea1d6bd5a5241188d5f1a39b85c28dbbfbf772db212e1f1d",
+                "13e6e022fa8902117ef29f64a4c81783245edc088d707c2ef4ae9b3f5e58181f",
             )
             self.assertEqual(config["plugins"]["entries"]["nbhd-journal-tools"], {"enabled": True})
             assert_config_writable(config)
