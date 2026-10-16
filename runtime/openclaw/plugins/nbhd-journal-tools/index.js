@@ -2035,7 +2035,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_task_list",
       description:
-        "List tasks. Filter by status (open/in_progress/done/skipped/deferred), pillar, parent_goal_id, due_before, due_after. Use this BEFORE stating any task status — never rely on memory for what's open vs done. Example: 'any open finance tasks?' → nbhd_task_list({status: 'open', pillar: 'gravity'}).",
+        "List tasks. Filter by status (open/in_progress/done/skipped/deferred), pillar, parent_goal_id, due_before, due_after, or stale_days (untouched for that many days). Use order: 'updated_at' for oldest first, limit to bound results, and fields: 'compact' for candidate rows with parent goal context; nbhd_task_get supplies full detail. Use this BEFORE stating any task status — never rely on memory for what's open vs done. Example: 'any open finance tasks?' → nbhd_task_list({status: 'open', pillar: 'gravity'}).",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -2045,14 +2045,21 @@ export default function register(api) {
           parent_goal_id: { type: "string" },
           due_before: { type: "string", description: "ISO date YYYY-MM-DD." },
           due_after: { type: "string", description: "ISO date YYYY-MM-DD." },
+          stale_days: { type: "integer", minimum: 1, maximum: 365 },
+          order: { type: "string", enum: ["updated_at"] },
+          limit: { type: "integer", minimum: 1, maximum: 50 },
+          fields: { type: "string", enum: ["compact"] },
         },
       },
       async execute(_id, params) {
         const input = asObject(params);
         const query = {};
-        for (const k of ["status", "pillar", "parent_goal_id", "due_before", "due_after"]) {
+        for (const k of ["status", "pillar", "parent_goal_id", "due_before", "due_after", "order", "fields"]) {
           const v = asTrimmedString(input[k]);
           if (v) query[k] = v;
+        }
+        for (const k of ["stale_days", "limit"]) {
+          if (Number.isInteger(input[k])) query[k] = input[k];
         }
         const payload = await callRuntime(api, {
           path: tenantPath(api, "/tasks/"),

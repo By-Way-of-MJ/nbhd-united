@@ -1231,7 +1231,13 @@ class RuntimeCurrentStatusView(APIView):
 
 
 class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
-    """List or create tasks for a tenant runtime."""
+    """List or create tasks for a tenant runtime.
+
+    GET optionally accepts stale_days (1–365, strict updated_at cutoff),
+    order=updated_at (oldest first), limit (1–50), and fields=compact.
+    Without these options the full, newest-first list is unchanged.
+    Count always describes the returned rows, including when limited.
+    """
 
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -1239,7 +1245,7 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
     pii_egress_text_fields = _LIFECYCLE_EGRESS_TEXT_FIELDS
 
     def get(self, request, tenant_id):
-        from apps.journal.lifecycle_serializers import TaskSerializer
+        from apps.journal.lifecycle_serializers import TaskCompactSerializer, TaskSerializer
         from apps.journal.models import Task
 
         auth_failure = _internal_auth_or_401(request, tenant_id)
@@ -1261,6 +1267,19 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
         try:
             due_before = _parse_iso_date(request.query_params.get("due_before"), field_name="due_before")
             due_after = _parse_iso_date(request.query_params.get("due_after"), field_name="due_after")
+            bounds = {}
+            for field, maximum in (("stale_days", 365), ("limit", 50)):
+                raw = request.query_params.get(field)
+                if raw is not None:
+                    if not re.fullmatch(r"[0-9]+", raw) or not 1 <= int(raw) <= maximum:
+                        raise ValueError(f"{field} must be an integer between 1 and {maximum}.")
+                    bounds[field] = int(raw)
+            order = request.query_params.get("order")
+            if order is not None and order != "updated_at":
+                raise ValueError("order must be updated_at.")
+            fields = request.query_params.get("fields")
+            if fields is not None and fields != "compact":
+                raise ValueError("fields must be compact.")
         except ValueError as exc:
             return Response(
                 {"error": "invalid_request", "detail": str(exc)},
@@ -1271,7 +1290,29 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
         if due_after is not None:
             qs = qs.filter(due_date__gte=due_after)
 
-        serializer = TaskSerializer(qs, many=True)
+        if "stale_days" in bounds:
+            qs = qs.filter(updated_at__lt=tz.now() - timedelta(days=bounds["stale_days"]))
+        if order == "updated_at":
+            qs = qs.order_by("updated_at", "id")
+        if "limit" in bounds:
+            qs = qs[: bounds["limit"]]
+
+        if fields == "compact":
+            qs = qs.select_related("parent_goal").only(
+                "id",
+                "tenant_id",
+                "title",
+                "status",
+                "pillar",
+                "due_date",
+                "updated_at",
+                "parent_goal__id",
+                "parent_goal__tenant_id",
+                "parent_goal__title",
+            )
+            serializer = TaskCompactSerializer(qs, many=True)
+        else:
+            serializer = TaskSerializer(qs, many=True)
         return Response(
             {
                 "tenant_id": str(tenant.id),
