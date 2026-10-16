@@ -33,6 +33,57 @@ function collectTools(context = {}, pluginConfig = {}) {
   return tools;
 }
 
+test("task_list schema bounds optional candidates and remains closed", () => {
+  const schema = collectTools().nbhd_task_list.parameters;
+  assert.equal(schema.additionalProperties, false);
+  assert.equal(schema.required, undefined);
+  assert.deepEqual(Object.keys(schema.properties), [
+    "status", "pillar", "parent_goal_id", "due_before", "due_after",
+    "stale_days", "order", "limit", "fields",
+  ]);
+  assert.deepEqual(schema.properties.stale_days, { type: "integer", minimum: 1, maximum: 365 });
+  assert.deepEqual(schema.properties.limit, { type: "integer", minimum: 1, maximum: 50 });
+  assert.deepEqual(schema.properties.order, { type: "string", enum: ["updated_at"] });
+  assert.deepEqual(schema.properties.fields, { type: "string", enum: ["compact"] });
+});
+
+test("task_list forwards candidates as GET query and leaves legacy calls unchanged", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url: new URL(url), options });
+    return { ok: true, status: 200, async text() { return '{"tasks":[],"count":0}'; } };
+  });
+  const tool = collectTools().nbhd_task_list;
+  await tool.execute("candidates", {
+    status: "open", stale_days: 14, order: "updated_at", limit: 25, fields: "compact",
+  });
+  await tool.execute("legacy", {
+    status: "open", pillar: "gravity", parent_goal_id: "goal-1",
+    due_before: "2026-10-17", due_after: "2026-10-01",
+  });
+  await tool.execute("fallback", { status: "open" });
+  await tool.execute("all", {});
+  for (const { url, options } of requests) {
+    assert.equal(url.pathname, "/api/v1/integrations/runtime/tenant-test/tasks/");
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+  }
+  assert.deepEqual(Object.fromEntries(requests[0].url.searchParams), {
+    status: "open", stale_days: "14", order: "updated_at", limit: "25", fields: "compact",
+  });
+  assert.deepEqual(Object.fromEntries(requests[1].url.searchParams), {
+    status: "open", pillar: "gravity", parent_goal_id: "goal-1",
+    due_before: "2026-10-17", due_after: "2026-10-01",
+  });
+  assert.equal(requests[2].url.search, "?status=open");
+  assert.equal(requests[3].url.search, "");
+});
+
 test("read/append/search kind params carry the full Document.Kind enum (exact)", () => {
   const tools = collectTools();
   for (const name of DOC_KIND_TOOLS) {

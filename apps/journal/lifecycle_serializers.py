@@ -113,6 +113,23 @@ class GoalSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerialize
         return Goal.objects.create(tenant=tenant, **validated_data)
 
 
+class TaskCompactSerializer(serializers.ModelSerializer):
+    """Read-only runtime candidates; fetch a task's full detail only on demand."""
+
+    parent_goal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Task
+        fields = ["id", "title", "status", "pillar", "due_date", "updated_at", "parent_goal"]
+
+    def get_parent_goal(self, task):
+        goal = task.parent_goal
+        if goal is None or goal.tenant_id != task.tenant_id:
+            return None
+        # Runtime titles stay in placeholder space, just like TaskSerializer.
+        return {"id": str(goal.id), "title": goal.title}
+
+
 class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerializer):
     """Read/write shape for Task lifecycle."""
 

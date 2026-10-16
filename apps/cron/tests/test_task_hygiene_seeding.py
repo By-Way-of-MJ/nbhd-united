@@ -194,6 +194,10 @@ class TaskHygieneSeedingTests(TestCase):
                 self.assertEqual(cron.typed_payload, {"stale_after_days": 21})
                 self.assertEqual(cron.enabled, enabled)
                 self.assertIn("at least 21 days", cron.data["payload"]["message"])
+                self.assertIn(
+                    "{status: 'open', stale_days: 21, order: 'updated_at', limit: 25, fields: 'compact'}",
+                    cron.data["payload"]["message"],
+                )
                 self.assertNotIn("nbhd_current_status", cron.data["payload"]["message"])
                 self.assertNotIn("nbhd_current_status", cron.data["payload"]["toolsAllow"])
                 gateway_job = _row_to_cron_dict(cron)
@@ -304,14 +308,25 @@ class TaskHygieneRenderedTurnTests(TestCase):
         payload = self.cron.data["payload"]
         self.assertEqual(payload["timeoutSeconds"], 300)
         for marker in (
-            "status: 'open'",
-            "status: 'in_progress'",
+            "Call `nbhd_task_list` exactly once",
+            "{status: 'open', stale_days: 14, order: 'updated_at', limit: 25, fields: 'compact'}",
             "no activity for at least 14 days",
             "`updated_at`, oldest first",
             "at most 25 stale candidates",
             "Steps 2–4 apply only to these candidates",
+            "Call `nbhd_goal_list` exactly once",
+            "only when a selected row is truly ambiguous",
+            "at most 5 calls per run",
         ):
             self.assertIn(marker, payload["message"])
+        self.assertNotIn("status: 'in_progress'", payload["message"])
+
+    def test_old_images_have_a_bounded_fallback_after_schema_error(self):
+        message = self.cron.data["payload"]["message"]
+        self.assertIn("Older images may reject these new keys with a schema error", message)
+        self.assertIn("Only if that call errors, fall back once to `nbhd_task_list({status: 'open'})`", message)
+        self.assertIn("or the result is an unfiltered full list", message)
+        self.assertIn("review at most 25 stale candidates before fetching details", message)
 
     def test_toolsallow_on_the_real_row_is_pinned_exactly(self):
         self.assertEqual(
