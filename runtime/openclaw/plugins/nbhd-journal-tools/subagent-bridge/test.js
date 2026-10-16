@@ -108,7 +108,7 @@ describe("announce marker parsing", () => {
 
 describe("sessions_spawn fail-closed guard", () => {
   const runtime = { tenantId: "spawn-guard-tenant" };
-  const spawn = (runId) => ({ toolName: "sessions_spawn", runId, params: { task: "research" } });
+  const spawn = (runId, toolCallId = runId) => ({ toolName: "sessions_spawn", runId, toolCallId, params: { task: "research" } });
   const ctx = (runId, sessionKey = `${SESSION_KEY}:${runId}`) => ({ runId, sessionKey, trigger: "user" });
 
   it("blocks helper requesters and missing context", () => {
@@ -117,6 +117,8 @@ describe("sessions_spawn fail-closed guard", () => {
       true,
     );
     assert.equal(decideSpawnGuard(spawn("missing"), { runId: "missing" }, runtime)?.block, true);
+    assert.equal(decideSpawnGuard({ toolName: "sessions_spawn", params: {} }, { sessionKey: SESSION_KEY }, runtime)?.block, true);
+    assert.equal(decideSpawnGuard(spawn("missing-tenant"), ctx("missing-tenant"), {})?.block, true);
   });
 
   it("blocks a cron run from ctx.trigger or the cron plugin lookup", () => {
@@ -145,12 +147,15 @@ describe("sessions_spawn fail-closed guard", () => {
   it("allows three spawns per requester rolling hour, then blocks the fourth", () => {
     const now = Date.UTC(2026, 7, 25, 10, 0, 0);
     const sessionCtx = ctx("budget-run", `${SESSION_KEY}:budget`);
-    assert.equal(decideSpawnGuard(spawn("budget-run"), sessionCtx, runtime, now), undefined);
-    assert.equal(decideSpawnGuard(spawn("budget-run"), sessionCtx, runtime, now + 1), undefined);
-    assert.equal(decideSpawnGuard(spawn("budget-run"), sessionCtx, runtime, now + 2), undefined);
-    assert.match(decideSpawnGuard(spawn("budget-run"), sessionCtx, runtime, now + 3).blockReason, /3 per rolling hour/);
+    for (let call = 0; call < 3; call += 1) {
+      for (let repeat = 0; repeat < 3; repeat += 1) {
+        assert.equal(decideSpawnGuard(spawn("budget-run", `call-${call}`), sessionCtx, runtime, now + call), undefined);
+      }
+    }
+    assert.match(decideSpawnGuard(spawn("budget-run", "call-4"), sessionCtx, runtime, now + 3).blockReason, /3 per rolling hour/);
+    assert.equal(decideSpawnGuard(spawn("budget-run", "call-0"), sessionCtx, runtime, now + 4), undefined);
     assert.equal(
-      decideSpawnGuard(spawn("budget-run"), sessionCtx, runtime, now + 60 * 60 * 1000),
+      decideSpawnGuard(spawn("budget-run", "call-4"), sessionCtx, runtime, now + 60 * 60 * 1000),
       undefined,
     );
   });
@@ -160,10 +165,12 @@ describe("sessions_spawn fail-closed guard", () => {
     const now = Date.UTC(2026, 7, 25, 10, 0, 0);
     for (let index = 0; index < 10; index += 1) {
       const runId = `daily-${index}`;
-      assert.equal(
-        decideSpawnGuard(spawn(runId), ctx(runId, `${SESSION_KEY}:daily:${index}`), dailyRuntime, now + index),
-        undefined,
-      );
+      for (let repeat = 0; repeat < 3; repeat += 1) {
+        assert.equal(
+          decideSpawnGuard(spawn(runId), ctx(runId, `${SESSION_KEY}:daily:${index}`), dailyRuntime, now + index),
+          undefined,
+        );
+      }
     }
     assert.match(
       decideSpawnGuard(spawn("daily-11"), ctx("daily-11", `${SESSION_KEY}:daily:11`), dailyRuntime, now + 11)
@@ -179,6 +186,118 @@ describe("sessions_spawn fail-closed guard", () => {
       ),
       undefined,
     );
+  });
+
+  it("shares call admissions across three register invocations", () => {
+    const hooks = Array.from({ length: 3 }, () => {
+      const api = fakeApi({ tenantId: "repeated-registration-tenant" });
+      registerBridge(api);
+      return api._handlers.before_tool_call;
+    });
+    for (let call = 0; call < 3; call += 1) {
+      for (const hook of hooks) assert.equal(hook(spawn("registered-run", `call-${call}`), ctx("registered-run")), undefined);
+    }
+    for (const hook of hooks) {
+      assert.match(hook(spawn("registered-run", "call-4"), ctx("registered-run")).blockReason, /3 per rolling hour/);
+    }
+  });
+
+  it("uses ctx.toolCallId when the event lacks it", () => {
+    const localRuntime = { tenantId: "context-id-tenant" };
+    for (let call = 0; call < 4; call += 1) {
+      for (let repeat = 0; repeat < 3; repeat += 1) {
+        const result = decideSpawnGuard(spawn("context-id", ""), { ...ctx("context-id"), toolCallId: `call-${call}` }, localRuntime);
+        if (call < 3) assert.equal(result, undefined);
+        else assert.match(result.blockReason, /3 per rolling hour/);
+      }
+    }
+  });
+
+  it("falls back to run plus canonical params without storing task text", () => {
+    const localRuntime = { tenantId: "fallback-tenant" };
+    const sessionCtx = ctx("fallback-run");
+    const event = { toolName: "sessions_spawn", params: { task: "research", model: "a" } };
+    const reordered = { ...event, params: { model: "a", task: "research" } };
+    for (const candidate of [event, reordered, event]) {
+      assert.equal(decideSpawnGuard(candidate, sessionCtx, localRuntime), undefined);
+    }
+    assert.equal(decideSpawnGuard({ ...event, params: { ...event.params, model: "b" } }, sessionCtx, localRuntime), undefined);
+    assert.equal(decideSpawnGuard(event, { ...sessionCtx, runId: "another-run" }, localRuntime), undefined);
+    assert.match(decideSpawnGuard({ ...event, params: { task: "fourth" } }, sessionCtx, localRuntime).blockReason, /3 per rolling hour/);
+  });
+
+  it("scopes call IDs by run, session, and tenant", () => {
+    const now = Date.UTC(2026, 7, 25, 10);
+    const localRuntime = { tenantId: "scoped-tenant" };
+    const sessionCtx = ctx("scope-run");
+    for (let run = 0; run < 3; run += 1) {
+      assert.equal(decideSpawnGuard(spawn(`scope-${run}`, "same-id"), { ...sessionCtx, runId: `scope-${run}` }, localRuntime, now), undefined);
+    }
+    assert.match(decideSpawnGuard(spawn("scope-4", "same-id"), { ...sessionCtx, runId: "scope-4" }, localRuntime, now).blockReason, /3 per rolling hour/);
+    const otherCtx = ctx("scope-0", `${SESSION_KEY}:scope-other`);
+    assert.equal(decideSpawnGuard(spawn("scope-0", "same-id"), otherCtx, localRuntime, now), undefined);
+    assert.equal(decideSpawnGuard(spawn("scope-0", "same-id"), otherCtx, { tenantId: "other-tenant" }, now), undefined);
+    assert.equal(decideSpawnGuard(spawn("scope-0", "third-id"), otherCtx, localRuntime, now), undefined);
+    assert.match(decideSpawnGuard(spawn("scope-0", "fourth-id"), otherCtx, localRuntime, now).blockReason, /3 per rolling hour/);
+  });
+
+  it("does not charge invalid direct tasks and still checks requester safety", () => {
+    const api = fakeApi({ tenantId: "invalid-task-tenant" });
+    registerBridge(api);
+    const hook = api._handlers.before_tool_call;
+    const sessionCtx = ctx("invalid-task");
+    for (const params of [{ objective: "research" }, {}, { task: "" }, { task: "  " }, { task: 42 }]) {
+      const event = { ...spawn("invalid-task"), params };
+      assert.equal(hook(event, sessionCtx), undefined);
+      assert.equal(hook(event, { runId: "invalid-task" })?.block, true);
+      assert.equal(hook(event, { ...sessionCtx, trigger: "cron" })?.block, true);
+      assert.equal(hook(event, { ...sessionCtx, sessionKey: "agent:main:subagent:child" })?.block, true);
+    }
+    for (let call = 0; call < 3; call += 1) {
+      assert.equal(hook(spawn("invalid-task", `valid-${call}`), sessionCtx), undefined);
+    }
+    assert.match(hook(spawn("invalid-task", "valid-4"), sessionCtx).blockReason, /3 per rolling hour/);
+  });
+
+  it("does not exempt wrapped spawns with nested task params from charging", () => {
+    const localRuntime = { tenantId: "wrapped-tenant" };
+    for (let call = 0; call < 4; call += 1) {
+      const event = { toolName: "tool_call", toolCallId: `call-${call}`, params: { id: "sessions_spawn", arguments: { task: "research" } } };
+      const result = decideSpawnGuard(event, ctx("wrapped"), localRuntime);
+      if (call < 3) assert.equal(result, undefined);
+      else assert.match(result.blockReason, /3 per rolling hour/);
+    }
+  });
+
+  it("rechecks safety even for an already charged call", () => {
+    const event = spawn("newly-tainted");
+    const sessionCtx = ctx("newly-tainted");
+    assert.equal(decideSpawnGuard(event, sessionCtx, { tenantId: "newly-tainted" }), undefined);
+    const taintApi = fakeApi({ mode: "enforce" });
+    registerTaint(taintApi);
+    taintApi._handlers.before_agent_run({ prompt: "[Document attached: /workspace/a.pdf]\nResearch this" }, sessionCtx);
+    assert.match(decideSpawnGuard(event, sessionCtx, { tenantId: "newly-tainted" }).blockReason, /document or photo/);
+    taintApi._handlers.agent_end({ runId: sessionCtx.runId });
+  });
+
+  it("retains dedupe while either budget window still contains the charge", () => {
+    const localRuntime = { tenantId: "boundary-tenant" };
+    const now = Date.UTC(2026, 7, 25, 23, 59);
+    const sessionCtx = ctx("boundary");
+    const event = spawn("boundary", "original");
+    assert.equal(decideSpawnGuard(event, sessionCtx, localRuntime, now), undefined);
+    assert.equal(decideSpawnGuard(event, sessionCtx, localRuntime, now + 60000), undefined);
+    for (let call = 0; call < 2; call += 1) {
+      assert.equal(decideSpawnGuard(spawn("boundary", `next-${call}`), sessionCtx, localRuntime, now + 60000), undefined);
+    }
+    assert.match(decideSpawnGuard(spawn("boundary", "fourth"), sessionCtx, localRuntime, now + 60000).blockReason, /3 per rolling hour/);
+    // A same-day retry after the rolling window expires still has a daily receipt.
+    const later = now + 2 * 60 * 60 * 1000;
+    assert.equal(decideSpawnGuard(spawn("boundary", "next-0"), sessionCtx, localRuntime, later), undefined);
+    for (let call = 0; call < 3; call += 1) {
+      assert.equal(decideSpawnGuard(spawn("boundary", `later-${call}`), sessionCtx, localRuntime, later), undefined);
+    }
+    assert.match(decideSpawnGuard(spawn("boundary", "later-fourth"), sessionCtx, localRuntime, later).blockReason, /3 per rolling hour/);
   });
 
   it("the registered guard blocks when event inspection throws", () => {
