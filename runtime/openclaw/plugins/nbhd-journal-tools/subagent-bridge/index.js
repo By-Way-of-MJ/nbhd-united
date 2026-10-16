@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { isTrackedCronRun } from "../../nbhd-cron-enforcement/index.js";
 import { isDocumentTaintedRun } from "../../nbhd-doc-taint-guard/index.js";
 
@@ -22,7 +24,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 7000;
 const RETRY_BACKOFF_MS = [0, 250, 750];
 
 const sessionSpawnTimes = new Map();
-const tenantDailyCounts = new Map();
+const tenantDailySpawns = new Map();
 
 function asObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -97,22 +99,40 @@ function setSessionTimes(sessionKey, times) {
   sessionSpawnTimes.set(sessionKey, times);
 }
 
-function spendSpawnBudget(sessionKey, tenantId, nowMs) {
-  const recent = (sessionSpawnTimes.get(sessionKey) || []).filter((stamp) => nowMs - stamp < SESSION_WINDOW_MS);
-  if (recent.length >= MAX_SESSION_SPAWNS) return block(SESSION_BUDGET_BLOCK_REASON);
-
+function spendSpawnBudget(sessionKey, tenantId, callKey, nowMs) {
+  const recent = (sessionSpawnTimes.get(sessionKey) || []).filter(({ stamp }) => nowMs - stamp < SESSION_WINDOW_MS);
   const day = utcDay(nowMs);
-  for (const key of tenantDailyCounts.keys()) {
-    if (!key.endsWith(`|${day}`)) tenantDailyCounts.delete(key);
+  for (const key of tenantDailySpawns.keys()) {
+    if (!key.endsWith(`|${day}`)) tenantDailySpawns.delete(key);
   }
   const tenantDayKey = `${tenantId}|${day}`;
-  const dailyCount = tenantDailyCounts.get(tenantDayKey) || 0;
-  if (dailyCount >= MAX_TENANT_DAILY_SPAWNS) return block(TENANT_BUDGET_BLOCK_REASON);
+  const dailySpawns = tenantDailySpawns.get(tenantDayKey) || new Set();
+  // Keep admission identities with both counters, so repeated hooks remain
+  // free even at the limit, across an hour boundary, or across UTC midnight.
+  if (recent.some((spawn) => spawn.callKey === callKey) || dailySpawns.has(callKey)) return undefined;
+  if (recent.length >= MAX_SESSION_SPAWNS) return block(SESSION_BUDGET_BLOCK_REASON);
+  if (dailySpawns.size >= MAX_TENANT_DAILY_SPAWNS) return block(TENANT_BUDGET_BLOCK_REASON);
 
-  recent.push(nowMs);
+  recent.push({ stamp: nowMs, callKey });
   setSessionTimes(sessionKey, recent);
-  tenantDailyCounts.set(tenantDayKey, dailyCount + 1);
+  dailySpawns.add(callKey);
+  tenantDailySpawns.set(tenantDayKey, dailySpawns);
   return undefined;
+}
+
+function spawnCallKey(event, ctx, runId, sessionKey, tenantId) {
+  // OpenClaw 2026.9.4 supplies the host toolCallId on both event and context.
+  const toolCallId = asTrimmedString(event?.toolCallId) || asTrimmedString(ctx?.toolCallId);
+  // Older hook callers may lack an ID. Canonicalize JSON object key order;
+  // identical params in one run necessarily share a charge in this fallback.
+  const identity = toolCallId ? ["id", toolCallId] : ["params", createHash("sha256").update(
+    JSON.stringify(asObject(event?.params), (_key, value) => (
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]]))
+        : value
+    )),
+  ).digest("hex")];
+  return JSON.stringify([tenantId, sessionKey, runId, ...identity]);
 }
 
 /** Pure-enough spawn decision; mutable counters are intentionally process-local. */
@@ -126,7 +146,12 @@ export function decideSpawnGuard(event, ctx, runtime, nowMs = Date.now()) {
   if (sessionKey.includes("subagent:")) return block(HELPER_SPAWN_BLOCK_REASON);
   if (ctx?.trigger === "cron" || isTrackedCronRun(runId)) return block(CRON_SPAWN_BLOCK_REASON);
   if (isDocumentTaintedRun(runId)) return block(TAINT_SPAWN_BLOCK_REASON);
-  return spendSpawnBudget(sessionKey, tenantId, nowMs);
+  // The runtime wrapper can run hooks before argument validation. A direct
+  // spawn without a non-empty string task cannot execute; let it report its
+  // normal input error without spending. Do not infer nested dispatch schemas.
+  if (asTrimmedString(event?.toolName).toLowerCase() === SPAWN_TOOL_ID
+      && !asTrimmedString(asObject(event?.params).task)) return undefined;
+  return spendSpawnBudget(sessionKey, tenantId, spawnCallKey(event, ctx, runId, sessionKey, tenantId), nowMs);
 }
 
 function extractThreadId(sessionKey) {
