@@ -61,10 +61,11 @@ class SubagentCanaryConfigTests(TestCase):
         baseline_deny = generate_tool_config("starter", version=self.tenant.openclaw_version)["deny"]
         self.assertEqual(
             config["tools"]["deny"],
-            [name for name in baseline_deny if name not in {"sessions_spawn", "subagents"}],
+            [name for name in baseline_deny if name != "sessions_spawn"],
         )
         self.assertNotIn("sessions_spawn", config["tools"]["deny"])
-        self.assertNotIn("subagents", config["tools"]["deny"])
+        self.assertIn("subagents", config["tools"]["deny"])
+        self.assertIn("agents_wait", config["tools"]["deny"])
         self.assertIn("sessions_yield", config["tools"]["deny"])
         for still_denied in (
             "sessions_send",
@@ -82,6 +83,8 @@ class SubagentCanaryConfigTests(TestCase):
             {"tools": {"allow": list(SUBAGENT_READ_ONLY_TOOLS)}},
         )
         self.assertNotIn("nbhd_send_to_user", SUBAGENT_READ_ONLY_TOOLS)
+        for tool in ("agents_wait", "subagents", "sessions_spawn"):
+            self.assertNotIn(tool, SUBAGENT_READ_ONLY_TOOLS)
         self.assertNotIn("nbhd_generate_image", SUBAGENT_READ_ONLY_TOOLS)
         self.assertNotIn("publish_portfolio_image", SUBAGENT_READ_ONLY_TOOLS)
         self.assertFalse([tool for tool in SUBAGENT_READ_ONLY_TOOLS if tool.startswith("shop_")])
@@ -150,6 +153,8 @@ class SubagentCanaryConfigTests(TestCase):
                     "multi-part plan, report, or comparison",
                     "find it via tool search",
                     "On it — I'll let you know when it's ready.",
+                    "After spawning, do not wait or poll for the helper — reply with the acknowledgement "
+                    "and end your turn; the result arrives later as an internal completion event.",
                     "Answer directly for everything else",
                     "Compare three holiday destinations",
                 ):

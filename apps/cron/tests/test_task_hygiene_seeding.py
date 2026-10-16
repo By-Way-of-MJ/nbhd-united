@@ -172,6 +172,11 @@ class TaskHygieneSeedingTests(TestCase):
                 old_data = deepcopy(cron.data)
                 old_data["schedule"]["expr"] = "15 17 * * 0"
                 old_data["payload"].update(message="Old prompt", timeoutSeconds=120, model="custom-model")
+                if enabled:
+                    old_data["payload"]["thinking"] = "high"
+                else:
+                    old_data["payload"].pop("thinking", None)
+                old_data["payload"]["toolsAllow"].insert(3, "nbhd_current_status")
                 CronJob.objects.filter(pk=cron.pk).update(data=old_data, enabled=enabled)
 
                 with override_settings(TASK_HYGIENE_TENANT_IDS=str(self.tenant.id)):
@@ -182,11 +187,15 @@ class TaskHygieneSeedingTests(TestCase):
                 expected["payload"].update(
                     message=rendered_payload["message"],
                     timeoutSeconds=300,
+                    toolsAllow=rendered_payload["toolsAllow"],
+                    thinking="low",
                 )
                 self.assertEqual(cron.data, expected)
                 self.assertEqual(cron.typed_payload, {"stale_after_days": 21})
                 self.assertEqual(cron.enabled, enabled)
                 self.assertIn("at least 21 days", cron.data["payload"]["message"])
+                self.assertNotIn("nbhd_current_status", cron.data["payload"]["message"])
+                self.assertNotIn("nbhd_current_status", cron.data["payload"]["toolsAllow"])
                 gateway_job = _row_to_cron_dict(cron)
                 self.assertEqual(gateway_job["enabled"], enabled)
                 self.assertEqual(gateway_job["payload"]["timeoutSeconds"], 300)
@@ -311,13 +320,17 @@ class TaskHygieneRenderedTurnTests(TestCase):
                 "nbhd_task_list",
                 "nbhd_task_get",
                 "nbhd_goal_list",
-                "nbhd_current_status",
                 "nbhd_task_complete",
                 "nbhd_task_skip",
                 "nbhd_task_defer",
                 "nbhd_send_to_user",
             ],
         )
+
+    def test_prompt_keeps_goal_context_without_duplicate_task_status(self):
+        message = self.cron.data["payload"]["message"]
+        self.assertIn("`nbhd_goal_list`", message)
+        self.assertNotIn("nbhd_current_status", message)
 
     def test_the_real_row_carries_no_way_to_create_or_destroy_a_task(self):
         allow = self.cron.data["payload"]["toolsAllow"]

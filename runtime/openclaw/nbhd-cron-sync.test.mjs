@@ -124,7 +124,7 @@ const typedJob = () => ({
   schedule: { kind: "every", everyMs: 60000 },
   payload: {
     kind: "agentTurn", message: "Send the reminder\nThen stop.",
-    model: "v4-flash", fallbacks: ["v4-pro", "provider/backup"],
+    model: "v4-flash", thinking: "low", fallbacks: ["v4-pro", "provider/backup"],
     timeoutSeconds: 90, toolsAllow: ["nbhd_send_to_user", "read"], lightContext: true,
   },
   description: 'nbhd.v1 {"v":1,"check":{"kind":"contains","text":"東京"}}',
@@ -136,6 +136,7 @@ test("buildAddArgs: each supported typed field uses its individual CLI flag", ()
   const args = buildAddArgs(job);
   for (const [flag, value] of [
     ["--model", "v4-flash"], ["--fallbacks", "v4-pro,provider/backup"],
+    ["--thinking", "low"],
     ["--timeout-seconds", "90"], ["--tools", "nbhd_send_to_user,read"],
     ["--description", job.description], ["--agent", "main"],
   ]) {
@@ -152,10 +153,12 @@ test("buildAddArgs: absent fields omitted; explicit false and empty tools are ad
   delete job.description;
   delete job.agentId;
   const args = buildAddArgs(job);
-  for (const flag of ["--model", "--fallbacks", "--timeout-seconds", "--tools", "--light-context", "--no-light-context", "--description", "--agent"]) {
+  for (const flag of ["--model", "--thinking", "--fallbacks", "--timeout-seconds", "--tools", "--light-context", "--no-light-context", "--description", "--agent"]) {
     assert.ok(!args.includes(flag));
   }
   job.payload.lightContext = false;
+  assert.deepEqual(buildAddArgs(job), args);
+  job.payload.thinking = null;
   assert.deepEqual(buildAddArgs(job), args);
   job.payload.fallbacks = [];
   const emptyFallbacks = buildAddArgs(job);
@@ -180,13 +183,14 @@ test("buildAddArgs: parameters never enable a command/script payload or field", 
   event.payload.kind = "systemEvent";
   const args = buildAddArgs(event);
   assert.ok(args.includes("--system-event"));
-  for (const flag of ["--model", "--fallbacks", "--timeout-seconds", "--tools", "--light-context", "--command", "--script"]) {
+  for (const flag of ["--model", "--thinking", "--fallbacks", "--timeout-seconds", "--tools", "--light-context", "--command", "--script"]) {
     assert.ok(!args.includes(flag));
   }
 });
 
 for (const [field, changed] of [
   ["model", "v4-pro"], ["fallbacks", ["v4-pro"]], ["timeoutSeconds", 120],
+  ["thinking", "high"],
   ["toolsAllow", ["nbhd_send_to_user"]], ["lightContext", false],
 ]) {
   test(`sameCron: ${field}-only changes and removal require an upsert`, () => {
@@ -277,6 +281,32 @@ test("reconcileOnce: unchanged skips add; fallback-only change applies; failed a
   assert.deepEqual(calls.map(args => args[1]), ["list", "add"]);
 });
 
+test("reconcileOnce: signed thinking-only changes upsert once and then converge", async () => {
+  let current = { ...typedJob(), id: "runtime-id" };
+  delete current.payload.thinking;
+  const calls = [];
+  const run = async args => {
+    calls.push(args);
+    if (args[1] === "list") return JSON.stringify({ jobs: [current] });
+    if (args[1] === "add") {
+      current.payload.thinking = args[args.indexOf("--thinking") + 1];
+    }
+    return "{}";
+  };
+  for (const thinking of ["low", "high"]) {
+    const desired = typedJob();
+    desired.payload.thinking = thinking;
+    await writeFile(CRONS_FILE, signDoc([desired]));
+    calls.length = 0;
+    assert.equal((await reconcileOnce({ run })).applied, 1);
+    assert.deepEqual(calls.map(args => args[1]), ["list", "add"]);
+    assert.deepEqual(calls[1], buildAddArgs(desired));
+    calls.length = 0;
+    assert.equal((await reconcileOnce({ run })).applied, 0);
+    assert.deepEqual(calls.map(args => args[1]), ["list"]);
+  }
+});
+
 test("reconcileOnce: past or undetermined one-shots absent from current are skipped", async t => {
   const now = Date.parse("2026-09-20T12:00:00Z");
   t.mock.method(Date, "now", () => now);
@@ -363,15 +393,18 @@ test("pinned 9.4 source registers each emitted flag; negative light context is e
     : `pinned 9.4 package source not present at ${_pinnedBundle} (set OPENCLAW_PACKAGE_ROOT to run)`,
 }, async () => {
   const source = await readFile(_pinnedBundle, "utf8");
+  const pkg = JSON.parse(await readFile(path.join(_pinnedRoot, "package.json"), "utf8"));
+  assert.equal(pkg.version, "2026.9.4");
   const start = source.indexOf("function registerCronMutationOptions(");
   const end = source.indexOf("\n}", start);
   const options = source.slice(start, end);
-  for (const flag of ["--model <model>", "--fallbacks <list>", "--timeout-seconds <n>", "--tools <list>", "--light-context", "--description <text>", "--agent <id>"]) {
+  for (const flag of ["--model <model>", "--thinking <level>", "--fallbacks <list>", "--timeout-seconds <n>", "--tools <list>", "--light-context", "--description <text>", "--agent <id>"]) {
     assert.ok(options.includes(`.option("${flag}"`), flag);
   }
   assert.ok(!options.includes('"--no-light-context"'));
   assert.ok(source.includes('.option("--no-light-context", "Disable lightweight bootstrap context for agent jobs")'));
   assert.ok(source.includes("lightContext: opts.lightContext === true ? true : void 0"));
+  assert.ok(source.includes("thinking: normalizeOptionalString(opts.thinking)"));
 });
 
 test("stateRow: keeps timing metadata, drops the payload", () => {

@@ -531,7 +531,7 @@ def seed_task_hygiene_cron(tenant: Tenant) -> dict[str, Any]:
     from — the gate converges without a manual DB write.
 
     GATE OPEN, no row      → create it.
-    GATE OPEN, row exists  → refresh the managed system prompt and timeout,
+    GATE OPEN, row exists  → refresh managed prompt, timeout, tools and thinking,
                              preserving enabled and all other row settings.
                              This makes a user's "off" stick across applies.
     GATE CLOSED, row exists → DISABLE it. Removing a tenant from the allowlist
@@ -581,7 +581,7 @@ def seed_task_hygiene_cron(tenant: Tenant) -> dict[str, Any]:
                     schedule=existing.data["schedule"],
                 )
                 data = deepcopy(existing.data)
-                for field in ("message", "timeoutSeconds"):
+                for field in ("message", "timeoutSeconds", "toolsAllow", "thinking"):
                     data["payload"][field] = rendered["payload"][field]
                 if data != existing.data:
                     # The typed pre-save signal skips unchanged inputs. Persist

@@ -73,6 +73,7 @@ _STARTER_ALLOW_2026_4_5: tuple[str, ...] = (
 
 _DENIED_TOOLS_2026_4_15: tuple[str, ...] = _DENIED_TOOLS_2026_4_5 + (
     "sessions_yield",
+    "agents_wait",
     "subagents",
     "message",
     "browser",

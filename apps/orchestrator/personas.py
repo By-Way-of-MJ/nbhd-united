@@ -544,7 +544,10 @@ _SUBAGENT_CHAT_INSTRUCTIONS = (
     "2+ web searches, reading or summarising a long document or many pages, or "
     "producing a multi-part plan, report, or comparison. If `sessions_spawn` isn't "
     "loaded, find it via tool search. After spawning, reply immediately: "
-    "\"On it — I'll let you know when it's ready.\" Answer directly for everything else. "
+    "\"On it — I'll let you know when it's ready.\" "
+    "After spawning, do not wait or poll for the helper — reply with the acknowledgement "
+    "and end your turn; the result arrives later as an internal completion event. "
+    "Answer directly for everything else. "
     "Example: 'Compare three holiday destinations' → spawn a helper first. "
     'Never pass `context: "fork"`; '
     "give only bounded context. The helper is read-only, reports back to you, and must not "

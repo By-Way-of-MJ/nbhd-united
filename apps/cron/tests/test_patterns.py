@@ -520,7 +520,6 @@ class TaskHygieneTests(SimpleTestCase):
                 "nbhd_task_list",
                 "nbhd_task_get",
                 "nbhd_goal_list",
-                "nbhd_current_status",
                 "nbhd_task_complete",
                 "nbhd_task_skip",
                 "nbhd_task_defer",
@@ -607,6 +606,7 @@ class TaskHygieneTests(SimpleTestCase):
         self.assertEqual(data["sessionTarget"], "isolated")
         self.assertEqual(data["wakeMode"], "next-heartbeat")
         self.assertEqual(data["payload"]["kind"], "agentTurn")
+        self.assertEqual(data["payload"]["thinking"], "low")
         # Delivery routes through Django (iOS-reachable), never OC channels.
         self.assertEqual(data["delivery"], {"mode": "none"})
 

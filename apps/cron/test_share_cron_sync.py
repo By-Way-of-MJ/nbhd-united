@@ -75,6 +75,12 @@ class SignedParameterCarryTest(SimpleTestCase):
                     self.assertEqual(job["declarationKey"], "nbhd:42")
                     self.assertEqual(job["payload"], row.data["payload"])
                     self.assertEqual(job["description"], row.data["description"])
+                    if pattern == CronPattern.TASK_HYGIENE:
+                        self.assertEqual(job["payload"]["thinking"], "low")
+                        self.assertIn("nbhd_goal_list", job["payload"]["toolsAllow"])
+                        self.assertNotIn("nbhd_current_status", job["payload"]["toolsAllow"])
+                        self.assertIn("`nbhd_goal_list`", job["payload"]["message"])
+                        self.assertNotIn("nbhd_current_status", job["payload"]["message"])
                     if stamp_fallbacks:
                         self.assertEqual(job["payload"]["fallbacks"], ["v4-pro"])
                     else:

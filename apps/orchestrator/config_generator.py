@@ -2356,10 +2356,11 @@ def _build_tools_section(
     if subagents_on is None:
         subagents_on = subagents_enabled(tenant)
     if subagents_on:
-        # Unlock exactly the parent-side spawn/control tools. sessions_yield
-        # stays denied: yielding an OpenAI-compatible HTTP turn returns an empty
-        # response body instead of the required immediate acknowledgement.
-        tools["deny"] = [name for name in tools.get("deny", []) if name not in {"sessions_spawn", "subagents"}]
+        # Unlock only spawning. agents_wait/subagents stay denied so chat cannot
+        # block or poll; the bridge delivers internal completion events through
+        # before_prompt_build/agent_end without either tool. sessions_yield stays
+        # denied because it returns an empty HTTP response instead of an ack.
+        tools["deny"] = [name for name in tools.get("deny", []) if name != "sessions_spawn"]
         tools["subagents"] = {
             "tools": {
                 "allow": list(SUBAGENT_READ_ONLY_TOOLS),
