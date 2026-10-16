@@ -106,6 +106,7 @@ def record_proactive_outbound(
     panels: list[dict] | None = None,
     artifact_dedup_key: str | None = None,
     thread_id=None,
+    defer_push: bool = False,
 ) -> ProactiveOutbound | None:
     """Persist a row describing one proactive delivery or eval evidence event.
 
@@ -286,7 +287,12 @@ def record_proactive_outbound(
     # placeholder-space, but the notification the user reads shows real names.
     from apps.pii.redactor import rehydrate_for_tenant
 
-    _dispatch_ios_push(tenant, str(row.id), rehydrate_for_tenant(tenant, message_text))
+    if defer_push:
+        transaction.on_commit(
+            lambda: _dispatch_ios_push(tenant, str(row.id), rehydrate_for_tenant(tenant, message_text))
+        )
+    else:
+        _dispatch_ios_push(tenant, str(row.id), rehydrate_for_tenant(tenant, message_text))
     return row
 
 

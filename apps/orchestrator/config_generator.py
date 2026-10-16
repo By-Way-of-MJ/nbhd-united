@@ -2385,8 +2385,9 @@ def _build_tools_section(
     # remove/add storm we saw in the 2026-05-14 logs is a candidate
     # pattern). Token-level degeneration is handled separately by the
     # nbhd-routing-context plugin's before_agent_finalize hook; this is
-    # the tool-call abstraction layer. Defaults match the upstream
-    # documentation: warning at 10, critical block at 20.
+    # the tool-call abstraction layer. In 2026.9.4 the strict
+    # ToolLoopDetectionSchema accepts only enabled; thresholds were removed.
+    # See docs/reference/helper-closure.md for pinned runtime evidence.
     tools["loopDetection"] = {
         "enabled": True,
     }
@@ -3026,7 +3027,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                         "maxConcurrent": 2,
                         "maxChildrenPerAgent": 2,
                         "maxSpawnDepth": 1,
-                        "runTimeoutSeconds": 600,
+                        "runTimeoutSeconds": 300,
                         "announceTimeoutMs": 120000,
                         "archiveAfterMinutes": 60,
                         "model": models_config["primary"],

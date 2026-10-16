@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "node:test";
 
 import registerCron from "../../nbhd-cron-enforcement/index.js";
@@ -188,17 +189,18 @@ describe("sessions_spawn fail-closed guard", () => {
     );
   });
 
-  it("shares call admissions across three register invocations", () => {
+  it("shares call admissions across three register invocations", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => ({ ok: true, json: async () => ({ status: "pending" }) }));
     const hooks = Array.from({ length: 3 }, () => {
       const api = fakeApi({ tenantId: "repeated-registration-tenant" });
       registerBridge(api);
       return api._handlers.before_tool_call;
     });
     for (let call = 0; call < 3; call += 1) {
-      for (const hook of hooks) assert.equal(hook(spawn("registered-run", `call-${call}`), ctx("registered-run")), undefined);
+      for (const hook of hooks) assert.ok((await hook(spawn("registered-run", `call-${call}`), { ...ctx("registered-run"), sessionKey: SESSION_KEY })).params);
     }
     for (const hook of hooks) {
-      assert.match(hook(spawn("registered-run", "call-4"), ctx("registered-run")).blockReason, /3 per rolling hour/);
+      assert.match(hook(spawn("registered-run", "call-4"), { ...ctx("registered-run"), sessionKey: SESSION_KEY }).blockReason, /3 per rolling hour/);
     }
   });
 
@@ -241,11 +243,12 @@ describe("sessions_spawn fail-closed guard", () => {
     assert.match(decideSpawnGuard(spawn("scope-0", "fourth-id"), otherCtx, localRuntime, now).blockReason, /3 per rolling hour/);
   });
 
-  it("does not charge invalid direct tasks and still checks requester safety", () => {
+  it("does not charge invalid direct tasks and still checks requester safety", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => ({ ok: true, json: async () => ({ status: "pending" }) }));
     const api = fakeApi({ tenantId: "invalid-task-tenant" });
     registerBridge(api);
     const hook = api._handlers.before_tool_call;
-    const sessionCtx = ctx("invalid-task");
+    const sessionCtx = { ...ctx("invalid-task"), sessionKey: SESSION_KEY.replace("e621", "e622") };
     for (const params of [{ objective: "research" }, {}, { task: "" }, { task: "  " }, { task: 42 }]) {
       const event = { ...spawn("invalid-task"), params };
       assert.equal(hook(event, sessionCtx), undefined);
@@ -254,7 +257,7 @@ describe("sessions_spawn fail-closed guard", () => {
       assert.equal(hook(event, { ...sessionCtx, sessionKey: "agent:main:subagent:child" })?.block, true);
     }
     for (let call = 0; call < 3; call += 1) {
-      assert.equal(hook(spawn("invalid-task", `valid-${call}`), sessionCtx), undefined);
+      assert.ok((await hook(spawn("invalid-task", `valid-${call}`), sessionCtx)).params);
     }
     assert.match(hook(spawn("invalid-task", "valid-4"), sessionCtx).blockReason, /3 per rolling hour/);
   });
@@ -312,6 +315,116 @@ describe("sessions_spawn fail-closed guard", () => {
   });
 });
 
+describe("durable helper closure", () => {
+  const spawn = (id = "call", params = {}) => ({ toolName: "sessions_spawn", toolCallId: id, params: { task: "research", ...params } });
+  const context = () => ({ runId: randomUUID(), sessionKey: SESSION_KEY.replace(THREAD_ID, randomUUID()) });
+  const accept = () => ({ ok: true, status: 200, json: async () => ({ status: "pending" }) });
+
+  it("awaits backend admission before allowing launch and caps model timeout overrides", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    let resolve;
+    const fetch = t.mock.method(globalThis, "fetch", () => new Promise((done) => { resolve = done; }));
+    let finished = false;
+    const resultPromise = api._handlers.before_tool_call(spawn("a", { runTimeoutSeconds: 0 }), context()).then((value) => { finished = true; return value; });
+    await new Promise((done) => setImmediate(done));
+    assert.equal(finished, false);
+    resolve(accept());
+    const result = await resultPromise;
+    assert.equal(result.params.runTimeoutSeconds, 300);
+    const request = fetch.mock.calls[0].arguments;
+    assert.match(String(request[0]), /helpers\/admit\/$/);
+    const body = JSON.parse(request[1].body);
+    assert.match(body.occurrence_key, /^helper:[a-f0-9]{48}$/);
+    assert.ok(result.params.label.startsWith(`[nbhd-${body.occurrence_key}]`));
+    assert.deepEqual(Object.keys(body).sort(), ["occurrence_key", "thread_id"]);
+  });
+
+  it("retries lost admission replies with one identity, including repeated hooks", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    const bodies = [];
+    t.mock.method(globalThis, "fetch", async (_url, options) => {
+      bodies.push(options.body);
+      if (bodies.length === 1) throw new Error("response lost after DB commit");
+      return accept();
+    });
+    const ctx = context();
+    const event = spawn("same", { runTimeoutSeconds: 900 });
+    const first = await api._handlers.before_tool_call(event, ctx);
+    const repeated = await api._handlers.before_tool_call(event, ctx);
+    assert.equal(first.params.runTimeoutSeconds, 300);
+    assert.deepEqual(first, repeated);
+    assert.equal(new Set(bodies).size, 1);
+  });
+
+  it("fails closed when the backend cannot record the obligation", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: false, status: 503 }));
+    assert.equal((await api._handlers.before_tool_call(spawn(), context())).block, true);
+    assert.equal(fetch.mock.callCount(), 3);
+  });
+
+  it("does not mistake a 200 blocked body for admission", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    t.mock.method(globalThis, "fetch", async () => ({ ok: true, json: async () => ({ status: "blocked" }) }));
+    assert.equal((await api._handlers.before_tool_call(spawn(), context())).block, true);
+  });
+
+  it("registers wrapped calls, preserves shorter timeouts, and rejects unroutable sessions", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    const fetch = t.mock.method(globalThis, "fetch", async () => accept());
+    const ctx = context();
+    for (const nestedKey of ["params", "arguments"]) {
+      const result = await api._handlers.before_tool_call({ toolName: "tool_call", toolCallId: nestedKey,
+        params: { id: "sessions_spawn", [nestedKey]: { task: "research", runTimeoutSeconds: 120 } } }, ctx);
+      assert.equal(result.params[nestedKey].runTimeoutSeconds, 120);
+      assert.match(result.params[nestedKey].label, /^\[nbhd-helper:/);
+    }
+    assert.equal((await api._handlers.before_tool_call(spawn(), { ...context(), sessionKey: "agent:main:main" })).block, true);
+    assert.equal(fetch.mock.callCount(), 2);
+  });
+
+  it("uses the admitted key for ended failure, model sends, and a later parent after restart", async (t) => {
+    const api = fakeApi({ tenantId: randomUUID() });
+    registerBridge(api);
+    const requests = [];
+    t.mock.method(globalThis, "fetch", async (url, options) => {
+      requests.push({ url: String(url), ...options });
+      return { ok: true, json: async () => ({ status: String(url).endsWith("admit/") ? "pending" : "sent" }) };
+    });
+    const ctx = context();
+    const admitted = await api._handlers.before_tool_call(spawn(), ctx);
+    const key = JSON.parse(requests[0].body).occurrence_key;
+    api._handlers.subagent_spawned({ runId: "child-run", label: admitted.params.label }, { requesterSessionKey: ctx.sessionKey });
+    await api._handlers.subagent_ended({ runId: "child-run", targetKind: "subagent", outcome: "timeout" });
+    assert.equal(requests[1].headers["X-NBHD-Occurrence-Key"], key);
+    assert.equal(JSON.parse(requests[1].body).message, "I couldn't finish that research — want me to try again here?");
+    // Parent gets a different runId and the process has lost all memory.
+    const restarted = fakeApi();
+    registerBridge(restarted);
+    const parent = { runId: "different-parent-run", sessionKey: ctx.sessionKey };
+    restarted._handlers.before_prompt_build({ prompt: markerPrompt().replace("task: research", `task: ${admitted.params.label}`) }, parent);
+    const injected = restarted._handlers.before_tool_call({ toolName: "nbhd_send_to_user", params: { message: "result" } }, parent);
+    assert.equal(injected.params.occurrence_key, key);
+    assert.equal(injected.params.job_name, "_subagent_result");
+    await restarted._handlers.agent_end({ messages: [] }, parent);
+    assert.equal(requests[2].headers["X-NBHD-Occurrence-Key"], key);
+  });
+
+  it("allows successful helpers to reach parent review instead of sending failure", async (t) => {
+    const api = fakeApi();
+    registerBridge(api);
+    const fetch = t.mock.method(globalThis, "fetch", async () => accept());
+    api._handlers.subagent_spawned({ runId: "ok-child", label: `[nbhd-helper:${"a".repeat(48)}] Research` }, { requesterSessionKey: SESSION_KEY });
+    await api._handlers.subagent_ended({ runId: "ok-child", targetKind: "subagent", outcome: "ok" });
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+});
+
 describe("completion re-entry backstop", () => {
   it("injects a run-specific occurrence key into a marked model send", () => {
     const api = fakeApi({ tenantId: "model-provenance-tenant" });
@@ -334,13 +447,14 @@ describe("completion re-entry backstop", () => {
       message: "Research is ready.",
       thread_id: THREAD_ID,
       occurrence_key: "subagent:announce-model-key",
+      job_name: "_subagent_result",
     });
     assert.deepEqual(
       injectOccurrenceKey(
         { toolName: "tool_call", params: { id: "nbhd_send_to_user", params: { message: "Ready" } } },
         "subagent:wrapped",
       ),
-      { id: "nbhd_send_to_user", params: { message: "Ready", occurrence_key: "subagent:wrapped" } },
+      { id: "nbhd_send_to_user", params: { message: "Ready", occurrence_key: "subagent:wrapped", job_name: "_subagent_result" } },
     );
   });
 
@@ -351,7 +465,7 @@ describe("completion re-entry backstop", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (url, options) => {
       calls.push({ url: String(url), options });
-      return { ok: true, status: 200 };
+      return { ok: true, status: 200, json: async () => ({ status: "sent" }) };
     };
     try {
       const append = api._handlers.before_prompt_build(
@@ -381,7 +495,7 @@ describe("completion re-entry backstop", () => {
     registerBridge(api);
     let fetchCount = 0;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => { fetchCount += 1; return { ok: true, status: 200 }; };
+    globalThis.fetch = async () => { fetchCount += 1; return { ok: true, status: 200, json: async () => ({ status: "sent" }) }; };
     try {
       api._handlers.before_prompt_build(
         { runId: "announce-model", prompt: markerPrompt() },
@@ -409,7 +523,7 @@ describe("completion re-entry backstop", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (_url, options) => {
       posted = JSON.parse(options.body);
-      return { ok: true, status: 200 };
+      return { ok: true, status: 200, json: async () => ({ status: "sent" }) };
     };
     try {
       api._handlers.before_prompt_build(
@@ -435,7 +549,7 @@ describe("completion re-entry backstop", () => {
       const originalFetch = globalThis.fetch;
       globalThis.fetch = async (_url, options) => {
         posted = JSON.parse(options.body);
-        return { ok: true, status: 200 };
+        return { ok: true, status: 200, json: async () => ({ status: "sent" }) };
       };
       try {
         api._handlers.before_prompt_build(
@@ -460,7 +574,7 @@ describe("completion re-entry backstop", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (_url, options) => {
       posted = JSON.parse(options.body);
-      return { ok: true, status: 200 };
+      return { ok: true, status: 200, json: async () => ({ status: "sent" }) };
     };
     try {
       api._handlers.before_prompt_build(
@@ -485,7 +599,7 @@ describe("completion re-entry backstop", () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (_url, options) => {
       posted = JSON.parse(options.body);
-      return { ok: true, status: 200 };
+      return { ok: true, status: 200, json: async () => ({ status: "sent" }) };
     };
     try {
       api._handlers.before_prompt_build(
