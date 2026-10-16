@@ -147,6 +147,7 @@ export function buildAddArgs(job) {
     // Individual flags from 2026.9.4 registerCronMutationOptions. --json is
     // output-only. These are agentTurn parameters, never new payload kinds.
     if (p.model != null) args.push("--model", String(p.model));
+    if (p.thinking != null) args.push("--thinking", String(p.thinking));
     if (p.fallbacks != null) args.push("--fallbacks", cliList(p.fallbacks));
     if (p.timeoutSeconds != null) args.push("--timeout-seconds", String(p.timeoutSeconds));
     if (p.toolsAllow != null) {

@@ -93,6 +93,7 @@ class VersionAwareToolPolicyTest(TestCase):
         denied = get_denied_tools(version="2026.4.15")
         for tool in (
             "sessions_yield",
+            "agents_wait",
             "subagents",
             "message",
             "browser",

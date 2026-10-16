@@ -67,7 +67,6 @@ _HYGIENE_QUERY_TOOLS: tuple[str, ...] = (
     "nbhd_task_list",
     "nbhd_task_get",
     "nbhd_goal_list",
-    "nbhd_current_status",
 )
 
 # The three permitted lifecycle transitions. Deliberately NOT create/update/
@@ -124,8 +123,7 @@ class TaskHygieneHandler(PatternHandler):
             "The list tool has no activity filter or limit, so select this bounded "
             "set from its results before fetching details or making judgements. "
             "Steps 2–4 apply only to these candidates. "
-            "Use `nbhd_current_status` for the wider "
-            "picture and `nbhd_goal_list` to see which goals are still live. "
+            "Use `nbhd_goal_list` to see which goals are still live. "
             "Call `nbhd_task_get` only on selected candidates whose state you need "
             "detail on. Every judgement you make below must trace to one of "
             "those tool results — never to memory or assumption.\n"
@@ -180,6 +178,7 @@ class TaskHygieneHandler(PatternHandler):
                 "kind": "agentTurn",
                 "message": message,
                 "model": _CRON_MODEL,
+                "thinking": "low",
                 "lightContext": False,
                 "toolsAllow": self.get_tools_allow(payload),
                 "timeoutSeconds": _TURN_TIMEOUT_SECONDS,
