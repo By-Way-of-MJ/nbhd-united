@@ -209,7 +209,7 @@ class MaximalTenantBudgetTest(TestCase):
         self.assertLessEqual(len(ungated), 23_682)
         with override_settings(SUBAGENT_TENANT_IDS=str(tenant.id)):
             md = _agents_md(tenant)
-        self.assertIn("`sessions_spawn` BEFORE starting", md)
+        self.assertIn("`sessions_spawn` FIRST, before doing the work", md)
         self.assertLessEqual(len(md), _ALL_GATES_CEILING)
         self.assertLessEqual(len(md), BOOTSTRAP_MAX_CHARS)
 

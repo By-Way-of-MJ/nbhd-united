@@ -142,7 +142,7 @@ class SubagentWorkspaceRulesTest(TestCase):
         )
         self.assertNotIn("| `rules/subagents.md` |", agents_md)
         self.assertNotIn("rules/subagents.md", cron_prompt)
-        self.assertIn("`sessions_spawn` BEFORE starting", agents_md)
+        self.assertIn("`sessions_spawn` FIRST, before doing the work", agents_md)
 
 
 class UpdateTenantConfigUploadsRulesTest(TestCase):

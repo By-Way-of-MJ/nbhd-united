@@ -58,7 +58,7 @@ _CRON_MODEL = DEEPSEEK_FLASH_MODEL
 # Longer than the briefing's 90s: this turn reads the task list, may fetch
 # individual tasks for detail, performs several lifecycle calls, and only then
 # composes a summary.
-_TURN_TIMEOUT_SECONDS = 120
+_TURN_TIMEOUT_SECONDS = 300
 
 _MARKER = "[block: task_hygiene]"
 
@@ -116,10 +116,17 @@ class TaskHygieneHandler(PatternHandler):
             "this turn. Work quietly and only interrupt them if you actually "
             "changed something or need a decision.\n"
             "\n"
-            "STEP 1 — LOOK. Call `nbhd_task_list` for the current open and "
-            "in-progress tasks. Use `nbhd_current_status` for the wider "
+            "STEP 1 — LOOK. Call `nbhd_task_list` with `status: 'open'` and "
+            "again with `status: 'in_progress'`. From those results, select only "
+            f"tasks with no activity for at least {payload.stale_after_days} days "
+            "using `updated_at`, oldest first. Review at most 25 stale candidates "
+            "per run across both lists; leave all other tasks for a later run. "
+            "The list tool has no activity filter or limit, so select this bounded "
+            "set from its results before fetching details or making judgements. "
+            "Steps 2–4 apply only to these candidates. "
+            "Use `nbhd_current_status` for the wider "
             "picture and `nbhd_goal_list` to see which goals are still live. "
-            "Call `nbhd_task_get` on any individual task whose state you need "
+            "Call `nbhd_task_get` only on selected candidates whose state you need "
             "detail on. Every judgement you make below must trace to one of "
             "those tool results — never to memory or assumption.\n"
             "\n"
@@ -129,7 +136,7 @@ class TaskHygieneHandler(PatternHandler):
             "are not sure it happened, do NOT complete it — propose it in the "
             "summary instead.\n"
             "\n"
-            f"STEP 3 — TRIAGE what has gone stale (untouched for more than "
+            f"STEP 3 — TRIAGE what has gone stale (untouched for at least "
             f"{payload.stale_after_days} days). For each one pick ONE:\n"
             "  - `nbhd_task_defer` when it still matters but not now — push it "
             "to a realistic date.\n"
@@ -140,7 +147,7 @@ class TaskHygieneHandler(PatternHandler):
             "conservative: a wrongly-skipped task is worse than a stale one.\n"
             "\n"
             "STEP 4 — PROPOSE deletions, never perform them. Some items are "
-            "not stale but junk: test entries, exact duplicates, fragments "
+            "stale junk: test entries, exact duplicates, fragments "
             "that were never real tasks. You CANNOT delete them here. "
             "`nbhd_task_delete` is not available in this turn, and by design: "
             "deleting a task is permanent, cascades to its subtasks, and "

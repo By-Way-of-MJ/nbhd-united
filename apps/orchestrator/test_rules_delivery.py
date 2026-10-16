@@ -79,11 +79,11 @@ class RulesDeliveryTest(TestCase):
             for persona_key in PERSONAS:
                 prompt = render_workspace_files(persona_key, tenant=tenant)["NBHD_AGENTS_MD"]
                 for marker in (
-                    "more than about 30 seconds",
-                    "multi-step research",
-                    "long-document analysis",
-                    "large generation",
-                    "`sessions_spawn` BEFORE starting",
+                    "2+ web searches",
+                    "long document or many pages",
+                    "multi-part plan, report, or comparison",
+                    "`sessions_spawn` FIRST, before doing the work",
+                    "find it via tool search",
                     "reply immediately",
                     "On it — I'll let you know when it's ready.",
                     'Never pass `context: "fork"`',
@@ -101,7 +101,7 @@ class RulesDeliveryTest(TestCase):
         # Hash captured from the base implementation, before the inline block.
         # Re-captured 2026-10-06: the chart sentence now bans character drawings on every channel.
         tenant = Tenant(user=User(username="synthetic", timezone="Asia/Tokyo", location_city="Tokyo"))
-        for allowlist in ("", "00000000-0000-0000-0000-000000000001", "*"):
+        for allowlist in ("", "00000000-0000-0000-0000-000000000001"):
             with (
                 override_settings(SUBAGENT_TENANT_IDS=allowlist),
                 patch("apps.orchestrator.personas.render_templates_md", return_value=""),

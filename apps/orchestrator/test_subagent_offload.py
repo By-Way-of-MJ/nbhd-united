@@ -13,6 +13,7 @@ from apps.orchestrator.config_generator import (
     subagents_enabled,
 )
 from apps.orchestrator.config_validator import assert_config_writable, validate_openclaw_config
+from apps.orchestrator.personas import render_workspace_files
 from apps.orchestrator.tool_policy import generate_tool_config
 from apps.tenants.services import create_tenant
 
@@ -127,6 +128,38 @@ class SubagentCanaryConfigTests(TestCase):
             self.assertFalse(subagents_enabled(self.tenant))
         with override_settings(SUBAGENT_TENANT_IDS=str(self.tenant.id).upper()):
             self.assertTrue(subagents_enabled(self.tenant))
+
+    def test_gate_accepts_only_exact_wildcard_tokens(self):
+        for raw, enabled in (("*", True), ("other, * ", True), ("prefix*", False), ("**", False)):
+            with self.subTest(raw=raw), override_settings(SUBAGENT_TENANT_IDS=raw):
+                self.assertEqual(subagents_enabled(self.tenant), enabled)
+        with override_settings(SUBAGENT_TENANT_IDS="*"):
+            self.assertFalse(subagents_enabled(None))
+            config = generate_openclaw_config(self.tenant)
+            self.assertNotIn("sessions_spawn", config["tools"]["deny"])
+            self.assertIn("nbhd-subagent-bridge", config["plugins"]["allow"])
+
+    def test_chat_offloads_concrete_requests_and_explains_tool_discovery(self):
+        for gate in (str(self.tenant.id), "*"):
+            with self.subTest(gate=gate), override_settings(SUBAGENT_TENANT_IDS=gate):
+                prompt = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
+                for marker in (
+                    "`sessions_spawn` FIRST, before doing the work",
+                    "2+ web searches",
+                    "reading or summarising a long document or many pages",
+                    "multi-part plan, report, or comparison",
+                    "find it via tool search",
+                    "On it — I'll let you know when it's ready.",
+                    "Answer directly for everything else",
+                    "Compare three holiday destinations",
+                ):
+                    self.assertIn(marker, prompt)
+                self.assertNotIn("more than about 30 seconds", prompt)
+
+        with override_settings(SUBAGENT_TENANT_IDS=""):
+            prompt = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
+            self.assertNotIn("## Slow tasks", prompt)
+            self.assertNotIn("`sessions_spawn` FIRST", prompt)
 
     def test_python_and_javascript_helper_allowlists_are_equal(self):
         source = Path("runtime/openclaw/plugins/nbhd-routing-context/index.js").read_text()

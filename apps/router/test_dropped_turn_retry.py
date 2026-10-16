@@ -16,6 +16,7 @@ from django.utils import timezone
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage, RuntimeWriteActivity
 from apps.router.pending_queue import (
     _dropped_retry_enabled,
+    _is_silent_dropped_retry_candidate,
     drain_pending_messages_for_tenant_task,
     dropped_retry_dedup_id,
     dropped_retry_health_dedup_id,
@@ -243,6 +244,82 @@ class DroppedAppTurnRetryTest(TestCase):
 
     @patch("apps.router.push_views.notify_app_reply_error")
     @patch("apps.cron.publish.publish_task")
+    def test_empty_phase_old_drop_enqueues_and_replays(self, publish, notify_error):
+        turn, _ = self._pair("untouched-old-drop", phase="")
+        AppChatMessage.objects.filter(id=turn.id).update(created_at=timezone.now() - timedelta(seconds=300))
+
+        self._drop()
+
+        turn.refresh_from_db()
+        self.assertIsNotNone(turn.retried_at)
+        self.assertTrue(any(call.args[0] == "retry_dropped_app_turn" for call in publish.call_args_list))
+        with patch("apps.router.pending_queue._is_tenant_container_live", return_value=True):
+            self.assertEqual(retry_dropped_app_turn_task(str(turn.id)), {"retried": 1})
+        turn.refresh_from_db()
+        self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
+        notify_error.assert_not_called()
+
+    @patch("apps.router.push_views.notify_app_reply_error")
+    @patch("apps.cron.publish.publish_task")
+    def test_empty_phase_old_drop_with_runtime_write_does_not_retry(self, publish, notify_error):
+        turn, _ = self._pair("untouched-with-write", phase="")
+        AppChatMessage.objects.filter(id=turn.id).update(created_at=timezone.now() - timedelta(seconds=300))
+        RuntimeWriteActivity.objects.create(tenant=self.tenant, last_runtime_write_at=timezone.now())
+
+        self._drop()
+
+        turn.refresh_from_db()
+        self.assertIsNone(turn.retried_at)
+        self.assertFalse(any(call.args[0] == "retry_dropped_app_turn" for call in publish.call_args_list))
+        notify_error.assert_called_once_with(self.tenant, [turn.client_msg_id])
+
+    def test_empty_response_never_qualifies_for_retry(self):
+        for phase in ("", "thinking"):
+            with self.subTest(phase=phase):
+                turn, _ = self._pair(f"empty-response-{phase}", phase=phase)
+                self.assertFalse(
+                    _is_silent_dropped_retry_candidate(turn, "empty_response", dropped_stamped_at=timezone.now())
+                )
+
+    @patch("apps.router.push_views.notify_app_reply_error")
+    @patch("apps.cron.publish.publish_task")
+    def test_empty_phase_retry_rechecks_tool_progress_and_writes(self, _publish, _notify_error):
+        for after_health in (False, True):
+            for evidence in ("tool", "write"):
+                with self.subTest(after_health=after_health, evidence=evidence):
+                    turn, _ = self._pair(f"late-{after_health}-{evidence}", phase="")
+                    AppChatMessage.objects.filter(id=turn.id).update(created_at=timezone.now() - timedelta(seconds=300))
+                    RuntimeWriteActivity.objects.filter(tenant=self.tenant).delete()
+                    self._drop()
+                    turn.refresh_from_db()
+                    self.assertIsNotNone(turn.retried_at)
+
+                    def record_progress(*_args, evidence=evidence, turn=turn):
+                        if evidence == "tool":
+                            AppChatMessage.objects.filter(id=turn.id).update(phase="tool")
+                        else:
+                            RuntimeWriteActivity.objects.create(
+                                tenant=self.tenant,
+                                last_runtime_write_at=turn.retried_at - timedelta(seconds=1),
+                            )
+                        return True
+
+                    if not after_health:
+                        record_progress()
+                    with patch(
+                        "apps.router.pending_queue._is_tenant_container_live",
+                        side_effect=record_progress if after_health else None,
+                        return_value=True,
+                    ):
+                        result = retry_dropped_app_turn_task(str(turn.id))
+                    reason = "ineligible_after_health" if after_health else "ineligible"
+                    self.assertEqual(result, {"retried": 0, "exhausted": reason})
+                    self.assertFalse(
+                        PendingMessage.objects.filter(delivery_status=PendingMessage.Status.PENDING).exists()
+                    )
+
+    @patch("apps.router.push_views.notify_app_reply_error")
+    @patch("apps.cron.publish.publish_task")
     def test_ungated_tenant_uses_standard_notify(self, publish, notify_error):
         turn, _ = self._pair("ungated")
 
@@ -267,10 +344,15 @@ class DroppedAppTurnRetryTest(TestCase):
         with override_settings(RETRY_DROPPED_TENANT_IDS=raw):
             self.assertTrue(_dropped_retry_enabled(self.tenant))
 
+    def test_retry_gate_accepts_only_exact_wildcard_tokens(self):
+        for raw, enabled in (("*", True), ("other, * ", True), ("prefix*", False), ("**", False)):
+            with self.subTest(raw=raw), override_settings(RETRY_DROPPED_TENANT_IDS=raw):
+                self.assertEqual(_dropped_retry_enabled(self.tenant), enabled)
+
     @patch("apps.router.push_views.notify_app_reply_error")
     @patch("apps.cron.publish.publish_task")
-    def test_only_exact_thinking_phase_is_narrative_evidence(self, publish, notify_error):
-        for phase in ("", "waking", "tool", "composing"):
+    def test_other_progress_phases_never_retry(self, publish, notify_error):
+        for phase in ("waking", "tool", "composing"):
             with self.subTest(phase=phase):
                 turn, _ = self._pair(f"phase-{phase or 'empty'}", phase=phase)
                 self._drop()
@@ -278,7 +360,7 @@ class DroppedAppTurnRetryTest(TestCase):
                 self.assertIsNone(turn.retried_at)
                 self.assertFalse(any(call.args[0] == "retry_dropped_app_turn" for call in publish.call_args_list))
                 publish.reset_mock()
-        self.assertEqual(notify_error.call_count, 4)
+        self.assertEqual(notify_error.call_count, 3)
 
     @patch("apps.router.push_views.notify_app_reply_error")
     @patch("apps.cron.publish.publish_task")

@@ -19,6 +19,7 @@ a hand-fed literal would happily agree with itself while production diverged.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -83,6 +84,11 @@ class TaskHygieneGateTests(TestCase):
         with override_settings(TASK_HYGIENE_TENANT_IDS=raw):
             self.assertTrue(task_hygiene_enabled(self.tenant))
             self.assertTrue(task_hygiene_enabled(other))
+
+    def test_gate_accepts_only_exact_wildcard_tokens(self):
+        for raw, enabled in (("*", True), ("other, * ", True), ("prefix*", False), ("**", False)):
+            with self.subTest(raw=raw), override_settings(TASK_HYGIENE_TENANT_IDS=raw):
+                self.assertEqual(task_hygiene_enabled(self.tenant), enabled)
 
 
 class TaskHygieneSeedingTests(TestCase):
@@ -150,6 +156,59 @@ class TaskHygieneSeedingTests(TestCase):
         self.assertEqual(CronJob.objects.filter(tenant=self.tenant, name=TASK_HYGIENE_CRON_NAME).count(), 1)
         cron.refresh_from_db()
         self.assertFalse(cron.enabled)
+
+    def test_config_apply_refreshes_only_managed_payload_fields_and_preserves_enabled(self):
+        from apps.cron.share_cron_sync import build_signed_crons_doc
+        from apps.orchestrator.cron_reconcile import _row_to_cron_dict
+        from apps.orchestrator.services import refresh_system_cron_rows_from_seed
+
+        self.seed_gated()
+        cron = CronJob.objects.get(tenant=self.tenant, name=TASK_HYGIENE_CRON_NAME)
+        cron.typed_payload = {"stale_after_days": 21}
+        cron.save()
+        rendered_payload = deepcopy(cron.data["payload"])
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                old_data = deepcopy(cron.data)
+                old_data["schedule"]["expr"] = "15 17 * * 0"
+                old_data["payload"].update(message="Old prompt", timeoutSeconds=120, model="custom-model")
+                CronJob.objects.filter(pk=cron.pk).update(data=old_data, enabled=enabled)
+
+                with override_settings(TASK_HYGIENE_TENANT_IDS=str(self.tenant.id)):
+                    refresh_system_cron_rows_from_seed(self.tenant)
+
+                cron.refresh_from_db()
+                expected = deepcopy(old_data)
+                expected["payload"].update(
+                    message=rendered_payload["message"],
+                    timeoutSeconds=300,
+                )
+                self.assertEqual(cron.data, expected)
+                self.assertEqual(cron.typed_payload, {"stale_after_days": 21})
+                self.assertEqual(cron.enabled, enabled)
+                self.assertIn("at least 21 days", cron.data["payload"]["message"])
+                gateway_job = _row_to_cron_dict(cron)
+                self.assertEqual(gateway_job["enabled"], enabled)
+                self.assertEqual(gateway_job["payload"]["timeoutSeconds"], 300)
+                with patch("apps.cron.gateway_client.get_gateway_token_for_tenant", return_value="test-key"):
+                    document, _ = build_signed_crons_doc(self.tenant)
+                signed_jobs = json.loads(json.loads(document)["signed"])
+                jobs = [job for job in signed_jobs if job["name"] == TASK_HYGIENE_CRON_NAME]
+                self.assertEqual(len(jobs), int(enabled))
+                if enabled:
+                    self.assertEqual(jobs[0]["payload"], cron.data["payload"])
+
+    def test_existing_user_row_is_not_refreshed(self):
+        self.seed_gated()
+        cron = CronJob.objects.get(tenant=self.tenant, name=TASK_HYGIENE_CRON_NAME)
+        old_data = deepcopy(cron.data)
+        old_data["payload"].update(message="User prompt", timeoutSeconds=120)
+        CronJob.objects.filter(pk=cron.pk).update(source=CronJobSource.USER, data=old_data)
+
+        self.seed_gated()
+
+        cron.refresh_from_db()
+        self.assertEqual(cron.data, old_data)
 
 
 class TaskHygieneGateConvergesOffTests(TestCase):
@@ -231,6 +290,19 @@ class TaskHygieneRenderedTurnTests(TestCase):
         with override_settings(TASK_HYGIENE_TENANT_IDS=str(self.tenant.id)):
             seed_task_hygiene_cron(self.tenant)
         self.cron = CronJob.objects.get(tenant=self.tenant, name=TASK_HYGIENE_CRON_NAME)
+
+    def test_turn_bounds_stale_review_and_allows_five_minutes(self):
+        payload = self.cron.data["payload"]
+        self.assertEqual(payload["timeoutSeconds"], 300)
+        for marker in (
+            "status: 'open'",
+            "status: 'in_progress'",
+            "no activity for at least 14 days",
+            "`updated_at`, oldest first",
+            "at most 25 stale candidates",
+            "Steps 2–4 apply only to these candidates",
+        ):
+            self.assertIn(marker, payload["message"])
 
     def test_toolsallow_on_the_real_row_is_pinned_exactly(self):
         self.assertEqual(

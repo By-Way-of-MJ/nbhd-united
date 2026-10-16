@@ -540,10 +540,13 @@ def _rules_template_dir() -> str:
 
 _SUBAGENT_CHAT_INSTRUCTIONS = (
     "## Slow tasks\n\n"
-    "Delegate only work likely to take more than about 30 seconds: multi-step research, "
-    "long-document analysis, or large generation. Answer simple questions directly. "
-    "Call `sessions_spawn` BEFORE starting the work, then reply immediately: "
-    '"On it — I\'ll let you know when it\'s ready." Never pass `context: "fork"`; '
+    "Call `sessions_spawn` FIRST, before doing the work, when the request needs "
+    "2+ web searches, reading or summarising a long document or many pages, or "
+    "producing a multi-part plan, report, or comparison. If `sessions_spawn` isn't "
+    "loaded, find it via tool search. After spawning, reply immediately: "
+    "\"On it — I'll let you know when it's ready.\" Answer directly for everything else. "
+    "Example: 'Compare three holiday destinations' → spawn a helper first. "
+    'Never pass `context: "fork"`; '
     "give only bounded context. The helper is read-only, reports back to you, and must not "
     "send, create, publish, or act outward. On an `[Internal task completion event]`, "
     "send exactly one `nbhd_send_to_user` update to the requester's `thread_id`, in your "
