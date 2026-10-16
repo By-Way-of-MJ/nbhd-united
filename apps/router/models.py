@@ -403,6 +403,30 @@ class ProactiveOutbound(models.Model):
         return f"ProactiveOutbound({self.channel}, tenant={self.tenant_id}, job={self.job_name or '-'})"
 
 
+class HelperRun(models.Model):
+    """Durable closure obligation, admitted before a runtime helper starts."""
+
+    class ClosedBy(models.TextChoices):
+        RESULT = "result", "Result"
+        FAILURE = "failure", "Failure"
+
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE)
+    thread = models.ForeignKey("router.ChatThread", on_delete=models.CASCADE)
+    occurrence_key = models.CharField(max_length=64)
+    deadline = models.DateTimeField()
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.CharField(max_length=7, choices=ClosedBy.choices, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["tenant", "occurrence_key"], name="helper_unique_tenant_occurrence"),
+        ]
+        indexes = [
+            models.Index(fields=["deadline"], condition=models.Q(closed_at=None), name="helper_pending_deadline")
+        ]
+
+
 class DeliveryAttempt(models.Model):
     """Claims one degraded proactive-delivery occurrence before transport."""
 

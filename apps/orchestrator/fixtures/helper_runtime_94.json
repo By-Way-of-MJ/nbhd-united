@@ -1,0 +1,95 @@
+{
+  "package": "openclaw",
+  "version": "2026.9.4",
+  "source": "https://registry.npmjs.org/openclaw/-/openclaw-2026.9.4.tgz",
+  "files": {
+    "dist/agent-harness-runtime-BvaKEkqR.d.ts": {
+      "sha256": "0ddff2cd2b4be51f31cac08f3e20d32bff363355f1df78c7249226c13015580d",
+      "excerpts": [
+        {
+          "start_line": 1800,
+          "text": "type PluginHookSubagentContext = {\n  runId?: string;\n  childSessionKey?: string;\n  requesterSessionKey?: string;\n};\ntype PluginHookSubagentTargetKind = \"subagent\" | \"acp\";\ntype PluginHookSubagentRequester = {\n  channel?: string;\n  accountId?: string;\n  to?: string;\n  threadId?: string | number;\n  /** Native source channel/conversation id, when distinct from the routable target. */\n  channelId?: string | number;\n  /** Native source message that initiated the parent run, when available. */\n  messageId?: string | number;\n};\ntype PluginHookSubagentSpawnBase = {\n  childSessionKey: string;\n  agentId: string;\n  label?: string;\n  mode: \"run\" | \"session\";\n  requester?: PluginHookSubagentRequester;\n  threadRequested: boolean;\n};"
+        },
+        {
+          "start_line": 1850,
+          "text": "type PluginHookSubagentSpawnedEvent = PluginHookSubagentSpawnBase & {\n  runId: string;\n  /** Fully resolved provider/model ref applied to the spawned child session. */\n  resolvedModel?: string;\n  /** Provider prefix parsed from resolvedModel when the ref includes one. */\n  resolvedProvider?: string;\n};\n/** Portable channel presentation signal for one background child run. */"
+        },
+        {
+          "start_line": 1870,
+          "text": "type PluginHookSubagentEndedEvent = {\n  targetSessionKey: string;\n  targetKind: PluginHookSubagentTargetKind;\n  reason: string;\n  sendFarewell?: boolean;\n  accountId?: string;\n  runId?: string;\n  endedAt?: number;\n  outcome?: \"ok\" | \"error\" | \"timeout\" | \"killed\" | \"reset\" | \"deleted\";\n  error?: string;\n};\ntype PluginHookGatewayContext = {"
+        }
+      ]
+    },
+    "dist/subagent-completion-admission.store-9z9LjJoT.mjs": {
+      "sha256": "2c35132400baa832fcaab4c18690aa406ee53c75e282c6853d7ad85eccb3558b",
+      "excerpts": [
+        {
+          "start_line": 118,
+          "text": "/** Emits the subagent_ended hook once per completed run. */\nasync function emitSubagentEndedHookOnce(params) {\n\tconst runId = params.entry.runId.trim();\n\tif (!runId) return false;\n\tif (params.entry.endedHookEmittedAt) return false;\n\tif (params.inFlightRunIds.has(runId)) return false;\n\tparams.inFlightRunIds.add(runId);\n\ttry {\n\t\tconst hookRunner = getGlobalHookRunner();\n\t\tif (!hookRunner) return false;\n\t\tif (hookRunner?.hasHooks(\"subagent_ended\")) await hookRunner.runSubagentEnded({\n\t\t\ttargetSessionKey: params.entry.childSessionKey,\n\t\t\ttargetKind: SUBAGENT_TARGET_KIND_SUBAGENT,\n\t\t\treason: params.reason,\n\t\t\tsendFarewell: params.sendFarewell,\n\t\t\taccountId: params.accountId,\n\t\t\trunId: params.entry.runId,\n\t\t\tendedAt: params.entry.execution.endedAt,\n\t\t\toutcome: params.outcome,\n\t\t\terror: params.error\n\t\t}, {\n\t\t\trunId: params.entry.runId,\n\t\t\tchildSessionKey: params.entry.childSessionKey,\n\t\t\trequesterSessionKey: params.entry.requesterSessionKey\n\t\t});\n\t\tparams.entry.endedHookEmittedAt = Date.now();\n\t\tparams.persist(runId);\n\t\treturn true;\n\t} catch (err) {\n\t\tlog.warn(`failed to emit subagent_ended hook for run ${runId}: ${err instanceof Error ? err.message : String(err)}`);\n\t\treturn false;\n\t} finally {\n\t\tparams.inFlightRunIds.delete(runId);\n\t}\n}"
+        }
+      ]
+    },
+    "dist/zod-schema.agent-runtime-Ca6cjqf9.mjs": {
+      "sha256": "931fed6cdd2f8a30a040ecf2d6dda5378a8e7434ef49824ff8b3428d19183b9e",
+      "excerpts": [
+        {
+          "start_line": 468,
+          "text": "const ToolLoopDetectionSchema = object({ enabled: boolean().optional() }).strict().optional();"
+        }
+      ]
+    },
+    "dist/zod-schema-Q1KXOooO.mjs": {
+      "sha256": "1eee389a2c999b374caf2d605275895567d76b24e1d0f90c1e7a3b31ef4756d1",
+      "excerpts": [
+        {
+          "start_line": 267,
+          "text": "\tsubagents: object({\n\t\tdelegationMode: _enum([\"suggest\", \"prefer\"]).optional(),\n\t\tallowAgents: array(string()).optional(),\n\t\tmaxConcurrent: number().int().positive().optional(),\n\t\tmaxSpawnDepth: number().int().min(1).max(5).optional().describe(\"Maximum nesting depth for sub-agent spawning. Default: 5; 1 makes direct children leaves.\"),\n\t\tmaxChildrenPerAgent: number().int().min(1).max(20).optional().describe(\"Maximum number of active children a single agent session can spawn (default: 5).\"),\n\t\tarchiveAfterMinutes: number().int().min(0).optional(),\n\t\tmodel: AgentModelSchema.optional(),\n\t\tthinking: string().optional(),\n\t\trunTimeoutSeconds: number().int().min(0).optional(),\n\t\tannounceTimeoutMs: number().int().positive().optional(),\n\t\trequireAgentId: boolean().optional()\n\t}).strict().optional(),"
+        }
+      ]
+    },
+    "dist/tool-loop-detection-CJSZExqJ.mjs": {
+      "sha256": "a11817902cbff6bc7439a99b811821e86f8a1fa3cd66fa713cc646f6caeed4e0",
+      "excerpts": [
+        {
+          "start_line": 214,
+          "text": "const TOOL_CALL_HISTORY_SIZE = 30;\nconst CRITICAL_THRESHOLD = 20;\nconst GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30;\nfunction selectHistoryForScope(history, scope) {"
+        },
+        {
+          "start_line": 555,
+          "text": "\tif (pingPong.count >= CRITICAL_THRESHOLD && pingPong.noProgressEvidence) {\n\t\tlog.error(`Critical ping-pong loop detected: alternating calls count=${pingPong.count} currentTool=${toolName}`);\n\t\treturn {\n\t\t\tstuck: true,\n\t\t\tlevel: \"critical\",\n\t\t\tdetector: \"ping_pong\",\n\t\t\tcount: pingPong.count,\n\t\t\tmessage: `CRITICAL: You are alternating between repeated tool-call patterns (${pingPong.count} consecutive calls) with no progress. This appears to be a stuck ping-pong loop. Session execution blocked to prevent resource waste.`,\n\t\t\tpairedToolName: pingPong.pairedToolName,\n\t\t\twarningKey: pingPongWarningKey\n\t\t};\n\t}"
+        },
+        {
+          "start_line": 581,
+          "text": "\tif (!knownPollTool && noProgressStreak >= CRITICAL_THRESHOLD) {\n\t\tlog.error(`Critical generic loop detected: ${toolName} repeated ${noProgressStreak} times`);\n\t\treturn {\n\t\t\tstuck: true,\n\t\t\tlevel: \"critical\",\n\t\t\tdetector: \"generic_repeat\",\n\t\t\tcount: noProgressStreak,\n\t\t\tmessage: `CRITICAL: Called ${toolName} with identical outcomes ${noProgressStreak} times. Session execution blocked to prevent runaway loops.`,\n\t\t\twarningKey: `generic:${toolName}:${currentHash}:${noProgress.latestResultHash ?? \"none\"}`\n\t\t};\n\t}"
+        }
+      ]
+    },
+    "dist/subagent-announce-Demk1EmD.mjs": {
+      "sha256": "4800c48c07ed0c25a7aa01223054723293fe44b1d6923be6932eadde9d593af3",
+      "excerpts": [
+        {
+          "start_line": 228,
+          "text": "\t\t\tchildRunId: params.childRunId\n\t\t});\n\t\tif (params.wakeOnDescendantSettle === true && childCompletionFindings?.trim() && subagentRegistryRuntime) {\n\t\t\tif (await runDescendantWake({\n\t\t\t\trunId: params.childRunId,\n\t\t\t\tchildSessionKey: params.childSessionKey,\n\t\t\t\ttaskLabel: params.label || params.task || \"task\",\n\t\t\t\tfindings: childCompletionFindings,\n\t\t\t\tannounceId,\n\t\t\t\tisChildSessionEffectsAllowed: () => childSessionEffectsAllowed() && completionDeliveryAllowed(),"
+        }
+      ]
+    },
+    "dist/subagent-announce-delivery-Dcn7g21F.mjs": {
+      "sha256": "11fe7aad923e180df1b73c74886e67c78241e400bd2c954bb294f3c8e085230e",
+      "excerpts": [
+        {
+          "start_line": 196,
+          "text": "function formatTaskCompletionEvent(event, mode) {\n\tconst singleLine = (value, fallback) => sanitizeSingleLineField(value, fallback, mode === \"data\");\n\tconst sessionKey = singleLine(event.childSessionKey, \"unknown\");\n\tconst sessionId = singleLine(event.childSessionId ?? \"unknown\", \"unknown\");\n\tconst announceType = singleLine(event.announceType, \"unknown\");\n\tconst taskLabel = singleLine(event.taskLabel, \"unnamed task\");\n\tconst statusLabel = truncateWithMarker(singleLine(event.statusLabel, event.status), MAX_TASK_COMPLETION_STATUS_LABEL_CHARS, {\n\t\tmarker: TASK_COMPLETION_STATUS_LABEL_TRUNCATION_MARKER,\n\t\treserve: 12,\n\t\ttrimEnd: true\n\t});\n\tconst result = mode === \"data\" ? truncateWithMarker(event.result || \"(no output)\", MAX_TASK_COMPLETION_RESULT_ESCAPED_CHARS, {\n\t\tmarker: TASK_COMPLETION_RESULT_TRUNCATION_NOTICE,\n\t\treserve: 25,\n\t\ttrimEnd: true\n\t}) : formatChildResultDataBlock(event.result);\n\tconst modelRouteChange = normalizeAgentRunRouteChange(event.modelRouteChange);\n\tconst attachmentLines = formatGeneratedAttachmentLines(event.attachments);\n\tconst mediaDirectiveLines = formatGeneratedMediaDirectiveLines(event, mode === \"data\");\n\tconst lines = mode !== \"plain\" ? [\"[Internal task completion event]\"] : [\"A background task completed. Use this result to reply to the user in your normal assistant voice.\", \"\"];\n\tlines.push(`source: ${event.source}`, `session_key: ${sessionKey}`, `session_id: ${sessionId}`, `type: ${announceType}`, `task: ${taskLabel}`, `status: ${statusLabel}`, \"\", result);"
+        }
+      ]
+    },
+    "dist/sessions-spawn-tool-2GiVSHqU.mjs": {
+      "sha256": "01675d7193765f25b2f1345ed2a04d3bb88e96041eaca65b795cb41c42b28882",
+      "excerpts": [
+        {
+          "start_line": 2068,
+          "text": "\t\tif (params.hookRunner?.hasHooks(\"subagent_spawned\")) try {\n\t\t\tawait params.hookRunner.runSubagentSpawned({\n\t\t\t\trunId: hookRunId,\n\t\t\t\tchildSessionKey: params.childSessionKey,\n\t\t\t\tagentId: params.targetAgentId,\n\t\t\t\tlabel: params.label,\n\t\t\t\trequester: {\n\t\t\t\t\tchannel: params.requesterOrigin?.channel,\n\t\t\t\t\taccountId: params.requesterOrigin?.accountId,\n\t\t\t\t\tto: params.requesterOrigin?.to,\n\t\t\t\t\tthreadId: params.requesterOrigin?.threadId\n\t\t\t\t},\n\t\t\t\tthreadRequested: params.requestThreadBinding,\n\t\t\t\tmode: params.spawnMode,\n\t\t\t\t...params.resolvedModelMetadata\n\t\t\t}, {\n\t\t\t\trunId: hookRunId,\n\t\t\t\tchildSessionKey: params.childSessionKey,\n\t\t\t\trequesterSessionKey: params.requesterInternalKey\n\t\t\t});\n\t\t} catch {}"
+        }
+      ]
+    }
+  }
+}

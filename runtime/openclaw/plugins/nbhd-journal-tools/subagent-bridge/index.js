@@ -22,6 +22,9 @@ const MAX_TENANT_DAILY_SPAWNS = 10;
 const MAX_TRACKED_SESSIONS = 2000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 7000;
 const RETRY_BACKOFF_MS = [0, 250, 750];
+const HELPER_TIMEOUT_SECONDS = 300;
+const FAILURE_MESSAGE = "I couldn't finish that research — want me to try again here?";
+const HELPER_LABEL = /^\[nbhd-(helper:[0-9a-f]{48})\]/;
 
 const sessionSpawnTimes = new Map();
 const tenantDailySpawns = new Map();
@@ -73,18 +76,18 @@ export function injectOccurrenceKey(event, occurrenceKey) {
   const params = asObject(event?.params);
   if (resolveRealToolId(event) !== SEND_TOOL_ID) return undefined;
   if (asTrimmedString(event?.toolName).toLowerCase() !== TOOL_DISPATCH_META) {
-    return { ...params, occurrence_key: occurrenceKey };
+    return { ...params, occurrence_key: occurrenceKey, job_name: "_subagent_result" };
   }
   for (const nestedKey of ["params", "arguments"]) {
     const nested = asObject(params[nestedKey]);
     if (Object.keys(nested).length > 0) {
       return {
         ...params,
-        [nestedKey]: { ...nested, occurrence_key: occurrenceKey },
+        [nestedKey]: { ...nested, occurrence_key: occurrenceKey, job_name: "_subagent_result" },
       };
     }
   }
-  return { ...params, occurrence_key: occurrenceKey };
+  return { ...params, occurrence_key: occurrenceKey, job_name: "_subagent_result" };
 }
 
 function utcDay(nowMs) {
@@ -207,6 +210,7 @@ export function parseAnnounceTurn(prompt, sessionKey) {
     status: parsedStatus.status,
     rawStatus: parsedStatus.raw,
     childResult: extractChildResult(normalized),
+    occurrenceKey: normalized.match(/^task:\s*\[nbhd-(helper:[0-9a-f]{48})\]/m)?.[1] || "",
   };
 }
 
@@ -265,12 +269,12 @@ function delay(ms) {
   return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
 
-async function postCompletion(runtime, info, runId, message) {
+async function postRuntime(runtime, path, body, occurrenceKey = "") {
   if (!runtime.apiBaseUrl || !runtime.tenantId || !runtime.internalKey) {
     throw new Error("missing bridge runtime configuration");
   }
   const url = new URL(
-    `/api/v1/integrations/runtime/${encodeURIComponent(runtime.tenantId)}/send-to-user/`,
+    `/api/v1/integrations/runtime/${encodeURIComponent(runtime.tenantId)}/${path}`,
     runtime.apiBaseUrl,
   );
   let lastError;
@@ -286,20 +290,59 @@ async function postCompletion(runtime, info, runId, message) {
           "X-NBHD-Internal-Key": runtime.internalKey,
           "X-NBHD-Tenant-Id": runtime.tenantId,
           "X-NBHD-Job-Name": "_subagent_result",
-          "X-NBHD-Occurrence-Key": `subagent:${runId}`.slice(0, 64),
+          "X-NBHD-Occurrence-Key": occurrenceKey,
         },
-        body: JSON.stringify({ message, thread_id: info.threadId }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
-      if (response.ok) return;
-      lastError = new Error(`send-to-user returned ${response.status}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (["sent", "duplicate", "pending"].includes(data?.status)) return;
+      }
+      lastError = new Error(`runtime ${path} returned ${response.status} without acceptance`);
     } catch (error) {
       lastError = error;
     } finally {
       clearTimeout(timeout);
     }
   }
-  throw lastError || new Error("send-to-user failed");
+  throw lastError || new Error("runtime request failed");
+}
+
+function postCompletion(runtime, info, runId, message) {
+  return postRuntime(runtime, "send-to-user/", { message, thread_id: info.threadId },
+    info.occurrenceKey || `subagent:${runId}`.slice(0, 64));
+}
+
+async function admitSpawn(api, runtime, event, ctx) {
+  try {
+    const threadId = extractThreadId(asTrimmedString(ctx?.sessionKey));
+    if (!threadId) return block("Background helpers require an app conversation thread. Answer here instead.");
+    const outer = asObject(event?.params);
+    const wrapped = asTrimmedString(event?.toolName).toLowerCase() === TOOL_DISPATCH_META;
+    const nestedKey = wrapped ? ["params", "arguments"].find((key) => Object.keys(asObject(outer[key])).length) : null;
+    if (wrapped && !nestedKey) return block(SESSION_SPAWN_BLOCK_REASON);
+    const params = nestedKey ? outer[nestedKey] : outer;
+    if (!asTrimmedString(params.task)) return undefined;
+    const occurrenceKey = `helper:${createHash("sha256").update(spawnCallKey(
+      event, ctx, asTrimmedString(ctx?.runId || event?.runId), ctx.sessionKey, runtime.tenantId,
+    )).digest("hex").slice(0, 48)}`;
+    // Await the durable obligation BEFORE permitting OpenClaw to launch. A
+    // lost HTTP response is safe: retries use the same key and never rearm it.
+    await postRuntime(runtime, "helpers/admit/", { occurrence_key: occurrenceKey, thread_id: threadId });
+    const timeout = Number(params.runTimeoutSeconds);
+    const overrides = {
+      ...params,
+      label: `[nbhd-${occurrenceKey}] ${asTrimmedString(params.label).replace(HELPER_LABEL, "").trim()}`.trim(),
+      // Zero disables OpenClaw's timeout. Never allow it or a model-supplied
+      // longer timeout to outlive the server watchdog's bounded run budget.
+      runTimeoutSeconds: Number.isInteger(timeout) && timeout > 0 ? Math.min(timeout, HELPER_TIMEOUT_SECONDS) : HELPER_TIMEOUT_SECONDS,
+    };
+    return { params: nestedKey ? { ...outer, [nestedKey]: overrides } : overrides };
+  } catch (error) {
+    safeLog(api, "error", `nbhd-subagent-bridge: admission failed: ${safeErrorText(error)}`);
+    return block("I couldn't arrange a reliable background update. Answer the user here instead.");
+  }
 }
 
 export default function register(api) {
@@ -308,6 +351,7 @@ export default function register(api) {
   const runtime = getRuntimeConfig(api);
   const markedRuns = new Map();
   const successfulSendRuns = new Set();
+  const spawnedRuns = new Map();
   safeLog(api, "warn", "nbhd-subagent-bridge: registered");
 
   api.on("before_tool_call", (event, ctx) => {
@@ -331,7 +375,10 @@ export default function register(api) {
             `nbhd-subagent-bridge: sessions_spawn blocked runId=${asTrimmedString(ctx?.runId || event?.runId) || "?"}`,
           );
         }
-        return decision;
+        if (decision) return decision;
+        if (asTrimmedString(event?.toolName).toLowerCase() === SPAWN_TOOL_ID
+            && !asTrimmedString(asObject(event?.params).task)) return undefined;
+        return admitSpawn(api, runtime, event, ctx);
       } catch (error) {
         safeLog(api, "error", `nbhd-subagent-bridge: sessions_spawn guard error: ${safeErrorText(error)}`);
         return block(SESSION_SPAWN_BLOCK_REASON);
@@ -342,13 +389,37 @@ export default function register(api) {
       try {
         const runId = asTrimmedString(ctx?.runId || event?.runId);
         if (!runId || !markedRuns.has(runId)) return undefined;
-        const params = injectOccurrenceKey(event, `subagent:${runId}`.slice(0, 64));
+        const params = injectOccurrenceKey(event, markedRuns.get(runId).occurrenceKey || `subagent:${runId}`.slice(0, 64));
         return params ? { params } : undefined;
       } catch (error) {
         safeLog(api, "warn", `nbhd-subagent-bridge: occurrence injection failed: ${safeErrorText(error)}`);
       }
     }
     return undefined;
+  });
+
+  // Verified 2026.9.4 lifecycle payloads; see docs/reference/helper-closure.md.
+  // This fast path is best-effort. The backend admission survives lost hooks,
+  // registry persistence failure, and container restart.
+  api.on("subagent_spawned", (event, ctx) => {
+    const occurrenceKey = asTrimmedString(event?.label).match(HELPER_LABEL)?.[1];
+    const threadId = extractThreadId(asTrimmedString(ctx?.requesterSessionKey));
+    if (!occurrenceKey || !threadId || !event?.runId) return;
+    if (spawnedRuns.size >= MAX_TRACKED_SESSIONS) spawnedRuns.delete(spawnedRuns.keys().next().value);
+    spawnedRuns.set(event.runId, { occurrenceKey, threadId });
+  });
+
+  api.on("subagent_ended", async (event) => {
+    const info = spawnedRuns.get(event?.runId);
+    if (!info || event?.targetKind !== "subagent") return;
+    spawnedRuns.delete(event.runId);
+    if (event.outcome === "ok") return; // Allow parent review; watchdog owns lost successes.
+    try {
+      await postCompletion(runtime, info, event.runId, FAILURE_MESSAGE);
+      safeLog(api, "info", `[subagent-bridge] delivered_by=ended_hook status=failed runId=${event.runId}`);
+    } catch (error) {
+      safeLog(api, "error", `nbhd-subagent-bridge: ended delivery failed: ${safeErrorText(error)}`);
+    }
   });
 
   // OpenClaw 2026.9.4 removed the before_agent_start hook. before_prompt_build is

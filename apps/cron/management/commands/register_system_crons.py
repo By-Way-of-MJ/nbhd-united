@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # System crons: (name, cron_expr, path)
 # cron_expr is UTC
 SYSTEM_CRONS = [
+    ("close-expired-helpers", "* * * * *", "/api/cron/trigger/close_expired_helpers/"),
     # Every 60 min — push workspace files + update idle container images
     ("apply-pending-configs", "0 * * * *", "/api/cron/apply-pending-configs/"),
     # Daily at midnight UTC — reset per-day usage counters

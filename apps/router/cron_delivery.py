@@ -653,6 +653,18 @@ class CronDeliveryView(APIView):
         delivery_attempt = None
         occurrence_key_header = request.headers.get("X-NBHD-Occurrence-Key", "").strip()[:64]
         explicit_occurrence_key = occurrence_key_header if job_name == "_subagent_result" else ""
+        if explicit_occurrence_key.startswith("helper:"):
+            from apps.router.helper_runs import deliver_helper
+
+            return deliver_helper(
+                tenant=tenant,
+                occurrence_key=explicit_occurrence_key,
+                message_text=placeholder_message_text,
+                thread_id=requested_thread_id,
+                panels=panels,
+                quick_replies=quick_replies,
+                journal_link=journal_link,
+            )
         if occurrence_key_header and not explicit_occurrence_key:
             logger.debug(
                 "delivery_occurrence_key_ignored tenant=%s job_name=%s",
