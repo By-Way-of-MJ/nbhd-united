@@ -3029,7 +3029,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                         "runTimeoutSeconds": 600,
                         "announceTimeoutMs": 120000,
                         "archiveAfterMinutes": 60,
-                        "model": TIER_TASK_DEFAULTS["starter"]["background_tasks"],
+                        "model": models_config["primary"],
                         "delegationMode": "suggest",
                     }
                     if subagents_on
