@@ -483,8 +483,9 @@ def task_hygiene_enabled(tenant: Tenant) -> bool:
     cannot drift into disagreeing about who gets a proactive sender.
 
     Backed by ``settings.TASK_HYGIENE_TENANT_IDS`` — a comma-separated
-    allowlist of tenant UUIDs. Unset/empty means NOBODY: this cron messages
-    the user unprompted, so it fails closed and is opened one tenant at a time
+    allowlist of tenant UUIDs, or the exact token ``*`` for everyone. Unset/empty
+    means NOBODY: this cron messages the user unprompted, so it fails closed
+    and is opened one tenant at a time
     (canary first, per the standing rollout ladder). Fleet-go is a deliberate
     later change, never a side effect of this code deploying.
     """
@@ -494,6 +495,8 @@ def task_hygiene_enabled(tenant: Tenant) -> bool:
     allowed = {part.strip().lower() for part in raw.split(",") if part.strip()}
     if not allowed:
         return False
+    if "*" in allowed:
+        return True
     if str(tenant.id).lower() in allowed:
         return True
     # The allowlist is populated but this tenant is not on it. Almost always
@@ -528,11 +531,9 @@ def seed_task_hygiene_cron(tenant: Tenant) -> dict[str, Any]:
     from — the gate converges without a manual DB write.
 
     GATE OPEN, no row      → create it.
-    GATE OPEN, row exists  → leave it EXACTLY as it is, enabled or not. This is
-                             what makes "user turns the weekly cleanup off"
-                             stick: a check that only looked for enabled rows
-                             would helpfully recreate it on the next config
-                             apply and the user could never be rid of it.
+    GATE OPEN, row exists  → refresh the managed system prompt and timeout,
+                             preserving enabled and all other row settings.
+                             This makes a user's "off" stick across applies.
     GATE CLOSED, row exists → DISABLE it. Removing a tenant from the allowlist
                              is the rollback lever for a proactive sender, so it
                              has to actually stop the sending — a gate that only
@@ -563,11 +564,33 @@ def seed_task_hygiene_cron(tenant: Tenant) -> dict[str, Any]:
         result["reason"] = "not_gated"
         return result
 
-    if existing is not None:
-        result["reason"] = "already_exists"
-        return result
-
     try:
+        if existing is not None:
+            if (
+                existing.source == CronJobSource.SYSTEM
+                and existing.managed
+                and existing.creation_path == CronCreationPath.TYPED
+                and existing.pattern == CronPattern.TASK_HYGIENE
+            ):
+                handler = get_handler(existing.pattern)
+                payload = handler.validate_payload(existing.typed_payload or {})
+                rendered = handler.build_oc_data(
+                    payload,
+                    tenant=tenant,
+                    name=existing.name,
+                    schedule=existing.data["schedule"],
+                )
+                data = deepcopy(existing.data)
+                for field in ("message", "timeoutSeconds"):
+                    data["payload"][field] = rendered["payload"][field]
+                if data != existing.data:
+                    # The typed pre-save signal skips unchanged inputs. Persist
+                    # just these derived fields; post-save queues reconciliation.
+                    existing.data = data
+                    existing.save(update_fields=["data", "updated_at"])
+            result["reason"] = "already_exists"
+            return result
+
         create_typed_cron(
             tenant=tenant,
             pattern=CronPattern.TASK_HYGIENE,

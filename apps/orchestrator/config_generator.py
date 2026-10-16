@@ -112,14 +112,16 @@ SUBAGENT_READ_ONLY_TOOLS: tuple[str, ...] = (
 def subagents_enabled(tenant: Tenant | None) -> bool:
     """Return whether native OpenClaw helper offload is open for ``tenant``.
 
-    ``SUBAGENT_TENANT_IDS`` is a comma-separated canary allowlist. Empty means
-    nobody. A populated miss is logged at INFO because a typo otherwise looks
-    exactly like a correctly dark tenant.
+    ``SUBAGENT_TENANT_IDS`` is a comma-separated allowlist; ``*`` opens it to
+    every tenant and empty means nobody. A miss is logged at INFO because a
+    typo otherwise looks exactly like a correctly dark tenant.
     """
     raw = str(getattr(settings, "SUBAGENT_TENANT_IDS", "") or "")
     allowed = {part.strip().lower() for part in raw.split(",") if part.strip()}
     if not allowed or tenant is None:
         return False
+    if "*" in allowed:
+        return True
     if str(tenant.id).lower() in allowed:
         return True
     logger.info(

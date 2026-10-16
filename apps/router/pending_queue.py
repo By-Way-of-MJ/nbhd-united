@@ -99,8 +99,8 @@ _DROPPED_RETRY_HEALTH_DELAY_SECONDS = 120
 # is accepted until the deferred wrapping-plugin guard lands.
 _DROPPED_RETRY_MAX_DROP_AGE_SECONDS = 30
 
-# Narration is only corroborating evidence: exact ``thinking`` is required,
-# while the control plane's runtime-write record is authoritative for mutations.
+# Once progress is reported, only exact ``thinking`` can qualify for replay;
+# the control plane's runtime-write record is authoritative for mutations.
 _DROPPED_RETRY_SAFE_PHASE = "thinking"
 
 # Seconds to wait after waking a hibernated container before re-attempting
@@ -1054,6 +1054,8 @@ def _dropped_retry_enabled(tenant: Tenant) -> bool:
     allowed = {part.strip().lower() for part in raw.split(",") if part.strip()}
     if not allowed:
         return False
+    if "*" in allowed:
+        return True
     if str(tenant.id).lower() in allowed:
         return True
     logger.info(
@@ -1064,12 +1066,19 @@ def _dropped_retry_enabled(tenant: Tenant) -> bool:
     return False
 
 
+def _dropped_retry_phase_is_safe(turn: AppChatMessage, dropped_stamped_at) -> bool:
+    """Untouched turns can replay; thinking turns retain the short safety window."""
+    return turn.phase == "" or (
+        turn.phase == _DROPPED_RETRY_SAFE_PHASE
+        and (dropped_stamped_at - turn.created_at).total_seconds() <= _DROPPED_RETRY_MAX_DROP_AGE_SECONDS
+    )
+
+
 def _is_silent_dropped_retry_candidate(turn: AppChatMessage, error: str, *, dropped_stamped_at) -> bool:
     """Conservative enqueue predicate, evaluated before terminalizing."""
-    # Four safety legs bound the accepted raw-cron residual: canary gate,
-    # exact thinking phase, no authoritative runtime write, and drop age at
-    # most 30 seconds. Follow-up guard lane: apps/cron/gateway_client.py's
-    # deferred wrapping-plugin guard for OC-native raw cron.add.
+    # Empty phase means the runtime never reported progress. Thinking turns
+    # retain the 30-second bound on the accepted raw-cron residual. Both paths
+    # require the gate and no authoritative runtime write; tool phases fail shut.
     return bool(
         error == "dropped"
         and _dropped_retry_enabled(turn.tenant)
@@ -1077,9 +1086,8 @@ def _is_silent_dropped_retry_candidate(turn: AppChatMessage, error: str, *, drop
         and turn.retried_at is None
         and turn.reply_text == ""
         and turn.partial_text == ""
-        and turn.phase == _DROPPED_RETRY_SAFE_PHASE
+        and _dropped_retry_phase_is_safe(turn, dropped_stamped_at)
         and not _runtime_write_in_retry_window(turn, dropped_stamped_at)
-        and (dropped_stamped_at - turn.created_at).total_seconds() <= _DROPPED_RETRY_MAX_DROP_AGE_SECONDS
         and not _app_turn_has_newer_message(turn)
     )
 
@@ -1332,8 +1340,8 @@ def retry_dropped_app_turn_task(turn_id: str) -> dict:
         if turn.status == AppChatMessage.Status.PENDING and turn.retried_at is not None:
             return {"retried": 0, "duplicate": True}
         # The canary gate is mutable and must still authorize the replay when
-        # this delayed task fires. Drop age is immutable once ``retried_at``
-        # stamps the original drop, so it does not need a fire-time re-check.
+        # this delayed task fires. Phase/age checks use ``retried_at``, the
+        # original drop timestamp, rather than the delayed task's fire time.
         if not _dropped_retry_enabled(tenant):
             return _exhaust("gate_revoked")
         if (
@@ -1342,7 +1350,7 @@ def retry_dropped_app_turn_task(turn_id: str) -> dict:
             or turn.retried_at is None
             or turn.source != AppChatMessage.Source.TENANT
             or turn.reply_text != ""
-            or turn.phase != _DROPPED_RETRY_SAFE_PHASE
+            or not _dropped_retry_phase_is_safe(turn, turn.retried_at)
             or _runtime_write_in_retry_window(turn, turn.retried_at)
         ):
             # A late original reply may have won the race and moved the row READY;
@@ -1404,7 +1412,7 @@ def retry_dropped_app_turn_task(turn_id: str) -> dict:
                 locked_turn.error != "dropped"
                 or locked_turn.retried_at is None
                 or locked_turn.reply_text != ""
-                or locked_turn.phase != _DROPPED_RETRY_SAFE_PHASE
+                or not _dropped_retry_phase_is_safe(locked_turn, locked_turn.retried_at)
                 or _runtime_write_in_retry_window(locked_turn, locked_turn.retried_at)
                 or _app_turn_has_newer_message(locked_turn)
             ):
