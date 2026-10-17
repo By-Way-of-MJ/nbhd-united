@@ -79,6 +79,8 @@ class RulesDeliveryTest(TestCase):
             for persona_key in PERSONAS:
                 prompt = render_workspace_files(persona_key, tenant=tenant)["NBHD_AGENTS_MD"]
                 for marker in (
+                    "Follow an `[NBHD routing: ...]` note on the current message",
+                    "An explicit user request to work in the background always means spawn",
                     "2+ web searches",
                     "long document or many pages",
                     "multi-part plan, report, or comparison",

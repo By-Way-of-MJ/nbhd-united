@@ -2815,6 +2815,26 @@ def _drain_ios_batch(
 
     content = annotate_model_context(content, getattr(tenant, "pii_entity_map", None))
 
+    # Only real app user turns participate, off the ingress POST path. Use the
+    # latest bare (already redacted) message, never recap/structural framing.
+    # Attachment flags survive even failed uploads. In a coalesced turn the
+    # routing note explicitly scopes itself to the latest request.
+    from apps.router.background_route import BACKGROUND_ROUTING_NOTE, route_background
+
+    latest = batch[-1]
+    if (latest.payload or {}).get("client_msg_id"):
+        routing = route_background(
+            latest.user_text or "",
+            tenant,
+            has_attachment=any(
+                (row.payload or {}).get("is_image") or (row.payload or {}).get("is_document") for row in batch
+            ),
+        )
+        if routing.decision == "background":
+            # Static server-owned framing goes AFTER all PII processing and is
+            # never persisted to user_text, queue payloads, or the app feed.
+            content += "\n" + BACKGROUND_ROUTING_NOTE
+
     url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 

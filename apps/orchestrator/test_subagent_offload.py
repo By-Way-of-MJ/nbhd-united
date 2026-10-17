@@ -168,6 +168,8 @@ class SubagentCanaryConfigTests(TestCase):
             with self.subTest(gate=gate), override_settings(SUBAGENT_TENANT_IDS=gate):
                 prompt = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
                 for marker in (
+                    "Follow an `[NBHD routing: ...]` note on the current message",
+                    "An explicit user request to work in the background always means spawn",
                     "`sessions_spawn` FIRST, before doing the work",
                     "2+ web searches",
                     "reading or summarising a long document or many pages",

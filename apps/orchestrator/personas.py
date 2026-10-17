@@ -540,6 +540,8 @@ def _rules_template_dir() -> str:
 
 _SUBAGENT_CHAT_INSTRUCTIONS = (
     "## Slow tasks\n\n"
+    "Follow an `[NBHD routing: ...]` note on the current message. "
+    "An explicit user request to work in the background always means spawn. "
     "Call `sessions_spawn` FIRST, before doing the work, when the request needs "
     "2+ web searches, reading or summarising a long document or many pages, or "
     "producing a multi-part plan, report, or comparison. If `sessions_spawn` isn't "
