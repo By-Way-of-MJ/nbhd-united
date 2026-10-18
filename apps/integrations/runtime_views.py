@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone as tz
 from pydantic import ValidationError as PydanticValidationError
 from rest_framework import status
@@ -2625,6 +2626,62 @@ class RuntimeSessionsPendingView(APIView):
 
         sessions_data = [_serialize_session_for_runtime(s) for s in qs]
 
+        return Response(
+            {
+                "tenant_id": str(tenant.id),
+                "count": len(sessions_data),
+                "sessions": sessions_data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class RuntimeSessionsRecentView(APIView):
+    """Read work sessions whose session_start is within the last N rolling days.
+
+    Includes processed sessions, excludes test sessions, and never marks them processed.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+
+        parsed = {}
+        for name, default, maximum in (("days", 7, 90), ("limit", 10, 25)):
+            try:
+                parsed[name] = _parse_positive_int(request.query_params.get(name), default=default, max_value=maximum)
+            except ValueError as exc:
+                return Response(
+                    {"error": "invalid_request", "detail": f"{name} {exc}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        now = tz.now()
+        qs = Session.objects.filter(
+            tenant=tenant,
+            test_mode=False,
+            session_start__gte=now - timedelta(days=parsed["days"]),
+            session_start__lte=now,
+        )
+        project = request.query_params.get("project", "").strip()
+        if project:
+            qs = qs.filter(Q(project__icontains=project) | Q(project_identity__icontains=project))
+
+        sessions_data = [
+            {
+                **_serialize_session_for_runtime(session),
+                "processed_at": session.processed_at.isoformat() if session.processed_at else None,
+            }
+            for session in qs.order_by("-session_start")[: parsed["limit"]]
+        ]
         return Response(
             {
                 "tenant_id": str(tenant.id),

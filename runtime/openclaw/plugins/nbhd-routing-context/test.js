@@ -241,6 +241,7 @@ describe("sub-agent read-only guard", () => {
   it("allows reviewed read-only tools directly and through tool_call", () => {
     for (const id of [
       "nbhd_journal_search",
+      "nbhd_sessions_recent",
       "nbhd_task_list",
       "nbhd_gmail_get_message_detail",
       "nbhd_fuel_get_plan",

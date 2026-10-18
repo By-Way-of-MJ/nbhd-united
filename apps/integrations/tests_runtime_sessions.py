@@ -2,12 +2,13 @@
 
 Covers:
 - RuntimeSessionsPendingView (list undistilled non-test sessions)
+- RuntimeSessionsRecentView (read recent sessions regardless of filing status)
 - RuntimeSessionMarkProcessedView (mark distilled, idempotent)
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 from django.test import TestCase
@@ -160,6 +161,132 @@ class RuntimeSessionsPendingViewTest(TestCase):
             "source",
         ):
             self.assertIn(key, s)
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeSessionsRecentViewTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Recent Tenant", telegram_chat_id=911005)
+        seed_internal_key(self.tenant)
+        self.other_tenant = create_tenant(display_name="Other Tenant", telegram_chat_id=911006)
+        self.now = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+        clock = patch("apps.integrations.runtime_views.tz.now", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.url = f"/api/v1/integrations/runtime/{self.tenant.id}/sessions/recent/"
+        self.headers = {
+            "HTTP_X_NBHD_INTERNAL_KEY": "shared-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def _get(self, **params):
+        return self.client.get(self.url, params, **self.headers)
+
+    def test_includes_processed_and_pending_without_mutating(self):
+        pending = _make_session(self.tenant)
+        processed = _make_session(
+            self.tenant,
+            session_start=self.now - timedelta(hours=2),
+            processed_at=self.now - timedelta(hours=1),
+            processed_summary={"notes": "filed"},
+        )
+        response = self._get()
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["tenant_id"], str(self.tenant.id))
+        self.assertEqual(body["count"], 2)
+        self.assertEqual([s["id"] for s in body["sessions"]], [str(processed.id), str(pending.id)])
+        self.assertEqual(body["sessions"][0]["processed_at"], processed.processed_at.isoformat())
+        self.assertIsNone(body["sessions"][1]["processed_at"])
+        pending.refresh_from_db()
+        processed.refresh_from_db()
+        self.assertIsNone(pending.processed_at)
+        self.assertEqual(pending.processed_summary, {})
+        self.assertEqual(processed.processed_summary, {"notes": "filed"})
+        self.assertEqual(processed.processed_at, self.now - timedelta(hours=1))
+
+    def test_excludes_test_mode_and_other_tenant(self):
+        _make_session(self.tenant, test_mode=True)
+        _make_session(self.other_tenant)
+        self.assertEqual(self._get().json()["sessions"], [])
+
+    def test_default_days_uses_start_with_inclusive_boundary(self):
+        boundary = _make_session(self.tenant, session_start=self.now - timedelta(days=7))
+        # Ends inside the window, but starts outside it.
+        _make_session(self.tenant, session_start=self.now - timedelta(days=7, seconds=1))
+        _make_session(self.tenant, session_start=self.now + timedelta(seconds=1))
+        self.assertEqual([s["id"] for s in self._get().json()["sessions"]], [str(boundary.id)])
+
+    def test_custom_days_and_90_day_cap(self):
+        recent = _make_session(self.tenant, session_start=self.now - timedelta(days=2))
+        older = _make_session(self.tenant, session_start=self.now - timedelta(days=90))
+        _make_session(self.tenant, session_start=self.now - timedelta(days=90, seconds=1))
+        self.assertEqual(self._get(days=1).json()["count"], 0)
+        self.assertEqual(self._get(days=2).json()["count"], 1)
+        self.assertEqual(
+            [s["id"] for s in self._get(days=999).json()["sessions"]],
+            [str(recent.id), str(older.id)],
+        )
+
+    def test_project_matches_name_or_identity_case_insensitively(self):
+        named = _make_session(self.tenant, project="My YardTalk App")
+        identified = _make_session(self.tenant, project="desktop", session_start=self.now)
+        identified.project_identity = "https://example.test/yardtalk/repo"
+        identified.save(update_fields=["project_identity"])
+        _make_session(self.tenant, project="unrelated")
+        self.assertEqual(
+            [s["id"] for s in self._get(project="  YARDtalk  ").json()["sessions"]],
+            [str(identified.id), str(named.id)],
+        )
+        self.assertEqual(self._get(project="missing").json()["count"], 0)
+        self.assertEqual(self._get(project=" ").json()["count"], 3)
+
+    def test_limit_default_custom_and_cap(self):
+        sessions = [_make_session(self.tenant, session_start=self.now - timedelta(minutes=i)) for i in range(30)]
+        for limit, expected in ((None, 10), (2, 2), (999, 25)):
+            with self.subTest(limit=limit):
+                params = {} if limit is None else {"limit": limit}
+                body = self._get(**params).json()
+                self.assertEqual(body["count"], expected)
+                self.assertEqual(
+                    [s["id"] for s in body["sessions"]],
+                    [str(s.id) for s in sessions[:expected]],
+                )
+
+    def test_bad_numeric_params_return_400(self):
+        for name in ("days", "limit"):
+            for value in ("abc", "1.5", "0", "-1"):
+                with self.subTest(name=name, value=value):
+                    response = self._get(**{name: value})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(response.json()["error"], "invalid_request")
+                    self.assertTrue(response.json()["detail"].startswith(name))
+
+    def test_requires_internal_auth(self):
+        self.assertEqual(self.client.get(self.url).status_code, 401)
+        self.assertEqual(
+            self.client.get(self.url, **{**self.headers, "HTTP_X_NBHD_INTERNAL_KEY": "bad"}).status_code,
+            401,
+        )
+
+    def test_tenant_header_mismatch_rejected(self):
+        response = self.client.get(self.url, **{**self.headers, "HTTP_X_NBHD_TENANT_ID": str(self.other_tenant.id)})
+        self.assertEqual(response.status_code, 401)
+
+    def test_payload_matches_pending_serializer_plus_processed_at(self):
+        session = _make_session(self.tenant)
+        session.accomplishments = ["shipped"]
+        session.blockers = ["waiting"]
+        session.next_steps = ["review"]
+        session.references = {"clip_ids": ["abc"]}
+        # Dark sidecars must not change the existing pending read path.
+        session.summary_enc = b"dark-sidecar"
+        session.save()
+        pending = self.client.get(self.url.replace("recent/", "pending/"), **self.headers)
+        expected = {**pending.json()["sessions"][0], "processed_at": None}
+        self.assertEqual(self._get().json()["sessions"][0], expected)
+        self.assertNotIn("processed_at", pending.json()["sessions"][0])
+        self.assertNotIn("summary_enc", expected)
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")

@@ -59,6 +59,7 @@ from .runtime_views import (
     RuntimeSautaiGeneratePlanView,
     RuntimeSessionMarkProcessedView,
     RuntimeSessionsPendingView,
+    RuntimeSessionsRecentView,
     RuntimeSituationUpdateView,
     RuntimeTaskCompleteView,
     RuntimeTaskDeferView,
@@ -196,7 +197,12 @@ urlpatterns = [
         RuntimeJournalContextView.as_view(),
         name="runtime-journal-context",
     ),
-    # YardTalk session distillation — list pending + mark processed
+    # YardTalk sessions — pending filing + on-demand reads + mark processed
+    path(
+        "runtime/<uuid:tenant_id>/sessions/recent/",
+        RuntimeSessionsRecentView.as_view(),
+        name="runtime-sessions-recent",
+    ),
     path(
         "runtime/<uuid:tenant_id>/sessions/pending/",
         RuntimeSessionsPendingView.as_view(),

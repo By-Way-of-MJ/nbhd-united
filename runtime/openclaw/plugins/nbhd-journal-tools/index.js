@@ -954,6 +954,49 @@ export default function register(api) {
     { optional: true },
   );
 
+  // ── Sessions: on-demand history ──────────────────────────────────────
+  api.registerTool(wrap({
+      name: "nbhd_sessions_recent",
+      description:
+        "Answer the user's questions about recent YardTalk / external work sessions: what they worked on, by project or date range. " +
+        "Read-only: includes processed and unprocessed sessions and does NOT mark anything processed. " +
+        "Heartbeat filing still uses `nbhd_sessions_pending`. " +
+        "Returns sessions whose session_start falls within the rolling lookback in days, newest first (default 7, max 90); default limit 10, max 25.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          days: {
+            type: "number",
+            description: "Rolling lookback in days based on session_start (default 7, max 90).",
+          },
+          project: {
+            type: "string",
+            description: "Case-insensitive substring of project name or project_identity.",
+          },
+          limit: {
+            type: "number",
+            description: "Max sessions to return (default 10, max 25).",
+          },
+        },
+      },
+      async execute(_id, params) {
+        const input = asObject(params);
+        const payload = await callRuntime(api, {
+          path: tenantPath(api, "/sessions/recent/"),
+          method: "GET",
+          query: {
+            days: parseInteger(input.days, { defaultValue: 7, min: 1, max: 90 }),
+            project: asTrimmedString(input.project),
+            limit: parseInteger(input.limit, { defaultValue: 10, min: 1, max: 25 }),
+          },
+        });
+        return renderPayload(payload);
+      },
+    }),
+    { optional: true },
+  );
+
   // ── Sessions: mark distilled ──────────────────────────────────────────
   api.registerTool(wrap({
       name: "nbhd_session_mark_processed",

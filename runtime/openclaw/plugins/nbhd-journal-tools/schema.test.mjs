@@ -17,12 +17,13 @@ const PUT_KINDS = ["daily", "weekly", "monthly", "project", "ideas", "memory"];
 const DOC_KIND_TOOLS = ["nbhd_document_get", "nbhd_document_append", "nbhd_journal_search"];
 const ALL_KIND_TOOLS = [...DOC_KIND_TOOLS, "nbhd_document_put"];
 
-function collectTools(context = {}, pluginConfig = {}) {
+function collectTools(context = {}, pluginConfig = {}, registrations = {}) {
   const tools = {};
   const api = {
     pluginConfig,
-    registerTool(def) {
+    registerTool(def, options) {
       if (typeof def === "function") def = def(context);
+      registrations[def.name] = options;
       tools[def.name] = def;
     },
     registerHook() {},
@@ -590,4 +591,54 @@ test("nbhd_weather_briefing is registered, declared, takes only an optional date
   assert.match(tool.description, /never describe weather from any other source/i);
   const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
   assert.ok(manifest.contracts.tools.includes("nbhd_weather_briefing"), "manifest declares the tool");
+});
+
+
+test("sessions_recent is an optional read-only tool declared in the manifest", () => {
+  const registrations = {};
+  const tools = collectTools({ sessionKey: "agent:main:main" }, {}, registrations);
+  const tool = tools.nbhd_sessions_recent;
+  assert.ok(tool);
+  assert.deepEqual(registrations.nbhd_sessions_recent, { optional: true });
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.deepEqual(Object.keys(tool.parameters.properties), ["days", "project", "limit"]);
+  assert.equal(tool.parameters.required, undefined);
+  assert.match(tool.description, /Read-only/);
+  assert.match(tool.description, /does NOT mark anything processed/);
+  assert.match(tool.description, /Heartbeat filing still uses `nbhd_sessions_pending`/);
+  assert.match(tool.description, /session_start/);
+  const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  assert.ok(manifest.contracts.tools.includes(tool.name));
+  const names = Object.keys(tools);
+  assert.equal(names.indexOf(tool.name), names.indexOf("nbhd_sessions_pending") + 1);
+});
+
+test("sessions_recent sends bounded GET queries and renders processed sessions", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const requests = [];
+  const payload = { count: 1, sessions: [{ id: "session-1", processed_at: "2026-05-08T12:00:00Z" }] };
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url: new URL(url), options });
+    return { ok: true, status: 200, async text() { return JSON.stringify(payload); } };
+  });
+  const tool = collectTools({ sessionKey: "agent:main:main" }).nbhd_sessions_recent;
+  const result = await tool.execute("defaults", {});
+  assert.deepEqual(result.details.json, payload);
+  assert.deepEqual(JSON.parse(result.content[0].text), payload);
+  await tool.execute("filtered", { days: 3, project: "  YardTalk / app  ", limit: 2 });
+  await tool.execute("capped", { days: 999, limit: 999 });
+  for (const { url, options } of requests) {
+    assert.equal(url.pathname, "/api/v1/integrations/runtime/tenant-test/sessions/recent/");
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+    assert.equal(options.headers["X-NBHD-Internal-Key"], "test-key");
+    assert.equal(options.headers["X-NBHD-Tenant-Id"], "tenant-test");
+  }
+  assert.deepEqual(Object.fromEntries(requests[0].url.searchParams), { days: "7", limit: "10" });
+  assert.deepEqual(Object.fromEntries(requests[1].url.searchParams), { days: "3", project: "YardTalk / app", limit: "2" });
+  assert.deepEqual(Object.fromEntries(requests[2].url.searchParams), { days: "90", limit: "25" });
 });
