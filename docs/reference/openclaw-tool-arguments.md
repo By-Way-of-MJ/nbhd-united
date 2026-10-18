@@ -9,11 +9,35 @@ also lacks the required top-level `message`. We reproduced both cases offline.
 We did not reproduce a valid `args` object being emptied by 9.4, or establish a
 5.28 → 9.4 argument-loss regression. No production model call was made.
 
-The config change is a mitigation: on >=2026.9.4 use Tool Search `directory`
-mode, allowing direct calls to exact deferred tool names while retaining the
-policy-filtered catalog and schema compaction. Generic `tool_call` remains
+The config change is a canary mitigation: only tenants allowlisted in
+`TOOL_SEARCH_DIRECTORY_TENANT_IDS` **and** on >=2026.9.4 use Tool Search
+`directory` mode, allowing direct calls to exact deferred tool names while
+retaining the policy-filtered catalog and schema compaction. Generic `tool_call` remains
 available, so the change cannot guarantee that every model avoids that envelope.
 Confirm its effect with production shapes, direct-call success, and retry rates.
+
+## Historical production evidence (reviewer-supplied)
+
+Weekly counts supplied for Round 2, not independently queried in this task:
+
+| Week starting (2026) | NBHD `missing required parameter(s)` | Core `tool_call failed: Invalid arguments` | Combined |
+| --- | ---: | ---: | ---: |
+| 09-14 | 894 | 11 | 905 |
+| 09-21 | 2,684 | 309 | 2,993 |
+| 09-28 | 58 | 748 | 806 |
+| 10-05 | 46 | 2,126 | 2,172 |
+| 10-12 | 24 | 3,677 | 3,701 |
+
+The old message is our own required-field guard at
+`runtime/openclaw/tool-logger.js:150`, already present on the 5.28 execution
+path. The reviewer reports this missing-required-arguments pattern, usually all
+required fields at once, has persisted for months. The supplied five weeks
+show the same failure class moving from our guard to 9.4's earlier catalog
+validator (`local-model-lean-Ct7p3GNL.mjs:1449`), rather than starting with 9.4.
+This supports a longstanding model-side argument/envelope-shape mistake and
+contradicts treating the new core message as evidence of a 9.4 argument-loss
+regression. Counts are not traffic-normalized rates, and neither message proves
+the exact raw envelope; empty args versus alternate nesting remains unconfirmed.
 
 ## Exact package evidence
 
@@ -62,10 +86,12 @@ coercion. This change does not explain an object becoming empty.
   availability, not argument conversion. 9.4 `dist/tools-CulcXFDi.mjs:566`
   filters optional tools through policy; `:630` attaches metadata and retains
   the tool object.
-- `apps/orchestrator/config_generator.py:2411` keeps structured mode for
-  5.28–9.3 and selects directory mode for >=9.4. No tool policy expansion.
-- Defaults use DeepSeek Pro (`config_generator.py:1452`), with DeepSeek Flash
-  for heartbeat (`:1725`); OpenRouter provider config is emitted in
+- `apps/orchestrator/config_generator.py` keeps structured mode for 5.28–9.3
+  and all unlisted tenants. Directory mode requires both >=9.4 and the tenant
+  allowlist. No tool policy expansion; the off-path Tool Search object remains
+  byte-identical to main: `{"enabled": true, "mode": "tools"}`.
+- Defaults use DeepSeek Pro (`config_generator.py:1467`), with DeepSeek Flash
+  for heartbeat (`:1740`); OpenRouter provider config is emitted in
   `generate_openclaw_config`. Tenant overrides can select other models.
 
 No core patch or plugin argument coercion is justified by the available
@@ -83,13 +109,29 @@ raw_params=<redacted> argument_shape=raw:object(id:string,args:object);raw.args:
 raw_params=<redacted> argument_shape=raw:object(id:string,params:object);raw.params:object(message:string)
 ```
 
-Only allowlisted schema key names and types survive. Unknown names become
-`other`; no values, nested content, tool selector values, or hashes are logged.
+Diagnostics remain fleet-wide, independent of the directory-mode gate. Only
+fixed-vocabulary schema key names and JS types (with explicit `array`/`null`
+labels) survive. Unknown names become `other`; no values, nested content, tool selector values, or hashes are logged.
 The outer envelope and the immediate target-argument object's top-level keys
-are reported. Changed `effective_params` gets a separate shape. Missing,
-truncated, or already-redacted previews report `unavailable`, never `{}`.
+are reported. The explicit user-text-key test checks `{"Tokyo trip": "x"}`
+and its nested `args` form become `other:string`, with neither key text nor
+value surviving. Existing tests cover values, deeper content, unknown keys,
+output bounds, and malformed previews. Changed `effective_params` gets a
+separate shape. Missing, truncated, or already-redacted previews report `unavailable`, never `{}`.
 This is the adapter's input, not the original provider wire payload or the
 target's final post-hook input; it cannot by itself localize every loss.
+
+To canary exactly one tenant, set the Django/control-plane environment to:
+
+```sh
+TOOL_SEARCH_DIRECTORY_TENANT_IDS="<full-tenant-uuid>"
+```
+
+Replace the placeholder with that tenant's full UUID, with no other IDs. IDs
+are comma-separated, whitespace-trimmed and case-insensitive; `*` opts in every
+tenant, and unset/empty opts in nobody. The version check still excludes every
+runtime below 2026.9.4, even with `*`. Apply through the normal tenant config
+refresh; merely changing the setting does not mutate a running container.
 
 For rollout, the usual image update is needed for new redactor diagnostics;
 the directory config already works on unpatched 9.4. Verify
@@ -98,6 +140,80 @@ the directory config already works on unpatched 9.4. Verify
 per heartbeat fall. Those lines prove use/success of the bypass, not the exact
 historical cause. Remaining `tool_call` failures should now distinguish empty
 args from alternate nesting. No deployment was performed during this task.
+
+## Per-turn prompt cost: directory versus tools on 9.4
+
+**Both modes already include a compact directory in the system prompt.**
+Switching to `directory` does not newly add an ~86-tool listing to 9.4's
+`tools` mode. Source tracing in the exact package:
+
+- `dist/tool-surface-plan-xPHTiYsA.mjs:1905` enables Tool Search controls
+  independently of `tools` versus `directory` mode.
+- `dist/builtin-openclaw-B-H-7lKk.mjs:20393` enables the directory prompt for
+  either mode when the catalog is registered; `:19070` calls the formatter
+  with the run's context-token budget.
+- `dist/system-prompt-params-BOlFEPMI.mjs:804` inserts it under
+  `### Deferred Tool Schemas`. This is per-request prompt context, not merely
+  a one-time search response. An in-process formatting cache avoids rebuilding
+  text; it does not remove it from subsequent model inputs.
+- `dist/local-model-lean-Ct7p3GNL.mjs:1960–2015` formats alphabetically sorted,
+  unique, policy-visible deferred OpenClaw tool names, plugin/core owner names,
+  and whitespace-normalized descriptions. Example row from our real plugin:
+  `- nbhd_constellation_notes (nbhd-journal-tools): Read the enriched context behind the user's constellation sta...`
+- Full parameter schemas remain deferred in both modes; the visible
+  `tool_search`, `tool_describe`, and `tool_call` schemas are identical in the
+  measurement. Already-direct tools keep their normal schemas. MCP/client
+  entries are not rendered as directory rows; a notice points to search.
+
+The directory budget is **characters**, not tokens:
+`min(18000, max(768, floor(contextTokenBudget / 10)))`, or 18,000 without a
+positive context budget. Descriptions start at 180 characters, shrink globally
+to 64, then disappear if needed. If names/owners still exceed the budget, rows
+are removed from the end and an omitted-count/search hint is added. Duplicate
+names and invalid identifiers are also excluded. Therefore it does not
+unconditionally list every tool, and it does not send every full description.
+
+Measured offline with `scripts/measure_openclaw_tool_directory.mjs`, invoking
+the package's real catalog/formatter on **87 real plugin registrations** as a
+representative sample for the ~86-tool fleet catalog: journal 51, finance 9,
+Fuel 15, insights 12. No invented descriptions or production tenant data.
+This sample is not an exact tenant inventory: feature gates, policy, core
+primitives and optional integrations change the effective catalog.
+
+| Context budget | Mode | Rows | Description cap | Directory chars | Estimated tokens (`cl100k_base`) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 262,144 or 131,072 | `tools` | 87 | 64 | 9,928 | 2,408 |
+| 262,144 or 131,072 | `directory` | 87 | 64 | 9,813 | 2,388 |
+| 32,768 | `tools` | 63 | 0 | 3,258 | 934 |
+| 32,768 | `directory` | 66 | 0 | 3,273 | 955 |
+
+At the larger budgets the rows are identical; only the footer changes from
+mandatory `tool_call` envelope guidance to direct-name-or-wrapper guidance.
+**Estimated incremental cost: -115 characters, approximately -20 tokens per
+turn**, with roughly **2.4K directory tokens already present in either mode**.
+At a tight budget, the shorter footer admits three more names in this sample,
+producing +21 estimated tokens instead. This measures the catalog block,
+excluding common system text, control schemas and conversation history.
+`cl100k_base` is an explicitly approximate tokenizer proxy, not a DeepSeek
+billing measurement. Actual provider tokenization, cache discounts, discovery
+calls, tool-result history, and retries need canary usage data. Client-tool
+surfaces can also differ between modes (`local-model-lean-Ct7p3GNL.mjs:2106`);
+this estimate covers our native plugin catalog without client tools.
+
+Reproduce the exact character counts and approximate token counts:
+
+```sh
+OPENCLAW_STATE_DIR="$PWD/.scratch/contract-state" .scratch/node24/node_modules/.bin/node scripts/measure_openclaw_tool_directory.mjs .scratch/runtime/node_modules/openclaw > .scratch/tool-directory-cost.json
+.venv/bin/python - <<'PYTOKENS'
+import json
+from pathlib import Path
+import tiktoken  # analysis-only local dependency; no application change
+enc = tiktoken.get_encoding("cl100k_base")
+for row in json.loads(Path(".scratch/tool-directory-cost.json").read_text())["measurements"]:
+    print(row["contextTokenBudget"], row["mode"], row["listedRows"],
+          row["chars"], len(enc.encode(row["prompt"])))
+PYTOKENS
+```
 
 ## Reproduce offline
 
@@ -128,8 +244,9 @@ OPENCLAW_STATE_DIR="$PWD/.scratch/contract-state" .scratch/node24/node_modules/.
 git diff --check
 ```
 
-Results: 196 Django tests pass; 151 Node tests pass; exact-runtime probe passes;
-Ruff and diff checks pass. The initial Django run identified the two modified
-redactor path hashes; only those entries in `automatic_paths_main.json` changed.
+Round 2 results: 198 Django tests pass; 152 Node tests pass; exact-runtime probe passes;
+Ruff and diff checks pass. Round 2 updates only the redactor test-file hash in
+`automatic_paths_main.json`; the production redactor stays unchanged and ungated.
+The directory-cost probe also passes and confirms identical control schemas.
 No plugin implementation was changed. No Docker build, model call, or production
 verification was performed.

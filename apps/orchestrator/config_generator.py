@@ -148,6 +148,21 @@ def usage_hooks_enabled(tenant: Tenant) -> bool:
     return False
 
 
+def tool_search_directory_enabled(tenant: Tenant) -> bool:
+    """Return whether the tenant is allowlisted for Tool Search directory mode."""
+    raw = str(getattr(settings, "TOOL_SEARCH_DIRECTORY_TENANT_IDS", "") or "")
+    allowed = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if "*" in allowed or str(tenant.id).lower() in allowed:
+        return True
+    if allowed:
+        logger.info(
+            "tool_search: tenant %s is not in TOOL_SEARCH_DIRECTORY_TENANT_IDS (%d id(s) configured) — directory disabled",
+            str(tenant.id)[:8],
+            len(allowed),
+        )
+    return False
+
+
 _CRON_CONTEXT_PREAMBLE = (
     "**MANDATORY — do this BEFORE following the instructions below:**\n"
     "1. Load today's daily note (`nbhd_daily_note_get`). Read EVERY section — "
@@ -2410,12 +2425,12 @@ def _build_tools_section(
 
     if _parse_version(version) >= (2026, 5, 28):
         tools["toolSearch"] = {"enabled": True, "mode": "tools"}
-        if _parse_version(version) >= (2026, 9, 4):
+        if _parse_version(version) >= (2026, 9, 4) and tool_search_directory_enabled(tenant):
             # 9.4 directory mode hydrates exact tool names from the same
             # policy-filtered catalog, without sending every schema each turn.
             # This permits direct calls without the generic tool_call args
-            # envelope implicated in fleet invalid-input retries. It is a
-            # mitigation: redacted logs do not prove where arguments were lost.
+            # envelope implicated in fleet invalid-input retries. Canary only:
+            # those failures predate 9.4; this mitigation is not yet proven.
             # See docs/reference/openclaw-tool-arguments.md for package evidence.
             tools["toolSearch"]["mode"] = "directory"
     return tools

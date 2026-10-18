@@ -977,7 +977,30 @@ class VersionAwareConfigTest(TestCase):
         self.assertNotIn("group:web", allowed)
         self.assertNotIn("group:automation", allowed)
 
-    def test_tool_search_directory_is_gated_to_94(self):
+    @override_settings(TOOL_SEARCH_DIRECTORY_TENANT_IDS="")
+    def test_tool_search_directory_is_off_by_default(self):
+        for version in ("2026.5.28", "2026.9.4", "2026.10.1"):
+            with self.subTest(version=version):
+                self.tenant.openclaw_version = version
+                self.assertEqual(
+                    generate_openclaw_config(self.tenant)["tools"]["toolSearch"],
+                    {"enabled": True, "mode": "tools"},
+                )
+
+    def test_tool_search_directory_requires_listed_tenant(self):
+        self.tenant.openclaw_version = "2026.9.4"
+        for allowed, mode in (
+            ("unlisted-tenant", "tools"),
+            (f" other-tenant, {str(self.tenant.id).upper()} , ", "directory"),
+        ):
+            with self.subTest(allowed=allowed), self.settings(TOOL_SEARCH_DIRECTORY_TENANT_IDS=allowed):
+                self.assertEqual(
+                    generate_openclaw_config(self.tenant)["tools"]["toolSearch"],
+                    {"enabled": True, "mode": mode},
+                )
+
+    @override_settings(TOOL_SEARCH_DIRECTORY_TENANT_IDS="*")
+    def test_tool_search_directory_wildcard_is_gated_to_94(self):
         for version, expected in (
             ("2026.5.7", None),
             ("2026.5.28", {"enabled": True, "mode": "tools"}),

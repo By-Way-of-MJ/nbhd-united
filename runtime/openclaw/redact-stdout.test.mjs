@@ -62,6 +62,17 @@ test("invalid argument shapes mask unknown keys, never descend into content, and
   assert.match(bounded, /,more\)/);
 });
 
+test("invalid argument shapes mask user text used as a key at either level", () => {
+  for (const [params, shape] of [
+    [{ 'Tokyo trip': 'x' }, 'raw:object(other:string)'],
+    [{ args: { 'Tokyo trip': 'x' } }, 'raw:object(args:object);raw.args:object(other:string)'],
+  ]) {
+    const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + JSON.stringify(params));
+    assert.ok(out.endsWith('argument_shape=' + shape), out);
+    assert.doesNotMatch(out, /Tokyo trip|"x"/);
+  }
+});
+
 test("invalid argument previews: truncated or already redacted is unavailable, not empty", () => {
   for (const preview of ['{"args":{"message":"secret', '<redacted>', '<empty>', 'undefined', '{"message":"' + 'x'.repeat(8200) + '"}']) {
     const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + preview);
