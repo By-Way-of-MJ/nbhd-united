@@ -105,6 +105,7 @@ Single input `tenant`; tier and version are derived from tenant fields (`config_
 | `>= 2026.4.15` | `models.providers.openrouter` block (correct base URL) | `config_generator.py:2272` |
 | `>= 2026.5.0` | `plugins.bundledDiscovery:"compat"`; per-provider `timeoutSeconds` **replaces** the retired `agents.defaults.llm` idle key (pre-5.0 emits `llm`, `:2293`; post emits provider timeout) | `:2216`, `:2285` |
 | `>= 2026.5.28` | `tools.toolSearch`, and `agents.defaults.params`/`contextPruning` | `:1744`, `:2330` |
+| `>= 2026.9.4` | Tool Search `mode: "directory"`: exact deferred-name calls with schema compaction; older supported binaries retain `"tools"`. See [argument investigation](openclaw-tool-arguments.md) for evidence and limits. | `_build_tools_section` |
 
 **Bootstrap budget.** The runtime cap is 26,000 characters (`BOOTSTRAP_MAX_CHARS`, emitted as `agents.defaults.bootstrapMaxChars`), and OpenClaw silently truncates each bootstrap file's tail past it. The CI ceiling is 25,950 characters, a truncation alarm fixed 50 characters below the runtime cap. The separate 22,759-character content pin (`MaximalTenantBudgetTest.test_rules_delivery_r0_all_gates_budget`) enforces that an addition is funded by a trim; `bootstrapTotalMaxChars` remains 80,000.
 

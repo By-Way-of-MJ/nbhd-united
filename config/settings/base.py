@@ -365,6 +365,10 @@ CRON_GATE_TENANT_IDS = env("CRON_GATE_TENANT_IDS", default="")
 # gate fleet-wide. Empty/unset means nobody so the reporter ships dark.
 USAGE_HOOKS_TENANT_IDS = env("USAGE_HOOKS_TENANT_IDS", default="")
 
+# OpenClaw Tool Search directory mode — canary rollout gate, also requires
+# >=2026.9.4. Comma-separated tenant UUIDs; "*" means everyone; empty means off.
+TOOL_SEARCH_DIRECTORY_TENANT_IDS = env("TOOL_SEARCH_DIRECTORY_TENANT_IDS", default="")
+
 # Proactive calendar / Apple Reminder / recurring-task suggestions in the
 # Morning Briefing and Week Ahead Review. Comma-separated tenant UUIDs open
 # individual tenants; the literal "*" opens the feature fleet-wide. Empty or

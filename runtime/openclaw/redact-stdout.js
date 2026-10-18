@@ -46,9 +46,62 @@ function jsonValueEnd(line, start) {
   return line.length;
 }
 
+// Fixed schema vocabulary only: even a JSON *key* can contain tenant text.
+// Unknown names become "other"; types never include values or nested content.
+const ARGUMENT_SHAPE_KEYS = new Set([
+  'id', 'toolId', 'name', 'args', 'input', 'params', 'arguments',
+  'category', 'summary', 'kind', 'section_slug', 'section', 'content',
+  'message', 'query', 'text', 'date', 'mode', 'path', 'operation',
+]);
+const ARGUMENT_ENVELOPES = ['args', 'input', 'params', 'arguments'];
+function argumentType(value) {
+  return value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+}
+function argumentShape(value) {
+  if (argumentType(value) !== 'object') return argumentType(value);
+  const entries = Object.entries(value);
+  const keys = entries.slice(0, 32).map(([key, item]) =>
+    `${ARGUMENT_SHAPE_KEYS.has(key) ? key : 'other'}:${argumentType(item)}`);
+  if (entries.length > 32) keys.push('more');
+  return `object(${keys.join(',')})`;
+}
+function invalidArgumentShapes(line) {
+  // Capture at the existing core failure-log boundary: plugin execute() is
+  // never entered when Tool Search rejects a target's schema in OpenClaw 9.4.
+  if (!/\[tools\] [a-zA-Z0-9_:.-]+ failed: (?:Invalid arguments for tool|Validation failed for tool)/.test(line)) return '';
+  const first = /\b(raw_params|effective_params)=/.exec(line);
+  if (!first) return ' argument_shape=unavailable';
+  const shapes = [];
+  let offset = first.index;
+  for (let i = 0; i < 2; i += 1) {
+    const match = /^(raw_params|effective_params)=/.exec(line.slice(offset));
+    if (!match) break;
+    const label = match[1] === 'raw_params' ? 'raw' : 'effective';
+    const start = offset + match[0].length;
+    const end = jsonValueEnd(line, start);
+    try {
+      // Core previews may already be truncated/redacted. Never call them empty.
+      if (end - start > 8192) throw new Error('oversized preview');
+      const value = JSON.parse(line.slice(start, end));
+      shapes.push(`${label}:${argumentShape(value)}`);
+      if (argumentType(value) === 'object') {
+        for (const key of ARGUMENT_ENVELOPES) {
+          if (Object.hasOwn(value, key)) shapes.push(`${label}.${key}:${argumentShape(value[key])}`);
+        }
+      }
+    } catch {
+      shapes.push(`${label}:unavailable`);
+    }
+    offset = end;
+    while (line[offset] === ' ') offset += 1;
+  }
+  return ` argument_shape=${shapes.join(';')}`;
+}
+
 function applyFieldPatterns(line) {
   // Params may be arbitrarily nested or malformed. Drop the entire remaining
   // suffix rather than leave a content-bearing tail after a partial match.
+  const shapes = invalidArgumentShapes(line);
   let out = line.replace(/(raw_params|effective_params)=.*$/g, (_match, key) => `${key}=<redacted>`);
   const keys = /"((?:[^"\\]|\\.)*)"\s*:\s*/g;
   let match;
@@ -60,7 +113,7 @@ function applyFieldPatterns(line) {
     out = out.slice(0, match.index) + replacement + out.slice(end);
     keys.lastIndex = match.index + replacement.length;
   }
-  return out;
+  return out + shapes;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
