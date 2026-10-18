@@ -159,6 +159,26 @@ class ConfigGeneratorTest(TestCase):
         self.assertIn("/opt/nbhd/plugins/nbhd-journal-tools", paths)
         self.assertIn("group:plugins", config["tools"]["allow"])
 
+    @override_settings(
+        OPENCLAW_JOURNAL_PLUGIN_ID="nbhd-journal-tools",
+        OPENCLAW_JOURNAL_PLUGIN_PATH="/opt/nbhd/plugins/nbhd-journal-tools",
+    )
+    def test_recent_sessions_visible_to_main_chat_across_tiers(self):
+        for tier in Tenant.ModelTier.values:
+            for version in ("2026.5.28", "2026.9.4"):
+                with self.subTest(tier=tier, version=version):
+                    self.tenant.model_tier = tier
+                    self.tenant.openclaw_version = version
+                    config = generate_openclaw_config(self.tenant)
+                    self.assertIn("nbhd-journal-tools", config["plugins"]["allow"])
+                    self.assertTrue(config["plugins"]["entries"]["nbhd-journal-tools"]["enabled"])
+                    self.assertIn("/opt/nbhd/plugins/nbhd-journal-tools", config["plugins"]["load"]["paths"])
+                    self.assertIn("group:plugins", config["tools"]["allow"])
+                    self.assertNotIn("nbhd_sessions_recent", config["tools"]["deny"])
+                    for agent in config["agents"].get("list", []):
+                        if agent.get("id") == "main":
+                            self.assertNotIn("tools", agent)
+
     def test_plugin_wiring_omitted_when_no_plugins_configured(self):
         with override_settings(
             OPENCLAW_GOOGLE_PLUGIN_ID="",

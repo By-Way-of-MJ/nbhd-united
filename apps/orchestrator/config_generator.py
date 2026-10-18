@@ -96,6 +96,7 @@ SUBAGENT_READ_ONLY_TOOLS: tuple[str, ...] = (
     "nbhd_purpose_list",  # Purpose list read.
     "nbhd_reconcile_scan",  # Reconciliation scan; no mutation.
     "nbhd_sessions_pending",  # Pending session inventory read.
+    "nbhd_sessions_recent",  # On-demand work session history read.
     "nbhd_task_get",  # Task detail read.
     "nbhd_task_list",  # Task list read.
     "nbhd_workspace_list",  # Workspace list read.

@@ -22,6 +22,7 @@
       "nbhd_lessons_pending",
       "nbhd_constellation_notes",
       "nbhd_sessions_pending",
+      "nbhd_sessions_recent",
       "nbhd_session_mark_processed",
       "nbhd_platform_issue_report",
       "nbhd_send_to_user",

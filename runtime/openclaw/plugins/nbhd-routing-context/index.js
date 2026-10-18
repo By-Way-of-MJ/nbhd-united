@@ -117,6 +117,7 @@ export const SUBAGENT_READ_ONLY_TOOL_IDS = new Set([
   "nbhd_purpose_list",
   "nbhd_reconcile_scan",
   "nbhd_sessions_pending",
+  "nbhd_sessions_recent",
   "nbhd_task_get",
   "nbhd_task_list",
   "nbhd_workspace_list",
