@@ -977,6 +977,21 @@ class VersionAwareConfigTest(TestCase):
         self.assertNotIn("group:web", allowed)
         self.assertNotIn("group:automation", allowed)
 
+    def test_tool_search_directory_is_gated_to_94(self):
+        for version, expected in (
+            ("2026.5.7", None),
+            ("2026.5.28", {"enabled": True, "mode": "tools"}),
+            ("2026.9.3", {"enabled": True, "mode": "tools"}),
+            ("2026.9.4", {"enabled": True, "mode": "directory"}),
+            ("2026.10.1", {"enabled": True, "mode": "directory"}),
+        ):
+            with self.subTest(version=version):
+                self.tenant.openclaw_version = version
+                tools = generate_openclaw_config(self.tenant)["tools"]
+                self.assertEqual(tools.get("toolSearch"), expected)
+                self.assertIn("group:plugins", tools["allow"])
+                self.assertIn("gateway", tools["deny"])
+
     def test_tools_use_2026_4_15_when_version_set(self):
         self.tenant.openclaw_version = "2026.4.15"
         self.tenant.save()

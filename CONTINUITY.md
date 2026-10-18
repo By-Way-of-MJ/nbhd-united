@@ -1,6 +1,7 @@
 # Master Ledger
 
 ## Goal
+- Active here: prove/fix OpenClaw 9.4 blank Tool Search arguments on fix/blank-tool-args; local commit only.
 - Active in this worktree: on-demand YardTalk session read tool on feat/yardtalk-sessions-recent; local commit only.
 - Prior completed work: fleet reminder list/cancel on feat/assistant-cancel-reminder; local commits only.
 - Prior completed work: prevent calendar plans and assistant-written daily notes from proving completion; commit locally on fix/calendar-not-proof-of-done.
@@ -19,6 +20,7 @@
 - Round 4 supersedes wake exception: hibernation, reconciliation and signed selector restored to main.
 - Follow-up: 9.4 lifecycle (croner vs croniter semantics, suspend, idle guards).
 ## State
+- Done (blank args): >=9.4 directory-mode mitigation and safe shape diagnostics; 196 Django/151 Node tests, exact-runtime probe and Ruff pass. Exact fleet cause unproven; see docs/reference/openclaw-tool-arguments.md. Local commit only; production confirmation remains release work.
 - Done (YardTalk): recent-session endpoint/tool and main/helper exposure verified. Django 1949/1951 pass (only existing socket-path/SDK environment errors); Node 89/89 and Ruff pass.
 - Now (YardTalk): local commit handoff with requested message/trailer; no push/PR.
 - Done (prior reminder worktree): assistant reminder list/cancel implemented and verified; local commit handoff on feat/assistant-cancel-reminder. 2911 backend tests exercised; corrected AST pin passes replay; only 2 known environment errors remain. 238 Node tests and Ruff pass.
@@ -29,6 +31,7 @@
 ## Task Map
 ```
 CONTINUITY.md
+  ├─ CONTINUITY_blank-tool-args.md (complete investigation/mitigation; local handoff; @owner:codex)
   ├─ CONTINUITY_yardtalk-sessions-recent.md (complete; local handoff; @owner:codex)
   ├─ CONTINUITY_reminder-cancel.md (complete; local commit; @owner:codex)
   ├─ CONTINUITY_calendar-not-proof.md (complete; local commit; @owner:codex)
@@ -42,6 +45,7 @@ CONTINUITY.md
   └─ CONTINUITY_openclaw_94_migration.md (prior implementation/reviews; scope superseded)
 ```
 ## Active ledgers
+- CONTINUITY_blank-tool-args.md
 - CONTINUITY_yardtalk-sessions-recent.md
 - CONTINUITY_reminder-cancel.md
 - CONTINUITY_calendar-not-proof.md

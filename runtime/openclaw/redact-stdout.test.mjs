@@ -31,6 +31,62 @@ assert.equal(
 
 const redactor = require("./redact-stdout.js");
 
+const invalidToolArgs = '[tools] tool_call failed: Invalid arguments for tool "openclaw:nbhd-journal-tools:nbhd_send_to_user": message: must have required property message. ';
+
+test("invalid arguments: distinguish empty, wrong nesting and populated envelopes without values", () => {
+  for (const [params, shape] of [
+    [{ id: "private target", args: {} }, 'raw:object(id:string,args:object);raw.args:object()'],
+    [{ id: "private target", args: { message: "private text" } }, 'raw:object(id:string,args:object);raw.args:object(message:string)'],
+    [{ id: "private target", params: { message: "private text" } }, 'raw:object(id:string,params:object);raw.params:object(message:string)'],
+    [{ id: "private target", arguments: '{"message":"private text"}' }, 'raw:object(id:string,arguments:string);raw.arguments:string'],
+    [{ id: "private target" }, 'raw:object(id:string)'],
+    [{}, 'raw:object()'],
+    [[], 'raw:array'],
+    [null, 'raw:null'],
+  ]) {
+    const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + JSON.stringify(params));
+    assert.ok(out.endsWith('argument_shape=' + shape), out);
+    assert.doesNotMatch(out, /private/);
+    assert.match(out, /raw_params=<redacted>/);
+  }
+});
+
+test("invalid argument shapes mask unknown keys, never descend into content, and bound output", () => {
+  const params = { args: { 'secret person@example.com': 'secret value', content: { 'private nested name': 'private value' }, query: ['private item'], summary: false } };
+  const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + JSON.stringify(params));
+  assert.match(out, /raw.args:object\(other:string,content:object,query:array,summary:boolean\)/);
+  assert.doesNotMatch(out, /secret|private|person@example/);
+  const many = Object.fromEntries(Array.from({ length: 50 }, (_, i) => ['private' + i, 1]));
+  const bounded = redactor.redactLine(invalidToolArgs + 'raw_params=' + JSON.stringify(many));
+  assert.equal((bounded.match(/other:number/g) || []).length, 32);
+  assert.match(bounded, /,more\)/);
+});
+
+test("invalid argument previews: truncated or already redacted is unavailable, not empty", () => {
+  for (const preview of ['{"args":{"message":"secret', '<redacted>', '<empty>', 'undefined', '{"message":"' + 'x'.repeat(8200) + '"}']) {
+    const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + preview);
+    assert.ok(out.endsWith('argument_shape=raw:unavailable'), out.slice(-100));
+    assert.doesNotMatch(out, /secret|xxx/);
+  }
+});
+
+test("invalid argument shapes report core hook adjustments and ignore labels inside values", () => {
+  const raw = JSON.stringify({ args: { message: 'effective_params={"secret":"private"}' } });
+  const out = redactor.redactLine(invalidToolArgs + 'raw_params=' + raw + ' effective_params={}');
+  assert.match(out, /argument_shape=raw:object\(args:object\);raw.args:object\(message:string\);effective:object\(\)$/);
+  assert.doesNotMatch(out, /secret|private/);
+});
+
+test("shape diagnostics also survive real stdout wrapping on core invalid arguments", () => {
+  const script = `require(${JSON.stringify(join(__dirname, 'redact-stdout.js'))}); process.stderr.write(${JSON.stringify(invalidToolArgs + 'raw_params={"args":{"message":"private"}}\n')});`;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    env: { ...process.env, NBHD_REDACT_STDOUT_DISABLE_AUTOINSTALL: '0' }, encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /raw.args:object\(message:string\)/);
+  assert.doesNotMatch(result.stderr, /private/);
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 // Pattern-based redaction (Strategy A)
 // ─────────────────────────────────────────────────────────────────────────

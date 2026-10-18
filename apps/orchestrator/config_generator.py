@@ -2410,6 +2410,14 @@ def _build_tools_section(
 
     if _parse_version(version) >= (2026, 5, 28):
         tools["toolSearch"] = {"enabled": True, "mode": "tools"}
+        if _parse_version(version) >= (2026, 9, 4):
+            # 9.4 directory mode hydrates exact tool names from the same
+            # policy-filtered catalog, without sending every schema each turn.
+            # This permits direct calls without the generic tool_call args
+            # envelope implicated in fleet invalid-input retries. It is a
+            # mitigation: redacted logs do not prove where arguments were lost.
+            # See docs/reference/openclaw-tool-arguments.md for package evidence.
+            tools["toolSearch"]["mode"] = "directory"
     return tools
 
 

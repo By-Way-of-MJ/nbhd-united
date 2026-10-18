@@ -51,6 +51,13 @@ Outcome mapping: `<400` → `accepted`, `4xx` → `rejected`, `5xx` → `error`,
 - 404s record `tool_name = "unresolved"`. The request path is caller-controlled, so it is deliberately not echoed into the row.
 - Console/API traffic is excluded by design; it is not tool traffic and would distort the rates.
 
+For OpenClaw input-schema rejection before plugin execution, the container
+redactor adds `argument_shape=...` to existing core failure logs. It records
+allowlisted top-level key names/types (including the immediate `args` envelope),
+never values; unknown keys are masked. Truncated upstream previews report
+`unavailable`. See [Tool Search argument investigation](../reference/openclaw-tool-arguments.md)
+for examples, version evidence, and production confirmation limits.
+
 ## Querying rates
 
 ```sql
