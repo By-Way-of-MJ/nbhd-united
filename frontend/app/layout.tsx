@@ -63,13 +63,16 @@ const schibstedGrotesk = localFont({
 });
 
 export const metadata: Metadata = {
+  // Production web origin also configured by APPLE_SIWA_REDIRECT_URI in config/settings/base.py.
+  metadataBase: new URL("https://hoodunited.org"),
   title: "Neighborhood United",
   description: "Your AI-powered personal assistant.",
   icons: {
     icon: [
-      { url: "/favicon.ico", sizes: "32x32" },
+      { url: "/favicon.ico", sizes: "16x16 32x32 48x48", type: "image/x-icon" },
       { url: "/icons/favicon/favicon-32x32.png", sizes: "32x32", type: "image/png" },
       { url: "/icons/favicon/favicon-16x16.png", sizes: "16x16", type: "image/png" },
+      { url: "/icons/favicon/favicon.svg", sizes: "any", type: "image/svg+xml" },
     ],
     apple: [
       { url: "/icons/apple-touch-icon.png", sizes: "180x180", type: "image/png" },
@@ -79,7 +82,21 @@ export const metadata: Metadata = {
   openGraph: {
     title: "Neighborhood United",
     description: "Your AI-powered personal assistant.",
-    images: [{ url: "/images/logo-textured.png", width: 1200, height: 654 }],
+    images: [{
+      url: "/images/og/nbhd-social-card-1200x630.png",
+      width: 1200,
+      height: 630,
+      alt: "NBHD constellation N mark — Your personal assistant for real life",
+    }],
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Neighborhood United",
+    description: "Your AI-powered personal assistant.",
+    images: [{
+      url: "/images/og/nbhd-social-card-1200x630.png",
+      alt: "NBHD constellation N mark — Your personal assistant for real life",
+    }],
   },
 };
 

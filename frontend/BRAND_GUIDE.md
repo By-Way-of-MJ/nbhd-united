@@ -2,6 +2,10 @@
 
 Reference for all visual design tokens, typography, spacing, and accessibility standards.
 
+## Logo — superseded
+
+Logo guidance and the former lotus/green lockup are superseded by [DESIGN.md — Logo](../DESIGN.md#logo) and the approved `nbhd-ios/Brand/` masters/exports. Use the shared `BrandMark` component; do not redraw the mark or regenerate icons from old lockups. The remaining palette/type guidance below is historical; `DESIGN.md` and `app/globals.css` are authoritative.
+
 ---
 
 ## Color Tokens

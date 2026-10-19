@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { BrandMark } from "@/components/brand-mark";
 import { useSyncExternalStore } from "react";
 import { isLoggedIn } from "@/lib/auth";
 import { AppStoreBadge } from "@/components/app-store-badge";
@@ -42,7 +43,7 @@ export default function LandingPage() {
       <div className="universe-scrim" aria-hidden="true" />
       <div className="universe-twinkles" aria-hidden="true">{[0, 1, 2, 3, 4].map((star) => <span key={star} />)}</div>
       <header className="universe-nav universe-gutter">
-        <Link href="/" aria-label="NBHD home page" className="universe-wordmark">NBHD</Link>
+        <Link href="/" aria-label="NBHD home page" className="universe-wordmark gap-3"><BrandMark size={32} />NBHD</Link>
         <nav aria-label="Site">
           <a href="#how" className="universe-nav-detail">How it works</a>
           <Link href="/legal/privacy" className="universe-nav-detail">Privacy</Link>

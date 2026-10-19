@@ -3,6 +3,14 @@
 @tailwind utilities;
 
 :root {
+  /* Approved N-mark constants; independent of surface/theme accent overrides. */
+  --brand-purple: #7C6BF0;
+  --brand-white: #FFFFFF;
+  --brand-teal: #4ECDC4;
+  --brand-pink: #E8B4B8;
+  --brand-connector: #E2E8F0;
+  --brand-light-ink: #24313D;
+
   /* ── Constellation Dark Palette ── */
   --ink: #e2e8f0;
   --ink-muted: rgba(226, 232, 240, 0.72);

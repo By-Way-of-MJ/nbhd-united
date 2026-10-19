@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="NBHD N mark">
+  <title>NBHD N mark</title>
+  <rect width="32" height="32" fill="#0B0F13"/>
+  <polyline points="4.905,23.255 13.225,11.735 20.905,18.775 27.945,7.895" fill="none" stroke="#E2E8F0" stroke-opacity="0.72" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="4.905" cy="23.255" r="3.2" fill="#7C6BF0"/>
+  <circle cx="13.225" cy="11.735" r="2.35" fill="#FFFFFF"/>
+  <circle cx="20.905" cy="18.775" r="2.35" fill="#4ECDC4"/>
+  <circle cx="27.945" cy="7.895" r="2.35" fill="#E8B4B8"/>
+</svg>
