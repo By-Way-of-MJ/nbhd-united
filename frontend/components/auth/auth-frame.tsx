@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { BrandMark } from "@/components/brand-mark";
 import type { ReactNode } from "react";
 
 /*
@@ -32,8 +33,8 @@ export function AuthFrame({ title, subtitle, children }: { title: ReactNode; sub
           style={{ background: "linear-gradient(90deg, rgba(7,9,12,.1) 0%, rgba(7,9,12,.3) 70%, var(--os-sky) 100%), linear-gradient(180deg, rgba(7,9,12,.55) 0%, rgba(7,9,12,0) 35%, rgba(7,9,12,0) 70%, rgba(7,9,12,.72) 100%)" }}
         />
         <div aria-hidden="true" className="absolute inset-0 md:hidden" style={{ background: "linear-gradient(180deg, rgba(7,9,12,.5) 0%, rgba(7,9,12,0) 40%, rgba(7,9,12,.3) 70%, var(--os-sky) 100%)" }} />
-        <Link href="/" className="os-focus absolute left-5 top-[calc(env(safe-area-inset-top)+1.25rem)] rounded text-[0.8125rem] tracking-[0.45em] text-white md:left-11 md:top-9 md:text-[0.875rem]" aria-label="NBHD home page">
-          NBHD
+        <Link href="/" className="os-focus absolute inline-flex min-h-[44px] items-center gap-3 left-5 top-[calc(env(safe-area-inset-top)+1.25rem)] rounded text-[0.8125rem] tracking-[0.45em] text-white md:left-11 md:top-9 md:text-[0.875rem]" aria-label="NBHD home page">
+          <BrandMark size={32} />NBHD
         </Link>
         <p className="os-serif absolute bottom-[4.5rem] left-11 right-14 hidden text-[1.875rem] italic leading-tight text-white md:block">&ldquo;We carry a universe inside us.&rdquo;</p>
         <span className="absolute bottom-3 right-5 text-[0.6875rem] text-white/70 md:bottom-9 md:left-11 md:right-auto">The Cosmic Cliffs &middot; NASA, ESA, CSA, STScI</span>

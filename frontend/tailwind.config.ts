@@ -18,6 +18,13 @@ const config: Config = {
         "page": "var(--page-pad)",
       },
       colors: {
+        "brand-purple": "var(--brand-purple)",
+        "brand-white": "var(--brand-white)",
+        "brand-teal": "var(--brand-teal)",
+        "brand-pink": "var(--brand-pink)",
+        "brand-connector": "var(--brand-connector)",
+        "brand-light-ink": "var(--brand-light-ink)",
+
         "os-sky": "var(--os-sky)",
         "os-ink": "var(--os-ink)",
         "os-muted": "var(--os-muted)",

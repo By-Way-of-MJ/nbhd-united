@@ -521,7 +521,7 @@ class ComebackTemplateRenderTest(TestCase):
         self.assertIn("July 20, 2026", text)
         # App Store link + app-icon artwork present in the HTML.
         self.assertIn("apps.apple.com/us/app/nbhd/id6779158519", html)
-        self.assertIn("images/icon-textured.png", html)
+        self.assertIn("images/email/nbhd-icon-176.png", html)
 
     def test_final_copy_spliced_no_markers(self):
         from django.template.loader import render_to_string

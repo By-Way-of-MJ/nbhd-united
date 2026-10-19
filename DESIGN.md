@@ -6,6 +6,14 @@ Source of truth for tokens: [`frontend/app/globals.css`](frontend/app/globals.cs
 
 ---
 
+## Logo
+
+- The NBHD mark is the four circular nodes connected into an N. Approved masters and exports live in `nbhd-ios/Brand/`; do not redraw, stretch, reorder, or individually recolor them.
+- Use `frontend/components/brand-mark.tsx` for inline marks. Its `size` prop selects the solid small optical geometry at ≤32px and the dashed standard geometry above 32px. `variant="dark"` uses the white node and pale connector; `variant="light"` uses deep ink on white/cream. Mono artwork is available in the source masters when explicitly needed.
+- Fixed brand tokens in `globals.css` / Tailwind are `brand-purple` (#7C6BF0), `brand-white` (#FFFFFF), `brand-teal` (#4ECDC4), `brand-pink` (#E8B4B8), `brand-connector` (#E2E8F0), and `brand-light-ink` (#24313D). Keep them independent of theme accents. Preserve at least one first-dot diameter of external clear space.
+- From `frontend/`, run `npm run generate-icons -- /path/to/nbhd-ios/Brand` to copy approved exports, including the real ICO and true-size PWA icons. The SVG favicon adds a dark backing tile to the small master for visibility in either browser theme. Social artwork is copied last; wait for the artwork lane to finish before syncing.
+- Email and social images use `images/email/nbhd-icon-176.png` and `images/og/nbhd-social-card-1200x630.png`. Keep the four legacy public image files for existing emails/caches; do not use them in new code. Rebuild `frontend/out/` rather than editing it.
+
 ## 1. Visual Theme & Atmosphere
 
 **Constellation / inner universe.** The product's metaphor is "there are as many neurons in your brain as stars in the Milky Way." Every surface should feel like looking into a calm, luminous night sky — deep space backdrops, starfield overlays, synapse/constellation line art, soft purple/teal/pink glows.

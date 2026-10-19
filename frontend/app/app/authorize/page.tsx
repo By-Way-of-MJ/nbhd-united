@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { BrandMark } from "@/components/brand-mark";
 import { OnboardingShell } from "@/components/onboarding/onboarding-shell";
 import { clearTokens, getAccessToken, isLoggedIn } from "@/lib/auth";
 import {
@@ -233,13 +234,8 @@ export default function AppAuthorizePage() {
       <div className="w-full max-w-[420px]">
         <div className="rounded-[24px] bg-[#12161b]/60 backdrop-blur-xl border border-white/[0.06] p-7 sm:p-8 shadow-[0_20px_60px_rgba(0,0,0,0.4)]">
           <div className="flex justify-center mb-6">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-[#7C6BF0]/30 bg-[#7C6BF0]/20 shadow-[0_0_20px_rgba(124,107,240,0.3)]">
-              <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5 text-[#c7bfff]">
-                <path
-                  d="M12 2L13.09 8.26L18 4L14.74 9.91L21 10L14.74 12.09L18 18L13.09 13.74L12 20L10.91 13.74L6 18L9.26 12.09L3 10L9.26 9.91L6 4L10.91 8.26L12 2Z"
-                  fill="currentColor"
-                />
-              </svg>
+            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-brand-purple/30 bg-brand-purple/20 glow-purple">
+              <BrandMark size={24} />
             </div>
           </div>
 
