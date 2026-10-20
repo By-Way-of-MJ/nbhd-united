@@ -109,7 +109,8 @@ _DROPPED_RETRY_SAFE_PHASE = "thinking"
 # Containers often boot in ~30s; a short defer plus the boot-grace retry
 # below delivers within ~20s of readiness instead of always waiting the
 # worst case (was a fixed 60s).
-_WAKE_DEFER_SECONDS = 20
+# 2026-10-20: 20 → 8 s; cold app turns measured one 20 s defer (~24 s) before the good POST.
+_WAKE_DEFER_SECONDS = 8
 
 # After a wake, container-down errors within this window mean "still
 # booting" — release the lease and retry in _WAKE_DEFER_SECONDS without

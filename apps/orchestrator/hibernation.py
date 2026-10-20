@@ -941,6 +941,31 @@ def wake_for_cron_task(tenant_id: str) -> dict:
     return {"status": "woken_for_cron"}
 
 
+def wake_tenant_for_app_message(tenant_id: str) -> dict:
+    """Wake a hibernated tenant's container when an app message arrives.
+
+    Published asynchronously by the iOS chat ingress right after it enqueues
+    the turn, so the Azure activate starts while the drain is still in flight
+    instead of only after the drain's first 404. Hibernated tenants are the
+    only ones with work here; the conditional claim inside
+    ``wake_hibernated_tenant`` collapses the race with the drain's own wake.
+    The drain's wake path remains the fallback if this publish never lands.
+    """
+    tenant = Tenant.objects.filter(id=tenant_id).first()
+    if not tenant:
+        logger.warning("wake_app_message: tenant %s not found", tenant_id[:8])
+        return {"status": "tenant_not_found"}
+
+    if not tenant.hibernated_at:
+        return {"status": "already_awake"}
+
+    if not wake_hibernated_tenant(tenant):
+        return {"status": "wake_failed"}
+
+    logger.info("wake_app_message: tenant %s woken for app message", tenant_id[:8])
+    return {"status": "woken_for_app_message"}
+
+
 def check_cron_wake_idle_task(tenant_id: str) -> dict:
     """Check if a cron-woken tenant should be re-hibernated.
 

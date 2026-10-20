@@ -826,6 +826,24 @@ def enqueue_tenant_turn(
         # Telegram poller, which also stores a redacted excerpt.
         user_text_excerpt=redacted_text,
     )
+    # Start the wake at ingress, not after the drain's first 404. The drain's
+    # own wake path stays the fallback; publish failures must never fail the
+    # user's POST. This runs after the turn transaction committed, so no Azure
+    # call (inside the QStash task) can happen inside this request's transaction.
+    if tenant.hibernated_at is not None:
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task(
+                "wake_tenant_for_app_message",
+                str(tenant.id),
+                retries=1,
+            )
+        except Exception:
+            logger.exception(
+                "enqueue_tenant_turn: app-message wake publish failed for tenant %s — drain wake path remains fallback",
+                str(tenant.id)[:8],
+            )
     # Deferred redaction receipt + transparency metadata (see above). A process
     # death between the publish and this write leaves redaction_confirmed null —
     # "unconfirmed", the fail-safe reading.
