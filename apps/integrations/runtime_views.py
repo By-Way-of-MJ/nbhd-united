@@ -3249,7 +3249,7 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
 
 
 class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
-    """Full-text search across all documents for a tenant."""
+    """Hybrid keyword + semantic search across all documents for a tenant."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -3281,7 +3281,11 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        from apps.journal.document_authoring import document_fts_search, search_query_variants
+        from apps.journal.document_authoring import (
+            document_fts_search,
+            document_semantic_search,
+            search_query_variants,
+        )
 
         # Content-based full-text search is intentionally NOT slug-filtered by
         # date: a mis-kinded daily with real content (e.g. an old
@@ -3304,7 +3308,8 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
         # grounding probe, whose whole job is to predict what this endpoint
         # returns, cannot drift from it.
         variants = search_query_variants(tenant, query)
-        results = document_fts_search(qs, variants, limit=limit)
+        keyword_results = document_fts_search(qs, variants, limit=limit)
+        semantic_results = document_semantic_search(tenant, qs, query, limit=limit)
 
         def _make_snippet(text: str, query_variants: list[str], max_len: int = 300) -> str:
             """Extract relevant snippet around first match.
@@ -3331,21 +3336,56 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
                 snippet = snippet + "..."
             return snippet
 
+        # Reciprocal Rank Fusion over the two independently ordered lists. RRF
+        # needs no score calibration between ts_rank and cosine similarity, and
+        # a document surfaced by both arms outranks one found by either alone.
+        fused: dict = {}
+
+        def _fuse(doc, rank: int, source: str, semantic_text: str = "") -> None:
+            entry = fused.setdefault(
+                doc.id,
+                {"document": doc, "score": 0.0, "sources": set(), "semantic_text": semantic_text},
+            )
+            entry["score"] += 1.0 / (60 + rank)
+            entry["sources"].add(source)
+            if source == "keyword":
+                entry["document"] = doc
+            elif semantic_text:
+                entry["semantic_text"] = semantic_text
+
+        for rank, doc in enumerate(keyword_results, start=1):
+            _fuse(doc, rank, "keyword")
+        for rank, (doc, chunk_text, _similarity) in enumerate(semantic_results, start=1):
+            _fuse(doc, rank, "semantic", chunk_text)
+
+        ordered = sorted(fused.values(), key=lambda entry: entry["score"], reverse=True)[:limit]
+
+        results = []
+        for entry in ordered:
+            doc = entry["document"]
+            if "keyword" in entry["sources"]:
+                snippet = _make_snippet(doc.markdown, variants)
+                rank = float(doc.rank)
+            else:
+                snippet = entry["semantic_text"][:300]
+                rank = 0.0
+            results.append(
+                {
+                    "kind": doc.kind,
+                    "slug": doc.slug,
+                    "title": doc.title,
+                    "snippet": snippet,
+                    "updated_at": doc.updated_at.isoformat(),
+                    "rank": rank,
+                    "match": "both" if len(entry["sources"]) == 2 else next(iter(entry["sources"])),
+                }
+            )
+
         return Response(
             {
                 "query": query,
                 "count": len(results),
-                "results": [
-                    {
-                        "kind": doc.kind,
-                        "slug": doc.slug,
-                        "title": doc.title,
-                        "snippet": _make_snippet(doc.markdown, variants),
-                        "updated_at": doc.updated_at.isoformat(),
-                        "rank": float(doc.rank),
-                    }
-                    for doc in results
-                ],
+                "results": results,
             },
             status=status.HTTP_200_OK,
         )

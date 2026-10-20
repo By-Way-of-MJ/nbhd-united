@@ -21,8 +21,11 @@ removed from row-presence fencing.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Worst → best. ``unconfirmed`` and ``residual`` both pull a field into the
 # repair sweep; ``bypass`` means no checked provenance ran at all, which is
@@ -380,6 +383,59 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
     return list(
         annotated.annotate(rarity=rarity_weight).filter(search=any_term_query).order_by("-rarity", "-rank")[:limit]
     )
+
+
+def document_semantic_search(tenant, base_queryset, query: str, *, limit: int) -> list[tuple[Any, str, float]]:
+    """Return up to ``limit`` documents whose best chunk is nearest the query.
+
+    The query embedding is the same call the session-start recall path makes,
+    with its own seam label. Chunks below 0.30 cosine similarity are dropped:
+    measured production recalls of the right note land at 0.43–0.49, so a high
+    floor (the poller's 0.65) would discard the very results this exists to
+    rescue. Any embedding/network/pgvector failure is logged without the query
+    text and degrades to an empty list so the keyword path still answers.
+    """
+    try:
+        from pgvector.django import CosineDistance
+
+        from apps.journal.models import DocumentChunk
+        from apps.lessons.services import generate_embedding
+
+        chunks = DocumentChunk.objects.filter(tenant=tenant, document__in=base_queryset)
+        # No embedded corpus means no semantic results; don't spend an embedding
+        # call (or a network round trip in tests) on a query that cannot match.
+        if not chunks.exists():
+            return []
+
+        query_embedding = generate_embedding(
+            query[:500],
+            tenant=tenant,
+            seam="journal_search_query_embedding",
+        )
+        nearest = (
+            chunks.select_related("document")
+            .annotate(distance=CosineDistance("embedding", query_embedding))
+            .order_by("distance")[:20]
+        )
+
+        best_by_document: dict[Any, tuple[Any, str, float]] = {}
+        for chunk in nearest:
+            similarity = 1.0 - float(chunk.distance)
+            if similarity < 0.30:
+                continue
+            # ``nearest`` is distance-ordered, so the first chunk seen for a
+            # document is its best one.
+            best_by_document.setdefault(chunk.document_id, (chunk.document, chunk.text, similarity))
+
+        results = sorted(best_by_document.values(), key=lambda item: item[2], reverse=True)
+        return results[:limit]
+    except Exception:
+        logger.warning(
+            "journal_semantic_search: embedding search failed for tenant %s",
+            getattr(tenant, "id", "?"),
+            exc_info=True,
+        )
+        return []
 
 
 def search_query_variants(tenant, query: str) -> list[str]:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from django.test import TestCase
 from django.test.utils import override_settings
 
-from apps.journal.models import Document
+from apps.journal.models import Document, DocumentChunk
 from apps.tenants.services import create_tenant
 from apps.tenants.test_utils import seed_internal_key
 
@@ -97,3 +99,60 @@ class RuntimeJournalSearchViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertLessEqual(body["count"], 1)
+
+    @patch("apps.lessons.services.generate_embedding")
+    def test_semantic_search_rescues_meaning_match(self, mock_embedding):
+        for index in range(12):
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="daily",
+                slug=f"2026-03-{index + 1:02d}",
+                title=f"Daily Note 2026-03-{index + 1:02d}",
+                markdown=f"Today's photo walk around the neighbourhood, number {index}.",
+            )
+        rescue = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-03-20",
+            title="Daily Note 2026-03-20",
+            markdown="Nearest studios in Horie: PADstudio, a short walk from the river.",
+        )
+        query_vector = [0.01] * 1536
+        DocumentChunk.objects.create(
+            tenant=self.tenant,
+            document=rescue,
+            chunk_index=0,
+            text="Nearest studios in Horie: PADstudio, a short walk from the river.",
+            embedding=query_vector,
+            source_date="2026-03-20",
+        )
+        mock_embedding.return_value = query_vector
+
+        response = self.client.get(self._url(), {"q": "photo places Horie"}, **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["results"][0]["slug"], rescue.slug)
+        self.assertIn(body["results"][0]["match"], {"semantic", "both"})
+
+    @patch("apps.lessons.services.generate_embedding")
+    def test_embedding_failure_falls_back_to_keyword_results(self, mock_embedding):
+        # No chunk exists yet, so the keyword-only response is the baseline the
+        # failing semantic arm must reproduce exactly.
+        keyword_body = self.client.get(self._url(), {"q": "garden"}, **self._headers()).json()
+
+        DocumentChunk.objects.create(
+            tenant=self.tenant,
+            document=self.doc1,
+            chunk_index=0,
+            text="Today I worked on the garden project and planted tomatoes.",
+            embedding=[0.02] * 1536,
+            source_date="2026-02-10",
+        )
+        mock_embedding.side_effect = RuntimeError("embedding provider unavailable")
+
+        response = self.client.get(self._url(), {"q": "garden"}, **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), keyword_body)
+        mock_embedding.assert_called_once()

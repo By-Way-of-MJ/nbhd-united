@@ -661,7 +661,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_journal_search",
       description:
-        "Search shared journal records first when recalling what was written about a topic. Searches all journal documents (daily notes, goals, projects, memory, reviews, etc.) by keyword or phrase using full-text search.",
+        "Search shared journal records first when recalling what was written about a topic. Searches all journal documents (daily notes, goals, projects, memory, reviews, etc.) by keyword or phrase using full-text search; matches by meaning as well as keywords.",
       parameters: {
         type: "object",
         additionalProperties: false,
