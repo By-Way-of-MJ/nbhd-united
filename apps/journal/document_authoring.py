@@ -313,10 +313,21 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
     unmatched query dumped the corpus. The OR pass expresses the intended
     best-effort recall with semantics that actually hold.
 
-    Ordering stays keyed to the full-intent query in both passes, so a document
-    matching two terms of three still outranks one matching a single term.
+    The strict pass keeps ordering keyed to the full-intent query, so a document
+    matching two terms of three still outranks one matching a single term. The
+    fallback cannot do that: ``ts_rank`` against the full query scores a common
+    word as highly as a rare one. Measured on production (2026-10-20), ``Horie
+    photo spots`` found no strict match, and the fallback put the Horie note at
+    position 18 of 20 because dozens of notes say "photo" while only two say
+    "Horie" — the agent read the top results and told the user nothing was
+    saved. The fallback therefore orders by a rarity-weighted count of matched
+    terms (``log((N + 1) / (df + 1))``, capped to the first eight distinct
+    terms), then by ``rank`` as the tie-breaker.
     """
+    from math import log
+
     from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+    from django.db.models import Case, FloatField, Value, When
 
     search_vector = SearchVector("title", weight="A") + SearchVector("markdown", weight="B")
     search_query = SearchQuery(as_fts_phrase(variants[0]), search_type="websearch")
@@ -332,13 +343,43 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
         return strict
 
     any_term_query = None
+    terms: list[str] = []
     for variant in variants:
         for term in variant.split():
+            if term not in terms:
+                terms.append(term)
             term_query = SearchQuery(as_fts_phrase(term), search_type="websearch")
             any_term_query = term_query if any_term_query is None else (any_term_query | term_query)
     if any_term_query is None:
         return []
-    return list(annotated.filter(search=any_term_query).order_by("-rank")[:limit])
+
+    total_documents = base_queryset.count()
+    weighted_cases = []
+    for term in terms[:8]:
+        term_query = SearchQuery(as_fts_phrase(term), search_type="websearch")
+        document_frequency = annotated.filter(search=term_query).count()
+        if document_frequency == 0:
+            continue
+        weight = log((total_documents + 1) / (document_frequency + 1))
+        weighted_cases.append(
+            Case(
+                When(search=term_query, then=Value(weight)),
+                default=Value(0.0),
+                output_field=FloatField(),
+            )
+        )
+    if not weighted_cases:
+        # No term in the rarity window matches anything, but the OR predicate
+        # can still match a later term. Fall back to the pre-rarity ordering
+        # instead of wrongly reporting that nothing matched.
+        return list(annotated.filter(search=any_term_query).order_by("-rank")[:limit])
+
+    rarity_weight = Value(0.0, output_field=FloatField())
+    for weighted_case in weighted_cases:
+        rarity_weight = rarity_weight + weighted_case
+    return list(
+        annotated.annotate(rarity=rarity_weight).filter(search=any_term_query).order_by("-rarity", "-rank")[:limit]
+    )
 
 
 def search_query_variants(tenant, query: str) -> list[str]:
