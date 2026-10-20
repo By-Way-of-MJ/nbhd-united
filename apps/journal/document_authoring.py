@@ -327,7 +327,7 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
     from math import log
 
     from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
-    from django.db.models import Case, FloatField, Sum, Value, When
+    from django.db.models import Case, FloatField, Value, When
 
     search_vector = SearchVector("title", weight="A") + SearchVector("markdown", weight="B")
     search_query = SearchQuery(as_fts_phrase(variants[0]), search_type="websearch")
@@ -369,13 +369,16 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
             )
         )
     if not weighted_cases:
-        return []
+        # No term in the rarity window matches anything, but the OR predicate
+        # can still match a later term. Fall back to the pre-rarity ordering
+        # instead of wrongly reporting that nothing matched.
+        return list(annotated.filter(search=any_term_query).order_by("-rank")[:limit])
 
     rarity_weight = Value(0.0, output_field=FloatField())
     for weighted_case in weighted_cases:
         rarity_weight = rarity_weight + weighted_case
     return list(
-        annotated.annotate(rarity=Sum(rarity_weight)).filter(search=any_term_query).order_by("-rarity", "-rank")[:limit]
+        annotated.annotate(rarity=rarity_weight).filter(search=any_term_query).order_by("-rarity", "-rank")[:limit]
     )
 
 

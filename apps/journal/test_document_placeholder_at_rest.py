@@ -946,17 +946,19 @@ class DocumentFtsFallbackRankingTests(_DocumentPiiBase):
     def test_fallback_ranks_the_rare_term_match_first(self):
         """Production case: ``Horie photo spots`` returned the Horie note 18th.
 
-        Every daily note says "photo", so the OR fallback matches all of them;
-        only the Horie note says "Horie". Ordering by the full-intent rank
-        buried it, and the agent concluded nothing had been saved.
+        Every noise note says "photo" in its TITLE and several times in its body
+        (and says "spots"), so full-intent ``rank`` ranks them above the Horie
+        note, which says "Horie" and "photo" once each in its body only and has
+        no "photo" in its title. Ordering by rarity has to overcome that rank
+        advantage; the old fallback returns a noise note first.
         """
         for index in range(12):
             Document.objects.create(
                 tenant=self.tenant,
                 kind="daily",
                 slug=f"photo-day-{index}",
-                title=f"Daily photo {index}",
-                markdown=f"photo of the usual scene {index} with filler",
+                title=f"Daily photo spots {index}",
+                markdown=f"photo spots: photo photo photo of the usual scene {index} with filler",
             )
         horie = Document.objects.create(
             tenant=self.tenant,
@@ -970,6 +972,20 @@ class DocumentFtsFallbackRankingTests(_DocumentPiiBase):
 
         self.assertGreater(len(results), 1)
         self.assertEqual(results[0].pk, horie.pk)
+
+    def test_fallback_keeps_matches_from_terms_beyond_the_rarity_window(self):
+        """A match on term 9 must survive when terms 1-8 match nothing."""
+        target = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="late-term",
+            title="Studios",
+            markdown="the xylophone lesson moved to Thursday",
+        )
+
+        results = self._search("alpha bravo charlie delta echo foxtrot golf hotel xylophone")
+
+        self.assertEqual([doc.pk for doc in results], [target.pk])
 
     def test_strict_pass_returns_only_documents_matching_every_term(self):
         target = Document.objects.create(
