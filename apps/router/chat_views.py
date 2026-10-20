@@ -25,6 +25,7 @@ import uuid
 from datetime import timedelta
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
@@ -57,6 +58,7 @@ from apps.tenants.throttling import (
     ChatContextHourThrottle,
     ChatLocalTurnHourThrottle,
     ChatMessageSendHourThrottle,
+    ChatPrewarmThrottle,
 )
 
 logger = logging.getLogger(__name__)
@@ -1345,6 +1347,54 @@ class ChatMessageDetailView(APIView):
         # poll's serializer msg.tenant access refetches the whole Tenant row.
         turn.tenant = tenant
         return _no_store(Response(_serialize_message(turn)))
+
+
+class ChatPrewarmView(APIView):
+    """POST: opportunistically wake a hibernated tenant when Chat opens.
+
+    Opening the app is the strongest signal that a wake is imminent, but it is
+    NOT a message: this must never stamp ``last_message_at`` or call Azure
+    inline, so an unanswered pre-warm still lets the next idle sweep hibernate
+    the box. A cache cap (one wake per tenant per 10 minutes) bounds the
+    worst-case cold-start spend; repeated opens inside the window are cheap
+    no-ops.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ChatPrewarmThrottle]
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not tenant or tenant.status != Tenant.Status.ACTIVE:
+            return Response({"state": "unavailable"}, status=status.HTTP_200_OK)
+
+        if tenant.hibernated_at is None:
+            return Response({"state": "awake"}, status=status.HTTP_200_OK)
+
+        # Atomic add is the cap: only the first caller in a 10-minute window
+        # wins the publish. The key deliberately outlives this request; that
+        # is what keeps repeated Chat opens from paying for repeat cold starts.
+        if not cache.add(f"chat_prewarm:{tenant.id}", 1, timeout=600):
+            return Response({"state": "recent"}, status=status.HTTP_200_OK)
+
+        try:
+            from apps.cron.publish import publish_task
+
+            publish_task(
+                "wake_tenant_for_app_message",
+                str(tenant.id),
+                retries=1,
+            )
+        except Exception:
+            # A QStash blip must not turn opening Chat into an error. The next
+            # real message still wakes the tenant through the ingress/drain
+            # fallback, so accepting the pre-warm is safe either way.
+            logger.exception(
+                "chat_prewarm: wake publish failed for tenant %s",
+                str(tenant.id)[:8],
+            )
+
+        return Response({"state": "waking"}, status=status.HTTP_202_ACCEPTED)
 
 
 class ChatReadView(APIView):
