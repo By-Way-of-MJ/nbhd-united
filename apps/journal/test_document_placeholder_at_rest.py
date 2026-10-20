@@ -26,7 +26,7 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
-from apps.journal.document_authoring import as_fts_phrase, merge_field_receipt
+from apps.journal.document_authoring import as_fts_phrase, document_fts_search, merge_field_receipt
 from apps.journal.document_views import _default_markdown
 from apps.journal.models import Document, DocumentChunk, DocumentIngestion, DocumentIngestionArtifact
 from apps.pii.testsupport import neural_ran
@@ -931,6 +931,76 @@ class DocumentSearchVariantTests(_DocumentPiiBase):
         self.assertEqual([d.slug for d in journal_search(self.tenant, "Alice")], ["reno"])
         report = probe_grounding(self.tenant, "Alice", expect_terms=["kitchen"])
         self.assertTrue(report.grounded)
+
+
+class DocumentFtsFallbackRankingTests(_DocumentPiiBase):
+    """The recall floor surfaces rare-term matches, not common-word noise."""
+
+    def _search(self, query, *, limit=20):
+        return document_fts_search(
+            Document.objects.filter(tenant=self.tenant),
+            [query],
+            limit=limit,
+        )
+
+    def test_fallback_ranks_the_rare_term_match_first(self):
+        """Production case: ``Horie photo spots`` returned the Horie note 18th.
+
+        Every daily note says "photo", so the OR fallback matches all of them;
+        only the Horie note says "Horie". Ordering by the full-intent rank
+        buried it, and the agent concluded nothing had been saved.
+        """
+        for index in range(12):
+            Document.objects.create(
+                tenant=self.tenant,
+                kind="daily",
+                slug=f"photo-day-{index}",
+                title=f"Daily photo {index}",
+                markdown=f"photo of the usual scene {index} with filler",
+            )
+        horie = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="horie-studios",
+            title="Studios",
+            markdown="Nearest studios in Horie: PADstudio ... photo",
+        )
+
+        results = self._search("Horie photo spots")
+
+        self.assertGreater(len(results), 1)
+        self.assertEqual(results[0].pk, horie.pk)
+
+    def test_strict_pass_returns_only_documents_matching_every_term(self):
+        target = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="all-terms",
+            title="Kitchen renovation",
+            markdown="the kitchen renovation permits were approved",
+        )
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="partial",
+            title="Kitchen renovation",
+            markdown="the kitchen renovation starts in March",
+        )
+
+        results = self._search("kitchen renovation permits")
+
+        self.assertEqual([doc.pk for doc in results], [target.pk])
+
+    def test_unmatched_query_still_returns_empty(self):
+        Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="photo-day",
+            title="Daily photo",
+            markdown="photo of the usual scene with filler",
+        )
+
+        self.assertEqual(self._search("xylophone bassoon"), [])
 
 
 # ── Receipt folding ────────────────────────────────────────────────────────
