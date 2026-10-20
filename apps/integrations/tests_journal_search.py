@@ -136,6 +136,39 @@ class RuntimeJournalSearchViewTest(TestCase):
         self.assertIn(body["results"][0]["match"], {"semantic", "both"})
 
     @patch("apps.lessons.services.generate_embedding")
+    def test_both_match_snippet_comes_from_semantic_chunk(self, mock_embedding):
+        # The keyword arm matches on the opening "garden", but the passage that
+        # actually answers the query lives in the chunk, past the first 300
+        # chars. A "both" result must show the chunk text, not the markdown head.
+        marker = "PADSTUDIO-MARKER-42"
+        padding = "Routine upkeep notes about the neighbourhood walk. " * 10
+        matched = Document.objects.create(
+            tenant=self.tenant,
+            kind="daily",
+            slug="2026-04-01",
+            title="Daily Note 2026-04-01",
+            markdown=f"Garden plans for spring.\n\n{padding}\n\n{marker}",
+        )
+        query_vector = [0.03] * 1536
+        DocumentChunk.objects.create(
+            tenant=self.tenant,
+            document=matched,
+            chunk_index=0,
+            text=f"Garden plans for spring. {marker}",
+            embedding=query_vector,
+            source_date="2026-04-01",
+        )
+        mock_embedding.return_value = query_vector
+
+        response = self.client.get(self._url(), {"q": "garden"}, **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        results = {result["slug"]: result for result in response.json()["results"]}
+        self.assertIn(matched.slug, results)
+        self.assertEqual(results[matched.slug]["match"], "both")
+        self.assertIn(marker, results[matched.slug]["snippet"])
+
+    @patch("apps.lessons.services.generate_embedding")
     def test_embedding_failure_falls_back_to_keyword_results(self, mock_embedding):
         # No chunk exists yet, so the keyword-only response is the baseline the
         # failing semantic arm must reproduce exactly.

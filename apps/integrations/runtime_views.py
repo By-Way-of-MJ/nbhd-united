@@ -3344,13 +3344,16 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
         def _fuse(doc, rank: int, source: str, semantic_text: str = "") -> None:
             entry = fused.setdefault(
                 doc.id,
-                {"document": doc, "score": 0.0, "sources": set(), "semantic_text": semantic_text},
+                {"document": doc, "score": 0.0, "sources": set(), "semantic_text": ""},
             )
             entry["score"] += 1.0 / (60 + rank)
             entry["sources"].add(source)
             if source == "keyword":
+                # The keyword copy carries the ``rank`` annotation; keep it.
                 entry["document"] = doc
             elif semantic_text:
+                # Store the chunk text whenever it arrives, so a document fused
+                # by both arms keeps it no matter which list was fused first.
                 entry["semantic_text"] = semantic_text
 
         for rank, doc in enumerate(keyword_results, start=1):
@@ -3363,12 +3366,16 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
         results = []
         for entry in ordered:
             doc = entry["document"]
-            if "keyword" in entry["sources"]:
+            if "semantic" in entry["sources"]:
+                # The matched passage IS the chunk, which may sit past the first
+                # 300 chars of the markdown; show the best chunk text instead.
+                snippet = entry["semantic_text"][:600]
+                if len(entry["semantic_text"]) > 600:
+                    snippet = snippet + "..."
+                rank = float(doc.rank) if "keyword" in entry["sources"] else 0.0
+            else:
                 snippet = _make_snippet(doc.markdown, variants)
                 rank = float(doc.rank)
-            else:
-                snippet = entry["semantic_text"][:300]
-                rank = 0.0
             results.append(
                 {
                     "kind": doc.kind,

@@ -432,7 +432,7 @@ def document_semantic_search(tenant, base_queryset, query: str, *, limit: int) -
     except Exception:
         logger.warning(
             "journal_semantic_search: embedding search failed for tenant %s",
-            getattr(tenant, "id", "?"),
+            str(tenant.id)[:8],
             exc_info=True,
         )
         return []
