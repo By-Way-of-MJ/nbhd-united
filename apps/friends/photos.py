@@ -28,6 +28,7 @@ from . import access
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_PIXELS = 40_000_000
 MIN_SIDE = 96
 OUTPUT_SIDE = 512
 MODERATION_MODEL = "omni-moderation-latest"
@@ -55,10 +56,14 @@ def normalize(raw: bytes, *, note=False) -> bytes:
         raise ValidationError("That photo is too large. Please choose one under 10 MB.")
     try:
         with Image.open(io.BytesIO(raw)) as probe:
+            if probe.width * probe.height > MAX_PIXELS:
+                raise ValidationError("That photo is too large. Try a smaller one.")
             probe.verify()
         image = Image.open(io.BytesIO(raw))
         image.load()
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except Image.DecompressionBombError as exc:
+        raise ValidationError("That photo is too large. Try a smaller one.") from exc
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ValidationError("That file isn’t a photo we can use.") from exc
     if getattr(image, "is_animated", False):
         raise ValidationError("Please choose a still photo.")

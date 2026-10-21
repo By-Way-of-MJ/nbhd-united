@@ -92,7 +92,14 @@ def create(tenant, user, mission_id, step_id, text, prepared):
         .exists()
     )
     note = access.create_note(goal, step, member, text, prepared)
-    services._append_update(goal, tenant, user, "step_note", text=text[:120], payload={"step_id": str(step.id)})
+    services._append_update(
+        goal,
+        tenant,
+        user,
+        "step_note",
+        text=text[:120],
+        payload={"step_id": str(step.id), "note_id": str(note.id)},
+    )
     if not recent:
         from .project_notifications import notify_step_note
 
@@ -114,6 +121,9 @@ def edit(tenant, mission_id, note_id, data):
     note.text = text
     note.edited_at = timezone.now()
     note.save(update_fields=["text", "edited_at"])
+    access.mission_updates().filter(shared_goal=goal, kind="step_note", payload__note_id=str(note.id)).update(
+        text=text[:120]
+    )
     return _display_one(goal, member, note)
 
 
@@ -125,6 +135,7 @@ def delete(tenant, mission_id, note_id):
         raise PermissionDenied("Only the author or a project owner can delete this note.")
     note.deleted_at = timezone.now()
     note.save(update_fields=["deleted_at"])
+    access.mission_updates().filter(shared_goal=goal, kind="step_note", payload__note_id=str(note.id)).update(text="")
 
 
 def photo(tenant, mission_id, photo_id):

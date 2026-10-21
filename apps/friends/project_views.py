@@ -12,6 +12,7 @@ from apps.tenants.authentication import JWTAuthenticationWithRLS
 from . import project_notes
 from . import project_services as projects
 from .project_flags import projects_v2_enabled
+from .throttling import StepNoteDayThrottle
 from .views import FriendsView
 
 
@@ -235,6 +236,11 @@ class ProposalActionView(ProjectView):
 class StepNotesView(ProjectView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
+    def get_throttles(self):
+        if self.request.method == "POST":
+            return [StepNoteDayThrottle()]
+        return []
+
     def dispatch(self, request, *args, **kwargs):
         if request.method == "POST":
             # Moderation is network I/O; pin a backend only for each short DB phase.
@@ -251,13 +257,14 @@ class StepNotesView(ProjectView):
     def post(self, request, mission_id, step_id):
         from apps.tenants.middleware import set_rls_context
 
+        data = self.data(request)
         tenant = self.get_tenant(request)
         with transaction.atomic():
             set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
             project_notes.check_step(tenant, mission_id, step_id)
-        if set(request.data) - {"text", "photos"} or set(request.FILES) - {"photos"}:
+        if set(data) - {"text", "photos"} or set(request.FILES) - {"photos"}:
             raise ValidationError("Unknown note fields.")
-        text, prepared = project_notes.prepare(request.data.get("text"), request.FILES.getlist("photos"))
+        text, prepared = project_notes.prepare(data.get("text"), request.FILES.getlist("photos"))
         with transaction.atomic():
             set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
             result = project_notes.create(tenant, request.user, mission_id, step_id, text, prepared)

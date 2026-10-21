@@ -2,6 +2,7 @@
 photo, change/remove, and reporting."""
 
 import io
+import struct
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -31,6 +32,11 @@ def _jpeg(size=(800, 600), color=(90, 120, 160), exif_gps=False) -> bytes:
 
 def _moderation(flagged=False):
     return SimpleNamespace(results=[SimpleNamespace(flagged=flagged)])
+
+
+def _oversized_bmp(size=(8001, 5000)):
+    """Only a BMP header: advertised dimensions, no pixel data or allocation."""
+    return struct.pack("<2sIHHI", b"BM", 54, 0, 0, 54) + struct.pack("<IiiHHIIiiII", 40, *size, 1, 24, 0, 0, 0, 0, 0, 0)
 
 
 @override_settings(OPENAI_API_KEY="test-key")
@@ -111,6 +117,17 @@ class ProfilePhotoTests(TestCase):
             response, check = self.upload(self.a, data)
             self.assertEqual(response.status_code, 400)
             check.assert_not_called()
+
+    def test_oversized_header_is_refused_before_decode_or_moderation(self):
+        # Cover our 40 MP limit and Pillow's own higher bomb-error threshold.
+        for size in [(8001, 5000), (20000, 10000)]:
+            with self.subTest(size=size), patch("PIL.BmpImagePlugin.BmpImageFile.load") as load:
+                response, check = self.upload(self.a, _oversized_bmp(size))
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("That photo is too large. Try a smaller one.", str(response.data))
+            load.assert_not_called()
+            check.assert_not_called()
+        self.assertFalse(NeighborPhoto.objects.filter(profile=self.pa).exists())
 
     # ── Change / remove ─────────────────────────────────────────────────────
 

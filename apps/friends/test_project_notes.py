@@ -1,9 +1,11 @@
 """Shared step notes: privacy, authorship, image safety, context and push contracts."""
 
 import io
+import json
 from datetime import timedelta
 from unittest.mock import patch
 
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import TestCase, TransactionTestCase, override_settings
@@ -15,12 +17,15 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from . import access, photos, project_assistant, project_notes, project_services, services
 from .models import SharedGoalMembership, SharedGoalStepNote, SharedGoalStepNotePhoto, SharedGoalUpdate
 from .test_pr6 import _edge, _profile, _tenant
-from .test_profile_photos import _jpeg, _moderation
+from .test_profile_photos import _jpeg, _moderation, _oversized_bmp
 from .test_projects_v2_p1b import _PushCapture
+from .throttling import StepNoteDayThrottle
 
 
 class _NotesFixture:
     def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
         self.a, self.b, self.c = [_tenant("sn_" + n) for n in "abc"]
         for tenant, handle in [(self.a, "aya"), (self.b, "ben"), (self.c, "cleo")]:
             _profile(tenant, handle)
@@ -80,11 +85,74 @@ class StepNotesTests(_NotesFixture, TestCase):
             .order_by("created_at", "id")
             .first()
         )
-        self.assertEqual(update.payload, {"step_id": str(self.step.id)})
+        self.assertEqual(update.payload, {"step_id": str(self.step.id), "note_id": first["id"]})
         self.assertEqual(update.text, "A fact")
         long = self.post(text="x" * 2000)
         self.assertEqual(long.status_code, 201, long.data)
         self.assertEqual(SharedGoalUpdate.objects.filter(kind="step_note").latest("created_at").text, "x" * 120)
+
+    def test_edit_and_delete_update_only_the_matching_note_activity_text(self):
+        note = self.post(self.b, "Original text").json()
+        other = self.post(self.b, "Other note").json()
+        unrelated = services._append_update(
+            self.goal, self.b, self.b.user, "note", text="Unrelated activity", payload={"note_id": note["id"]}
+        )
+        update = SharedGoalUpdate.objects.get(kind="step_note", payload__note_id=note["id"])
+        author = self.client_for(self.b)
+        changed = "Changed " + "x" * 150
+        response = author.patch(self.note_url(note), {"text": changed}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        update.refresh_from_db()
+        self.assertEqual(update.text, changed[:120])
+        self.assertEqual(self.client_for(self.a).delete(self.note_url(note)).status_code, 204)
+        update.refresh_from_db()
+        unrelated.refresh_from_db()
+        self.assertEqual(update.text, "")
+        self.assertEqual(unrelated.text, "Unrelated activity")
+        self.assertEqual(
+            SharedGoalUpdate.objects.get(kind="step_note", payload__note_id=other["id"]).text, "Other note"
+        )
+
+    def test_non_object_json_bodies_are_refused_on_post_and_patch(self):
+        note = self.post().json()
+        client = self.client_for(self.a)
+        for data in [[], ["text"], [{"text": "No"}], "text", 42, True, None]:
+            for method, url in [("POST", self.notes_url), ("PATCH", self.note_url(note))]:
+                with self.subTest(method=method, data=data):
+                    response = client.generic(method, url, json.dumps(data), content_type="application/json")
+                    self.assertEqual(response.status_code, 400, response.data)
+                    self.assertEqual(response.json(), {"non_field_errors": ["An object is required."]})
+        self.assertEqual(SharedGoalStepNote.objects.count(), 1)
+        self.assertEqual(SharedGoalStepNote.objects.get(id=note["id"]).text, "A fact")
+        response = client.post(self.notes_url, {"text": "Valid JSON"}, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_note_creation_daily_cap_is_per_tenant_across_projects_and_post_only(self):
+        self.assertEqual(StepNoteDayThrottle.rate, "200/day")
+        other_goal = services.create_mission(self.a, self.a.user, member_friendship_ids=[], title="Other")
+        other_step = project_services.create_step(self.a, self.a.user, other_goal.id, {"title": "Other step"})
+        other_url = f"/api/v1/friends/missions/{other_goal.id}/steps/{other_step.id}/notes/"
+        with patch.object(StepNoteDayThrottle, "rate", "2/day"):
+            first = self.post()
+            self.assertEqual(first.status_code, 201, first.data)
+            second = self.client_for(self.a).post(other_url, {"text": "Second"}, format="json")
+            self.assertEqual(second.status_code, 201, second.data)
+            with patch("apps.friends.project_notes.prepare") as prepare:
+                refused = self.post()
+            self.assertEqual(refused.status_code, 429, refused.data)
+            self.assertEqual(set(refused.json()), {"detail"})
+            self.assertIn("Request was throttled.", refused.json()["detail"])
+            self.assertGreater(int(refused["Retry-After"]), 0)
+            prepare.assert_not_called()
+            client = self.client_for(self.a)
+            self.assertEqual(client.get(self.notes_url).status_code, 200)
+            url = self.note_url(first.json())
+            self.assertEqual(client.patch(url, {"text": "Edited"}, format="json").status_code, 200)
+            self.assertEqual(client.delete(url).status_code, 204)
+            self.assertEqual(self.post().status_code, 429)
+            self.assertEqual(self.post(self.b).status_code, 201)
+            with patch.object(StepNoteDayThrottle, "timer", return_value=timezone.now().timestamp() + 86401):
+                self.assertEqual(self.post().status_code, 201)
 
     def test_access_nonmember_invitee_left_and_foreign_ids(self):
         with patch("apps.friends.photos.check_safe"):
@@ -149,6 +217,19 @@ class StepNotesTests(_NotesFixture, TestCase):
             check.assert_not_called()
         self.assertEqual(SharedGoalStepNote.objects.count(), 0)
         self.assertEqual(SharedGoalStepNotePhoto.objects.count(), 0)
+
+    def test_oversized_photo_header_is_refused_before_decode_or_moderation(self):
+        with (
+            patch("PIL.BmpImagePlugin.BmpImageFile.load") as load,
+            patch("apps.friends.photos.check_safe") as check,
+        ):
+            response = self.post(uploads=[self.upload(_oversized_bmp())])
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.json(), {"non_field_errors": ["That photo is too large. Try a smaller one."]})
+        load.assert_not_called()
+        check.assert_not_called()
+        self.assertFalse(SharedGoalStepNote.objects.exists())
+        self.assertFalse(SharedGoalStepNotePhoto.objects.exists())
 
     def test_photo_only_six_photos_normalized_metadata_and_private_serving(self):
         with patch("openai.resources.moderations.Moderations.create", return_value=_moderation()) as check:
