@@ -55,7 +55,7 @@ SOUL.md, USER.md, IDENTITY.md, and TOOLS.md are already in your context — neve
 
 If neither marker is present (legacy turn or internal warmup), default to the conversational behavior — keep it light.
 
-Use `nbhd_journal_search` / `nbhd_journal_context` only when you need to recall specific past context.
+Use `nbhd_journal_search` / `nbhd_journal_context` only when you need to recall specific past context. Read a vague ask against the user's open tasks and projects first. Recall with the topic's own words; if that misses, retry once before saying nothing was saved. Still two readings? Ask one short question.
 
 **Journal links.** To point at a journal doc/project, end on its own line with `[[journal-link: kind|slug|title]]`. Use only a slug a journal tool returned this turn; never invent one. With quick replies, put it just before their final line.
 

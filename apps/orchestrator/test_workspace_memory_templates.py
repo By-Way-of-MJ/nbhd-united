@@ -12,6 +12,7 @@ class WorkspaceMemoryTemplateTests(SimpleTestCase):
         agents = (_ROOT / "templates/openclaw/AGENTS.md").read_text()
         for phrase in ("## Session Start", "SOUL.md", "USER.md", "IDENTITY.md", "TOOLS.md"):
             self.assertIn(phrase, agents)
+        self.assertIn("retry once before saying nothing was saved", agents)
         self.assertNotIn("MEMORY.md", agents)
         self.assertNotIn("memory/YYYY-MM-DD.md", agents)
 
