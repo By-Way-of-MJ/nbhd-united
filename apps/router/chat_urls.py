@@ -11,6 +11,7 @@ from apps.router.chat_views import (
     ChatLocalTurnView,
     ChatMessageDetailView,
     ChatMessageView,
+    ChatPrewarmView,
     ChatReadView,
     ChatThreadDetailView,
     ChatThreadListView,
@@ -23,6 +24,7 @@ from apps.router.talk_route_views import TalkRouteView
 urlpatterns = [
     path("talk-route/", TalkRouteView.as_view(), name="chat-talk-route"),
     path("shape/", ChatShapeView.as_view(), name="chat-shape"),
+    path("prewarm/", ChatPrewarmView.as_view(), name="chat-prewarm"),
     path("messages/", ChatMessageView.as_view(), name="chat-message-create"),
     path("read/", ChatReadView.as_view(), name="chat-read"),
     path("context/", ChatContextView.as_view(), name="chat-context"),
