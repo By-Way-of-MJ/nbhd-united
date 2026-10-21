@@ -36,8 +36,8 @@ test("descriptions carry the untrusted-text rule", () => {
 
 test("descriptions say drafts and suggestions live in the Mission tab", () => {
   const t = tools();
-  assert.match(t.nbhd_project_draft.description, /first tile under Projects in the Mission tab/);
+  assert.match(t.nbhd_project_draft.description, /Draft tile under Projects in the Mission tab/);
   assert.match(t.nbhd_project_draft.description, /NBHD app's Mission tab/);
-  assert.match(t.nbhd_project_propose_change.description, /on the project in the Mission tab, and on the Projects card in chat/);
+  assert.match(t.nbhd_project_propose_change.description, /on the project in the Mission tab, or on the Projects card in chat/);
   assert.match(t.nbhd_project_propose_change.description, /NBHD app's Mission tab/);
 });

@@ -366,7 +366,7 @@ def create_draft(tenant, raw) -> dict:
     )
     return {
         "draft_id": str(draft.id),
-        "note": "Private draft saved. Your human reviews it as the first tile under Projects in the Mission tab "
+        "note": "Private draft saved. Your human reviews it as a Draft tile under Projects in the Mission tab "
         "and decides whether to start it. Nothing is shared and nobody is invited or asked until they do. "
         "Outside the app, say it's in the NBHD app's Mission tab.",
     }
@@ -578,7 +578,7 @@ def propose(tenant, mission_id, raw) -> dict:
     )
     return {
         "proposal_id": str(action.id),
-        "note": "Suggestion saved. Your human sees it on the project in the Mission tab, and on the Projects card "
+        "note": "Suggestion saved. Your human sees it on the project in the Mission tab or on the Projects card "
         "in chat, and decides. Nothing changes until they approve — you cannot approve it for them. "
         "Outside the app, say it's in the NBHD app's Mission tab.",
     }
