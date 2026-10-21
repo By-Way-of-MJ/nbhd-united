@@ -138,6 +138,9 @@ urlpatterns = [
 ]
 
 urlpatterns += [
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/notes/", project_views.StepNotesView.as_view()),
+    path("missions/<uuid:mission_id>/notes/<uuid:note_id>/", project_views.StepNoteView.as_view()),
+    path("missions/<uuid:mission_id>/notes/photos/<uuid:photo_id>/", project_views.StepNotePhotoView.as_view()),
     path("missions/<uuid:mission_id>/plan/", project_views.PlanView.as_view()),
     path("missions/<uuid:mission_id>/membership/", project_views.MembershipView.as_view()),
     path("missions/<uuid:mission_id>/members/", project_views.MembersView.as_view()),

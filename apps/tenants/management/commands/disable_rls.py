@@ -4,7 +4,7 @@ Supabase re-enables RLS on tables created by migrations.
 Run this after every `migrate` to ensure the application can
 read/write without per-row policies blocking access.
 
-EXCEPTION (friends DB backstop + transcript ledger): the eight friends tables
+EXCEPTION (friends DB backstop + transcript ledger): the ten friends tables
 and three ciphertext-only transcript tables carry deliberate FORCE-RLS tenant
 policies. Those MUST survive this boot-time sweep, or the backstop would be
 wiped on every deploy. Everything else keeps the pre-existing fleet posture
@@ -27,6 +27,8 @@ RLS_KEEP_ENABLED = frozenset(
         "shared_goal_steps",
         "shared_goal_step_assignments",
         "shared_goal_step_dependencies",
+        "shared_goal_step_notes",
+        "shared_goal_step_note_photos",
         "transcripts_transcriptevent",
         "transcripts_transcriptcapturequarantine",
         "transcripts_transcriptindexoutbox",

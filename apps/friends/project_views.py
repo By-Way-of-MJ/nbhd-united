@@ -1,10 +1,15 @@
 """App-JWT-only project API; runtime credentials never authorize a mutation."""
 
+from django.db import transaction
+from django.http import HttpResponse
 from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.tenants.authentication import JWTAuthenticationWithRLS
 
+from . import project_notes
 from . import project_services as projects
 from .project_flags import projects_v2_enabled
 from .views import FriendsView
@@ -225,3 +230,52 @@ class ProposalActionView(ProjectView):
         if action == "approve":
             return Response(assistant.approve(tenant, request.user, proposal_id))
         return Response(assistant.reject(tenant, proposal_id))
+
+
+class StepNotesView(ProjectView):
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method == "POST":
+            # Moderation is network I/O; pin a backend only for each short DB phase.
+            return APIView.dispatch(self, request, *args, **kwargs)
+        return super().dispatch(request, *args, **kwargs)
+
+    def initial(self, request, *args, **kwargs):
+        with transaction.atomic():
+            return super().initial(request, *args, **kwargs)
+
+    def get(self, request, mission_id, step_id):
+        return Response(project_notes.list_notes(self.get_tenant(request), mission_id, step_id))
+
+    def post(self, request, mission_id, step_id):
+        from apps.tenants.middleware import set_rls_context
+
+        tenant = self.get_tenant(request)
+        with transaction.atomic():
+            set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
+            project_notes.check_step(tenant, mission_id, step_id)
+        if set(request.data) - {"text", "photos"} or set(request.FILES) - {"photos"}:
+            raise ValidationError("Unknown note fields.")
+        text, prepared = project_notes.prepare(request.data.get("text"), request.FILES.getlist("photos"))
+        with transaction.atomic():
+            set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
+            result = project_notes.create(tenant, request.user, mission_id, step_id, text, prepared)
+        return Response(result, status=201)
+
+
+class StepNoteView(ProjectView):
+    def patch(self, request, mission_id, note_id):
+        return Response(project_notes.edit(self.get_tenant(request), mission_id, note_id, self.data(request)))
+
+    def delete(self, request, mission_id, note_id):
+        project_notes.delete(self.get_tenant(request), mission_id, note_id)
+        return Response(status=204)
+
+
+class StepNotePhotoView(ProjectView):
+    def get(self, request, mission_id, photo_id):
+        row = project_notes.photo(self.get_tenant(request), mission_id, photo_id)
+        response = HttpResponse(bytes(row.image), content_type="image/jpeg")
+        response["Cache-Control"] = "private, max-age=86400"
+        return response

@@ -79,6 +79,16 @@ class ProfilePhotoTests(TestCase):
         self.pa.refresh_from_db()
         self.assertIsNone(self.pa.photo_version)
 
+    def test_missing_moderation_verdict_fails_closed(self):
+        with patch("openai.resources.moderations.Moderations.create", return_value=SimpleNamespace(results=[])):
+            response = self.client_for(self.a).post(
+                "/api/v1/friends/profile/photo/",
+                {"photo": SimpleUploadedFile("me.jpg", _jpeg(), content_type="image/jpeg")},
+                format="multipart",
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(NeighborPhoto.objects.filter(profile=self.pa).exists())
+
     def test_check_that_cannot_run_fails_closed(self):
         with patch("openai.resources.moderations.Moderations.create", side_effect=RuntimeError("down")):
             response = self.client_for(self.a).post(
