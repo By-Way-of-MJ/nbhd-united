@@ -39,11 +39,10 @@ INBOUND_MEDIA_DIR = "workspace/media/inbound"
 _CONTAINER_WORKSPACE_ROOT = "/home/node/.openclaw"
 
 # Post-decode size cap for an app-uploaded image. A base64 image rides the JSON
-# body and inflates ~4/3, so 1.5 MB decoded ≈ 2.0 MB on the wire. NOTE: DRF's
-# JSONParser bypasses Django's DATA_UPLOAD_MAX_MEMORY_SIZE, so this cap alone
-# does NOT bound the request body — the ingress view enforces a Content-Length
-# ceiling (``_MAX_REQUEST_BODY_BYTES``) before materializing the body. iOS
-# compresses before upload.
+# body and inflates ~4/3, so 1.5 MB decoded ≈ 2.0 MB on the wire. The ingress
+# view enforces a Content-Length ceiling (``_MAX_REQUEST_BODY_BYTES``) before
+# materializing the body; Django 6.1 also bounds body reads using the larger
+# global DATA_UPLOAD_MAX_MEMORY_SIZE backstop. iOS compresses before upload.
 MAX_APP_IMAGE_BYTES = 1_500_000
 
 # Post-decode size cap for an app-uploaded PDF. Matches the OpenClaw ``pdf``
@@ -52,6 +51,10 @@ MAX_APP_IMAGE_BYTES = 1_500_000
 # images, the ingress view's Content-Length guard bounds the raw body before
 # this cap is reached.
 MAX_APP_DOCUMENT_BYTES = 10 * 1024 * 1024
+
+# Per-message limits, also advertised by /api/v1/tenants/me/.
+MULTI_ATTACHMENT_LIMITS = {"images": 6, "documents": 3}
+MAX_APP_ATTACHMENTS_BYTES = 20 * 1024 * 1024
 
 # Canonical image extensions we accept. We sniff DECODED magic bytes rather than
 # trusting a client-supplied mime, so a mislabeled or non-image payload can
@@ -380,6 +383,42 @@ def decode_and_validate_document(
     return (data, ext, None)
 
 
+def decode_and_validate_attachments(
+    payload: dict, *, tenant_id: str
+) -> tuple[list[tuple[str, bytes, str]], str | None]:
+    """Validate all files before any storage or enqueue side effects.
+
+    Order is images then documents, preserving each array's order. Legacy
+    singular fields precede their corresponding arrays and count toward the
+    same limits. Blank singular fields retain their historical absent meaning;
+    array entries must each contain a file.
+    """
+    files = []
+    for singular, plural, kind, validate in (
+        ("image", "images", "photo", decode_and_validate_image),
+        ("document", "documents", "document", decode_and_validate_document),
+    ):
+        kwargs = {"tenant_id": tenant_id} if kind == "document" else {}
+        data, ext, error = validate(payload.get(singular), **kwargs)
+        if error:
+            return [], error
+        entries = payload.get(plural, [])
+        if not isinstance(entries, list):
+            return [], f"invalid_{singular}"
+        if len(entries) + (data is not None) > MULTI_ATTACHMENT_LIMITS[plural]:
+            return [], "multiple_attachments"
+        if data is not None:
+            files.append((kind, data, ext))
+        for raw in entries:
+            data, ext, error = validate(raw, **kwargs)
+            if error or data is None:
+                return [], error or f"invalid_{singular}"
+            files.append((kind, data, ext))
+        if sum(len(data) for _, data, _ in files) > MAX_APP_ATTACHMENTS_BYTES:
+            return [], "attachments_too_large"
+    return files, None
+
+
 def _store_inbound_media(
     tenant_id: str,
     data: bytes,
@@ -388,6 +427,7 @@ def _store_inbound_media(
     prefix: str,
     allowed_exts: frozenset[str],
     default_ext: str,
+    hash_full_content: bool = False,
 ) -> tuple[str, str]:
     """Write media bytes to the tenant's workspace share; return its paths.
 
@@ -395,8 +435,9 @@ def _store_inbound_media(
       - ``container_path``  — the MOUNTED path to hand the agent in the marker.
       - ``workspace_path``  — the share-relative path (for the attachment ref).
 
-    The filename is content-addressed (sha256 of the first 1 KB) so re-sending
-    the same file is idempotent on the share. The binary write bypasses the text
+    Legacy filenames hash the first 1 KB. Multi-file turns hash complete bytes
+    so files sharing that prefix cannot overwrite each other. Re-sending the
+    same file remains idempotent. The binary write bypasses the text
     sanitizer (which would strip NUL/C0 and corrupt a JPEG or PDF) and is a
     single atomic PUT via ``upload_workspace_file_binary``.
     """
@@ -405,7 +446,7 @@ def _store_inbound_media(
     from apps.orchestrator.azure_client import upload_workspace_file_binary
 
     safe_ext = ext if ext in allowed_exts else default_ext
-    name_hash = hashlib.sha256(data[:1024]).hexdigest()[:8]
+    name_hash = hashlib.sha256(data if hash_full_content else data[:1024]).hexdigest()[:8]
     filename = f"{prefix}_{name_hash}.{safe_ext}"
     workspace_path = f"{INBOUND_MEDIA_DIR}/{filename}"
     upload_workspace_file_binary(str(tenant_id), workspace_path, data)
@@ -425,14 +466,22 @@ def _store_inbound_media(
     return container_path, workspace_path
 
 
-def store_inbound_image(tenant_id: str, data: bytes, ext: str) -> tuple[str, str]:
+def store_inbound_image(tenant_id: str, data: bytes, ext: str, *, hash_full_content: bool = False) -> tuple[str, str]:
     """Write image bytes to the tenant's share as ``photo_<hash>.<ext>``.
 
-    Thin wrapper over ``_store_inbound_media`` — the filename scheme and
-    container path are byte-identical to what the Telegram poller has always
-    written, so both channels share the storage chokepoint.
+    Thin wrapper over ``_store_inbound_media``. By default the filename and
+    container path are byte-identical to the Telegram poller's legacy paths;
+    multi-file turns opt into hashing the complete contents.
     """
-    return _store_inbound_media(tenant_id, data, ext, prefix="photo", allowed_exts=_ALLOWED_EXTS, default_ext="jpg")
+    return _store_inbound_media(
+        tenant_id,
+        data,
+        ext,
+        prefix="photo",
+        allowed_exts=_ALLOWED_EXTS,
+        default_ext="jpg",
+        hash_full_content=hash_full_content,
+    )
 
 
 # Basename prefix ``store_inbound_document`` stamps (``prefix="doc"`` below).
@@ -466,14 +515,24 @@ def container_media_path(workspace_path: str) -> str:
     return f"{_CONTAINER_WORKSPACE_ROOT}/{workspace_path}"
 
 
-def store_inbound_document(tenant_id: str, data: bytes, ext: str) -> tuple[str, str]:
+def store_inbound_document(
+    tenant_id: str, data: bytes, ext: str, *, hash_full_content: bool = False
+) -> tuple[str, str]:
     """Write document bytes to the tenant's share as ``doc_<hash>.<ext>``.
 
     The ``doc_`` prefix keeps documents distinguishable from ``photo_`` images
     in the same inbound directory; both are GC'd together by
     ``cleanup_inbound_media_task`` (24h, directory-wide).
     """
-    return _store_inbound_media(tenant_id, data, ext, prefix="doc", allowed_exts=_ALLOWED_DOC_EXTS, default_ext="pdf")
+    return _store_inbound_media(
+        tenant_id,
+        data,
+        ext,
+        prefix="doc",
+        allowed_exts=_ALLOWED_DOC_EXTS,
+        default_ext="pdf",
+        hash_full_content=hash_full_content,
+    )
 
 
 # Appended to every attachment marker so the model reads the file's contents as

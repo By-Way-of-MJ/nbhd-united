@@ -830,6 +830,13 @@ class AppChatMessage(models.Model):
         "turns. The agent reads it via the '[Photo attached: <container-path>]' marker "
         "baked into the queued message_text — the bytes never ride the queue payload.",
     )
+    attachment_paths = models.JSONField(
+        default=list,
+        db_default=[],
+        blank=True,
+        help_text="All stored inbound attachment workspace paths in delivery order; "
+        "attachment_path retains the first path for older readers.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     replied_at = models.DateTimeField(null=True, blank=True)
     retried_at = models.DateTimeField(
@@ -934,22 +941,26 @@ class AppChatMessage(models.Model):
     journal_link = models.JSONField(null=True, blank=True, default=None)
 
     @property
-    def attachment_flags(self) -> tuple[bool, bool]:
-        """``(has_image, has_document)`` for this turn's stored attachment.
+    def stored_attachment_paths(self) -> list[str]:
+        """All paths, falling back to the singular field for historical rows."""
+        return self.attachment_paths or ([self.attachment_path] if self.attachment_path else [])
 
-        One attachment per turn, typed off the stored file's extension (no
-        schema column): a ``.pdf`` path is a document, any other non-empty path
-        is an image, an empty path is neither. Null-safe. The single source of
-        truth shared by the per-message detail serializer
-        (``chat_views._serialize_message``) and the ``?since=`` history feed
-        (``apps.router.chat_history``) so the two rendering paths can never
-        drift on how a stored path maps to an attachment bubble.
+    @property
+    def attachments(self) -> list[dict[str, str]]:
+        """Owner-facing metadata; tenant-share paths stay internal."""
+        return [
+            {"kind": "document" if path.lower().endswith(".pdf") else "image"} for path in self.stored_attachment_paths
+        ]
+
+    @property
+    def attachment_flags(self) -> tuple[bool, bool]:
+        """Presence flags shared by detail and since-feed serializers.
+
+        A PDF path is a document; every other non-empty path is an image.
+        Historical singular rows keep their original flag values.
         """
-        path = self.attachment_path
-        if not path:
-            return False, False
-        is_pdf = path.lower().endswith(".pdf")
-        return (not is_pdf, is_pdf)
+        kinds = {item["kind"] for item in self.attachments}
+        return "image" in kinds, "document" in kinds
 
     class Meta:
         db_table = "app_chat_messages"

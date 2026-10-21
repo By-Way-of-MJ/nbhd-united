@@ -109,22 +109,23 @@ bounce.
 
 ### iOS / web app chat
 
-`ChatMessageView.post` (`chat_views.py:475`) is JWT-authed. It bounds the raw body
-*before* DRF materializes it (`:490` — DRF's JSONParser bypasses
-`DATA_UPLOAD_MAX_MEMORY_SIZE`, so an unbounded base64 image could OOM the shared
-control plane), is **idempotent on `client_msg_id` first** (a retry replays the
-existing turn, so an image is written to the share exactly once), decodes+validates
-an optional inbound image, resolves the `ChatThread`, and calls
-`enqueue_tenant_turn` (`:230`). That helper is the single chokepoint for "route
-this to the full tenant agent" — also used by the Siri escalation path. It creates
-a PENDING `AppChatMessage`, budget-gates, stores any image on the tenant share
-(marker `[Photo attached: <path>]`, bytes never ride the queue), redacts PII,
-injects datetime/chat markers, and enqueues an `ios` `PendingMessage`. The client
-then **polls** `ChatMessageDetailView` (`:694`) until `status` flips to
+`ChatMessageView.post` is JWT-authed. It bounds the raw body before DRF
+materializes it, below Django 6.1's larger `DATA_UPLOAD_MAX_MEMORY_SIZE` backstop.
+It is **idempotent on `client_msg_id` first** (a retry replays the existing turn
+without revalidating or storing attachments), validates up to six images and
+three PDFs with a 20 MiB decoded total, resolves the `ChatThread`, and calls
+`enqueue_tenant_turn`. Legacy singular fields still work; see
+[App chat attachments](chat-attachments.md) for the array contract. The helper is
+the single chokepoint for "route this to the full tenant agent" — also used by
+the Siri escalation path. It creates
+a PENDING `AppChatMessage`, budget-gates, stores every attachment on the tenant
+share (ordered photo/document markers with untrusted-data framing; bytes never
+ride the queue), redacts PII, injects datetime/chat markers, and enqueues an `ios`
+`PendingMessage`. The client then **polls** `ChatMessageDetailView` until `status` flips to
 `ready`/`error`. iOS is a first-class channel for the idle-hibernation freshness
-signal (`last_message_at` stamped at `:371`).
+signal (`last_message_at` stamped by the enqueue helper).
 
-**On-device (private) mode** (`ChatLocalTurnView`, `:631`) records a turn that
+**On-device (private) mode** (`ChatLocalTurnView`) records a turn that
 *already happened* on the client's own model as a READY `AppChatMessage`
 (`source="on_device"`) — nothing is enqueued, no container woken, no model budget
 spent. The recorded text still enters the USER.md conversation digest so crons and

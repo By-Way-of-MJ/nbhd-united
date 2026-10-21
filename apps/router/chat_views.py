@@ -39,11 +39,10 @@ from apps.crypto.nolog import RedactedStr
 from apps.router import enc_columns, enc_read
 from apps.router.conversation_capture import scrub_chat_thread_title
 from apps.router.inbound_media import (
-    MAX_APP_DOCUMENT_BYTES,
-    MAX_APP_IMAGE_BYTES,
+    MAX_APP_ATTACHMENTS_BYTES,
+    MULTI_ATTACHMENT_LIMITS,
     attachment_marker,
-    decode_and_validate_document,
-    decode_and_validate_image,
+    decode_and_validate_attachments,
     store_inbound_document,
     store_inbound_image,
 )
@@ -65,15 +64,13 @@ logger = logging.getLogger(__name__)
 # bounded so a pathological payload can't bloat the queue row / prompt.
 _MAX_CHARS = 8000
 
-# Hard ceiling on the raw request body. DRF's JSONParser reads the request
-# stream directly, bypassing Django's DATA_UPLOAD_MAX_MEMORY_SIZE, so without
-# this an authenticated client could POST a multi-hundred-MB base64 attachment
-# and OOM the shared control plane. Sized to admit the largest allowed
-# attachment (a 10 MB PDF; base64 ≈ 4/3 ⇒ ~13.4 MB) plus the JSON envelope + an
+# Reject oversized raw bodies before parsing, below Django 6.1's larger global
+# DATA_UPLOAD_MAX_MEMORY_SIZE backstop. Sized to admit the largest allowed
+# attachments (20 MiB decoded; base64 ≈ 4/3) plus the JSON envelope + an
 # 8k caption, and nothing beyond that. A too-large image still fails its own
 # precise 400 (image_too_large) after decode; this coarse guard is the pre-body
 # OOM defense only.
-_MAX_REQUEST_BODY_BYTES = max(MAX_APP_IMAGE_BYTES, MAX_APP_DOCUMENT_BYTES) * 4 // 3 + 300_000
+_MAX_REQUEST_BODY_BYTES = MAX_APP_ATTACHMENTS_BYTES * 4 // 3 + 300_000
 
 # ``AppChatMessage.client_msg_id`` is CharField(max_length=64); Django doesn't
 # enforce that on save, so an oversized id would surface as a Postgres
@@ -488,7 +485,7 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         tenant_id=msg.tenant_id,
         channel="ios_detail",
     )
-    # One attachment per turn, typed off the stored file's extension. Shared
+    # Attachments are typed off the stored file's extension. Shared
     # with the ?since= feed via AppChatMessage.attachment_flags so the two
     # rendering paths can't drift.
     has_image, has_document = msg.attachment_flags
@@ -537,10 +534,10 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         "partial_seq": msg.partial_seq if msg.status == AppChatMessage.Status.PENDING else 0,
         # True when the user's turn carried an inbound image / PDF (stored on
         # the share; the raw path is internal and not exposed). Lets a polling
-        # client render the right attachment bubble for the turn. Mutually
-        # exclusive — see AppChatMessage.attachment_flags.
+        # client render the right attachment bubble for the turn.
         "has_image": has_image,
         "has_document": has_document,
+        "attachments": msg.attachments,
         # Per-turn PII transparency: the real values obfuscated behind
         # placeholders on the way to / back from the assistant, as
         # [{"placeholder", "value"}]. null when nothing was obfuscated or the
@@ -576,6 +573,7 @@ def enqueue_tenant_turn(
     image_ext: str = "jpg",
     document: bytes | None = None,
     document_ext: str = "pdf",
+    attachments: list[tuple[str, bytes, str]] | None = None,
     ingress_origin: str = "ios",
     idempotency_prechecked: bool = False,
     tenant_fresh: bool = False,
@@ -599,8 +597,8 @@ def enqueue_tenant_turn(
     skips its budget-field re-read. The Siri escalation leaves it False: its
     tenant row predates a multi-second fast-responder model call.
 
-    ``image`` / ``document`` (optional, already-decoded+validated bytes; at most
-    one per turn) are stored on the tenant share and referenced from the
+    ``image`` / ``document`` and ``attachments`` (already-decoded+validated
+    bytes, in delivery order) are stored on the tenant share and referenced from the
     LLM-bound text via ``inbound_media.attachment_marker`` — ``[Photo attached:
     <path> — ...]`` for an image (the same marker the Telegram poller uses;
     read by the built-in ``image`` tool) or ``[Document attached: <path> —
@@ -615,13 +613,22 @@ def enqueue_tenant_turn(
     turn is recorded as ERROR and returned with ``created=False`` (nothing
     enqueued, no container woken).
     """
-    # Defense in depth: one attachment per turn (attachment_path is a single
-    # column). The ChatMessageView POST already enforces this XOR before calling
-    # in; this guard makes the invariant local so a future caller can't silently
-    # store two files and clobber attachment_path. (Neither the Siri escalation
-    # path nor any current caller passes both.)
-    if image is not None and document is not None:
-        raise ValueError("enqueue_tenant_turn: pass at most one of image/document per turn")
+    files = []
+    if image is not None:
+        files.append(("photo", image, image_ext))
+    if document is not None:
+        files.append(("document", document, document_ext))
+    files.extend(attachments or [])
+    # Internal callers must obey the same per-turn limits as the HTTP ingress.
+    if (
+        any(kind not in {"photo", "document"} for kind, _, _ in files)
+        or sum(kind == "photo" for kind, _, _ in files) > MULTI_ATTACHMENT_LIMITS["images"]
+        or sum(kind == "document" for kind, _, _ in files) > MULTI_ATTACHMENT_LIMITS["documents"]
+        or sum(len(data) for _, data, _ in files) > MAX_APP_ATTACHMENTS_BYTES
+    ):
+        raise ValueError("enqueue_tenant_turn: invalid attachments or attachment limits exceeded")
+    has_image = any(kind == "photo" for kind, _, _ in files)
+    has_document = any(kind == "document" for kind, _, _ in files)
 
     if not idempotency_prechecked:
         existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
@@ -680,50 +687,33 @@ def enqueue_tenant_turn(
 
     user_tz = getattr(user, "timezone", None) or "UTC"
 
-    # Inbound image: persist the bytes on the tenant share and decorate the
-    # LLM-bound text with the same [Photo attached: <path>] marker the Telegram
-    # poller uses, so the agent's built-in ``image`` tool reads the local file.
-    # The marker is NOT PII and is NOT part of the user's displayed text, so it
-    # is assembled separately from (and never fed through) redaction. If the
-    # store fails we degrade to a text turn with a "couldn't process" marker —
-    # mirrors the poller's >5 MB fallback — rather than dropping the turn.
-    image_marker = ""
-    if image:
+    # Preserve each file's framing and delivery order. Store failures keep the
+    # existing per-file resend notice and do not discard successful siblings.
+    # Paths are persisted before publishing PDF extraction, as for legacy turns.
+    markers = []
+    paths = []
+    for kind, data, ext in files:
         try:
-            container_path, workspace_path = store_inbound_image(str(tenant.id), image, image_ext)
-            AppChatMessage.objects.filter(pk=turn.pk).update(attachment_path=workspace_path)
-            turn.attachment_path = workspace_path
-            image_marker = attachment_marker("photo", container_path)
+            store = store_inbound_image if kind == "photo" else store_inbound_document
+            # Keep legacy single-file paths byte-identical. Multi-file turns
+            # must distinguish files whose first 1 KiB happens to be identical.
+            storage_options = {"hash_full_content": True} if len(files) > 1 else {}
+            container_path, workspace_path = store(str(tenant.id), data, ext, **storage_options)
+            paths.append(workspace_path)
+            AppChatMessage.objects.filter(pk=turn.pk).update(attachment_path=paths[0], attachment_paths=paths)
+            turn.attachment_path = paths[0]
+            turn.attachment_paths = list(paths)
+            extraction_queued = (
+                _enqueue_document_extraction(tenant, workspace_path, str(thread.id)) if kind == "document" else False
+            )
+            markers.append(attachment_marker(kind, container_path, extraction_pending=extraction_queued))
         except Exception:
             logger.exception(
-                "enqueue_tenant_turn: image store failed for tenant %s — degrading to a text turn",
+                "enqueue_tenant_turn: %s store failed for tenant %s — degrading to a text turn",
+                kind,
                 str(tenant.id)[:8],
             )
-            image_marker = "[The user attached a photo but it couldn't be processed — ask them to resend it.]\n"
-
-    # Inbound PDF: same pattern as the photo above, but the read is moved OFF
-    # this turn. ``extract_inbound_document_task`` pulls the text layer
-    # server-side and delivers it as a follow-up turn, so the marker tells the
-    # agent to acknowledge now instead of blocking the whole queue on the
-    # in-turn ``pdf`` tool (the speed complaint this feature exists to fix —
-    # CONTINUITY_async_pdf_extraction.md). The ``pdf`` tool stays the fallback:
-    # the task says so explicitly when it can't produce text.
-    # The view enforces at most one attachment per turn, so image and document
-    # never both write attachment_path in the same call.
-    document_marker = ""
-    if document:
-        try:
-            container_path, workspace_path = store_inbound_document(str(tenant.id), document, document_ext)
-            AppChatMessage.objects.filter(pk=turn.pk).update(attachment_path=workspace_path)
-            turn.attachment_path = workspace_path
-            extraction_queued = _enqueue_document_extraction(tenant, workspace_path, str(thread.id))
-            document_marker = attachment_marker("document", container_path, extraction_pending=extraction_queued)
-        except Exception:
-            logger.exception(
-                "enqueue_tenant_turn: document store failed for tenant %s — degrading to a text turn",
-                str(tenant.id)[:8],
-            )
-            document_marker = "[The user attached a document but it couldn't be processed — ask them to resend it.]\n"
+            markers.append(f"[The user attached a {kind} but it couldn't be processed — ask them to resend it.]\n")
 
     # PII redaction for outgoing LLM-provider traffic. Redact the bare user
     # text BEFORE prepending the datetime/chat markers (redacting the
@@ -775,9 +765,11 @@ def enqueue_tenant_turn(
     # act on.
     if redacted_text:
         llm_text = redacted_text
-    elif image:
+    elif len(files) > 1:
+        llm_text = "(the user sent attachments with no caption)"
+    elif has_image:
         llm_text = "(the user sent a photo with no caption)"
-    elif document:
+    elif has_document:
         llm_text = "(the user sent a document with no caption)"
     else:
         llm_text = ""
@@ -785,11 +777,7 @@ def enqueue_tenant_turn(
     # "this is a chat turn, don't pre-load workspace docs" marker + any
     # attachment marker, then the user's (redacted) text.
     message_text = (
-        build_datetime_context(user_tz)
-        + build_chat_context_marker("ios", tenant=tenant)
-        + image_marker
-        + document_marker
-        + llm_text
+        build_datetime_context(user_tz) + build_chat_context_marker("ios", tenant=tenant) + "".join(markers) + llm_text
     )
 
     payload = {
@@ -803,12 +791,12 @@ def enqueue_tenant_turn(
             "reason": redaction.reason,
         },
     }
-    if image:
+    if has_image:
         # Force a singleton batch: a coalesced batch (cold-start burst) rebuilds
         # content from row.user_text, which carries no [Photo attached] marker —
         # so a coalesced image turn would lose the photo. Mirrors is_voice.
         payload["is_image"] = True
-    if document:
+    if has_document:
         # Same singleton reasoning as is_image: the [Document attached] marker
         # lives only in message_text and would be dropped by a coalesced rebuild.
         payload["is_document"] = True
@@ -1030,9 +1018,8 @@ class ChatMessageView(APIView):
             return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
 
         # Bound the raw body BEFORE DRF materializes it (the request.data access
-        # below). DRF's JSONParser reads the request stream directly, bypassing
-        # Django's DATA_UPLOAD_MAX_MEMORY_SIZE, so an unbounded base64 image body
-        # could OOM the shared control plane. Content-Length is trusted only to
+        # below). This gives a typed response before Django's larger global
+        # DATA_UPLOAD_MAX_MEMORY_SIZE backstop. Content-Length is trusted only to
         # reject early; an absent/chunked length still falls back to Django's
         # capped ``.body`` when request.data is parsed.
         try:
@@ -1065,29 +1052,13 @@ class ChatMessageView(APIView):
 
         text = str(request.data.get("text") or "").strip()
 
-        # Optional inbound image / PDF (base64 / data URL). Decode + validate up
-        # front so a malformed payload is a 400 before any enqueue; the actual
-        # share write is deferred to enqueue_tenant_turn (after the budget gate).
-        image_bytes, image_ext, image_err = decode_and_validate_image(
-            request.data.get("image"), max_bytes=MAX_APP_IMAGE_BYTES
-        )
-        if image_err:
-            return Response({"error": image_err}, status=status.HTTP_400_BAD_REQUEST)
+        # Validate every file before storing any, while preserving the legacy
+        # single-field decoders and their error codes.
+        attachments, attachment_error = decode_and_validate_attachments(request.data, tenant_id=str(tenant.id))
+        if attachment_error:
+            return Response({"error": attachment_error}, status=status.HTTP_400_BAD_REQUEST)
 
-        document_bytes, document_ext, document_err = decode_and_validate_document(
-            request.data.get("document"), max_bytes=MAX_APP_DOCUMENT_BYTES, tenant_id=str(tenant.id)
-        )
-        if document_err:
-            return Response({"error": document_err}, status=status.HTTP_400_BAD_REQUEST)
-
-        # One attachment per turn: attachment_path holds a single path, and a
-        # turn carrying both a photo and a PDF has no clear single intent.
-        if image_bytes is not None and document_bytes is not None:
-            return Response({"error": "multiple_attachments"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # A bare attachment with no caption is a valid turn — require text OR an
-        # image OR a document.
-        if not text and image_bytes is None and document_bytes is None:
+        if not text and not attachments:
             return Response({"error": "empty_message"}, status=status.HTTP_400_BAD_REQUEST)
         if len(text) > _MAX_CHARS:
             return Response({"error": "message_too_long"}, status=status.HTTP_400_BAD_REQUEST)
@@ -1125,10 +1096,7 @@ class ChatMessageView(APIView):
             text=text,
             thread=thread,
             client_msg_id=client_msg_id,
-            image=image_bytes,
-            image_ext=image_ext or "jpg",
-            document=document_bytes,
-            document_ext=document_ext or "pdf",
+            attachments=attachments,
             # The replay read above already ran for this client_msg_id.
             idempotency_prechecked=True,
             # request.user.tenant was loaded by auth in this request.

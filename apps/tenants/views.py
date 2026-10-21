@@ -16,6 +16,7 @@ from apps.common.cache import tenant_cache
 from apps.cron.publish import publish_task
 from apps.orchestrator.config_generator import TIER_MODEL_CONFIGS
 from apps.orchestrator.migration_cron_fence import cron_edits_fenced, cron_fenced_response
+from apps.router.inbound_media import MULTI_ATTACHMENT_LIMITS
 from apps.router.telegram_availability import telegram_inbound_enabled
 
 from .models import Tenant
@@ -37,7 +38,7 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         return Tenant.objects.none()
 
     @action(detail=False, methods=["get"])
-    @tenant_cache(ttl=60, tag="tenant", key_extra=telegram_inbound_enabled)
+    @tenant_cache(ttl=60, tag="tenant", key_extra=lambda: f"multi_attachments_v1:{telegram_inbound_enabled()}")
     def me(self, request):
         """Get current user's tenant."""
         try:
@@ -47,7 +48,9 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
                 {"detail": "No tenant found. Complete onboarding first."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(TenantSerializer(tenant).data)
+        data = TenantSerializer(tenant).data
+        data["multi_attachments"] = MULTI_ATTACHMENT_LIMITS.copy()
+        return Response(data)
 
 
 class OnboardTenantView(APIView):

@@ -1,7 +1,7 @@
 """D8 same-turn document-write backstop — the prompt-injection defense.
 
 Lives in ``apps.router`` (not a pillar app) because it reads router inbound state
-(``AppChatMessage.attachment_path``) and is invoked from the runtime destination-write
+(``AppChatMessage.stored_attachment_paths``) and is invoked from the runtime destination-write
 views of several apps (integrations, fuel, finance) — a neutral home keeps those
 imports acyclic.
 
@@ -95,7 +95,7 @@ def assert_write_allowed_for_document_turn(tenant, thread=None) -> Response | No
     Returns a 409 ``Response`` to refuse, else ``None``. Gated on
     ``document_ingestion_enabled`` during canary (default-on at the fleet flip).
 
-    The discriminator is ``AppChatMessage.attachment_path`` (a stored ``doc_<hash>``
+    The discriminator is ``AppChatMessage.stored_attachment_paths`` (a stored ``doc_<hash>``
     file), NOT the ``[Document attached:]`` marker — the marker lives only in the
     queued payload, never on the persisted row. If the tenant's most recent inbound
     turn is a document upload with no plain user turn after it, refuse. False-positives
@@ -114,8 +114,8 @@ def assert_write_allowed_for_document_turn(tenant, thread=None) -> Response | No
     qs = AppChatMessage.objects.filter(tenant=tenant)
     if thread is not None:
         qs = qs.filter(thread=thread)
-    latest_attachment = qs.order_by("-created_at").values_list("attachment_path", flat=True).first()
-    if not is_inbound_document_path(latest_attachment):
+    latest = qs.order_by("-created_at").only("attachment_path", "attachment_paths").first()
+    if latest is None or not any(is_inbound_document_path(path) for path in latest.stored_attachment_paths):
         return None
     logger.info("doc_write_blocked tenant=%s view=%s", str(tenant.id)[:8], _current_view_name())
     return Response(

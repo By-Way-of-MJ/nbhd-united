@@ -55,13 +55,12 @@ PII_PROVISIONAL_SWEEP_ENABLED = env.bool("PII_PROVISIONAL_SWEEP_ENABLED", defaul
 PII_PROVISIONAL_TTL_HOURS = _positive_int_env("PII_PROVISIONAL_TTL_HOURS", 72)
 
 # Django 6.1 enforces this cap on request.body reads, including DRF JSON
-# parsing. iOS base64 document uploads legitimately reach ~14.1 MB (a 10 MiB
-# document × 4/3 plus the JSON envelope). The app-level typed caps in
+# parsing. App chat uploads may contain 20 MiB decoded (roughly 28 MB as
+# base64 plus the JSON envelope). The app-level typed caps in
 # apps/router/inbound_media.py, plus per-view caps such as datebook's 1 MiB,
 # remain the front-line, user-facing limits. This global value is the hard
-# backstop and must stay above base64(MAX_APP_DOCUMENT_BYTES + the oversize-test
-# margin).
-DATA_UPLOAD_MAX_MEMORY_SIZE = 16 * 1024 * 1024
+# backstop and must stay above the chat view's raw-body ceiling.
+DATA_UPLOAD_MAX_MEMORY_SIZE = 32 * 1024 * 1024
 
 # Application definition
 INSTALLED_APPS = [
