@@ -88,6 +88,16 @@ class ChatMessageSendHourThrottle(_UserScopedThrottle):
     rate = "300/hour"
 
 
+class ChatPrewarmThrottle(_UserScopedThrottle):
+    """Opening Chat fires a best-effort wake. Each call can cost a container
+    cold start, so cap per-user opens well above human tap rate while the
+    per-tenant cache window (one publish per 10 minutes) does the real spend
+    bounding."""
+
+    scope = "chat_prewarm_hour"
+    rate = "30/hour"
+
+
 class SiriRespondMinuteThrottle(_UserScopedThrottle):
     """The Tier-2 fast responder calls a model on every request (platform ZDR
     key, platform-absorbed cost). Human voice pacing is a few per minute; this

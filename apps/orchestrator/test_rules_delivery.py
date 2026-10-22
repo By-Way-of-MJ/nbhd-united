@@ -102,6 +102,7 @@ class RulesDeliveryTest(TestCase):
     def test_ungated_chat_is_byte_identical_to_pre_change_render(self):
         # Hash captured from the base implementation, before the inline block.
         # Re-captured 2026-10-06: the chart sentence now bans character drawings on every channel.
+        # Re-captured 2026-10-22: recall line in AGENTS.md.
         tenant = Tenant(user=User(username="synthetic", timezone="Asia/Tokyo", location_city="Tokyo"))
         for allowlist in ("", "00000000-0000-0000-0000-000000000001"):
             with (
@@ -111,7 +112,7 @@ class RulesDeliveryTest(TestCase):
                 prompt = render_workspace_files("neighbor", tenant=tenant)["NBHD_AGENTS_MD"]
             self.assertEqual(
                 hashlib.sha256(prompt.encode()).hexdigest(),
-                "e05e3c7eb7f23aadaa0f38d4a59d4321a0c04da185678dccc620c0d21d0deee7",
+                "1f01c454714a687fb91ca11b855d65be2e3905cdfca5afcff2d5a465740c37aa",
             )
 
     def test_all_gates_render_within_pin(self):
@@ -119,7 +120,8 @@ class RulesDeliveryTest(TestCase):
 
         # Measured after rules-delivery W0: 21,920 chars (R0 ceiling 22,759). 2026-08-30 KSE-9: the approval-code Website edit gate yields 23,505; runtime cap BOOTSTRAP_MAX_CHARS=26,000.
         # 2026-10-06: the one-line Shop gate (site-publishing tenants) yields 23,682; still 2,268 under the 25,950 alarm.
-        self.assertLessEqual(len(prompt), 23_682)
+        # 2026-10-22: recall line (read vague asks against open tasks; retry recall once) yields 23,888; 2,062 under the 25,950 alarm.
+        self.assertLessEqual(len(prompt), 23_888)
 
 
 class ToolsReferenceCronStubTest(SimpleTestCase):

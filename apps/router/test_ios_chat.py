@@ -2396,3 +2396,195 @@ class IOSChatSendThrottleTest(TestCase):
         for _ in range(5):
             r = self.client.get("/api/v1/chat/messages/")
             self.assertEqual(r.status_code, 200, r.content)
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class IOSChatWakeAtIngressTest(TestCase):
+    """A cold app message must start the tenant wake at ingress, not wait for
+    the drain's first 404 and its (formerly 20 s) blind retry defer."""
+
+    def setUp(self):
+        self.user = _make_user()
+        self.tenant = _make_tenant(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _hibernate(self):
+        from django.utils import timezone
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=timezone.now())
+        # Re-fetch the auth user so the request's cached tenant row carries the
+        # new hibernated_at instead of the value from creation time.
+        self.user = User.objects.get(pk=self.user.pk)
+        self.client.force_authenticate(user=self.user)
+
+    @staticmethod
+    def _wake_calls(mock_publish):
+        return [
+            call for call in mock_publish.call_args_list if call.args and call.args[0] == "wake_tenant_for_app_message"
+        ]
+
+    @patch("apps.cron.publish.publish_task")
+    def test_hibernated_tenant_publishes_wake_before_drain_failure(self, mock_publish):
+        self._hibernate()
+
+        resp = self.client.post(
+            "/api/v1/chat/messages/",
+            {"text": "cold hello", "client_msg_id": "cold1"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201, resp.content)
+        wake_calls = self._wake_calls(mock_publish)
+        self.assertEqual(len(wake_calls), 1, mock_publish.call_args_list)
+        self.assertEqual(wake_calls[0].args, ("wake_tenant_for_app_message", str(self.tenant.id)))
+        self.assertEqual(wake_calls[0].kwargs, {"retries": 1})
+
+    @patch("apps.cron.publish.publish_task")
+    def test_awake_tenant_does_not_publish_a_wake(self, mock_publish):
+        resp = self.client.post(
+            "/api/v1/chat/messages/",
+            {"text": "warm hello", "client_msg_id": "warm1"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(self._wake_calls(mock_publish), [])
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("QStash down"))
+    def test_wake_publish_failure_never_fails_the_post_or_drops_the_turn(self, mock_publish):
+        self._hibernate()
+
+        resp = self.client.post(
+            "/api/v1/chat/messages/",
+            {"text": "still delivered", "client_msg_id": "fail1"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(
+            AppChatMessage.objects.filter(
+                tenant=self.tenant,
+                client_msg_id="fail1",
+                status=AppChatMessage.Status.PENDING,
+            ).exists()
+        )
+        self.assertTrue(
+            PendingMessage.objects.filter(
+                tenant=self.tenant,
+                channel=PendingMessage.Channel.IOS,
+            ).exists()
+        )
+
+    @patch("apps.orchestrator.hibernation.wake_hibernated_tenant", return_value=True)
+    def test_wake_task_only_wakes_hibernated_tenants(self, mock_wake):
+        from apps.orchestrator.hibernation import wake_tenant_for_app_message
+
+        result = wake_tenant_for_app_message(str(self.tenant.id))
+        self.assertEqual(result, {"status": "already_awake"})
+        mock_wake.assert_not_called()
+
+        self._hibernate()
+        result = wake_tenant_for_app_message(str(self.tenant.id))
+        self.assertEqual(result, {"status": "woken_for_app_message"})
+        mock_wake.assert_called_once()
+        self.assertEqual(str(mock_wake.call_args.args[0].id), str(self.tenant.id))
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key")
+class ChatPrewarmEndpointTest(TestCase):
+    """POST /chat/prewarm/ wakes a hibernated tenant when Chat opens.
+
+    The wake is capped per tenant (cache add, 10-minute window) and must stay
+    purely a wake: no ``last_message_at`` stamp (so the idle sweep can still
+    hibernate an unanswered box) and no inline Azure call. The QStash publish
+    is mocked here; a publish failure is still an accepted 202.
+    """
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        self.user = _make_user()
+        self.tenant = _make_tenant(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _hibernate(self):
+        from django.utils import timezone
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=timezone.now())
+        # Force the next request to load the hibernated row, not the tenant
+        # instance captured when the test user was created.
+        self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
+        self.client.force_authenticate(user=self.user)
+        self.tenant = self.user.tenant
+
+    @patch("apps.cron.publish.publish_task")
+    def test_hibernated_tenant_publishes_one_wake(self, mock_publish):
+        self._hibernate()
+
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 202, resp.content)
+        self.assertEqual(resp.data, {"state": "waking"})
+        mock_publish.assert_called_once_with(
+            "wake_tenant_for_app_message",
+            str(self.tenant.id),
+            retries=1,
+        )
+
+    @patch("apps.cron.publish.publish_task")
+    def test_second_open_within_window_is_recent_and_does_not_republish(self, mock_publish):
+        self._hibernate()
+
+        first = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+        self.assertEqual(first.status_code, 202, first.content)
+
+        second = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+        self.assertEqual(second.status_code, 200, second.content)
+        self.assertEqual(second.data, {"state": "recent"})
+        self.assertEqual(mock_publish.call_count, 1)
+
+    @patch("apps.cron.publish.publish_task")
+    def test_awake_tenant_is_awake_and_does_not_publish(self, mock_publish):
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data, {"state": "awake"})
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_prewarm_does_not_stamp_last_message_at(self, mock_publish):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        stale = timezone.now() - timedelta(days=1)
+        Tenant.objects.filter(pk=self.tenant.pk).update(last_message_at=stale)
+        self._hibernate()
+
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 202, resp.content)
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.last_message_at, stale)
+
+    def test_unauthenticated_is_rejected(self):
+        resp = APIClient().post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertIn(resp.status_code, (401, 403), resp.content)
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("QStash down"))
+    def test_publish_failure_still_returns_202(self, mock_publish):
+        self._hibernate()
+
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 202, resp.content)
+        self.assertEqual(resp.data, {"state": "waking"})
+        mock_publish.assert_called_once_with(
+            "wake_tenant_for_app_message",
+            str(self.tenant.id),
+            retries=1,
+        )
