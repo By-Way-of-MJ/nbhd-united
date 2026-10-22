@@ -19,6 +19,7 @@ Shape per message row (the contract iOS dedups/merges against):
       "thread_id": "<stable thread id>",
       "has_image": bool,                   # always present; true only on a user app row whose turn carried an image
       "has_document": bool,                # always present; true only on a user app row whose turn carried a PDF
+      "attachments": [{"kind": "image" | "document"}],  # ordered; empty except on app user rows
       "user_redactions": [{"placeholder", "value"}],   # optional; user rows only
       "reply_redactions": [{"placeholder", "value"}],  # optional; assistant rows only
       "redaction_confirmed": bool | null,  # app user rows only; null on historical rows
@@ -170,6 +171,7 @@ def _row(
     client_msg_id=None,
     has_image=False,
     has_document=False,
+    attachments=None,
     user_redactions=None,
     reply_redactions=None,
     redaction_confirmed=_UNSET,
@@ -197,6 +199,7 @@ def _row(
         # bubble across devices/reinstalls, older builds ignore them.
         "has_image": has_image,
         "has_document": has_document,
+        "attachments": attachments or [],
     }
     if client_msg_id:
         msg["client_msg_id"] = client_msg_id
@@ -229,7 +232,7 @@ def _row(
 
 
 def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None):
-    """An ``AppChatMessage`` → a user row (always, if there's user text) and an
+    """An ``AppChatMessage`` → a user row (if there's text or attachments) and an
     assistant row (only once the reply has actually landed).
 
     ``reply_text`` is stored placeholder-space and rehydrated here (owner-facing).
@@ -251,7 +254,7 @@ def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None):
     # _row's False defaults. Shared source of truth with the detail path.
     has_image, has_document = m.attachment_flags
     out = []
-    if (user_text or "").strip():
+    if (user_text or "").strip() or m.stored_attachment_paths:
         out.append(
             _row(
                 row_id=f"app:{m.id}:0",
@@ -263,6 +266,7 @@ def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None):
                 client_msg_id=m.client_msg_id,  # device-originated → echo for dedup
                 has_image=has_image,
                 has_document=has_document,
+                attachments=m.attachments,
                 user_redactions=m.user_redactions,
                 redaction_confirmed=m.redaction_confirmed,
                 redaction_reason=m.redaction_reason,

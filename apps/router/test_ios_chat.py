@@ -956,14 +956,15 @@ class IOSChatImageTest(TestCase):
         self.assertEqual(AppChatMessage.objects.get(client_msg_id="sf1").attachment_path, "")
 
     def test_oversized_body_rejected_early(self):
-        # DRF's JSON parser bypasses DATA_UPLOAD_MAX_MEMORY_SIZE, so the view
-        # guards Content-Length before materializing the body (OOM defense).
-        # The ceiling now covers a 10 MB PDF (base64 ≈ 13.4 MB), so the body
-        # must exceed THAT to trip the 413 — a payload merely over the image
-        # cap falls through to the per-field 400 (image_too_large) instead.
+        # The view guards Content-Length before materializing the body, below
+        # Django's global DATA_UPLOAD_MAX_MEMORY_SIZE backstop.
+        # The ceiling covers 20 MiB of decoded attachments plus the envelope.
+        # Anything over it must still be rejected before parsing/decoding.
+        from apps.router.chat_views import _MAX_REQUEST_BODY_BYTES
+
         resp = self.client.post(
             "/api/v1/chat/messages/",
-            {"document": "A" * 14_500_000, "client_msg_id": "huge1"},
+            {"document": "A" * (_MAX_REQUEST_BODY_BYTES + 1), "client_msg_id": "huge1"},
             format="json",
         )
         self.assertEqual(resp.status_code, 413)
@@ -1073,8 +1074,8 @@ class IOSChatDocumentTest(TestCase):
     share as ``doc_<hash>.pdf`` and referenced from the LLM-bound text via the
     ``[Document attached: <path>]`` marker — bytes NEVER inlined in the queue
     payload. The agent's built-in ``pdf`` tool then reads the local file. Mirrors
-    the image ingress; the same one-attachment-per-turn ``attachment_path``
-    column is reused."""
+    the image ingress; the legacy ``attachment_path`` column keeps the first
+    stored file."""
 
     _FAKE_STORE = (
         "/home/node/.openclaw/workspace/media/inbound/doc_test.pdf",
@@ -1200,11 +1201,16 @@ class IOSChatDocumentTest(TestCase):
 
     @patch("apps.router.chat_views.store_inbound_document")
     @patch("apps.router.chat_views.store_inbound_image")
-    def test_image_and_document_together_rejected(self, mock_img, mock_doc):
-        # One attachment per turn: attachment_path is a single column.
+    def test_over_limit_mixed_attachments_rejected(self, mock_img, mock_doc):
+        # Singular and array fields count together toward the per-kind limits.
         resp = self.client.post(
             "/api/v1/chat/messages/",
-            {"image": _b64(_JPEG_BYTES), "document": _b64(_PDF_BYTES), "client_msg_id": "both1"},
+            {
+                "image": _b64(_JPEG_BYTES),
+                "images": [_b64(_JPEG_BYTES)] * 6,
+                "document": _b64(_PDF_BYTES),
+                "client_msg_id": "both1",
+            },
             format="json",
         )
         self.assertEqual(resp.status_code, 400)
