@@ -29,7 +29,8 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import connection, transaction
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q, Window
+from django.db.models.functions import RowNumber
 from django.utils import timezone
 
 from apps.tenants.models import Tenant
@@ -1399,6 +1400,66 @@ def project_steps(goal):
     return SharedGoalStep.objects.filter(shared_goal=goal)
 
 
+def project_notes(goal):
+    """Live notes with redundant goal/step/author scoping as an application backstop."""
+    from .models import SharedGoalStepNote
+
+    return SharedGoalStepNote.objects.filter(
+        shared_goal=goal, step__shared_goal=goal, author__shared_goal=goal, deleted_at__isnull=True
+    )
+
+
+def project_note_photos(goal):
+    from .models import SharedGoalStepNotePhoto
+
+    return SharedGoalStepNotePhoto.objects.filter(note__in=project_notes(goal))
+
+
+def notes_for_display(goal, *, step):
+    """Eager metadata only; listing notes must never load stored photo bytes."""
+    return (
+        project_notes(goal)
+        .filter(step=step)
+        .select_related("author")
+        .prefetch_related(Prefetch("photos", queryset=project_note_photos(goal).defer("image")))
+    )
+
+
+def note_profiles(notes):
+    return {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={n.author.tenant_id for n in notes})}
+
+
+def newest_shared_notes(goal):
+    """Newest three per step in one metadata-only query, including the photo count."""
+    return (
+        project_notes(goal)
+        .annotate(
+            photo_count=Count("photos"),
+            position=Window(
+                expression=RowNumber(),
+                partition_by=[F("step_id")],
+                order_by=[F("created_at").desc(), F("id").desc()],
+            ),
+        )
+        .filter(position__lte=3)
+        .order_by("step_id", "-created_at", "-id")
+        .values("step_id", "text", "author_id", "photo_count")
+    )
+
+
+def create_note(goal, step, author, text, prepared):
+    from .models import SharedGoalStepNotePhoto
+
+    note = project_notes(goal).create(shared_goal=goal, step=step, author=author, text=text)
+    SharedGoalStepNotePhoto.objects.bulk_create(
+        [
+            SharedGoalStepNotePhoto(note=note, image=jpeg, width=width, height=height, order=order)
+            for order, (jpeg, width, height) in enumerate(prepared)
+        ]
+    )
+    return note
+
+
 def project_milestones(goal):
     from .models import SharedGoalMilestone
 
@@ -1544,7 +1605,14 @@ def project_snapshot(goal, *, viewer):
                 "reviewed_by_membership_id": membership_by_tenant.get(row["reviewed_by_id"]),
                 "review_set_by_membership_id": membership_by_tenant.get(row["review_set_by_id"]),
             }
-            for row in project_steps(goal).values(
+            for row in project_steps(goal)
+            .annotate(
+                notes_count=Count("notes", filter=Q(notes__deleted_at__isnull=True)),
+                last_note_at=Max("notes__created_at", filter=Q(notes__deleted_at__isnull=True)),
+            )
+            .values(
+                "notes_count",
+                "last_note_at",
                 "id",
                 "milestone_id",
                 "title",

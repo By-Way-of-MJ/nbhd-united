@@ -586,6 +586,7 @@ class SharedGoalUpdate(models.Model):
     class Kind(models.TextChoices):
         JOINED = "joined", "Joined"
         STEP_ADDED = "step_added", "Step added"
+        STEP_NOTE = "step_note", "Step note"
         STEP_ASSIGNED = "step_assigned", "Step assigned"
         STEP_ANSWERED = "step_answered", "Step answered"
         STEP_DONE = "step_done", "Step done"
@@ -794,6 +795,35 @@ class SharedGoalStep(models.Model):
 
     class Meta:
         db_table = "shared_goal_steps"
+        ordering = ["order", "id"]
+
+
+class SharedGoalStepNote(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    step = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="notes")
+    shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="step_notes")
+    author = models.ForeignKey(SharedGoalMembership, on_delete=models.CASCADE, related_name="step_notes")
+    text = models.CharField(max_length=2000, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "shared_goal_step_notes"
+        ordering = ["created_at", "id"]
+        indexes = [models.Index(fields=["step", "created_at"], name="step_notes_step_created_idx")]
+
+
+class SharedGoalStepNotePhoto(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    note = models.ForeignKey(SharedGoalStepNote, on_delete=models.CASCADE, related_name="photos")
+    image = models.BinaryField()
+    width = models.PositiveIntegerField()
+    height = models.PositiveIntegerField()
+    order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        db_table = "shared_goal_step_note_photos"
         ordering = ["order", "id"]
 
 

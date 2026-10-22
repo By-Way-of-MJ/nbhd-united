@@ -145,6 +145,8 @@ def build_plan(goal, *, today):
     members = {str(m["id"]): m for m in data["members"]}
     for sid, s in steps.items():
         assignments = [a for a in data.get("assignments", []) if str(a["step_id"]) == sid]
+        s.setdefault("notes_count", 0)
+        s.setdefault("last_note_at", None)
         s["assignments"] = assignments
         s["owners"] = [
             dict(members[str(a["membership_id"])], assignment_status=a["status"])

@@ -1,15 +1,16 @@
-"""Profile photos: one per person, optional.
+"""Profile photos and shared step note photos.
 
 Upload pipeline (all before anything is stored):
 1. Decode with Pillow — anything that is not a real still image is refused.
-2. Fix orientation, crop to a centred square, shrink to 512 px, re-encode as JPEG.
+2. Fix orientation and re-encode as JPEG. Profiles use a 512 px square; note
+   photos preserve their aspect ratio with a long edge of at most 1600 px.
    Re-encoding drops every metadata block, so a phone's GPS/EXIF never survives.
 3. The image safety check (OpenAI's moderation model, free). Flagged → refused with
    a kind message. If the check can't run, the upload fails closed: better "try
    again later" than an unchecked photo in front of neighbors.
 
 The photo is never given to the assistant; it is only served to people allowed by
-``access.can_view_photo``.
+the access helpers (profile visibility or active project membership).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from . import access
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_PIXELS = 40_000_000
 MIN_SIDE = 96
 OUTPUT_SIDE = 512
 MODERATION_MODEL = "omni-moderation-latest"
@@ -44,8 +46,8 @@ class PhotoRefused(APIException):
     default_code = "photo_refused"
 
 
-def normalize(raw: bytes) -> bytes:
-    """Any phone photo → a clean 512 px square JPEG with no metadata."""
+def normalize(raw: bytes, *, note=False) -> bytes:
+    """Clean JPEG without metadata: a 512 px profile square, or a note up to 1600 px."""
     from PIL import Image, ImageOps, UnidentifiedImageError
 
     if not raw:
@@ -54,17 +56,25 @@ def normalize(raw: bytes) -> bytes:
         raise ValidationError("That photo is too large. Please choose one under 10 MB.")
     try:
         with Image.open(io.BytesIO(raw)) as probe:
+            if probe.width * probe.height > MAX_PIXELS:
+                raise ValidationError("That photo is too large. Try a smaller one.")
             probe.verify()
         image = Image.open(io.BytesIO(raw))
         image.load()
-    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
+    except Image.DecompressionBombError as exc:
+        raise ValidationError("That photo is too large. Try a smaller one.") from exc
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise ValidationError("That file isn’t a photo we can use.") from exc
     if getattr(image, "is_animated", False):
         raise ValidationError("Please choose a still photo.")
     image = ImageOps.exif_transpose(image)
     if min(image.size) < MIN_SIDE:
         raise ValidationError("That photo is too small. Please choose a bigger one.")
-    image = ImageOps.fit(image.convert("RGB"), (OUTPUT_SIDE, OUTPUT_SIDE), method=Image.Resampling.LANCZOS)
+    image = image.convert("RGB")
+    if note:
+        image.thumbnail((1600, 1600), resample=Image.Resampling.LANCZOS)
+    else:
+        image = ImageOps.fit(image, (OUTPUT_SIDE, OUTPUT_SIDE), method=Image.Resampling.LANCZOS)
     out = io.BytesIO()
     image.save(out, format="JPEG", quality=85, optimize=True)
     return out.getvalue()
@@ -89,7 +99,9 @@ def check_safe(jpeg: bytes) -> None:
         result = client.moderations.create(
             model=MODERATION_MODEL, input=[{"type": "image_url", "image_url": {"url": data_url}}]
         )
-        flagged = bool(result.results and result.results[0].flagged)
+        if not result.results or type(result.results[0].flagged) is not bool:
+            raise ValueError("Missing moderation verdict")
+        flagged = result.results[0].flagged
     except Exception:
         logger.warning("profile photo: safety check failed to run — refusing upload", exc_info=True)
         raise PhotoCheckUnavailable() from None

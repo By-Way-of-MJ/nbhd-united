@@ -21,8 +21,16 @@ from django.db import transaction
 logger = logging.getLogger(__name__)
 
 TITLE_CAP = 60
-# Push types the first Projects v2 app builds (2.2.x) know how to open.
-_ORIGINAL_TYPES = {"project_invite", "step_ask", "step_answer", "step_unblocked", "step_due", "milestone_reached"}
+# Direct routing types, including shared notes in the notes-capable app builds.
+_DIRECT_ROUTE_TYPES = {
+    "project_invite",
+    "step_ask",
+    "step_answer",
+    "step_unblocked",
+    "step_due",
+    "milestone_reached",
+    "step_note",
+}
 
 
 def _short(text: str, cap: int = TITLE_CAP) -> str:
@@ -50,9 +58,9 @@ def _deliver(memberships, *, ptype: str, body: str, mission_id, step_id=None, ac
     blocked = access.blocked_counterpart_ids(actor_tenant_id) if actor_tenant_id else set()
     sent = 0
     # App builds route a tap by ``type`` and send an unknown one to Chat. Kinds added
-    # after the first Projects v2 release ride a type every build already opens the
+    # outside the direct routing set ride a type every build already opens the
     # project (or step) for; ``kind`` carries what actually happened.
-    route_type = ptype if ptype in _ORIGINAL_TYPES else ("step_answer" if step_id else "milestone_reached")
+    route_type = ptype if ptype in _DIRECT_ROUTE_TYPES else ("step_answer" if step_id else "milestone_reached")
     extra = {"type": route_type, "mission_id": str(mission_id)}
     if route_type != ptype:
         extra["kind"] = ptype
@@ -141,6 +149,30 @@ def notify_step_ask(goal, step, membership_ids, actor_tenant) -> None:
             _members(goal, ids=ids, statuses=("active", "invited")),
             ptype="step_ask",
             body=body,
+            mission_id=goal.id,
+            step_id=step.id,
+            actor_tenant_id=actor_tenant.id,
+        )
+
+    _dispatch(fn)
+
+
+def notify_step_note(goal, step, actor_tenant) -> None:
+    def fn():
+        from . import access
+
+        with access.backstop_service_context():
+            ids = (
+                access.project_assignments(goal)
+                .filter(step=step, status__in=["accepted", "asked"])
+                .values_list("membership_id", flat=True)
+            )
+            members = _members(goal, ids=ids)
+            name = _name(actor_tenant.id)
+        _deliver(
+            members,
+            ptype="step_note",
+            body=f"{name} added a note on “{_short(step.title)}”",
             mission_id=goal.id,
             step_id=step.id,
             actor_tenant_id=actor_tenant.id,
