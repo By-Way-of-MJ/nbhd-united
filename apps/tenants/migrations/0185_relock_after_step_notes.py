@@ -27,7 +27,7 @@ REVERSE_SQL = "-- Reversing would leave public tables unlocked at migration time
 class Migration(migrations.Migration):
     dependencies = [
         ("friends", "0020_step_notes"),
-        ("tenants", "0183_tenant_scheduled_messages_opt_in"),
+        ("tenants", "0184_relock_after_chat_attachment_paths"),
     ]
 
     operations = [migrations.RunSQL(RELOCK_SQL, REVERSE_SQL)]
