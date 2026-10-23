@@ -99,6 +99,7 @@ def recent_active_stars(
             | Q(tutoring_sessions__created_at__gte=cutoff)
         )
         .distinct()
+        .defer("embedding")
         .prefetch_related("journal_entries", "tutoring_sessions")
     )
     stars = list(qs)

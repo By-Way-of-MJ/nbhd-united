@@ -109,6 +109,12 @@ class LessonViewSet(RLSRequestTransactionMixin, viewsets.ModelViewSet):
         elif self.action == "galaxy":
             qs = qs.filter(status="approved")
 
+        # galaxy/constellation compute cosine affinity from ``l.embedding``;
+        # every other action only serializes representations that exclude the
+        # vector, so never ship the 1536-float column (~19 KB/row) there.
+        if self.action not in {"galaxy", "constellation"}:
+            qs = qs.defer("embedding")
+
         return qs
 
     def perform_create(self, serializer: LessonCreateSerializer):
@@ -474,6 +480,7 @@ class LessonViewSet(RLSRequestTransactionMixin, viewsets.ModelViewSet):
         sessions = (
             TutoringSession.objects.filter(star__tenant=request.user.tenant)
             .select_related("star")
+            .defer("star__embedding")
             .order_by("-created_at")[:limit]
         )
 
