@@ -1208,6 +1208,7 @@ class TelegramPoller:
             chunks = (
                 DocumentChunk.objects.filter(tenant=tenant)
                 .annotate(distance=CosineDistance("embedding", query_embedding))
+                .only("id", "text")
                 .order_by("distance")[:5]
             )
             for c in chunks:
@@ -1221,6 +1222,7 @@ class TelegramPoller:
             lessons = (
                 Lesson.objects.filter(tenant=tenant, status="approved", embedding__isnull=False)
                 .annotate(distance=CosineDistance("embedding", query_embedding))
+                .only("id", "text")
                 .order_by("distance")[:3]
             )
             for lsn in lessons:

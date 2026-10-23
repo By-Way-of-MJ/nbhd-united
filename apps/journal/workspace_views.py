@@ -51,7 +51,11 @@ class WorkspaceListCreateView(APIView):
     def get(self, request):
         tenant = _get_tenant_for_user(request.user)
 
-        workspaces = Workspace.objects.filter(tenant=tenant).order_by("-is_default", "-last_used_at", "name")
+        workspaces = (
+            Workspace.objects.filter(tenant=tenant)
+            .defer("description_embedding")
+            .order_by("-is_default", "-last_used_at", "name")
+        )
         active_id = tenant.active_workspace_id
 
         return Response(

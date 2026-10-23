@@ -273,13 +273,17 @@ def name_clusters_for_tenant(tenant_id: str) -> dict[str, Any]:
     if tenant is None:
         return {"skipped": "no_tenant"}
 
-    clustered = list(Lesson.objects.filter(tenant=tenant, status="approved", cluster_id__isnull=False))
+    clustered = list(
+        Lesson.objects.filter(tenant=tenant, status="approved", cluster_id__isnull=False).only(
+            "id", "tags", "text", "cluster_id"
+        )
+    )
     if not clustered:
         return {"clusters": 0, "named": 0, "cache_hits": 0, "calls": 0}
 
     # total_docs + global tag DF over ALL approved lessons — mirrors the
     # deterministic labeler so the evidence terms match what shipped.
-    all_lessons = list(Lesson.objects.filter(tenant=tenant, status="approved"))
+    all_lessons = list(Lesson.objects.filter(tenant=tenant, status="approved").only("id", "tags"))
     total_docs = len(all_lessons) or 1
     global_tag_df: Counter = Counter()
     for lesson in all_lessons:
