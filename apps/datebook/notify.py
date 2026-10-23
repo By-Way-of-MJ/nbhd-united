@@ -52,6 +52,7 @@ def notify_datebook_gate_changed(tenant_id) -> None:
     try:
         gateway = (
             DatebookGateway.objects.select_related("tenant__user")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
             .filter(tenant_id=tenant_id, status=DatebookGateway.Status.ACTIVE)
             .first()
         )
@@ -87,7 +88,11 @@ def notify_device_command(command_id) -> None:
         ).update(notified_at=timezone.now())
         if not claimed:
             return
-        command = DeviceCommand.objects.select_related("tenant__user").get(id=command_id)
+        command = (
+            DeviceCommand.objects.select_related("tenant__user")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(id=command_id)
+        )
 
         from apps.router.push_views import _push_to_user_devices
 

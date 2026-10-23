@@ -113,7 +113,11 @@ def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expi
 
 def close_expired_helpers():
     """Minute sweep. Failed deliveries remain pending for the next sweep."""
-    pending = HelperRun.objects.filter(closed_at=None, deadline__lte=timezone.now()).select_related("tenant__user")
+    pending = (
+        HelperRun.objects.filter(closed_at=None, deadline__lte=timezone.now())
+        .select_related("tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+    )
     sent = 0
     for row in pending.iterator(chunk_size=100):
         try:
