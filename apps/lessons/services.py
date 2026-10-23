@@ -177,6 +177,7 @@ def search_lessons(tenant: Tenant, query: str, limit: int = 10) -> QuerySet[Less
     return (
         Lesson.objects.filter(tenant=tenant, status="approved", embedding__isnull=False)
         .annotate(similarity=similarity_expr)
+        .defer("embedding")
         .prefetch_related("journal_entries", "tutoring_sessions")
         .order_by("-similarity")[:limit]
     )

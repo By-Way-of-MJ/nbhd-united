@@ -67,7 +67,12 @@ def record_action_audit(
 def record_datebook_command_transition(command, result: str, *, detail_code: str = "") -> None:
     """Append a lifecycle audit when a command originated from the review gate."""
 
-    action = PendingAction.objects.select_related("tenant").filter(datebook_command_id=command.id).first()
+    action = (
+        PendingAction.objects.select_related("tenant")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+        .filter(datebook_command_id=command.id)
+        .first()
+    )
     if action is None:
         return
     record_action_audit(

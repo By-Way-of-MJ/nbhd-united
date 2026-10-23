@@ -27,6 +27,19 @@ class WaveSendDayThrottle(_UserScopedThrottle):
     rate = "10/day"
 
 
+class StepNoteDayThrottle(SimpleRateThrottle):
+    """A tenant's note creation budget, shared across all their projects."""
+
+    scope = "friend_step_note_day"
+    rate = "200/day"
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        tenant = view.get_tenant(request)
+        return self.cache_format % {"scope": self.scope, "ident": str(tenant.pk)}
+
+
 class ShareSendDayThrottle(_UserScopedThrottle):
     """Sharing a lesson kicks off a fail-closed DeBERTa scrub (real compute).
     Generous for a normal day of sharing, but caps a runaway loop / abuse."""

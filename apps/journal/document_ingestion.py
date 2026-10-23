@@ -307,7 +307,7 @@ REMOVAL_HANDLERS: dict[str, RemovalHandler] = {
 def _marker_message(tenant, client_msg_id):
     """The document-upload turn for this ``client_msg_id``, or None.
 
-    Keys off ``attachment_path`` (a stored ``doc_<hash>`` file), NOT the
+    Keys off stored attachment paths (a ``doc_<hash>`` file), NOT the
     ``[Document attached:]`` marker — the marker lives only in the queued payload,
     never on the persisted ``AppChatMessage`` row.
     """
@@ -317,7 +317,7 @@ def _marker_message(tenant, client_msg_id):
     from apps.router.models import AppChatMessage
 
     msg = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
-    if msg is None or not is_inbound_document_path(msg.attachment_path):
+    if msg is None or not any(is_inbound_document_path(path) for path in msg.stored_attachment_paths):
         return None
     return msg
 

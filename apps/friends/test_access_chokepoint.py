@@ -56,6 +56,8 @@ CROSS_TENANT_MODELS = frozenset(
         "SharedGoalMilestone",
         "SharedGoalStepAssignment",
         "SharedGoalStepDependency",
+        "SharedGoalStepNote",
+        "SharedGoalStepNotePhoto",
         "NeighborPhoto",
     }
 )

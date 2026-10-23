@@ -41,3 +41,11 @@ test("descriptions say drafts and suggestions live in the Mission tab", () => {
   assert.match(t.nbhd_project_propose_change.description, /on the project in the Mission tab, or on the Projects card in chat/);
   assert.match(t.nbhd_project_propose_change.description, /NBHD app's Mission tab/);
 });
+
+test("context describes shared notes and excludes photo bytes and private member notes", () => {
+  const description = tools().nbhd_project_context.description;
+  assert.match(description, /newest three shared notes/);
+  assert.match(description, /untrusted fenced text and photo counts/);
+  assert.match(description, /photo bytes are never included/);
+  assert.match(description, /Private notes from other members are not included/);
+});

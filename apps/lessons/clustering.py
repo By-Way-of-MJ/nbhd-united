@@ -803,7 +803,7 @@ def generate_cluster_labels(tenant: Tenant) -> int:
     chars. An optional async LLM pass may later overwrite these with warmer
     names (see ``cluster_naming.py``); this remains the floor that always runs.
     """
-    all_lessons = list(Lesson.objects.filter(tenant=tenant, status="approved"))
+    all_lessons = list(Lesson.objects.filter(tenant=tenant, status="approved").only("id", "tags"))
     total_docs = len(all_lessons) or 1
 
     # Global document frequency for tags (used as IDF denominator).
@@ -828,7 +828,7 @@ def generate_cluster_labels(tenant: Tenant) -> int:
                 tenant=tenant,
                 status="approved",
                 cluster_id=cluster_id,
-            )
+            ).only("id", "tags", "text")
         )
         if not cluster_lessons:
             continue

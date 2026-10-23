@@ -180,7 +180,8 @@ class BaseTemplateDocProseTrimTest(TestCase):
     # R0 then brought the lean render from 16221 to 15040. A ceiling between the
     # two fails loudly if the prose re-bloats, without being so tight that an
     # ordinary one-line wording tweak trips it.
-    _LEAN_CEILING = 15119
+    # 2026-10-20: +206 for the recall/vague-ask line (unrelated to the doc-prose trim; was 15,119).
+    _LEAN_CEILING = 15325
     _WORST_NON_FINANCE_CEILING = 20600
 
     def test_lean_tenant_base_render_reflects_the_trim(self):

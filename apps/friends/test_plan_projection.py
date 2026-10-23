@@ -41,6 +41,13 @@ def result(data, sid):
 
 
 class PlanProjectionTests(SimpleTestCase):
+    def test_note_metadata_defaults_and_timestamp_serialization(self):
+        stamp = datetime(2026, 10, 1, 9, tzinfo=UTC)
+        data = snapshot([step("a"), step("b", notes_count=2, last_note_at=stamp)])
+        rows = build_plan(data, today=TODAY)["steps"]
+        self.assertEqual((rows[0]["notes_count"], rows[0]["last_note_at"]), (0, None))
+        self.assertEqual((rows[1]["notes_count"], rows[1]["last_note_at"]), (2, stamp.isoformat()))
+
     def test_empty_project(self):
         plan = build_plan(snapshot(), today=TODAY)
         self.assertEqual((plan["health"], plan["done_count"], plan["total"]), ("on_track", 0, 0))

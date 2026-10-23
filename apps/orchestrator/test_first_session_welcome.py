@@ -118,6 +118,7 @@ class FirstSessionWelcomePersistenceTest(TestCase):
                     "thread_id": str(message.thread_id),
                     "has_image": False,
                     "has_document": False,
+                    "attachments": [],
                     "quick_replies": FIRST_SESSION_WELCOME_QUICK_REPLIES,
                 }
             ],

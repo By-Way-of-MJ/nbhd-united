@@ -150,6 +150,36 @@ class DocumentWriteBackstopRealIngressTest(TestCase):
         self.assertEqual(resp.json()["error"], "document_turn_write_blocked")
         self.assertFalse(Task.objects.filter(tenant=self.tenant).exists())
 
+    def test_write_blocked_when_document_follows_image_in_same_turn(self):
+        with (
+            patch("apps.router.chat_views.store_inbound_image", return_value=_FAKE_PHOTO_STORE),
+            patch("apps.router.chat_views.store_inbound_document", return_value=_FAKE_DOC_STORE),
+            patch("apps.router.pending_queue.httpx.post", return_value=_ok_chat_response("ok")),
+        ):
+            upload = self.ios.post(
+                "/api/v1/chat/messages/",
+                {"images": [_b64(_JPEG_BYTES)], "documents": [_b64(_PDF_BYTES)], "client_msg_id": "mixed"},
+                format="json",
+            )
+        self.assertEqual(upload.status_code, 201, upload.content)
+        response = self._create_task()
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["error"], "document_turn_write_blocked")
+        self.assertFalse(Task.objects.filter(tenant=self.tenant).exists())
+        # Keep/forget provenance must also recognize a PDF after the first path.
+        turn = AppChatMessage.objects.get(tenant=self.tenant, client_msg_id="mixed")
+        task = Task.objects.create(tenant=self.tenant, title="confirmed artifact")
+        kept = record_keep(
+            self.tenant,
+            source={"original_filename": "d.pdf", "client_msg_id": "mixed"},
+            artifacts=[{"object_type": "journal.Task", "object_id": str(task.id)}],
+        )
+        ingestion = DocumentIngestion.objects.get(id=kept["ingestion_id"])
+        self.assertEqual(ingestion.thread_id, turn.thread_id)
+        self.assertEqual(ingestion.uploaded_at, turn.created_at)
+        self._send_text("confirm", "confirm-mixed")
+        self.assertEqual(self._create_task().status_code, 201)
+
     def test_injection_document_cannot_drive_a_save(self):
         # A document whose CAPTION instructs a save must still physically fail.
         self._upload_document("u1", caption=_INJECTION_CAPTION)

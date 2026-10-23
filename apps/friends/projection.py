@@ -62,7 +62,10 @@ def build_mission_status(mission, *, now=None) -> dict:
 
     updates = list(access.mission_updates().filter(shared_goal=mission).order_by("created_at"))
     memberships = list(
-        access.mission_memberships().filter(shared_goal=mission, status="active").select_related("tenant")
+        access.mission_memberships()
+        .filter(shared_goal=mission, status="active")
+        .select_related("tenant")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
     )
 
     members: list[dict] = []

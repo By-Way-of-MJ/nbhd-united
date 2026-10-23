@@ -133,6 +133,8 @@ class PublicSchemaLockdownRuntimeGuard(TestCase):
             "shared_goal_steps",
             "shared_goal_step_assignments",
             "shared_goal_step_dependencies",
+            "shared_goal_step_notes",
+            "shared_goal_step_note_photos",
             "transcripts_transcriptevent",
             "transcripts_transcriptcapturequarantine",
             "transcripts_transcriptindexoutbox",

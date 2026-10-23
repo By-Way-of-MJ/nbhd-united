@@ -130,7 +130,7 @@ class ReviewRegressionTests(TransactionTestCase):
                     mock.patch.object(PersonalAccessToken.objects, "select_related") as pats,
                     connection.execute_wrapper(record),
                 ):
-                    pats.return_value.get.return_value = pat
+                    pats.return_value.defer.return_value.get.return_value = pat
                     self.assertFalse(connection.in_atomic_block)
                     response = probe.as_view()(self.factory.get("/probe/", HTTP_AUTHORIZATION=f"Bearer {raw}"))
                     self.assertEqual(response.data, [owner.id])

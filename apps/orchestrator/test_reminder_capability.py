@@ -206,7 +206,8 @@ class MaximalTenantBudgetTest(TestCase):
         with override_settings(SUBAGENT_TENANT_IDS=""):
             ungated = _agents_md(tenant)
         # 2026-10-06: +178 for the one-line Shop gate (was 23,505; the pin had 1 char left).
-        self.assertLessEqual(len(ungated), 23_682)
+        # 2026-10-20: +206 for the recall/vague-ask line (journal search miss; was 23,682).
+        self.assertLessEqual(len(ungated), 23_888)
         with override_settings(SUBAGENT_TENANT_IDS=str(tenant.id)):
             md = _agents_md(tenant)
         self.assertIn("`sessions_spawn` FIRST, before doing the work", md)

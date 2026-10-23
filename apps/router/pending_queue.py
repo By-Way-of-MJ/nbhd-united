@@ -109,7 +109,8 @@ _DROPPED_RETRY_SAFE_PHASE = "thinking"
 # Containers often boot in ~30s; a short defer plus the boot-grace retry
 # below delivers within ~20s of readiness instead of always waiting the
 # worst case (was a fixed 60s).
-_WAKE_DEFER_SECONDS = 20
+# 2026-10-20: 20 → 8 s; cold app turns measured one 20 s defer (~24 s) before the good POST.
+_WAKE_DEFER_SECONDS = 8
 
 # After a wake, container-down errors within this window mean "still
 # booting" — release the lease and retry in _WAKE_DEFER_SECONDS without
@@ -1322,7 +1323,12 @@ def retry_dropped_app_turn_task(turn_id: str) -> dict:
     serving, then atomically returns the same AppChatMessage to PENDING and
     copies the original failed queue payload into a fresh PendingMessage.
     """
-    turn = AppChatMessage.objects.select_related("tenant", "user", "thread").filter(id=turn_id).first()
+    turn = (
+        AppChatMessage.objects.select_related("tenant", "user", "thread")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+        .filter(id=turn_id)
+        .first()
+    )
     if turn is None:
         logger.warning(
             "retry_exhausted count=1 tenant=unknown turn=%s reason=missing_turn",
@@ -1401,7 +1407,13 @@ def retry_dropped_app_turn_task(turn_id: str) -> dict:
             # it through the final recency check and requeue makes "newest" an
             # invariant rather than a check-then-insert race.
             ChatThread.objects.select_for_update().only("id").get(id=turn.thread_id)
-            locked_turn = AppChatMessage.objects.select_for_update().select_related("tenant").filter(id=turn.id).first()
+            locked_turn = (
+                AppChatMessage.objects.select_for_update()
+                .select_related("tenant")
+                .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+                .filter(id=turn.id)
+                .first()
+            )
             if locked_turn is None:
                 failure_reason = "missing_turn"
             elif locked_turn.status != AppChatMessage.Status.ERROR:
