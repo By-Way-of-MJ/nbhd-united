@@ -2220,7 +2220,9 @@ def rollout_byo_image_bump(request):
             raise ValueError
     except (ValueError, TypeError):
         return JsonResponse({"error": "Explicit non-empty UUID scope and valid JSON object required"}, status=400)
-    selected = list(Tenant.objects.filter(pk__in=ids))
+    # runtime_guard reads openclaw_migration per tenant; include the deferred
+    # columns in this one scoped query instead of an N+1 of lazy field loads.
+    selected = list(Tenant.objects.filter(pk__in=ids).defer(None))
     if len(selected) != len(ids):
         return JsonResponse({"error": "Unknown tenant in scope"}, status=400)
     target = getattr(settings, "OPENCLAW_IMAGE_TAG", "")
@@ -2434,11 +2436,13 @@ def rollout_atomic_bump(request):
         )
 
     try:
+        # runtime_guard reads openclaw_migration per tenant; include the
+        # deferred columns in this one scoped query instead of an N+1.
         eligible = Tenant.objects.filter(
             status=Tenant.Status.ACTIVE,
             container_id__gt="",
         )
-        eligible = eligible.filter(id__in=scoped_ids)
+        eligible = eligible.filter(id__in=scoped_ids).defer(None)
         from apps.orchestrator.runtime_guard import MIGRATION_REQUIRED, manual_version_update_allowed
 
         if eligible.count() != len(scoped_ids):

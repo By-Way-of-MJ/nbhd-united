@@ -161,6 +161,23 @@ class User(AbstractUser):
         return self.display_name or self.username
 
 
+class TenantManager(models.Manager):
+    """Default ``Tenant`` reads omit the two multi-KB private JSON columns.
+
+    ``cron_jobs_snapshot`` (avg ~22 KB) and ``openclaw_migration`` (avg ~18 KB)
+    are most of a ``tenants`` row (avg 44 KB, max 333 KB) and made every
+    authenticated request ship them back from the DB. Nothing on a request path
+    reads them; the rare crons/commands that do pay one extra single-column
+    query when the deferred attribute is first touched. Reads built on
+    ``select_related("tenant")`` bypass this manager and must defer the same
+    fields explicitly; a loop that truly needs them per tenant re-includes them
+    with ``.defer(None)`` so it stays one query instead of N+1.
+    """
+
+    def get_queryset(self):
+        return super().get_queryset().defer("cron_jobs_snapshot", "openclaw_migration")
+
+
 class Tenant(models.Model):
     """
     A tenant = one subscriber = one OpenClaw instance.
@@ -181,6 +198,8 @@ class Tenant(models.Model):
     class TourGuideMode(models.TextChoices):
         CARDS = "cards", "Cards"
         LINKS = "links", "Links"
+
+    objects = TenantManager()
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="tenant")

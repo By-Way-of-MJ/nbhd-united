@@ -31,7 +31,12 @@ def blocks_real_transport_for_identifier(transport: str, identifier) -> bool:
         raise ValueError(f"unsupported transport: {transport}")
 
     try:
-        owner = User.objects.select_related("tenant").filter(**lookup).first()
+        owner = (
+            User.objects.select_related("tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .filter(**lookup)
+            .first()
+        )
     except Exception:
         # Fail closed: an unresolved owner must never permit real transport.
         logger.exception(

@@ -195,6 +195,7 @@ def add_circle_member(tenant, user, circle_id, handle) -> dict:
     circle, _membership = _assert_circle_member(tenant, circle_id)
     profile = (
         NeighborProfile.objects.select_related("tenant", "tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
         .filter(handle=(handle or "").strip().lower())
         .first()
     )
@@ -242,6 +243,7 @@ def remove_circle_member(tenant, circle_id, handle) -> dict:
         raise ValidationError("Use leave to remove yourself.")
     target = (
         CircleMembership.objects.select_related("tenant", "tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
         .filter(circle=circle, tenant_id=profile.tenant_id, status="active")
         .first()
     )

@@ -219,7 +219,12 @@ def send_wave(from_tenant, from_user, handle: str, note: str = "") -> tuple[Frie
     current sender as requester). Waving back a pending incoming wave accepts it.
     """
     handle = (handle or "").strip().lower()
-    target_profile = NeighborProfile.objects.select_related("tenant", "tenant__user").filter(handle=handle).first()
+    target_profile = (
+        NeighborProfile.objects.select_related("tenant", "tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+        .filter(handle=handle)
+        .first()
+    )
     if target_profile is None:
         raise NotFound("No neighbor with that handle.")
     target = target_profile.tenant
