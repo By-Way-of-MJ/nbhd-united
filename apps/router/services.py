@@ -203,7 +203,11 @@ def resolve_container(chat_id: int) -> str | None:
 def resolve_tenant_by_line_user_id(line_user_id: str) -> Tenant | None:
     """Resolve tenant by LINE user ID, including suspended/provisioning users."""
     try:
-        user = User.objects.select_related("tenant").get(line_user_id=line_user_id)
+        user = (
+            User.objects.select_related("tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(line_user_id=line_user_id)
+        )
         tenant = user.tenant
 
         if tenant.status == Tenant.Status.SUSPENDED:
@@ -221,7 +225,11 @@ def resolve_tenant_by_line_user_id(line_user_id: str) -> Tenant | None:
 def resolve_tenant_by_chat_id(chat_id: int) -> Tenant | None:
     """Resolve tenant by Telegram chat_id, including suspended/provisioning users."""
     try:
-        user = User.objects.select_related("tenant").get(telegram_chat_id=chat_id)
+        user = (
+            User.objects.select_related("tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(telegram_chat_id=chat_id)
+        )
         tenant = user.tenant
 
         if tenant.status == Tenant.Status.SUSPENDED:

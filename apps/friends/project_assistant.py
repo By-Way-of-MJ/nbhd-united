@@ -499,7 +499,10 @@ def publish_draft(tenant, user, draft_id, extra_member_friendship_ids=None) -> d
                     )
             members = {
                 str(m.tenant_id): m
-                for m in access.mission_memberships().filter(shared_goal=goal).select_related("tenant")
+                for m in access.mission_memberships()
+                .filter(shared_goal=goal)
+                .select_related("tenant")
+                .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
             }
             by_handle = {
                 h: members.get(str(e.addressee_id if e.requester_id == tenant.id else e.requester_id))

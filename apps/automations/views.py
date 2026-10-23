@@ -32,9 +32,13 @@ def _get_tenant_for_user(user) -> Tenant:
 
 def _get_automation_for_tenant(*, tenant: Tenant, automation_id: UUID) -> Automation:
     try:
-        return Automation.objects.select_related("tenant", "tenant__user").get(
-            id=automation_id,
-            tenant=tenant,
+        return (
+            Automation.objects.select_related("tenant", "tenant__user")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(
+                id=automation_id,
+                tenant=tenant,
+            )
         )
     except Automation.DoesNotExist as exc:
         raise Http404("Automation not found.") from exc

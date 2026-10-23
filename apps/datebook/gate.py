@@ -504,6 +504,7 @@ def _recent_duplicate_action(
             created_at__gte=timezone.now() - DATEBOOK_DUPLICATE_WINDOW,
         )
         .select_related("tenant")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
         .order_by("-created_at")[:20]
     )
     for candidate in recent:

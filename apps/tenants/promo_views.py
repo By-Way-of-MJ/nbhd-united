@@ -80,7 +80,11 @@ def redeem_promo(request):
         return _redirect("invalid")
 
     try:
-        user = User.objects.select_related("tenant").get(id=user_id)
+        user = (
+            User.objects.select_related("tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(id=user_id)
+        )
     except (User.DoesNotExist, ValueError):
         # ValueError catches malformed UUIDs from a tampered token that
         # somehow survived signature verification (shouldn't happen,

@@ -42,6 +42,8 @@ class JWTAuthenticationWithRLS(JWTAuthentication):
         The stock implementation fetches the User alone; ``authenticate()``
         then touches ``user.tenant``, costing a second cross-region query on
         every request. ``select_related`` folds both into one round trip.
+        ``defer`` keeps the two large tenant JSON columns (tens of KB) out of
+        that round trip — ``select_related`` bypasses ``TenantManager``.
         Mirrors rest_framework_simplejwt 5.5.1 semantics otherwise.
         """
         try:
@@ -50,7 +52,11 @@ class JWTAuthenticationWithRLS(JWTAuthentication):
             raise InvalidToken("Token contained no recognizable user identification") from e
 
         try:
-            user = self.user_model.objects.select_related("tenant").get(**{jwt_settings.USER_ID_FIELD: user_id})
+            user = (
+                self.user_model.objects.select_related("tenant")
+                .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+                .get(**{jwt_settings.USER_ID_FIELD: user_id})
+            )
         except self.user_model.DoesNotExist as e:
             raise JWTAuthenticationFailed("User not found", code="user_not_found") from e
 
@@ -124,8 +130,12 @@ class PersonalAccessTokenAuthentication(BaseAuthentication):
 
         token_hash = hash_token(raw_token)
         try:
-            pat = PersonalAccessToken.objects.select_related("user", "user__tenant").get(
-                token_hash=token_hash,
+            pat = (
+                PersonalAccessToken.objects.select_related("user", "user__tenant")
+                .defer("user__tenant__cron_jobs_snapshot", "user__tenant__openclaw_migration")
+                .get(
+                    token_hash=token_hash,
+                )
             )
         except PersonalAccessToken.DoesNotExist:
             raise exceptions.AuthenticationFailed("Invalid token.")

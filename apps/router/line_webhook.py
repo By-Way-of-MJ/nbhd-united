@@ -641,7 +641,11 @@ def _parse_table(table_lines: list[str]) -> str | None:
 def _resolve_tenant_by_line_user_id(line_user_id: str) -> Tenant | None:
     """Resolve tenant by LINE user ID."""
     try:
-        user = User.objects.select_related("tenant").get(line_user_id=line_user_id)
+        user = (
+            User.objects.select_related("tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(line_user_id=line_user_id)
+        )
         tenant = user.tenant
 
         if tenant.status in (

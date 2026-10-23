@@ -707,6 +707,7 @@ def _can_anyone_look(goal, step, completer):
         .exclude(tenant=completer)
         .exclude(id__in=list(holders))
         .select_related("tenant")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
     )
     return any(projects_v2_enabled(m.tenant) for m in others)
 
