@@ -35,16 +35,25 @@ def expire_stale_pending_actions() -> str:
     from .models import ActionStatus, PendingAction
     from .services import record_action_audit
 
-    stale = PendingAction.objects.select_related("tenant__user").filter(
-        status=ActionStatus.PENDING,
-        expires_at__lt=timezone.now(),
+    stale = (
+        PendingAction.objects.select_related("tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+        .filter(
+            status=ActionStatus.PENDING,
+            expires_at__lt=timezone.now(),
+        )
     )
 
     count = 0
     for action in stale:
         if is_datebook_action_type(action.action_type) or is_cron_action_type(action.action_type):
             with transaction.atomic():
-                locked = PendingAction.objects.select_for_update().select_related("tenant__user").get(pk=action.pk)
+                locked = (
+                    PendingAction.objects.select_for_update()
+                    .select_related("tenant__user")
+                    .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+                    .get(pk=action.pk)
+                )
                 if locked.status != ActionStatus.PENDING or locked.expires_at >= timezone.now():
                     continue
                 if is_datebook_action_type(locked.action_type):
@@ -123,7 +132,11 @@ def replay_stale_cron_dispatches() -> str:
         counts[state] = counts.get(state, 0) + 1
         if state not in (CronDispatchState.EXECUTED, CronDispatchState.FAILED):
             continue
-        dispatch = CronDispatch.objects.select_related("action__tenant").get(pk=dispatch_id)
+        dispatch = (
+            CronDispatch.objects.select_related("action__tenant")
+            .defer("action__tenant__cron_jobs_snapshot", "action__tenant__openclaw_migration")
+            .get(pk=dispatch_id)
+        )
         try:
             update_gate_message(dispatch.action)
         except Exception:

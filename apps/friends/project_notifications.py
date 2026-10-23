@@ -112,6 +112,7 @@ def _members(goal, *, ids=None, statuses=("active",)):
         access.mission_memberships()
         .filter(shared_goal=goal, status__in=list(statuses))
         .select_related("user", "tenant")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
     )
     if ids is not None:
         qs = qs.filter(id__in=list(ids))

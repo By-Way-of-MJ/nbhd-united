@@ -607,7 +607,11 @@ def dispatch_cron_action(dispatch_id: int, *, response: dict | None = None) -> s
         _set_dispatch_response(response, state, code)
         return state
 
-    dispatch = CronDispatch.objects.select_related("action__tenant", "cron").get(pk=dispatch_id)
+    dispatch = (
+        CronDispatch.objects.select_related("action__tenant", "cron")
+        .defer("action__tenant__cron_jobs_snapshot", "action__tenant__openclaw_migration")
+        .get(pk=dispatch_id)
+    )
     try:
         _dispatch_claimed_cron(dispatch, stale_claim=claim_state)
     except CronDispatchVerificationError:

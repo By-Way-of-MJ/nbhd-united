@@ -764,7 +764,7 @@ def thread_messages_page(thread, after_seq: int, limit: int, viewer_tenant_id=No
         blocked = blocked_counterpart_ids(viewer_tenant_id)
         if blocked:
             qs = qs.exclude(sender_tenant_id__in=blocked)
-    return list(qs.select_related("sender_tenant").order_by("seq")[:limit])
+    return list(qs.order_by("seq")[:limit])
 
 
 def get_friend_message_by_public_id(public_id) -> FriendMessage | None:
@@ -913,7 +913,6 @@ def absorb_pending_chat(viewer_tenant) -> list[dict]:
                 thread=membership.thread, deleted_at__isnull=True, seq__gt=membership.last_absorbed_seq
             )
             .exclude(sender_tenant_id__in=blocked)
-            .select_related("sender_tenant")
             .order_by("seq")[:20]
         )
         if not messages:
@@ -1491,14 +1490,18 @@ def due_nudge_candidates():
     "due tomorrow" sweep narrows by each owner's local time)."""
     from .models import SharedGoalStepAssignment
 
-    return SharedGoalStepAssignment.objects.filter(
-        status="accepted",
-        membership__status="active",
-        membership__muted=False,
-        step__status__in=["open", "in_progress"],
-        step__due_date__isnull=False,
-        step__shared_goal__status="active",
-    ).select_related("step", "step__shared_goal", "membership", "membership__user", "membership__tenant")
+    return (
+        SharedGoalStepAssignment.objects.filter(
+            status="accepted",
+            membership__status="active",
+            membership__muted=False,
+            step__status__in=["open", "in_progress"],
+            step__due_date__isnull=False,
+            step__shared_goal__status="active",
+        )
+        .select_related("step", "step__shared_goal", "membership", "membership__user", "membership__tenant")
+        .defer("membership__tenant__cron_jobs_snapshot", "membership__tenant__openclaw_migration")
+    )
 
 
 def claim_due_nudge(assignment_id, due) -> bool:

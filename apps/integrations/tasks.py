@@ -184,7 +184,11 @@ def generate_sautai_meal_plan_task(job_id: str, poll_generation: int | None = No
         return
 
     try:
-        job = SautaiMealPlanJob.objects.select_related("tenant__user").get(id=job_id)
+        job = (
+            SautaiMealPlanJob.objects.select_related("tenant__user")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
+            .get(id=job_id)
+        )
     except SautaiMealPlanJob.DoesNotExist:
         logger.warning("generate_sautai_meal_plan_task: job %s not found", str(job_id)[:8])
         return

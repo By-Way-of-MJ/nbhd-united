@@ -168,10 +168,11 @@ class TenantManager(models.Manager):
     are most of a ``tenants`` row (avg 44 KB, max 333 KB) and made every
     authenticated request ship them back from the DB. Nothing on a request path
     reads them; the rare crons/commands that do pay one extra single-column
-    query when the deferred attribute is first touched. Reads built on
-    ``select_related("tenant")`` bypass this manager and must defer the same
-    fields explicitly; a loop that truly needs them per tenant re-includes them
-    with ``.defer(None)`` so it stays one query instead of N+1.
+    query when the deferred attribute is first touched. Joins (``select_related``)
+    bypass this manager, so every join site must add its own
+    ``.defer("<rel>__cron_jobs_snapshot", "<rel>__openclaw_migration")``. A loop
+    that truly needs them per tenant re-includes them with ``.defer(None)`` so it
+    stays one query instead of N+1.
     """
 
     def get_queryset(self):

@@ -44,6 +44,7 @@ def run_weekly_mission_digest(now=None) -> dict:
         access.mission_memberships()
         .filter(status="active", shared_goal__status="active")
         .select_related("shared_goal", "tenant", "tenant__user")
+        .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
         .order_by("tenant_id", "joined_at", "id")
     )
     by_tenant: dict = {}
