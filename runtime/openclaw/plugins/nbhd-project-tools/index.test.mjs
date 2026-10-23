@@ -34,6 +34,13 @@ test("descriptions carry the untrusted-text rule", () => {
   assert.match(t.nbhd_project_propose_change.description, /never approve/);
 });
 
+test("descriptions say drafts and suggestions live in the Mission tab", () => {
+  const t = tools();
+  assert.match(t.nbhd_project_draft.description, /Draft tile under Projects in the Mission tab/);
+  assert.match(t.nbhd_project_draft.description, /NBHD app's Mission tab/);
+  assert.match(t.nbhd_project_propose_change.description, /on the project in the Mission tab, or on the Projects card in chat/);
+  assert.match(t.nbhd_project_propose_change.description, /NBHD app's Mission tab/);
+});
 
 test("context describes shared notes and excludes photo bytes and private member notes", () => {
   const description = tools().nbhd_project_context.description;
