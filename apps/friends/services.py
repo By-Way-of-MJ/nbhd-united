@@ -19,11 +19,12 @@ import re
 import secrets
 from collections import Counter
 from datetime import UTC, timedelta
+from uuid import UUID
 
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import Count, F, Q
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 
@@ -1818,6 +1819,70 @@ def list_missions(tenant, *, include_invited=False) -> list[dict]:
     ]
 
 
+def _mission_learning_updates(mission):
+    """Newest 50 written updates, resolving live note metadata in bounded batches."""
+
+    def payload_id(update, key):
+        try:
+            return UUID(str(update.payload.get(key)))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    candidates = (
+        access.mission_updates()
+        .filter(shared_goal=mission, kind__in=_HUMAN_UPDATE_KINDS | {"step_note"})
+        .exclude(kind__in=_HUMAN_UPDATE_KINDS, text="")
+        .order_by("-created_at", "-id")
+    )
+    updates = []
+    page_query = candidates
+    while len(updates) < 50:
+        page = list(page_query[:50])
+        if not page:
+            break
+        references = {u.id: (payload_id(u, "note_id"), payload_id(u, "step_id")) for u in page if u.kind == "step_note"}
+        notes = {
+            n["id"]: n
+            for n in access.project_notes(mission)
+            .filter(id__in={note_id for note_id, _ in references.values() if note_id})
+            .annotate(photo_count=Count("photos"))
+            .values("id", "text", "photo_count")
+        }
+        steps = dict(
+            access.project_steps(mission)
+            .filter(id__in={step_id for _, step_id in references.values() if step_id})
+            .values_list("id", "title")
+        )
+        for update in page:
+            text = update.text
+            if update.kind == "step_note":
+                note_id, step_id = references[update.id]
+                note = notes.get(note_id)
+                if note is None:
+                    continue
+                if note["text"].strip():
+                    text = update.text if update.text.strip() else note["text"][:120]
+                elif note["photo_count"]:
+                    count = note["photo_count"]
+                    text = f"added {count} {'photo' if count == 1 else 'photos'}"
+                    if step_id in steps:
+                        text += f" to “{steps[step_id]}”"
+                else:
+                    continue
+            if text.strip():
+                updates.append((update, text))
+                if len(updates) == 50:
+                    break
+        if len(page) < 50:
+            break
+        # Continue past blanks/deleted notes; the display limit applies after filtering.
+        last = page[-1]
+        page_query = candidates.filter(
+            Q(created_at__lt=last.created_at) | Q(created_at=last.created_at, id__lt=last.id)
+        )
+    return updates
+
+
 def get_mission_detail(tenant, mission_id) -> dict:
     from . import projection
 
@@ -1844,19 +1909,19 @@ def get_mission_detail(tenant, mission_id) -> dict:
         }
     else:
         data = projection.build_mission_status(mission)
-        updates = list(access.mission_updates().filter(shared_goal=mission).order_by("-created_at", "-id")[:50])
+        updates = _mission_learning_updates(mission)
         profiles = {
-            p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={u.tenant_id for u in updates})
+            p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={u.tenant_id for u, _ in updates})
         }
         data["updates"] = [
             {
                 "id": str(u.id),
                 "kind": u.kind,
-                "text": u.text,
+                "text": text,
                 "created_at": u.created_at.isoformat(),
                 "author_name": profiles[u.tenant_id].display_name if u.tenant_id in profiles else "Neighbor",
             }
-            for u in updates
+            for u, text in updates
         ]
     data.update(
         description=mission.description,
