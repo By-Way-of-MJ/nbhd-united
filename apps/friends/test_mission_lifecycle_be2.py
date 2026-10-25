@@ -11,15 +11,17 @@ from rest_framework.exceptions import APIException
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from apps.journal.models import Task
+from apps.journal.models import Goal, Task
+from apps.tenants.test_utils import seed_internal_key
 
 from . import access, project_notes, services
 from . import project_assistant as assistant
 from . import project_services as projects
-from .models import ContentReport, PendingProjectAction, SharedGoalMembership
+from .models import ContentReport, PendingProjectAction, SharedGoal, SharedGoalMembership, SharedGoalStepNote
 from .test_pr6 import _edge, _profile, _tenant
 
 FINISHED = {"detail": "This project is finished — reopen it to change it."}
+FINISHED_JOIN = {"detail": "This project is finished, so it can't be joined."}
 
 
 @override_settings(PROJECTS_V2_TENANT_IDS="*", NBHD_DISABLE_BACKGROUND_THREADS=True)
@@ -195,23 +197,208 @@ class MissionLifecycleTests(TestCase):
             )
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, FINISHED["detail"])
-        self.assertEqual(PendingProjectAction.objects.get(id=self.proposal["proposal_id"]).status, "pending")
+        self.assertEqual(PendingProjectAction.objects.get(id=self.proposal["proposal_id"]).status, "expired")
 
-    def test_finished_decline_and_legacy_proposal_writes_are_blocked(self):
+    def test_finished_invitee_can_decline_but_join_has_invitee_copy(self):
         self.finish()
-        response = self.jwt(self.invitee).post(self.base + "decline/", {}, format="json")
+        before = access.mission_updates().filter(shared_goal=self.goal).count()
+        invitee = self.jwt(self.invitee)
+        response = invitee.post(self.base + "join/", {}, format="json")
+        self.assertEqual((response.status_code, response.json()), (409, FINISHED_JOIN))
+        self.members[self.invitee.id].refresh_from_db()
+        self.assertEqual(self.members[self.invitee.id].status, "invited")
+        for _ in range(2):
+            response = invitee.post(self.base + "decline/", {}, format="json")
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual(response.json(), {"mission_id": str(self.goal.id), "status": "declined"})
+        self.members[self.invitee.id].refresh_from_db()
+        self.assertEqual(self.members[self.invitee.id].status, "declined")
+        self.assertEqual(invitee.post(self.base + "join/", {}, format="json").status_code, 404)
+        for actor in [self.owner, self.member, self.removed, self.stranger]:
+            self.assertEqual(self.jwt(actor).post(self.base + "decline/", {}, format="json").status_code, 404)
+        self.assertEqual(self.version(), 1)
+        self.assertEqual(access.mission_updates().filter(shared_goal=self.goal).count(), before)
+
+    def test_finished_legacy_proposal_can_be_rejected_but_not_approved_or_created(self):
+        self.finish()
+        url = f"/api/v1/friends/mission-actions/{self.legacy_proposal.id}/"
+        owner = self.jwt(self.owner)
+        response = owner.post(url + "approve/", {}, format="json")
         self.assertEqual((response.status_code, response.json()), (409, FINISHED))
         self.legacy_proposal.refresh_from_db()
-        for action in ["approve", "reject"]:
-            response = self.jwt(self.owner).post(
-                f"/api/v1/friends/mission-actions/{self.legacy_proposal.id}/{action}/", {}, format="json"
-            )
-            self.assertEqual((response.status_code, response.json()), (409, FINISHED))
-            self.legacy_proposal.refresh_from_db()
-            self.assertEqual(self.legacy_proposal.status, "pending")
+        self.assertEqual(self.legacy_proposal.status, "pending")
+        self.assertIsNone(self.legacy_proposal.resolved_at)
+        self.assertEqual(self.jwt(self.coowner).post(url + "reject/", {}, format="json").status_code, 404)
+        response = owner.post(url + "reject/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.json(), {"action_id": str(self.legacy_proposal.id), "status": "rejected"})
+        self.legacy_proposal.refresh_from_db()
+        self.assertEqual(self.legacy_proposal.status, "rejected")
+        self.assertIsNotNone(self.legacy_proposal.resolved_at)
+        self.assertFalse(Task.objects.filter(tenant=self.owner).exists())
+        self.assertEqual(self.version(), 1)
         with self.assertRaises(APIException) as refused:
             services.propose_mission_task(self.owner, self.goal.id, title="No more")
         self.assertEqual(refused.exception.status_code, 409)
+
+    def test_finish_expires_every_members_pending_project_proposals_only(self):
+        other = services.create_mission(self.owner, self.owner.user, member_friendship_ids=[], title="Other")
+        rows = [
+            PendingProjectAction.objects.create(
+                tenant=actor,
+                shared_goal=goal,
+                status=status,
+                expires_at=self.legacy_proposal.expires_at,
+                resolved_at=None if status == "pending" else timezone.now(),
+            )
+            for actor, goal, status in [
+                (self.member, self.goal, "pending"),
+                (self.owner, self.goal, "approved"),
+                (self.owner, self.goal, "rejected"),
+                (self.owner, other, "pending"),
+            ]
+        ]
+        self.finish()
+        proposal = PendingProjectAction.objects.get(id=self.proposal["proposal_id"])
+        self.assertEqual(proposal.status, "expired")
+        self.assertIsNotNone(proposal.resolved_at)
+        for row, expected in zip(rows, ["expired", "approved", "rejected", "pending"], strict=True):
+            previous_stamp = row.resolved_at
+            row.refresh_from_db()
+            self.assertEqual(row.status, expected)
+            if expected == "expired":
+                self.assertIsNotNone(row.resolved_at)
+            else:
+                self.assertEqual(row.resolved_at, previous_stamp)
+        self.assertEqual(self.lifecycle(reopen=True).status_code, 200)
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.status, "expired")
+
+    def test_finished_existing_project_proposal_can_be_rejected(self):
+        self.finish()
+        # A pending suggestion on a project finished before expiry was introduced.
+        PendingProjectAction.objects.filter(id=self.proposal["proposal_id"]).update(status="pending", resolved_at=None)
+        url = f"/api/v1/friends/project-proposals/{self.proposal['proposal_id']}/reject/"
+        self.assertEqual(self.jwt(self.coowner).post(url, {}, format="json").status_code, 404)
+        response = self.jwt(self.owner).post(url, {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.json(), {"proposal_id": self.proposal["proposal_id"], "status": "rejected"})
+        proposal = PendingProjectAction.objects.get(id=self.proposal["proposal_id"])
+        self.assertEqual(proposal.status, "rejected")
+        self.assertIsNotNone(proposal.resolved_at)
+        self.assertFalse(Task.objects.filter(tenant=self.owner).exists())
+        self.assertEqual(self.version(), 1)
+
+    def test_finished_owner_can_delete_and_plan_flag_requires_active_owner_at_any_status(self):
+        _step, task = projects.add_owned_step(self.member, self.member.user, self.goal.id, title="Keep private work")
+        self.finish()
+        for status in ["active", "achieved", "abandoned", "expired"]:
+            SharedGoal.objects.filter(id=self.goal.id).update(status=status)
+            for actor in [self.owner, self.coowner, self.member]:
+                response = self.jwt(actor).get(self.base + "plan/")
+                self.assertEqual(response.status_code, 200, response.data)
+                self.assertEqual(response.data["can_delete_project"], actor != self.member)
+        SharedGoal.objects.filter(id=self.goal.id).update(status="achieved")
+        for actor in [self.member, self.invitee, self.removed, self.stranger]:
+            response = self.jwt(actor).post(self.base + "delete/", {}, format="json")
+            self.assertEqual(response.status_code, 403 if actor == self.member else 404)
+            if actor != self.member:
+                self.assertEqual(self.jwt(actor).get(self.base + "plan/").status_code, 404)
+        response = self.jwt(self.owner).post(self.base + "delete/", {}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.json(), {"mission_id": str(self.goal.id), "status": "abandoned"})
+        self.goal.refresh_from_db()
+        self.assertEqual(self.goal.status, "abandoned")
+        self.assertFalse(
+            access.mission_memberships().filter(shared_goal=self.goal, status__in=["active", "invited"]).exists()
+        )
+        task.refresh_from_db()
+        self.assertEqual(task.status, "open")
+        self.assertEqual(task.tenant_id, self.member.id)
+        self.assertEqual(self.jwt(self.owner).get(self.base + "plan/").status_code, 404)
+
+    def test_finished_combined_goal_and_mute_patch_moves_only_own_private_tasks(self):
+        _step, task = projects.add_owned_step(self.member, self.member.user, self.goal.id, title="My work")
+        _other_step, other_task = projects.add_owned_step(self.owner, self.owner.user, self.goal.id, title="Their work")
+        mine = Goal.objects.create(tenant=self.member, title="My Horizons goal")
+        theirs = Goal.objects.create(tenant=self.owner, title="Their Horizons goal")
+        self.finish()
+        client = self.jwt(self.member)
+        url = self.base + "membership/"
+        response = client.patch(url, {"linked_goal_id": str(theirs.id), "muted": True}, format="json")
+        self.assertEqual(response.status_code, 404)
+        self.members[self.member.id].refresh_from_db()
+        self.assertFalse(self.members[self.member.id].muted)
+        for goal_id, muted in [(str(mine.id), True), (None, False)]:
+            response = client.patch(url, {"linked_goal_id": goal_id, "muted": muted}, format="json")
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual(response.json(), {"linked_goal_id": goal_id, "muted": muted})
+            task.refresh_from_db()
+            other_task.refresh_from_db()
+            self.assertEqual(str(task.parent_goal_id) if task.parent_goal_id else None, goal_id)
+            self.assertIsNone(other_task.parent_goal_id)
+            self.members[self.member.id].refresh_from_db()
+            self.assertEqual(self.members[self.member.id].muted, muted)
+        self.assertEqual(self.version(), 1)
+
+    def test_plan_note_counts_and_latest_exclude_viewer_reports_without_extra_queries(self):
+        latest = SharedGoalStepNote.objects.get(id=self.own_note["id"])
+        remaining = SharedGoalStepNote.objects.get(id=self.note["id"])
+
+        def metadata(actor):
+            # The existing plan uses eight queries, including step aggregates.
+            with self.assertNumQueries(8):
+                plan = projects.get_plan(actor, self.goal.id)
+            row = next(s for s in plan["steps"] if s["id"] == str(self.step.id))
+            return row["notes_count"], row["last_note_at"]
+
+        self.assertEqual(metadata(self.member), (2, latest.created_at.isoformat()))
+        self.assertEqual(self.report(self.member, self.own_note).status_code, 200)
+        self.assertEqual(metadata(self.member), (1, remaining.created_at.isoformat()))
+        for actor in [self.owner, self.coowner]:
+            self.assertEqual(metadata(actor), (2, latest.created_at.isoformat()))
+        self.assertEqual(self.jwt(self.member).delete(self.base + f"notes/{self.note['id']}/").status_code, 204)
+        self.assertEqual(metadata(self.member), (0, None))
+        self.assertEqual(metadata(self.owner), (1, latest.created_at.isoformat()))
+
+    def test_admin_dismiss_restores_note_photos_feed_and_context_for_that_reporter(self):
+        for actor in [self.owner, self.coowner]:
+            self.assertEqual(self.report(actor).status_code, 200)
+        photo_url = self.note["photos"][0]["url"]
+        self.assertEqual(self.jwt(self.owner).get(photo_url).status_code, 404)
+        queue = admin.site._registry[ContentReport]
+        report = ContentReport.objects.get(reporter_tenant=self.owner, project_note_id=self.note["id"])
+        with patch.object(queue, "message_user"):
+            queue.mark_dismissed(
+                RequestFactory().post("/admin/friends/contentreport/"), ContentReport.objects.filter(id=report.id)
+            )
+        report.refresh_from_db()
+        self.assertEqual(report.status, "dismissed")
+        self.assertIsNotNone(report.resolved_at)
+        self.assertIn(self.note["id"], [n["id"] for n in self.notes(self.owner)])
+        self.assertEqual(self.jwt(self.owner).get(photo_url).status_code, 200)
+        self.assertIn("A fact", str(assistant.runtime_context(self.owner)))
+        self.assertIn("A fact", str(services.get_mission_detail(self.owner, self.goal.id)["updates"]))
+        self.assertNotIn(self.note["id"], [n["id"] for n in self.notes(self.coowner)])
+        self.assertEqual(self.jwt(self.coowner).get(photo_url).status_code, 404)
+        self.assertNotIn("A fact", str(assistant.runtime_context(self.coowner)))
+        plan = projects.get_plan(self.owner, self.goal.id)
+        self.assertEqual(next(s for s in plan["steps"] if s["id"] == str(self.step.id))["notes_count"], 2)
+
+    def test_legacy_runtime_finished_status_and_rule_match_v2_context(self):
+        seed_internal_key(self.owner, "be3-runtime-key")
+        runtime = APIClient()
+        runtime.credentials(HTTP_X_NBHD_INTERNAL_KEY="be3-runtime-key", HTTP_X_NBHD_TENANT_ID=str(self.owner.id))
+        url = f"/api/v1/integrations/runtime/{self.owner.id}/missions/"
+        self.assertEqual(runtime.get(url).json()["missions"][0]["status"], "active")
+        self.finish()
+        response = runtime.get(url)
+        self.assertEqual(response.status_code, 200, response.data)
+        [mission] = response.json()["missions"]
+        self.assertEqual(mission["status"], "finished")
+        self.assertEqual(mission["finished_rule"], assistant.runtime_context(self.owner)["finished_rule"])
+        self.assertIn("Do not propose changes", mission["finished_rule"])
+        self.assertTrue(mission["title"].startswith("<<untrusted"))
 
     def test_finish_between_note_preparation_and_commit_refuses_the_insert(self):
         prepare = project_notes.prepare
@@ -355,12 +542,20 @@ class MissionLifecycleTests(TestCase):
 
     def test_task_completion_does_not_mutate_finished_project(self):
         step, task = projects.add_owned_step(self.owner, self.owner.user, self.goal.id, title="Private")
+        legacy = Task.objects.create(
+            tenant=self.owner,
+            title="Legacy private work",
+            related_ref={"pillar": "friends", "object_type": "shared_goal", "object_id": str(self.goal.id)},
+        )
         self.finish()
         before = access.mission_updates().filter(shared_goal=self.goal).count()
-        task.complete()
+        for private_task in [task, legacy]:
+            with self.subTest(object_type=private_task.related_ref["object_type"]):
+                with self.assertNoLogs("apps.friends.task_links", level="WARNING"):
+                    private_task.complete()
+                self.assertEqual(Task.objects.get(id=private_task.id).status, "done")
         step.refresh_from_db()
         self.assertEqual(step.status, "open")
-        self.assertEqual(Task.objects.get(id=task.id).status, "done")
         self.assertEqual(access.mission_updates().filter(shared_goal=self.goal).count(), before)
 
 
@@ -398,20 +593,13 @@ WRITE_CASES = {
     "step_back": ("post", lambda s: s.base + "step-back/", lambda s: {}),
     "note_create": ("post", lambda s: s.base + f"steps/{s.step.id}/notes/", lambda s: {"text": "No"}),
     "rename": ("patch", lambda s: s.base, lambda s: {"version": 1, "title": "No"}),
-    "project_delete": ("post", lambda s: s.base + "delete/", lambda s: {}),
     "project_finish": ("post", lambda s: s.base + "finish/", lambda s: {"version": 1}),
-    "goal_link": ("patch", lambda s: s.base + "membership/", lambda s: {"linked_goal_id": None, "muted": True}),
     "legacy_update": ("post", lambda s: s.base + "updates/", lambda s: {"kind": "note", "text": "No"}),
     "legacy_owned_step": ("post", lambda s: s.base + "tasks/", lambda s: {"title": "No"}),
     "join": ("post", lambda s: s.base + "join/", lambda s: {}),
     "proposal_approve": (
         "post",
         lambda s: f"/api/v1/friends/project-proposals/{s.proposal['proposal_id']}/approve/",
-        lambda s: {},
-    ),
-    "proposal_reject": (
-        "post",
-        lambda s: f"/api/v1/friends/project-proposals/{s.proposal['proposal_id']}/reject/",
         lambda s: {},
     ),
 }
@@ -438,15 +626,24 @@ for action, body in [
 def _write_case(method, url, data):
     def test(self):
         self.finish()
+        waiting = "/project-proposals/" in url(self)
+        if waiting:
+            # Legacy pending row on a project finished before automatic expiry.
+            PendingProjectAction.objects.filter(id=self.proposal["proposal_id"]).update(
+                status="pending", resolved_at=None
+            )
         before = access.mission_updates().filter(shared_goal=self.goal).count()
         with patch("apps.friends.project_notes.prepare") as prepare:
             response = getattr(self.jwt(self.owner), method)(url(self), data(self), format="json")
         self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(response.json(), FINISHED)
+        self.assertEqual(response.json(), FINISHED_JOIN if url(self).endswith("/join/") else FINISHED)
         prepare.assert_not_called()
         self.assertEqual(self.version(), 1)
         self.assertEqual(access.mission_updates().filter(shared_goal=self.goal).count(), before)
-        self.assertEqual(PendingProjectAction.objects.get(id=self.proposal["proposal_id"]).status, "pending")
+        self.assertEqual(
+            PendingProjectAction.objects.get(id=self.proposal["proposal_id"]).status,
+            "pending" if waiting else "expired",
+        )
         self.assertFalse(self.members[self.owner.id].muted)
 
     return test

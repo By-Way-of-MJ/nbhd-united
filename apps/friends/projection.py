@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from . import access
 from .models import NeighborProfile, SharedGoalUpdate
+from .project_hygiene import FINISHED_PROJECT_RULE
 
 
 def _handle_for(tenant_id) -> str | None:
@@ -101,7 +102,8 @@ def build_mission_status(mission, *, now=None) -> dict:
     return {
         "mission_id": str(mission.id),
         "title": mission.title,
-        "status": mission.status,
+        "status": "finished" if mission.status == "achieved" else mission.status,
+        "finished_rule": FINISHED_PROJECT_RULE,
         "cadence": cadence,
         "window_days": window_days,
         "target": target,

@@ -1428,7 +1428,7 @@ def project_notes(goal, *, viewer=None):
     if viewer is not None:
         rows = rows.exclude(
             id__in=ContentReport.objects.filter(
-                reporter_tenant_id=_tenant_id(viewer), target_kind="project_note"
+                reporter_tenant_id=_tenant_id(viewer), target_kind="project_note", status="hidden"
             ).values("project_note_id")
         )
     return rows
@@ -1662,6 +1662,7 @@ def project_snapshot(goal, *, viewer):
             hue=profile.avatar_hue if profile else 210,
             photo_url=photo_url(profile),
         )
+    visible_notes = Q(notes__id__in=project_notes(goal, viewer=viewer).values("id"))
     return {
         "mission_id": goal.id,
         "title": goal.title,
@@ -1685,8 +1686,8 @@ def project_snapshot(goal, *, viewer):
             }
             for row in project_steps(goal)
             .annotate(
-                notes_count=Count("notes", filter=Q(notes__deleted_at__isnull=True)),
-                last_note_at=Max("notes__created_at", filter=Q(notes__deleted_at__isnull=True)),
+                notes_count=Count("notes", filter=visible_notes),
+                last_note_at=Max("notes__created_at", filter=visible_notes),
             )
             .values(
                 "notes_count",
@@ -1770,7 +1771,7 @@ def my_project_proposals(tenant):
 
 
 def expire_project_proposals(goal):
-    """A deleted project's pending assistant suggestions (every member's) expire."""
+    """A finished or deleted project's pending suggestions (every member's) expire."""
     from .models import PendingProjectAction
 
     PendingProjectAction.objects.filter(shared_goal=goal, status="pending").update(

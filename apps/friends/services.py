@@ -1949,7 +1949,6 @@ def decline_mission(tenant, mission_id) -> dict:
     )
     if membership is None or membership.status not in {"invited", "declined"}:
         raise NotFound("No such invitation.")
-    access.assert_project_writable(mission)
     membership.status = "declined"
     membership.save(update_fields=["status"])
     return {"mission_id": str(mission.id), "status": "declined"}
@@ -1963,7 +1962,10 @@ def join_mission(tenant, user, mission_id, commitment="") -> dict:
     membership = access.mission_memberships().select_for_update().filter(shared_goal=mission, tenant=tenant).first()
     if membership is None or membership.status in {"declined", "removed"}:
         raise NotFound("No such mission.")  # only invited members (friendship party) can join
-    access.assert_project_writable(mission)
+    if mission.status == "achieved":
+        from .project_services import Conflict
+
+        raise Conflict("This project is finished, so it can't be joined.")
     if membership.status != "active":
         access.assert_project_invitee(tenant, mission, membership)
         membership.status = "active"
@@ -2166,7 +2168,7 @@ def reject_goal_action(tenant, action_id) -> dict:
     action = access.pending_goal_actions().filter(id=action_id, tenant=tenant, status="pending").first()
     if action is None:
         raise NotFound("No such proposal.")
-    access.lock_project(tenant, action.shared_goal_id)
+    access.lock_project(tenant, action.shared_goal_id, allow_finished=True)
     action.status = "rejected"
     action.resolved_at = timezone.now()
     action.save(update_fields=["status", "resolved_at"])
@@ -2191,8 +2193,8 @@ _MISSION_TARGET_KEYS = frozenset({"metric", "unit", "cadence", "value", "aid_kin
 
 def _fence_mission_status(status: dict, my_handle, creator_handle) -> dict:
     """Everything in a mission another member wrote — or can edit — reaches the
-    assistant as fenced data. Any member can rename a mission, so the title is
-    fenced even for its creator; only my own member row stays plain."""
+    assistant as fenced data. Any active owner can rename a mission, so the title
+    is fenced even for its creator; only my own member row stays plain."""
     # Any member may have written these; name no author unless it is someone else's.
     author = None if creator_handle == my_handle else creator_handle
     status["title"] = fence(status.get("title", ""), None)

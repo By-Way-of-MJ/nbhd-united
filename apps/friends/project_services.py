@@ -137,6 +137,7 @@ def get_plan(tenant, mission_id):
         my_role=member.role,
         can_edit_project=goal.status != "achieved" and can_edit_project(member.role),
         can_invite=goal.status != "achieved" and can_edit_project(member.role),
+        can_delete_project=can_edit_project(member.role),
         can_finish=goal.status == "active" and can_edit_project(member.role),
         can_reopen=goal.status == "achieved" and can_edit_project(member.role),
     )
@@ -158,6 +159,8 @@ def finish_project(tenant, user, mission_id, data, *, reopen=False):
     goal.achieved_at = None if reopen else timezone.now()
     goal.version += 1
     goal.save(update_fields=["status", "achieved_at", "version"])
+    if not reopen:
+        access.expire_project_proposals(goal)
     services._append_update(goal, tenant, user, "project_reopened" if reopen else "project_finished")
     return {
         "mission_id": str(goal.id),
@@ -215,7 +218,7 @@ def delete_project(tenant, mission_id):
     ``abandoned`` and every membership ``left`` — so nobody's own journal Tasks are
     touched, and it drops out of lists, plans, nudges and assistant context, which
     all read active memberships only."""
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     if member.role != "owner":
         raise PermissionDenied("Only a project owner can delete it.")
     access.mission_memberships().filter(shared_goal=goal, status__in=["active", "invited"]).update(
@@ -1190,7 +1193,7 @@ def set_linked_goal(tenant, mission_id, goal_id):
 
     from apps.journal.models import Goal, Task
 
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     new_id = _uuid(goal_id) if goal_id else None
     if new_id and not Goal.objects.filter(id=new_id, tenant=tenant).exists():
         raise NotFound("No such goal.")

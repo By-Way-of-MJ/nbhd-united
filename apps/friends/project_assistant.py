@@ -34,7 +34,11 @@ from . import access, services
 from . import project_services as projects
 from .project_contracts import OWN_SIDE_KINDS, ProjectChange, ProjectDraftSpec, ProjectProposalSpec
 from .project_flags import projects_v2_enabled
-from .project_hygiene import UNTRUSTED_RULE, fence  # noqa: F401 — re-exported; callers import them from here
+from .project_hygiene import (  # noqa: F401 — re-exported; callers import them from here
+    FINISHED_PROJECT_RULE,
+    UNTRUSTED_RULE,
+    fence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +117,7 @@ def runtime_context(tenant) -> dict:
     return {
         "rule": UNTRUSTED_RULE,
         "notes_rule": STEP_NOTES_RULE,
-        "finished_rule": "A project with status finished is finished. Do not propose changes or ask the human to work on it; an owner must reopen it first.",
+        "finished_rule": FINISHED_PROJECT_RULE,
         "today": today.isoformat(),
         "projects": out,
     }
@@ -825,7 +829,7 @@ def reject(tenant, proposal_id) -> dict:
     row = access.my_project_proposals(tenant).filter(id=_uuid(proposal_id)).first()
     if row is None:
         raise NotFound("No such suggestion.")
-    access.lock_project(tenant, row.shared_goal_id)
+    access.lock_project(tenant, row.shared_goal_id, allow_finished=True)
     now = timezone.now()
     updated = (
         access.my_project_proposals(tenant)
