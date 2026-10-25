@@ -61,13 +61,27 @@ class StepView(ProjectView):
 
 
 class MembersView(ProjectView):
-    """POST more of my neighbors into a project I started (they get an invitation)."""
+    """POST more of my neighbors into a project I own (they get an invitation)."""
 
     def post(self, request, mission_id):
         invited = projects.add_members(
             self.get_tenant(request), mission_id, self.data(request).get("member_friendship_ids")
         )
         return Response({"invited": len(invited)}, status=201)
+
+
+class MemberActionView(ProjectView):
+    def post(self, request, mission_id, membership_id, action):
+        return Response(
+            projects.change_member(
+                self.get_tenant(request),
+                request.user,
+                mission_id,
+                membership_id,
+                self.data(request),
+                cancel=action == "cancel-invite",
+            )
+        )
 
 
 class ProjectDeleteView(ProjectView):

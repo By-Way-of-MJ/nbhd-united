@@ -555,9 +555,10 @@ class SharedGoalMembership(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     shared_goal = models.ForeignKey(SharedGoal, on_delete=models.CASCADE, related_name="memberships")
     tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="mission_memberships")
+    invited_by = models.ForeignKey(Tenant, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="+")
     role = models.CharField(max_length=8, default="member")  # owner | member
-    status = models.CharField(max_length=8, default="active")  # invited | active | left | declined
+    status = models.CharField(max_length=8, default="active")  # invited | active | left | declined | removed
     muted = models.BooleanField(default=False)
     # Projects v2 §11.1: this member's OWN Horizons goal the project serves. Private to
     # the member (stripped from every other member's plan payload). A plain UUID, not a

@@ -1783,7 +1783,7 @@ def create_mission(
     other_ids = {e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in edges}
     for other in Tenant.objects.select_related("user").filter(id__in=other_ids):
         access.mission_memberships().create(
-            shared_goal=mission, tenant=other, user=other.user, role="member", status="invited"
+            shared_goal=mission, tenant=other, user=other.user, role="member", status="invited", invited_by=tenant
         )
     _append_update(mission, tenant, user, SharedGoalUpdate.Kind.JOINED, text="created the mission")
     if other_ids:
@@ -1897,7 +1897,7 @@ def get_mission_detail(tenant, mission_id) -> dict:
     if membership is None:
         raise NotFound("No such mission.")
     if membership.status == "invited":
-        access.assert_project_invitee(tenant, mission)
+        access.assert_project_invitee(tenant, mission, membership)
         # Consent preview only: shared activity stays behind active membership.
         data = {
             "mission_id": str(mission.id),
@@ -1954,10 +1954,10 @@ def join_mission(tenant, user, mission_id, commitment="") -> dict:
     if mission is None:
         raise NotFound("No such mission.")
     membership = access.mission_memberships().select_for_update().filter(shared_goal=mission, tenant=tenant).first()
-    if membership is None or membership.status == "declined":
+    if membership is None or membership.status in {"declined", "removed"}:
         raise NotFound("No such mission.")  # only invited members (friendship party) can join
     if membership.status != "active":
-        access.assert_project_invitee(tenant, mission)
+        access.assert_project_invitee(tenant, mission, membership)
         membership.status = "active"
         membership.left_at = None
         if commitment:
@@ -2017,15 +2017,26 @@ def add_mission_task(tenant, user, mission_id, *, title, description="", due_dat
     return {"task_id": str(task.id), "title": step.title}
 
 
+@transaction.atomic
 def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dict, int]:
-    """Optimistic multi-writer edit → 409 on version/lock conflict."""
-    mission, _membership = _assert_mission_member(tenant, mission_id)
+    """Owner-only optimistic edit, including legacy rename callers."""
+    from .project_permissions import can_edit_project
+    from .project_services import _date
+
+    if not isinstance(fields, dict) or set(fields) - {"title", "description", "target_date"} or not fields:
+        raise ValidationError("Only title, description and target_date can be changed.")
+    mission, membership = access.lock_project(tenant, mission_id)
+    if not can_edit_project(membership.role):
+        raise PermissionDenied("Only a project owner can edit it.")
+    if expected_version is not None and type(expected_version) is not int:
+        raise ValidationError("version must be an integer.")
+    fields = dict(fields)
     if "title" in fields:
         fields["title"] = clean_text(fields["title"], limit=120, required=True)
-    if "target" in fields:
-        if not isinstance(fields["target"], dict):
-            raise ValidationError("target must be an object.")
-        fields["target"] = clean_payload(fields["target"])
+    if "description" in fields:
+        fields["description"] = clean_text(fields["description"])
+    if "target_date" in fields:
+        fields["target_date"] = _date(fields["target_date"])
     updated, result = access.update_mission(
         mission, expected_version=expected_version, editor_owner=f"user:{tenant.id}", fields=fields
     )
@@ -2036,7 +2047,13 @@ def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dic
         }, 409
     if result == "locked":
         return {"detail": "Someone else is editing this mission — try again in a moment."}, 409
-    return {"mission_id": str(updated.id), "version": updated.version, "title": updated.title}, 200
+    return {
+        "mission_id": str(updated.id),
+        "version": updated.version,
+        "title": updated.title,
+        "description": updated.description,
+        "target_date": updated.target_date,
+    }, 200
 
 
 def propose_mission_task(tenant, mission_id, *, title, description="", due_date=None) -> tuple:

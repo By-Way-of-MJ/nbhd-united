@@ -992,7 +992,11 @@ def missions_for(tenant, *, include_invited=False):
         neighbor_ids = Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status="accepted")
         counterparts = [e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in neighbor_ids]
         states |= Q(memberships__status="invited") & (
-            Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts)
+            Q(memberships__invited_by_id__in=counterparts)
+            | (
+                Q(memberships__invited_by__isnull=True)
+                & (Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts))
+            )
         )
     return SharedGoal.objects.filter(states, memberships__tenant=tenant).distinct().order_by("-created_at")
 
@@ -1374,7 +1378,12 @@ def pending_goal_actions():
     return PendingGoalAction.objects.all()
 
 
-def assert_project_invitee(tenant, mission):
+def assert_project_invitee(tenant, mission, membership=None):
+    membership = membership or mission_memberships().filter(shared_goal=mission, tenant_id=_tenant_id(tenant)).first()
+    if membership and membership.invited_by_id:
+        if not are_neighbors(tenant, membership.invited_by_id):
+            raise PermissionDenied("Friendship is not active")
+        return
     if mission.friendship_id:
         return assert_neighbors(tenant, mission.friendship_id)
     if _tenant_id(tenant) == mission.created_by_id:
@@ -1570,11 +1579,43 @@ def project_snapshot(goal, *, viewer):
 
     Pure projection cannot lazily read a Task. The caller has checked membership.
     """
+    from rest_framework.exceptions import NotFound
+
+    from .project_permissions import can_cancel_invite, can_edit_milestone, can_edit_step, can_remove_member
+
     members = list(
         mission_memberships()
         .filter(shared_goal=goal)
         .values("id", "tenant_id", "role", "status", "muted", "linked_goal_id")
     )
+    viewer_id = _tenant_id(viewer)
+    viewer_member = next((m for m in members if m["tenant_id"] == viewer_id and m["status"] == "active"), None)
+    if viewer_member is None:
+        raise NotFound("No such mission.")
+    viewer_role, viewer_membership_id = viewer_member["role"], viewer_member["id"]
+    assignments = list(
+        project_assignments(goal).values(
+            "id",
+            "step_id",
+            "membership_id",
+            "status",
+            "counter_start",
+            "counter_due",
+            "note",
+            "responded_at",
+            "released_at",
+            "kept_at",
+            "suggested_membership_id",
+        )
+    )
+    assignments_by_step = {}
+    for assignment in assignments:
+        assignments_by_step.setdefault(assignment["step_id"], []).append(assignment)
+    milestones = list(
+        project_milestones(goal).values("id", "title", "target_date", "order", "reached_at", "created_by_id")
+    )
+    for milestone in milestones:
+        milestone["can_edit"] = can_edit_milestone(viewer_role, viewer_id, milestone.pop("created_by_id"))
     profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
     membership_by_tenant = {m["tenant_id"]: m["id"] for m in members}
     for member in members:
@@ -1585,6 +1626,8 @@ def project_snapshot(goal, *, viewer):
             member["linked_goal_title"] = _own_goal_title(viewer, member["linked_goal_id"])
         profile = profiles.get(member.pop("tenant_id"))
         member.update(
+            can_remove=can_remove_member(viewer_role, member["role"], member["status"]),
+            can_cancel_invite=can_cancel_invite(viewer_role, member["status"]),
             handle=profile.handle if profile else None,
             display_name=profile.display_name if profile else "Neighbor",
             hue=profile.avatar_hue if profile else 210,
@@ -1598,12 +1641,26 @@ def project_snapshot(goal, *, viewer):
         "version": goal.version,
         "target_date": goal.target_date,
         "members": members,
-        "milestones": list(project_milestones(goal).values("id", "title", "target_date", "order", "reached_at")),
+        "milestones": milestones,
         # Tenant ids never leave the server: who completed a step is reported as their
         # membership id in this project.
         "steps": [
             {
-                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS},
+                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS | {"created_by_id"}},
+                "can_edit": can_edit_step(
+                    viewer_role,
+                    viewer_id,
+                    viewer_membership_id,
+                    row["created_by_id"],
+                    assignments_by_step.get(row["id"], []),
+                ),
+                "can_delete": can_edit_step(
+                    viewer_role,
+                    viewer_id,
+                    viewer_membership_id,
+                    row["created_by_id"],
+                    assignments_by_step.get(row["id"], []),
+                ),
                 "completed_by_membership_id": membership_by_tenant.get(row["completed_by_id"]),
                 "reviewed_by_membership_id": membership_by_tenant.get(row["reviewed_by_id"]),
                 "review_set_by_membership_id": membership_by_tenant.get(row["review_set_by_id"]),
@@ -1617,6 +1674,7 @@ def project_snapshot(goal, *, viewer):
                 "notes_count",
                 "last_note_at",
                 "id",
+                "created_by_id",
                 "milestone_id",
                 "title",
                 "description",
@@ -1635,21 +1693,7 @@ def project_snapshot(goal, *, viewer):
                 "version",
             )
         ],
-        "assignments": list(
-            project_assignments(goal).values(
-                "id",
-                "step_id",
-                "membership_id",
-                "status",
-                "counter_start",
-                "counter_due",
-                "note",
-                "responded_at",
-                "released_at",
-                "kept_at",
-                "suggested_membership_id",
-            )
-        ),
+        "assignments": assignments,
         "edges": list(project_dependencies(goal).order_by("id").values("id", "blocker_id", "blocked_id")),
     }
 
