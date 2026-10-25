@@ -532,13 +532,9 @@ class MissionDetailView(FriendsView):
 
     def patch(self, request, mission_id):
         tenant = self.get_tenant(request)
-        fields = {}
-        if "title" in request.data:
-            fields["title"] = str(request.data.get("title") or "").strip()
-        if "target" in request.data:
-            fields["target"] = request.data.get("target") or {}
-        if "target_date" in request.data:
-            fields["target_date"] = _parse_iso_date(request.data.get("target_date"))
+        if not isinstance(request.data, dict) or set(request.data) - {"title", "description", "target_date", "version"}:
+            raise ValidationError("Only title, description, target_date and version are accepted.")
+        fields = {key: value for key, value in request.data.items() if key != "version"}
         payload, code = services.update_mission(
             tenant, mission_id, expected_version=request.data.get("version"), fields=fields
         )
@@ -718,7 +714,8 @@ class CircleInviteCodeView(FriendsView):
 
 class ReportView(FriendsView):
     """POST /api/v1/friends/report/ {target_kind, target_id?, reason, detail?} —
-    hide the reported item for the reporter (shared_lesson / friend_message), OR
+    hide the reported item for the reporter (shared_lesson / friend_message /
+    profile_photo / project_note), OR
     record a ``general`` support concern (no content id; App Review #3)."""
 
     def post(self, request):

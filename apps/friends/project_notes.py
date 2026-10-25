@@ -57,18 +57,19 @@ def representation(note, member, profile):
         "created_at": note.created_at.isoformat(),
         "edited_at": note.edited_at.isoformat() if note.edited_at else None,
         "mine": note.author_id == member.id,
+        "can_report": member.status == "active" and note.author_id != member.id,
     }
 
 
 def list_notes(tenant, mission_id, step_id):
     goal, member, step = check_step(tenant, mission_id, step_id)
-    rows = list(access.notes_for_display(goal, step=step))
+    rows = list(access.notes_for_display(goal, step=step, viewer=tenant))
     profiles = access.note_profiles(rows)
     return {"notes": [representation(n, member, profiles.get(n.author.tenant_id)) for n in rows]}
 
 
 def _display_one(goal, member, note):
-    row = access.notes_for_display(goal, step=note.step_id).get(id=note.id)
+    row = access.notes_for_display(goal, step=note.step_id, viewer=member.tenant_id).get(id=note.id)
     return representation(row, member, access.note_profiles([row]).get(row.author.tenant_id))
 
 
@@ -109,9 +110,10 @@ def create(tenant, user, mission_id, step_id, text, prepared):
 
 @transaction.atomic
 def edit(tenant, mission_id, note_id, data):
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     note = _row(access.project_notes(goal), note_id)
     if note.author_id != member.id:
+        access.assert_project_writable(goal)
         raise PermissionDenied("Only the author can edit this note.")
     if set(data) != {"text"}:
         raise ValidationError("Only text can be edited.")
@@ -129,8 +131,10 @@ def edit(tenant, mission_id, note_id, data):
 
 @transaction.atomic
 def delete(tenant, mission_id, note_id):
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     note = _row(access.project_notes(goal), note_id)
+    if note.author_id != member.id:
+        access.assert_project_writable(goal)
     if note.author_id != member.id and member.role != "owner":
         raise PermissionDenied("Only the author or a project owner can delete this note.")
     note.deleted_at = timezone.now()
@@ -140,4 +144,4 @@ def delete(tenant, mission_id, note_id):
 
 def photo(tenant, mission_id, photo_id):
     goal, _ = services._assert_mission_member(tenant, mission_id)
-    return _row(access.project_note_photos(goal), photo_id)
+    return _row(access.project_note_photos(goal, viewer=tenant), photo_id)

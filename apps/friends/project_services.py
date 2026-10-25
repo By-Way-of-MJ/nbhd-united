@@ -10,11 +10,19 @@ from datetime import date, timedelta
 from uuid import UUID
 
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
 from . import access, plan_projection, services
 from .project_hygiene import clean_text
+from .project_permissions import (
+    can_cancel_invite,
+    can_edit_milestone,
+    can_edit_project,
+    can_edit_step,
+    can_remove_member,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +106,15 @@ def _assert_step_editor(goal, member, step):
     declined/countered assignments do not reserve editing rights for that member.
     Call under the project lock before mutating; PATCH also checks before authoring.
     """
-    assignments = access.project_assignments(goal).filter(step=step)
-    own = assignments.filter(membership=member, status="accepted").first()
-    if own or member.role == "owner":
-        return own
-    if (
-        step.created_by_id == member.tenant_id
-        and not assignments.filter(status__in=["asked", "accepted"]).exclude(membership=member).exists()
+    assignments = list(access.project_assignments(goal).filter(step=step))
+    if can_edit_step(
+        member.role,
+        member.tenant_id,
+        member.id,
+        step.created_by_id,
+        [{"membership_id": row.membership_id, "status": row.status} for row in assignments],
     ):
-        return None
+        return next((row for row in assignments if row.membership_id == member.id and row.status == "accepted"), None)
     raise PermissionDenied("Ask the step's owner to change it.")
 
 
@@ -127,11 +135,39 @@ def get_plan(tenant, mission_id):
     plan.update(
         my_membership_id=str(member.id),
         my_role=member.role,
-        # Invitations are checked against the creator's neighbors, so only the
-        # creator (while an owner) can add people.
-        can_invite=member.role == "owner" and goal.created_by_id == tenant.id,
+        can_edit_project=goal.status != "achieved" and can_edit_project(member.role),
+        can_invite=goal.status != "achieved" and can_edit_project(member.role),
+        can_delete_project=can_edit_project(member.role),
+        can_finish=goal.status == "active" and can_edit_project(member.role),
+        can_reopen=goal.status == "achieved" and can_edit_project(member.role),
     )
     return plan
+
+
+@transaction.atomic
+def finish_project(tenant, user, mission_id, data, *, reopen=False):
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=reopen)
+    if not can_edit_project(member.role):
+        raise PermissionDenied("Only a project owner can finish or reopen it.")
+    if set(data) != {"version"} or type(data.get("version")) is not int:
+        raise ValidationError("Only an integer version is required.")
+    if data["version"] != goal.version:
+        raise Conflict({"detail": "This project changed — refresh and try again.", "version": goal.version})
+    if goal.status != ("achieved" if reopen else "active"):
+        raise Conflict("This project is not finished." if reopen else "This project is not active.")
+    goal.status = "active" if reopen else "achieved"
+    goal.achieved_at = None if reopen else timezone.now()
+    goal.version += 1
+    goal.save(update_fields=["status", "achieved_at", "version"])
+    if not reopen:
+        access.expire_project_proposals(goal)
+    services._append_update(goal, tenant, user, "project_reopened" if reopen else "project_finished")
+    return {
+        "mission_id": str(goal.id),
+        "status": "active" if reopen else "finished",
+        "finished_at": goal.achieved_at,
+        "version": goal.version,
+    }
 
 
 MAX_PROJECT_PEOPLE = 12
@@ -139,15 +175,15 @@ MAX_PROJECT_PEOPLE = 12
 
 @transaction.atomic
 def add_members(tenant, mission_id, friendship_ids):
-    """Invite more of MY neighbors into a project I started. They still choose to
+    """Invite more of MY neighbors into a project I own. They still choose to
     join; a push goes only to the people invited now. Returns the new invitations."""
     from apps.tenants.models import Tenant
 
     if not isinstance(friendship_ids, list) or not friendship_ids or len(friendship_ids) > MAX_PROJECT_PEOPLE:
         raise ValidationError("member_friendship_ids must be a non-empty list.")
     goal, member = access.lock_project(tenant, mission_id)
-    if member.role != "owner" or goal.created_by_id != tenant.id:
-        raise PermissionDenied("Only the person who started the project can add people.")
+    if not can_edit_project(member.role):
+        raise PermissionDenied("Only a project owner can add people.")
     edges = [access.assert_neighbors(tenant, value) for value in friendship_ids]
     other_ids = {e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in edges}
     existing = {m.tenant_id: m for m in access.mission_memberships().filter(shared_goal=goal)}
@@ -161,10 +197,11 @@ def add_members(tenant, mission_id, friendship_ids):
             raise ValidationError(f"A project can have up to {MAX_PROJECT_PEOPLE} people.")
         if current:
             current.status, current.left_at = "invited", None
-            current.save(update_fields=["status", "left_at"])
+            current.invited_by = tenant
+            current.save(update_fields=["status", "left_at", "invited_by"])
         else:
             current = access.mission_memberships().create(
-                shared_goal=goal, tenant=other, user=other.user, role="member", status="invited"
+                shared_goal=goal, tenant=other, user=other.user, role="member", status="invited", invited_by=tenant
             )
         invited.append(current.id)
         live += 1
@@ -181,7 +218,7 @@ def delete_project(tenant, mission_id):
     ``abandoned`` and every membership ``left`` — so nobody's own journal Tasks are
     touched, and it drops out of lists, plans, nudges and assistant context, which
     all read active memberships only."""
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     if member.role != "owner":
         raise PermissionDenied("Only a project owner can delete it.")
     access.mission_memberships().filter(shared_goal=goal, status__in=["active", "invited"]).update(
@@ -223,6 +260,13 @@ def linked_projects(tenant):
     return out
 
 
+def _append_order(rows, fields):
+    if "order" not in fields:
+        maximum = rows.aggregate(maximum=Max("order"))["maximum"]
+        fields["order"] = maximum + 1 if maximum is not None else 0
+    return fields
+
+
 @transaction.atomic
 def create_step(tenant, user, mission_id, data):
     goal, _ = access.lock_project(tenant, mission_id)
@@ -230,6 +274,7 @@ def create_step(tenant, user, mission_id, data):
     _validate_step(goal, fields)
     if access.project_steps(goal).count() >= 60:
         raise ValidationError("A project can have at most 60 steps.")
+    _append_order(access.project_steps(goal).filter(milestone_id=fields.get("milestone_id")), fields)
     step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
     services._append_update(goal, tenant, user, "step_added", text=step.title, payload={"step_id": str(step.id)})
     _refresh_milestones(goal, tenant, user)
@@ -341,11 +386,15 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
     """
     with transaction.atomic():
         goal, member = access.lock_project(tenant, mission_id)
-        step_ids = set(access.project_steps(goal).values_list("id", flat=True))
+        step_rows = list(access.project_steps(goal).values_list("id", "milestone_id", "order"))
+        step_ids = {step_id for step_id, _milestone, _order in step_rows}
         milestones = set(access.project_milestones(goal).values_list("id", flat=True))
         edge_count = access.project_dependencies(goal).count()
         linked_goal_id = services._linked_goal_for(tenant, goal)
         updates, assignments, results = [], [], []
+        next_orders = {}
+        for _step_id, milestone_id, order in step_rows:
+            next_orders[milestone_id] = max(next_orders.get(milestone_id, order + 1), order + 1)
         update_model = access.mission_updates().model
         assignment_model = access.project_assignments(goal).model
 
@@ -374,7 +423,7 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
             )
 
         for (data, take, waits_on), prepared in zip(items, prepared_tasks, strict=True):
-            checkpoint = len(updates), len(assignments), step_ids.copy(), edge_count
+            checkpoint = len(updates), len(assignments), step_ids.copy(), edge_count, next_orders.copy()
             try:
                 with transaction.atomic():
                     try:
@@ -388,7 +437,11 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
                             raise ValidationError("add_step: waits_on names a step outside this project")
                         if len(step_ids) >= 60:
                             raise ValidationError("A project can have at most 60 steps.")
+                        group_id = fields.get("milestone_id")
+                        if "order" not in fields:
+                            fields["order"] = next_orders.get(group_id, 0)
                         step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
+                        next_orders[group_id] = max(next_orders.get(group_id, fields["order"]), fields["order"] + 1)
                         step_ids.add(step.id)
                         audit("step_added", step)
                         if milestones:
@@ -418,7 +471,7 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
                     except APIException as exc:
                         results.append(exc)
             except Exception as exc:  # noqa: BLE001
-                update_count, assignment_count, step_ids, edge_count = checkpoint
+                update_count, assignment_count, step_ids, edge_count, next_orders = checkpoint
                 del updates[update_count:]
                 del assignments[assignment_count:]
                 results.append(step_failure(exc))
@@ -431,7 +484,7 @@ def patch_step(tenant, mission_id, step_id, data):
     from apps.journal.models import Task
     from apps.pii.authoring import author_text, truncate_placeholder_safe
 
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     step = _row(access.project_steps(goal), step_id)
     assignment = _assert_step_editor(goal, member, step)
     _check_step_version(step, data)
@@ -502,7 +555,7 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
 
     for member in members:
         if member.status == "invited":
-            access.assert_project_invitee(member.tenant_id, goal)
+            access.assert_project_invitee(member.tenant_id, goal, member)
         if member.tenant_id != tenant.id and not projects_v2_enabled(member.tenant):
             # Their app can't show or answer an ask yet — refuse rather than dead-end.
             raise ValidationError("They need the newest version of the app before you can ask them.")
@@ -531,7 +584,7 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
 
 
 def respond(tenant, user, mission_id, step_id, data):
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     answer = data.get("answer")
     if answer not in {"yes", "dates", "smaller", "no", "other"}:
         raise ValidationError("answer must be yes, dates, smaller, no, or other.")
@@ -611,7 +664,7 @@ def respond(tenant, user, mission_id, step_id, data):
 
 
 def add_owned_step(tenant, user, mission_id, *, title, description="", due_date=None, prepared=None):
-    services._assert_mission_member(tenant, mission_id)
+    services._assert_mission_member(tenant, mission_id, for_write=True)
     title, description = clean_text(title, limit=120, required=True), clean_text(description)
     if prepared is None:
         prepared = services._prepare_member_task(tenant, title, description)
@@ -755,7 +808,7 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
     # Match journal writes' lock order: private Task first, project second.
     # Otherwise Task.save's synchronous receiver (Task -> project) can deadlock
     # against a project completion holding the project while waiting on Task.
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     step = _row(access.project_steps(goal), step_id)
     assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
     if assignment is None:
@@ -880,6 +933,67 @@ def question(tenant, user, mission_id, step_id, data):
 
 
 # ── Stepping back, leaving, looking after the project ────────────────────────
+
+
+@transaction.atomic
+def change_member(tenant, user, mission_id, membership_id, data, *, cancel=False):
+    """Remove a non-owner or retract an invitation. No removal push; Tasks stay.
+
+    A removed membership cannot self-rejoin; an owner must invite them again.
+    The required version is the plan's project version, checked under its lock.
+    """
+    goal, actor = access.lock_project(tenant, mission_id)
+    if not can_edit_project(actor.role):
+        raise PermissionDenied("Only a project owner can manage people.")
+    if set(data) - {"version"} or type(data.get("version")) is not int:
+        raise ValidationError("Only an integer version is required.")
+    target = _row(access.mission_memberships().filter(shared_goal=goal), membership_id)
+    permitted = (
+        can_cancel_invite(actor.role, target.status)
+        if cancel
+        else can_remove_member(actor.role, target.role, target.status)
+    )
+    if not permitted:
+        raise PermissionDenied(
+            "Only a pending invitation can be cancelled."
+            if cancel
+            else "Only an active member who is not an owner can be removed."
+        )
+    if data["version"] != goal.version:
+        raise Conflict({"detail": "This project changed — refresh and try again.", "version": goal.version})
+    # Match leave's release + member_left activity, without its notification.
+    released, _declined = _release(goal, target)
+    if not cancel:
+        for step in released:
+            services._append_update(
+                goal,
+                target.tenant,
+                target.user,
+                "step_released",
+                payload={
+                    "step_id": str(step.id),
+                    "membership_id": str(target.id),
+                    "removed_by_membership_id": str(actor.id),
+                },
+            )
+        services._append_update(
+            goal,
+            target.tenant,
+            target.user,
+            "member_left",
+            payload={"membership_id": str(target.id), "removed_by_membership_id": str(actor.id)},
+        )
+    target.status = "declined" if cancel else "removed"
+    target.left_at = timezone.now()
+    target.save(update_fields=["status", "left_at"])
+    goal.version += 1
+    goal.save(update_fields=["version"])
+    return {
+        "membership_id": str(target.id),
+        "status": target.status,
+        "released": len(released),
+        "version": goal.version,
+    }
 
 
 def _release(goal, member, *, picks=None):
@@ -1011,7 +1125,7 @@ def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=
     goal, member = access.lock_project(tenant, mission_id)
     if milestone_id:
         milestone = _row(access.project_milestones(goal), milestone_id)
-        if member.role != "owner" and milestone.created_by_id != tenant.id:
+        if not can_edit_milestone(member.role, tenant.id, milestone.created_by_id):
             raise PermissionDenied("Ask the milestone's creator or a project owner to change it.")
         if delete:
             milestone.delete()
@@ -1023,9 +1137,8 @@ def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=
         return milestone
     if access.project_milestones(goal).count() >= 8:
         raise ValidationError("A project can have at most 8 milestones.")
-    return access.project_milestones(goal).create(
-        shared_goal=goal, created_by=tenant, **_fields(data, milestone=True, creating=True)
-    )
+    fields = _append_order(access.project_milestones(goal), _fields(data, milestone=True, creating=True))
+    return access.project_milestones(goal).create(shared_goal=goal, created_by=tenant, **fields)
 
 
 @transaction.atomic
@@ -1061,7 +1174,7 @@ def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
 @transaction.atomic
 def set_muted(tenant, mission_id, muted):
     """My own switch: no pushes from this project for me. Nobody else sees it."""
-    _goal, member = access.lock_project(tenant, mission_id)
+    _goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     if member.muted != muted:
         member.muted = muted
         member.save(update_fields=["muted"])
@@ -1080,7 +1193,7 @@ def set_linked_goal(tenant, mission_id, goal_id):
 
     from apps.journal.models import Goal, Task
 
-    goal, member = access.lock_project(tenant, mission_id)
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     new_id = _uuid(goal_id) if goal_id else None
     if new_id and not Goal.objects.filter(id=new_id, tenant=tenant).exists():
         raise NotFound("No such goal.")

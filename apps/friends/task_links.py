@@ -108,6 +108,9 @@ def _on_task_saved(sender, instance, **kwargs) -> None:
                         text=(instance.title or "")[:120],
                         payload={"task_id": str(instance.id), "title": instance.title or ""},
                     )
+    except project_services.Conflict:
+        # Finished projects keep their shared steps frozen; private work still saves.
+        return
     except Exception:  # noqa: BLE001 — never break a Task save over crew bookkeeping
         logger.warning("mission task-completion linkage failed", exc_info=True)
 

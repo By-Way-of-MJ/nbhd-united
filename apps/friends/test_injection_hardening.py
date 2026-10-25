@@ -37,8 +37,9 @@ class ProjectInjectionTests(TestCase):
         projects.ask(self.a, self.a.user, self.goal.id, self.step.id, [str(member_a.id)])
         projects.respond(self.a, self.a.user, self.goal.id, self.step.id, {"answer": "yes"})
 
-    def test_a_member_renaming_my_project_never_reaches_my_standing_notes(self):
-        # Any member can rename a project.
+    def test_a_coowner_renaming_my_project_never_reaches_my_standing_notes(self):
+        # R1: only an owner can rename; retain the cross-user injection assertion.
+        SharedGoalMembership.objects.filter(shared_goal=self.goal, tenant=self.b).update(role="owner")
         payload, code = services.update_mission(
             self.b,
             self.goal.id,

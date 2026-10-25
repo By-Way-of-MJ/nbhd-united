@@ -60,7 +60,7 @@ class ProjectRound2Tests(TestCase):
         self.assertEqual(self.member(self.b).status, "invited")
         self.assertIsNone(self.member(self.b).left_at)
 
-    def test_only_the_creator_can_add_and_only_their_own_neighbors(self):
+    def test_only_an_owner_can_add_and_only_their_own_neighbors(self):
         bd = _edge(self.b, self.d)
         response = self.client_for(self.b).post(
             f"/api/v1/friends/missions/{self.goal.id}/members/", {"member_friendship_ids": [str(bd.id)]}, format="json"

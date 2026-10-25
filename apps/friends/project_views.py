@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 
 from apps.tenants.authentication import JWTAuthenticationWithRLS
 
-from . import project_notes
+from . import access, project_notes
 from . import project_services as projects
 from .project_flags import projects_v2_enabled
 from .throttling import StepNoteDayThrottle
@@ -61,13 +61,36 @@ class StepView(ProjectView):
 
 
 class MembersView(ProjectView):
-    """POST more of my neighbors into a project I started (they get an invitation)."""
+    """POST more of my neighbors into a project I own (they get an invitation)."""
 
     def post(self, request, mission_id):
         invited = projects.add_members(
             self.get_tenant(request), mission_id, self.data(request).get("member_friendship_ids")
         )
         return Response({"invited": len(invited)}, status=201)
+
+
+class MemberActionView(ProjectView):
+    def post(self, request, mission_id, membership_id, action):
+        return Response(
+            projects.change_member(
+                self.get_tenant(request),
+                request.user,
+                mission_id,
+                membership_id,
+                self.data(request),
+                cancel=action == "cancel-invite",
+            )
+        )
+
+
+class ProjectLifecycleView(ProjectView):
+    def post(self, request, mission_id, action):
+        return Response(
+            projects.finish_project(
+                self.get_tenant(request), request.user, mission_id, self.data(request), reopen=action == "reopen"
+            )
+        )
 
 
 class ProjectDeleteView(ProjectView):
@@ -261,7 +284,8 @@ class StepNotesView(ProjectView):
         tenant = self.get_tenant(request)
         with transaction.atomic():
             set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
-            project_notes.check_step(tenant, mission_id, step_id)
+            goal, _member, _step = project_notes.check_step(tenant, mission_id, step_id)
+            access.assert_project_writable(goal)
         if set(data) - {"text", "photos"} or set(request.FILES) - {"photos"}:
             raise ValidationError("Unknown note fields.")
         text, prepared = project_notes.prepare(data.get("text"), request.FILES.getlist("photos"))

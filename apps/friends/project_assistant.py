@@ -34,7 +34,11 @@ from . import access, services
 from . import project_services as projects
 from .project_contracts import OWN_SIDE_KINDS, ProjectChange, ProjectDraftSpec, ProjectProposalSpec
 from .project_flags import projects_v2_enabled
-from .project_hygiene import UNTRUSTED_RULE, fence  # noqa: F401 — re-exported; callers import them from here
+from .project_hygiene import (  # noqa: F401 — re-exported; callers import them from here
+    FINISHED_PROJECT_RULE,
+    UNTRUSTED_RULE,
+    fence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +109,18 @@ def runtime_context(tenant) -> dict:
     # zone, so the assistant relays day counts instead of doing date math. One date
     # for the whole reply, so a read that straddles midnight cannot disagree with itself.
     today = tenant_today(tenant)
-    out = [_project_context(tenant, m, today) for m in access.my_active_project_memberships(tenant)]
+    out = [
+        _project_context(tenant, m, today) for m in access.my_active_project_memberships(tenant, include_finished=True)
+    ]
     _mark_gone_quiet(out, today)
     cache.set(_taint_key(tenant), timezone.now().isoformat(), TAINT_WINDOW_SECONDS)
-    return {"rule": UNTRUSTED_RULE, "notes_rule": STEP_NOTES_RULE, "today": today.isoformat(), "projects": out}
+    return {
+        "rule": UNTRUSTED_RULE,
+        "notes_rule": STEP_NOTES_RULE,
+        "finished_rule": FINISHED_PROJECT_RULE,
+        "today": today.isoformat(),
+        "projects": out,
+    }
 
 
 # What the user says about a step has to land ON the step, or the next reader (the
@@ -206,7 +218,7 @@ def _mark_gone_quiet(projects_out, today) -> None:
         return to_due is None or not -1 - _GONE_QUIET_REST_DAYS <= to_due <= 10
 
     candidates = sorted(
-        (s for p in projects_out for s in p["my_steps"] if quiet(s)),
+        (s for p in projects_out if p.get("status") != "finished" for s in p["my_steps"] if quiet(s)),
         key=lambda s: (str(s["due_date"] or "9999"), s["id"]),
     )
     if candidates:
@@ -267,7 +279,7 @@ def _project_context(tenant, membership, today) -> dict:
         }
 
     shared_notes = {}
-    for note in access.newest_shared_notes(goal):
+    for note in access.newest_shared_notes(goal, viewer=tenant):
         author = member_by_id.get(str(note["author_id"]), {})
         shared_notes.setdefault(str(note["step_id"]), []).append(
             {
@@ -315,6 +327,8 @@ def _project_context(tenant, membership, today) -> dict:
     note_count = access.mission_updates().filter(shared_goal=goal, kind=SharedGoalUpdate.Kind.NOTE).count()
     return {
         "mission_id": str(goal.id),
+        "status": plan["status"],
+        "finished_at": plan["finished_at"],
         "title": text(goal.title, goal.created_by_id),
         "goal": text(goal.description, goal.created_by_id) if goal.description else "",
         "my_role": plan["my_role"],
@@ -537,11 +551,12 @@ def publish_draft(tenant, user, draft_id, extra_member_friendship_ids=None) -> d
 # ── Proposals ────────────────────────────────────────────────────────────────
 
 
-def _project_for(tenant, mission_id):
+def _project_for(tenant, mission_id, *, lock=False):
     if not projects_v2_enabled(tenant):
         raise PermissionDenied("Shared projects aren't enabled for this account yet.")
-    goal, member = services._assert_mission_member(tenant, mission_id)
-    return goal, member
+    if lock:
+        return access.lock_project(tenant, mission_id)
+    return services._assert_mission_member(tenant, mission_id)
 
 
 def _check_change(tenant, goal, change: ProjectChange, *, steps=None) -> None:
@@ -579,8 +594,9 @@ def _member_by_handle(goal, handle):
     return None
 
 
+@transaction.atomic
 def propose(tenant, mission_id, raw) -> dict:
-    goal, _ = _project_for(tenant, mission_id)
+    goal, _ = _project_for(tenant, mission_id, lock=True)
     try:
         spec = ProjectProposalSpec.model_validate(raw if isinstance(raw, dict) else {})
     except PydanticValidationError as exc:
@@ -750,10 +766,10 @@ def approve(tenant, user, proposal_id) -> dict:
             raise NotFound("No such suggestion.")
         if row.status != "pending" or row.expires_at <= now:
             raise ValidationError("This suggestion is no longer waiting.")
+        goal, member = _project_for(tenant, row.shared_goal_id, lock=True)
         row.status = "approved"  # claim; refined below
         row.resolved_at = now
         row.save(update_fields=["status", "resolved_at"])
-    goal, member = _project_for(tenant, row.shared_goal_id)
     spec = ProjectProposalSpec.model_validate(row.payload)
     results = []
 
@@ -808,7 +824,12 @@ def approve(tenant, user, proposal_id) -> dict:
     return {"proposal_id": str(row.id), "status": row.status, "changes": results}
 
 
+@transaction.atomic
 def reject(tenant, proposal_id) -> dict:
+    row = access.my_project_proposals(tenant).filter(id=_uuid(proposal_id)).first()
+    if row is None:
+        raise NotFound("No such suggestion.")
+    access.lock_project(tenant, row.shared_goal_id, allow_finished=True)
     now = timezone.now()
     updated = (
         access.my_project_proposals(tenant)

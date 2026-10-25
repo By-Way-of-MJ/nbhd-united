@@ -992,7 +992,11 @@ def missions_for(tenant, *, include_invited=False):
         neighbor_ids = Friendship.objects.filter(Q(requester=tenant) | Q(addressee=tenant), status="accepted")
         counterparts = [e.addressee_id if e.requester_id == tenant.id else e.requester_id for e in neighbor_ids]
         states |= Q(memberships__status="invited") & (
-            Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts)
+            Q(memberships__invited_by_id__in=counterparts)
+            | (
+                Q(memberships__invited_by__isnull=True)
+                & (Q(friendship__status="accepted") | Q(friendship__isnull=True, created_by_id__in=counterparts))
+            )
         )
     return SharedGoal.objects.filter(states, memberships__tenant=tenant).distinct().order_by("-created_at")
 
@@ -1374,7 +1378,12 @@ def pending_goal_actions():
     return PendingGoalAction.objects.all()
 
 
-def assert_project_invitee(tenant, mission):
+def assert_project_invitee(tenant, mission, membership=None):
+    membership = membership or mission_memberships().filter(shared_goal=mission, tenant_id=_tenant_id(tenant)).first()
+    if membership and membership.invited_by_id:
+        if not are_neighbors(tenant, membership.invited_by_id):
+            raise PermissionDenied("Friendship is not active")
+        return
     if mission.friendship_id:
         return assert_neighbors(tenant, mission.friendship_id)
     if _tenant_id(tenant) == mission.created_by_id:
@@ -1383,13 +1392,23 @@ def assert_project_invitee(tenant, mission):
         raise PermissionDenied("Friendship is not active")
 
 
-def lock_project(tenant, mission_id):
+def assert_project_writable(goal):
+    """One lifecycle rule for app, legacy and assistant writes."""
+    if goal.status == SharedGoal.Status.ACHIEVED:
+        from .project_services import Conflict
+
+        raise Conflict("This project is finished — reopen it to change it.")
+
+
+def lock_project(tenant, mission_id, *, allow_finished=False):
     from rest_framework.exceptions import NotFound
 
     goal = SharedGoal.objects.select_for_update().filter(id=mission_id).first()
     member = mission_memberships().filter(shared_goal=goal, tenant=tenant, status="active").first() if goal else None
     if member is None:
         raise NotFound("No such mission.")
+    if not allow_finished:
+        assert_project_writable(goal)
     return goal, member
 
 
@@ -1399,25 +1418,43 @@ def project_steps(goal):
     return SharedGoalStep.objects.filter(shared_goal=goal)
 
 
-def project_notes(goal):
+def project_notes(goal, *, viewer=None):
     """Live notes with redundant goal/step/author scoping as an application backstop."""
     from .models import SharedGoalStepNote
 
-    return SharedGoalStepNote.objects.filter(
+    rows = SharedGoalStepNote.objects.filter(
         shared_goal=goal, step__shared_goal=goal, author__shared_goal=goal, deleted_at__isnull=True
     )
+    if viewer is not None:
+        rows = rows.exclude(
+            id__in=ContentReport.objects.filter(
+                reporter_tenant_id=_tenant_id(viewer), target_kind="project_note", status="hidden"
+            ).values("project_note_id")
+        )
+    return rows
 
 
-def project_note_photos(goal):
+def project_note_report_target(tenant, note_id):
+    from .models import SharedGoalStepNote
+
+    return SharedGoalStepNote.objects.filter(
+        id=note_id,
+        deleted_at__isnull=True,
+        shared_goal__memberships__tenant_id=_tenant_id(tenant),
+        shared_goal__memberships__status="active",
+    ).first()
+
+
+def project_note_photos(goal, *, viewer=None):
     from .models import SharedGoalStepNotePhoto
 
-    return SharedGoalStepNotePhoto.objects.filter(note__in=project_notes(goal))
+    return SharedGoalStepNotePhoto.objects.filter(note__in=project_notes(goal, viewer=viewer))
 
 
-def notes_for_display(goal, *, step):
+def notes_for_display(goal, *, step, viewer=None):
     """Eager metadata only; listing notes must never load stored photo bytes."""
     return (
-        project_notes(goal)
+        project_notes(goal, viewer=viewer)
         .filter(step=step)
         .select_related("author")
         .prefetch_related(Prefetch("photos", queryset=project_note_photos(goal).defer("image")))
@@ -1428,10 +1465,10 @@ def note_profiles(notes):
     return {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={n.author.tenant_id for n in notes})}
 
 
-def newest_shared_notes(goal):
+def newest_shared_notes(goal, *, viewer=None):
     """Newest three per step in one metadata-only query, including the photo count."""
     return (
-        project_notes(goal)
+        project_notes(goal, viewer=viewer)
         .annotate(
             photo_count=Count("photos"),
             position=Window(
@@ -1570,11 +1607,44 @@ def project_snapshot(goal, *, viewer):
 
     Pure projection cannot lazily read a Task. The caller has checked membership.
     """
+    from rest_framework.exceptions import NotFound
+
+    from .project_permissions import can_cancel_invite, can_edit_milestone, can_edit_step, can_remove_member
+
     members = list(
         mission_memberships()
         .filter(shared_goal=goal)
         .values("id", "tenant_id", "role", "status", "muted", "linked_goal_id")
     )
+    viewer_id = _tenant_id(viewer)
+    viewer_member = next((m for m in members if m["tenant_id"] == viewer_id and m["status"] == "active"), None)
+    if viewer_member is None:
+        raise NotFound("No such mission.")
+    viewer_role, viewer_membership_id = viewer_member["role"], viewer_member["id"]
+    assignments = list(
+        project_assignments(goal).values(
+            "id",
+            "step_id",
+            "membership_id",
+            "status",
+            "counter_start",
+            "counter_due",
+            "note",
+            "responded_at",
+            "released_at",
+            "kept_at",
+            "suggested_membership_id",
+        )
+    )
+    assignments_by_step = {}
+    for assignment in assignments:
+        assignments_by_step.setdefault(assignment["step_id"], []).append(assignment)
+    milestones = list(
+        project_milestones(goal).values("id", "title", "target_date", "order", "reached_at", "created_by_id")
+    )
+    for milestone in milestones:
+        creator_id = milestone.pop("created_by_id")
+        milestone["can_edit"] = goal.status != "achieved" and can_edit_milestone(viewer_role, viewer_id, creator_id)
     profiles = {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in=[m["tenant_id"] for m in members])}
     membership_by_tenant = {m["tenant_id"]: m["id"] for m in members}
     for member in members:
@@ -1585,38 +1655,45 @@ def project_snapshot(goal, *, viewer):
             member["linked_goal_title"] = _own_goal_title(viewer, member["linked_goal_id"])
         profile = profiles.get(member.pop("tenant_id"))
         member.update(
+            can_remove=goal.status != "achieved" and can_remove_member(viewer_role, member["role"], member["status"]),
+            can_cancel_invite=goal.status != "achieved" and can_cancel_invite(viewer_role, member["status"]),
             handle=profile.handle if profile else None,
             display_name=profile.display_name if profile else "Neighbor",
             hue=profile.avatar_hue if profile else 210,
             photo_url=photo_url(profile),
         )
+    visible_notes = Q(notes__id__in=project_notes(goal, viewer=viewer).values("id"))
     return {
         "mission_id": goal.id,
         "title": goal.title,
         "description": goal.description,
-        "status": goal.status,
+        "status": "finished" if goal.status == "achieved" else goal.status,
+        "finished_at": goal.achieved_at,
         "version": goal.version,
         "target_date": goal.target_date,
         "members": members,
-        "milestones": list(project_milestones(goal).values("id", "title", "target_date", "order", "reached_at")),
+        "milestones": milestones,
         # Tenant ids never leave the server: who completed a step is reported as their
         # membership id in this project.
         "steps": [
             {
-                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS},
+                **{k: v for k, v in row.items() if k not in _STEP_TENANT_FIELDS | {"created_by_id"}},
+                "can_edit": editable,
+                "can_delete": editable,
                 "completed_by_membership_id": membership_by_tenant.get(row["completed_by_id"]),
                 "reviewed_by_membership_id": membership_by_tenant.get(row["reviewed_by_id"]),
                 "review_set_by_membership_id": membership_by_tenant.get(row["review_set_by_id"]),
             }
             for row in project_steps(goal)
             .annotate(
-                notes_count=Count("notes", filter=Q(notes__deleted_at__isnull=True)),
-                last_note_at=Max("notes__created_at", filter=Q(notes__deleted_at__isnull=True)),
+                notes_count=Count("notes", filter=visible_notes),
+                last_note_at=Max("notes__created_at", filter=visible_notes),
             )
             .values(
                 "notes_count",
                 "last_note_at",
                 "id",
+                "created_by_id",
                 "milestone_id",
                 "title",
                 "description",
@@ -1634,22 +1711,18 @@ def project_snapshot(goal, *, viewer):
                 "order",
                 "version",
             )
+            for editable in [
+                goal.status != "achieved"
+                and can_edit_step(
+                    viewer_role,
+                    viewer_id,
+                    viewer_membership_id,
+                    row["created_by_id"],
+                    assignments_by_step.get(row["id"], []),
+                )
+            ]
         ],
-        "assignments": list(
-            project_assignments(goal).values(
-                "id",
-                "step_id",
-                "membership_id",
-                "status",
-                "counter_start",
-                "counter_due",
-                "note",
-                "responded_at",
-                "released_at",
-                "kept_at",
-                "suggested_membership_id",
-            )
-        ),
+        "assignments": assignments,
         "edges": list(project_dependencies(goal).order_by("id").values("id", "blocker_id", "blocked_id")),
     }
 
@@ -1698,7 +1771,7 @@ def my_project_proposals(tenant):
 
 
 def expire_project_proposals(goal):
-    """A deleted project's pending assistant suggestions (every member's) expire."""
+    """A finished or deleted project's pending suggestions (every member's) expire."""
     from .models import PendingProjectAction
 
     PendingProjectAction.objects.filter(shared_goal=goal, status="pending").update(
@@ -1718,11 +1791,15 @@ def create_project_proposal(tenant, goal, **fields):
     return PendingProjectAction.objects.create(tenant_id=_tenant_id(tenant), shared_goal=goal, **fields)
 
 
-def my_active_project_memberships(tenant):
+def my_active_project_memberships(tenant, *, include_finished=False):
     """Projects I have joined that are still active (for the assistant's context)."""
     return (
         mission_memberships()
-        .filter(tenant_id=_tenant_id(tenant), status="active", shared_goal__status="active")
+        .filter(
+            tenant_id=_tenant_id(tenant),
+            status="active",
+            shared_goal__status__in=["active", "achieved"] if include_finished else ["active"],
+        )
         .select_related("shared_goal")
     )
 
