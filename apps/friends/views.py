@@ -714,7 +714,8 @@ class CircleInviteCodeView(FriendsView):
 
 class ReportView(FriendsView):
     """POST /api/v1/friends/report/ {target_kind, target_id?, reason, detail?} —
-    hide the reported item for the reporter (shared_lesson / friend_message), OR
+    hide the reported item for the reporter (shared_lesson / friend_message /
+    profile_photo / project_note), OR
     record a ``general`` support concern (no content id; App Review #3)."""
 
     def post(self, request):

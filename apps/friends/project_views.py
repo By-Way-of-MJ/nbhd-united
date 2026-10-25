@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 
 from apps.tenants.authentication import JWTAuthenticationWithRLS
 
-from . import project_notes
+from . import access, project_notes
 from . import project_services as projects
 from .project_flags import projects_v2_enabled
 from .throttling import StepNoteDayThrottle
@@ -80,6 +80,15 @@ class MemberActionView(ProjectView):
                 membership_id,
                 self.data(request),
                 cancel=action == "cancel-invite",
+            )
+        )
+
+
+class ProjectLifecycleView(ProjectView):
+    def post(self, request, mission_id, action):
+        return Response(
+            projects.finish_project(
+                self.get_tenant(request), request.user, mission_id, self.data(request), reopen=action == "reopen"
             )
         )
 
@@ -275,7 +284,8 @@ class StepNotesView(ProjectView):
         tenant = self.get_tenant(request)
         with transaction.atomic():
             set_rls_context(tenant_id=tenant.id, user_id=request.user.id, as_tenant=True)
-            project_notes.check_step(tenant, mission_id, step_id)
+            goal, _member, _step = project_notes.check_step(tenant, mission_id, step_id)
+            access.assert_project_writable(goal)
         if set(data) - {"text", "photos"} or set(request.FILES) - {"photos"}:
             raise ValidationError("Unknown note fields.")
         text, prepared = project_notes.prepare(data.get("text"), request.FILES.getlist("photos"))

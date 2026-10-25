@@ -154,6 +154,8 @@ urlpatterns += [
         project_views.MemberActionView.as_view(),
         {"action": "cancel-invite"},
     ),
+    path("missions/<uuid:mission_id>/finish/", project_views.ProjectLifecycleView.as_view(), {"action": "finish"}),
+    path("missions/<uuid:mission_id>/reopen/", project_views.ProjectLifecycleView.as_view(), {"action": "reopen"}),
     path("missions/<uuid:mission_id>/delete/", project_views.ProjectDeleteView.as_view()),
     path("missions/<uuid:mission_id>/step-back/", project_views.StepBackView.as_view()),
     path("missions/<uuid:mission_id>/owners/", project_views.OwnersView.as_view()),

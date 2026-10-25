@@ -16,6 +16,7 @@ class ContentReportAdmin(admin.ModelAdmin):
         "shared_lesson",
         "friend_message",
         "photo_profile",
+        "project_note",
         "reason",
         "created_at",
         "resolved_at",

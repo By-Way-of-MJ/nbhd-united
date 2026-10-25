@@ -269,15 +269,18 @@ def _uuid_or_none(value):
         return None
 
 
+@transaction.atomic
 def report_content(tenant, user, *, target_kind, target_id="", reason="", detail="") -> dict:
     """Reporter-side moderation + support intake. A content report (shared_lesson
     / friend_message) hides the item for the reporter and records it (design §10).
     A ``general`` report has no content id — it's the Settings → Support "Report a
     concern" destination (App Review #3); nothing is hidden, it lands as an open
     support row."""
-    if target_kind not in ("shared_lesson", "friend_message", "general", "profile_photo"):
-        raise ValidationError("target_kind must be shared_lesson, friend_message, profile_photo, or general.")
-    is_content = target_kind in ("shared_lesson", "friend_message", "profile_photo")
+    if target_kind not in ("shared_lesson", "friend_message", "general", "profile_photo", "project_note"):
+        raise ValidationError(
+            "target_kind must be shared_lesson, friend_message, profile_photo, project_note, or general."
+        )
+    is_content = target_kind in ("shared_lesson", "friend_message", "profile_photo", "project_note")
     text = (reason or "").strip()
     if detail:
         text = (text + " — " + str(detail).strip()).strip(" —")
@@ -288,6 +291,24 @@ def report_content(tenant, user, *, target_kind, target_id="", reason="", detail
         reason=text[:280],
         status="hidden" if is_content else "open",
     )
+    if target_kind == "project_note":
+        from .project_services import _uuid
+
+        note = access.project_note_report_target(tenant, _uuid(target_id))
+        if note is None:
+            raise NotFound("No such project note.")
+        goal, member = access.lock_project(tenant, note.shared_goal_id, allow_finished=True)
+        note = access.project_notes(goal).filter(id=note.id).first()
+        if note is None:
+            raise NotFound("No such project note.")
+        if note.author_id == member.id:
+            raise PermissionDenied("You cannot report your own note.")
+        report, _created = ContentReport.objects.get_or_create(
+            reporter_tenant=tenant,
+            project_note=note,
+            defaults={"reporter_user": user, "target_kind": target_kind, "reason": text[:280], "status": "hidden"},
+        )
+        return {"report_id": str(report.id), "hidden": True}
     if target_kind == "shared_lesson":
         shared_lesson = access.get_shared_lesson(target_id)
         if shared_lesson is None:

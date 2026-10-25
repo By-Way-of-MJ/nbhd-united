@@ -1676,7 +1676,7 @@ def _append_update(mission, tenant, user, kind, *, text="", payload=None):
     )
 
 
-def _assert_mission_member(tenant, mission_id):
+def _assert_mission_member(tenant, mission_id, *, for_write=False):
     """Return (mission, active membership) or raise NotFound (no-reveal IDOR)."""
     mission = access.get_mission(mission_id)
     if mission is None:
@@ -1684,6 +1684,8 @@ def _assert_mission_member(tenant, mission_id):
     membership = access.mission_memberships().filter(shared_goal=mission, tenant=tenant, status="active").first()
     if membership is None:
         raise NotFound("No such mission.")
+    if for_write:
+        access.assert_project_writable(mission)
     return mission, membership
 
 
@@ -1805,7 +1807,8 @@ def list_missions(tenant, *, include_invited=False) -> list[dict]:
         {
             "mission_id": str(mission.id),
             "title": mission.title,
-            "status": mission.status,
+            "status": "finished" if mission.status == "achieved" else mission.status,
+            "finished_at": mission.achieved_at,
             "target": mission.target,
             "target_date": mission.target_date,
             "version": mission.version,
@@ -1819,7 +1822,7 @@ def list_missions(tenant, *, include_invited=False) -> list[dict]:
     ]
 
 
-def _mission_learning_updates(mission):
+def _mission_learning_updates(mission, *, viewer=None):
     """Newest 50 written updates, resolving live note metadata in bounded batches."""
 
     def payload_id(update, key):
@@ -1843,7 +1846,7 @@ def _mission_learning_updates(mission):
         references = {u.id: (payload_id(u, "note_id"), payload_id(u, "step_id")) for u in page if u.kind == "step_note"}
         notes = {
             n["id"]: n
-            for n in access.project_notes(mission)
+            for n in access.project_notes(mission, viewer=viewer)
             .filter(id__in={note_id for note_id, _ in references.values() if note_id})
             .annotate(photo_count=Count("photos"))
             .values("id", "text", "photo_count")
@@ -1902,14 +1905,15 @@ def get_mission_detail(tenant, mission_id) -> dict:
         data = {
             "mission_id": str(mission.id),
             "title": mission.title,
-            "status": mission.status,
+            "status": "finished" if mission.status == "achieved" else mission.status,
+            "finished_at": mission.achieved_at,
             "target": mission.target,
             "members": [],
             "updates": [],
         }
     else:
         data = projection.build_mission_status(mission)
-        updates = _mission_learning_updates(mission)
+        updates = _mission_learning_updates(mission, viewer=tenant)
         profiles = {
             p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={u.tenant_id for u, _ in updates})
         }
@@ -1925,6 +1929,8 @@ def get_mission_detail(tenant, mission_id) -> dict:
         ]
     data.update(
         description=mission.description,
+        status="finished" if mission.status == "achieved" else mission.status,
+        finished_at=mission.achieved_at,
         version=mission.version,
         my_commitment=membership.commitment,
         my_role=membership.role,
@@ -1943,6 +1949,7 @@ def decline_mission(tenant, mission_id) -> dict:
     )
     if membership is None or membership.status not in {"invited", "declined"}:
         raise NotFound("No such invitation.")
+    access.assert_project_writable(mission)
     membership.status = "declined"
     membership.save(update_fields=["status"])
     return {"mission_id": str(mission.id), "status": "declined"}
@@ -1956,6 +1963,7 @@ def join_mission(tenant, user, mission_id, commitment="") -> dict:
     membership = access.mission_memberships().select_for_update().filter(shared_goal=mission, tenant=tenant).first()
     if membership is None or membership.status in {"declined", "removed"}:
         raise NotFound("No such mission.")  # only invited members (friendship party) can join
+    access.assert_project_writable(mission)
     if membership.status != "active":
         access.assert_project_invitee(tenant, mission, membership)
         membership.status = "active"
@@ -1971,7 +1979,7 @@ def join_mission(tenant, user, mission_id, commitment="") -> dict:
 def leave_mission(tenant, mission_id) -> dict:
     from . import project_notifications, project_services
 
-    mission, membership = access.lock_project(tenant, mission_id)
+    mission, membership = access.lock_project(tenant, mission_id, allow_finished=True)
     others = access.mission_memberships().filter(shared_goal=mission, status="active").exclude(id=membership.id)
     heir = None
     if membership.role == "owner" and not others.filter(role="owner").exists():
@@ -2000,8 +2008,9 @@ def leave_mission(tenant, mission_id) -> dict:
     return {"mission_id": str(mission.id), "status": "left", "released": len(released)}
 
 
+@transaction.atomic
 def add_mission_update(tenant, user, mission_id, kind, text) -> dict:
-    mission, _membership = _assert_mission_member(tenant, mission_id)
+    mission, _membership = access.lock_project(tenant, mission_id)
     if kind not in _HUMAN_UPDATE_KINDS:
         raise ValidationError("kind must be note, progress, or milestone.")
     update = _append_update(mission, tenant, user, kind, text=clean_text(text))
@@ -2056,11 +2065,12 @@ def update_mission(tenant, mission_id, *, expected_version, fields) -> tuple[dic
     }, 200
 
 
+@transaction.atomic
 def propose_mission_task(tenant, mission_id, *, title, description="", due_date=None) -> tuple:
     """Agent proposes a Mission task for ITS OWN human (the proposing tenant must
     be an active member; the task is for THAT member only). Never writes another
     human's task. Idempotent per (member, mission, title)."""
-    mission, _membership = _assert_mission_member(tenant, mission_id)
+    mission, _membership = access.lock_project(tenant, mission_id)
     title = clean_text(title, limit=120, required=True)
     description = clean_text(description)
     if not title:
@@ -2127,7 +2137,7 @@ def approve_goal_action(tenant, action_id) -> dict:
         due_date = None
     title = clean_text(suggested.get("title") or "Mission task", limit=120, required=True)
     description = clean_text(suggested.get("description"))
-    _assert_mission_member(tenant, mission.id)
+    _assert_mission_member(tenant, mission.id, for_write=True)
     prepared = _prepare_member_task(tenant, title, description)
     from . import project_services
 
@@ -2151,10 +2161,12 @@ def approve_goal_action(tenant, action_id) -> dict:
     return {"action_id": str(action.id), "status": "approved", "task_id": str(task.id)}
 
 
+@transaction.atomic
 def reject_goal_action(tenant, action_id) -> dict:
     action = access.pending_goal_actions().filter(id=action_id, tenant=tenant, status="pending").first()
     if action is None:
         raise NotFound("No such proposal.")
+    access.lock_project(tenant, action.shared_goal_id)
     action.status = "rejected"
     action.resolved_at = timezone.now()
     action.save(update_fields=["status", "resolved_at"])

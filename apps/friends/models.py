@@ -595,6 +595,8 @@ class SharedGoalUpdate(models.Model):
         STEP_RELEASED = "step_released", "Step released"
         STEP_SUBMITTED = "step_submitted", "Step waiting for a look"
         STEP_QUESTIONED = "step_questioned", "Step questioned"
+        PROJECT_FINISHED = "project_finished", "Project finished"
+        PROJECT_REOPENED = "project_reopened", "Project reopened"
         MEMBER_LEFT = "member_left", "Member left"
         OWNER_CHANGED = "owner_changed", "Owner changed"
         MILESTONE_REACHED = "milestone_reached", "Milestone reached"
@@ -722,6 +724,7 @@ class ContentReport(models.Model):
             ("friend_message", "Chat"),
             ("general", "General / support"),  # Settings → Support "Report a concern" (no content id)
             ("profile_photo", "Profile photo"),
+            ("project_note", "Project step note"),
         ],
     )
     shared_lesson = models.ForeignKey(SharedLesson, on_delete=models.CASCADE, null=True, blank=True)
@@ -731,6 +734,7 @@ class ContentReport(models.Model):
     photo_profile = models.ForeignKey(
         NeighborProfile, on_delete=models.CASCADE, null=True, blank=True, related_name="+"
     )
+    project_note = models.ForeignKey("SharedGoalStepNote", on_delete=models.CASCADE, null=True, blank=True)
     reason = models.CharField(max_length=280)
     status = models.CharField(max_length=12, default="open")  # open | hidden | dismissed
     created_at = models.DateTimeField(auto_now_add=True)
@@ -739,6 +743,9 @@ class ContentReport(models.Model):
     class Meta:
         db_table = "content_reports"
         indexes = [models.Index(fields=["reporter_tenant", "status"])]
+        constraints = [
+            models.UniqueConstraint(fields=["reporter_tenant", "project_note"], name="unique_project_note_reporter")
+        ]
 
     def __str__(self) -> str:
         return f"report:{self.id} ({self.target_kind})"

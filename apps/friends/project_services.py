@@ -10,6 +10,7 @@ from datetime import date, timedelta
 from uuid import UUID
 
 from django.db import transaction
+from django.db.models import Max
 from django.utils import timezone
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
 
@@ -134,10 +135,36 @@ def get_plan(tenant, mission_id):
     plan.update(
         my_membership_id=str(member.id),
         my_role=member.role,
-        can_edit_project=can_edit_project(member.role),
-        can_invite=can_edit_project(member.role),
+        can_edit_project=goal.status != "achieved" and can_edit_project(member.role),
+        can_invite=goal.status != "achieved" and can_edit_project(member.role),
+        can_finish=goal.status == "active" and can_edit_project(member.role),
+        can_reopen=goal.status == "achieved" and can_edit_project(member.role),
     )
     return plan
+
+
+@transaction.atomic
+def finish_project(tenant, user, mission_id, data, *, reopen=False):
+    goal, member = access.lock_project(tenant, mission_id, allow_finished=reopen)
+    if not can_edit_project(member.role):
+        raise PermissionDenied("Only a project owner can finish or reopen it.")
+    if set(data) != {"version"} or type(data.get("version")) is not int:
+        raise ValidationError("Only an integer version is required.")
+    if data["version"] != goal.version:
+        raise Conflict({"detail": "This project changed — refresh and try again.", "version": goal.version})
+    if goal.status != ("achieved" if reopen else "active"):
+        raise Conflict("This project is not finished." if reopen else "This project is not active.")
+    goal.status = "active" if reopen else "achieved"
+    goal.achieved_at = None if reopen else timezone.now()
+    goal.version += 1
+    goal.save(update_fields=["status", "achieved_at", "version"])
+    services._append_update(goal, tenant, user, "project_reopened" if reopen else "project_finished")
+    return {
+        "mission_id": str(goal.id),
+        "status": "active" if reopen else "finished",
+        "finished_at": goal.achieved_at,
+        "version": goal.version,
+    }
 
 
 MAX_PROJECT_PEOPLE = 12
@@ -230,6 +257,13 @@ def linked_projects(tenant):
     return out
 
 
+def _append_order(rows, fields):
+    if "order" not in fields:
+        maximum = rows.aggregate(maximum=Max("order"))["maximum"]
+        fields["order"] = maximum + 1 if maximum is not None else 0
+    return fields
+
+
 @transaction.atomic
 def create_step(tenant, user, mission_id, data):
     goal, _ = access.lock_project(tenant, mission_id)
@@ -237,6 +271,7 @@ def create_step(tenant, user, mission_id, data):
     _validate_step(goal, fields)
     if access.project_steps(goal).count() >= 60:
         raise ValidationError("A project can have at most 60 steps.")
+    _append_order(access.project_steps(goal).filter(milestone_id=fields.get("milestone_id")), fields)
     step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
     services._append_update(goal, tenant, user, "step_added", text=step.title, payload={"step_id": str(step.id)})
     _refresh_milestones(goal, tenant, user)
@@ -348,11 +383,15 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
     """
     with transaction.atomic():
         goal, member = access.lock_project(tenant, mission_id)
-        step_ids = set(access.project_steps(goal).values_list("id", flat=True))
+        step_rows = list(access.project_steps(goal).values_list("id", "milestone_id", "order"))
+        step_ids = {step_id for step_id, _milestone, _order in step_rows}
         milestones = set(access.project_milestones(goal).values_list("id", flat=True))
         edge_count = access.project_dependencies(goal).count()
         linked_goal_id = services._linked_goal_for(tenant, goal)
         updates, assignments, results = [], [], []
+        next_orders = {}
+        for _step_id, milestone_id, order in step_rows:
+            next_orders[milestone_id] = max(next_orders.get(milestone_id, order + 1), order + 1)
         update_model = access.mission_updates().model
         assignment_model = access.project_assignments(goal).model
 
@@ -381,7 +420,7 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
             )
 
         for (data, take, waits_on), prepared in zip(items, prepared_tasks, strict=True):
-            checkpoint = len(updates), len(assignments), step_ids.copy(), edge_count
+            checkpoint = len(updates), len(assignments), step_ids.copy(), edge_count, next_orders.copy()
             try:
                 with transaction.atomic():
                     try:
@@ -395,7 +434,11 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
                             raise ValidationError("add_step: waits_on names a step outside this project")
                         if len(step_ids) >= 60:
                             raise ValidationError("A project can have at most 60 steps.")
+                        group_id = fields.get("milestone_id")
+                        if "order" not in fields:
+                            fields["order"] = next_orders.get(group_id, 0)
                         step = access.project_steps(goal).create(shared_goal=goal, created_by=tenant, **fields)
+                        next_orders[group_id] = max(next_orders.get(group_id, fields["order"]), fields["order"] + 1)
                         step_ids.add(step.id)
                         audit("step_added", step)
                         if milestones:
@@ -425,7 +468,7 @@ def create_steps(tenant, user, mission_id, items, prepared_tasks):
                     except APIException as exc:
                         results.append(exc)
             except Exception as exc:  # noqa: BLE001
-                update_count, assignment_count, step_ids, edge_count = checkpoint
+                update_count, assignment_count, step_ids, edge_count, next_orders = checkpoint
                 del updates[update_count:]
                 del assignments[assignment_count:]
                 results.append(step_failure(exc))
@@ -438,7 +481,7 @@ def patch_step(tenant, mission_id, step_id, data):
     from apps.journal.models import Task
     from apps.pii.authoring import author_text, truncate_placeholder_safe
 
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     step = _row(access.project_steps(goal), step_id)
     assignment = _assert_step_editor(goal, member, step)
     _check_step_version(step, data)
@@ -538,7 +581,7 @@ def ask(tenant, user, mission_id, step_id, membership_ids):
 
 
 def respond(tenant, user, mission_id, step_id, data):
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     answer = data.get("answer")
     if answer not in {"yes", "dates", "smaller", "no", "other"}:
         raise ValidationError("answer must be yes, dates, smaller, no, or other.")
@@ -618,7 +661,7 @@ def respond(tenant, user, mission_id, step_id, data):
 
 
 def add_owned_step(tenant, user, mission_id, *, title, description="", due_date=None, prepared=None):
-    services._assert_mission_member(tenant, mission_id)
+    services._assert_mission_member(tenant, mission_id, for_write=True)
     title, description = clean_text(title, limit=120, required=True), clean_text(description)
     if prepared is None:
         prepared = services._prepare_member_task(tenant, title, description)
@@ -762,7 +805,7 @@ def complete(tenant, user, mission_id, step_id, *, reopen=False, data=None):
     # Match journal writes' lock order: private Task first, project second.
     # Otherwise Task.save's synchronous receiver (Task -> project) can deadlock
     # against a project completion holding the project while waiting on Task.
-    goal, member = services._assert_mission_member(tenant, mission_id)
+    goal, member = services._assert_mission_member(tenant, mission_id, for_write=True)
     step = _row(access.project_steps(goal), step_id)
     assignment = access.project_assignments(goal).filter(step=step, membership=member, status="accepted").first()
     if assignment is None:
@@ -920,9 +963,23 @@ def change_member(tenant, user, mission_id, membership_id, data, *, cancel=False
     if not cancel:
         for step in released:
             services._append_update(
-                goal, tenant, user, "step_released", payload={"step_id": str(step.id), "membership_id": str(target.id)}
+                goal,
+                target.tenant,
+                target.user,
+                "step_released",
+                payload={
+                    "step_id": str(step.id),
+                    "membership_id": str(target.id),
+                    "removed_by_membership_id": str(actor.id),
+                },
             )
-        services._append_update(goal, tenant, user, "member_left", payload={"membership_id": str(target.id)})
+        services._append_update(
+            goal,
+            target.tenant,
+            target.user,
+            "member_left",
+            payload={"membership_id": str(target.id), "removed_by_membership_id": str(actor.id)},
+        )
     target.status = "declined" if cancel else "removed"
     target.left_at = timezone.now()
     target.save(update_fields=["status", "left_at"])
@@ -1077,9 +1134,8 @@ def milestone_write(tenant, mission_id, data=None, *, milestone_id=None, delete=
         return milestone
     if access.project_milestones(goal).count() >= 8:
         raise ValidationError("A project can have at most 8 milestones.")
-    return access.project_milestones(goal).create(
-        shared_goal=goal, created_by=tenant, **_fields(data, milestone=True, creating=True)
-    )
+    fields = _append_order(access.project_milestones(goal), _fields(data, milestone=True, creating=True))
+    return access.project_milestones(goal).create(shared_goal=goal, created_by=tenant, **fields)
 
 
 @transaction.atomic
@@ -1115,7 +1171,7 @@ def dependency_write(tenant, mission_id, data=None, *, dependency_id=None):
 @transaction.atomic
 def set_muted(tenant, mission_id, muted):
     """My own switch: no pushes from this project for me. Nobody else sees it."""
-    _goal, member = access.lock_project(tenant, mission_id)
+    _goal, member = access.lock_project(tenant, mission_id, allow_finished=True)
     if member.muted != muted:
         member.muted = muted
         member.save(update_fields=["muted"])
