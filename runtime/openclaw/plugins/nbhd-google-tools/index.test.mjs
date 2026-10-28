@@ -139,7 +139,7 @@ test("gmail resolves calmly when the Google connection is inactive", async () =>
   assert.equal(payload.status, "google_unavailable");
   assert.equal(payload.reason, "integration_inactive");
   assert.equal(payload.integration_status, "unknown");
-  assert.match(payload.message, /temporary problem/);
+  assert.match(payload.message, /isn't available right now/);
 });
 
 test("calendar resolves calmly when Google is not connected", async () => {
@@ -185,7 +185,7 @@ test("gmail reports a server-side Google error as temporarily unavailable", asyn
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.status, "google_unavailable");
   assert.equal(payload.integration_status, "error");
-  assert.match(payload.message, /temporary problem/);
+  assert.match(payload.message, /isn't available right now/);
 });
 
 test("server-side Google error message does not promise reconnecting will fix it", async () => {
@@ -210,10 +210,14 @@ test("server-side Google error message does not promise reconnecting will fix it
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.status, "google_unavailable");
   assert.equal(payload.integration_status, "error");
-  assert.match(payload.message, /temporary problem/);
+  assert.match(payload.message, /isn't available right now/);
   assert.ok(
     !payload.message.includes("will restore it"),
     "server-side error must not promise that reconnecting will restore access",
+  );
+  assert.ok(
+    !payload.message.includes("on its own"),
+    "server-side error must not predict recovery",
   );
 });
 
