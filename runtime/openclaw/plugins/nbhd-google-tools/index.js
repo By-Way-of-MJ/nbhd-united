@@ -2,6 +2,7 @@ import { wrapTool } from "../../tool-logger.js";
 const wrap = (def) => wrapTool(def, { plugin: "nbhd-google-tools" });
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 20000;
+const GOOGLE_NOT_CONNECTED_CODES = new Set(["integration_not_connected", "integration_inactive"]);
 const CALENDAR_WINDOW_KINDS = Object.freeze([
   "today",
   "yesterday",
@@ -196,6 +197,15 @@ async function callNbhdRuntimeRequest(api, { path, method = "GET", query, body }
     if (!response.ok) {
       const normalized = asObject(payload);
       const code = asTrimmedString(normalized.error) || "runtime_request_failed";
+      if (GOOGLE_NOT_CONNECTED_CODES.has(code)) {
+        return {
+          ok: false,
+          status: "google_not_connected",
+          reason: code,
+          message:
+            "Google is not connected right now. Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, tell them they can connect or reconnect Google in the NBHD app under Settings → Integrations.",
+        };
+      }
       // DRF commonly returns field errors at the top level, e.g.
       // {week_rating: ["..."]}, rather than under `detail`. Preserve that
       // compact validation payload so the model can correct and retry.
