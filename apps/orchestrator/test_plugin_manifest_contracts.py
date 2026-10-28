@@ -36,15 +36,21 @@ class PluginManifestContractTests(SimpleTestCase):
         self.assertGreater(checked, 0)
 
     def test_rules_delivery_query_tools_are_declared(self):
-        expected = {
-            "nbhd-journal-tools": "nbhd_journal_query",
-            "nbhd-finance-tools": "nbhd_gravity_query",
-            "nbhd-insights-tools": "nbhd_yesterdays_signals",
-        }
-        for plugin, tool in expected.items():
+        expected = [
+            ("nbhd-journal-tools", "nbhd_journal_query"),
+            ("nbhd-journal-tools", "nbhd_yesterdays_signals"),
+            ("nbhd-finance-tools", "nbhd_gravity_query"),
+        ]
+        for plugin, tool in expected:
             manifest = json.loads((_PLUGIN_ROOT / plugin / "openclaw.plugin.json").read_text())
-            with self.subTest(plugin=plugin):
+            with self.subTest(plugin=plugin, tool=tool):
                 self.assertIn(tool, manifest["contracts"]["tools"])
+
+    def test_yesterdays_signals_lives_in_always_loaded_journal_plugin(self):
+        journal_source = (_PLUGIN_ROOT / "nbhd-journal-tools" / "index.js").read_text()
+        insights_source = (_PLUGIN_ROOT / "nbhd-insights-tools" / "index.js").read_text()
+        self.assertIn('name: "nbhd_yesterdays_signals"', journal_source)
+        self.assertNotIn('name: "nbhd_yesterdays_signals"', insights_source)
 
 
 class RulesDeliveryToolDescriptionTests(SimpleTestCase):
