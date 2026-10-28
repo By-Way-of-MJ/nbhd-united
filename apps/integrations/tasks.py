@@ -65,6 +65,16 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
             continue
 
         raw_tokens = load_tokens_from_key_vault(integration.tenant, integration.provider)
+        if raw_tokens is None:
+            integration.status = Integration.Status.ERROR
+            integration.save(update_fields=["status", "updated_at"])
+            errored += 1
+            logger.warning(
+                "Could not load tokens for %s/%s; will retry",
+                integration.tenant_id,
+                integration.provider,
+            )
+            continue
         tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
@@ -89,6 +99,14 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
             refreshed += 1
             if was_error:
                 retried_errors += 1
+                try:
+                    integration.tenant.bump_pending_config()
+                except Exception:
+                    logger.exception(
+                        "Could not bump pending config after healing %s/%s",
+                        integration.tenant_id,
+                        integration.provider,
+                    )
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             integration.status = Integration.Status.EXPIRED if status_code in (400, 401) else Integration.Status.ERROR

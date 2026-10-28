@@ -136,12 +136,67 @@ class RefreshExpiringIntegrationsTaskTest(TestCase):
         self.integration.token_expires_at = timezone.now() + timedelta(days=30)
         self.integration.save(update_fields=["status", "token_expires_at", "updated_at"])
         mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+        initial_config_version = self.integration.tenant.pending_config_version
+
+        def heal(**kwargs):
+            healed = Integration.objects.get(pk=self.integration.pk)
+            healed.status = Integration.Status.ACTIVE
+            healed.save(update_fields=["status", "updated_at"])
+
+        mock_refresh.side_effect = heal
 
         result = refresh_expiring_integrations_task()
+        self.integration.refresh_from_db()
+        self.integration.tenant.refresh_from_db()
 
         self.assertEqual(result["refreshed"], 1)
         self.assertEqual(result["retried_errors"], 1)
+        self.assertEqual(self.integration.status, Integration.Status.ACTIVE)
+        self.assertEqual(
+            self.integration.tenant.pending_config_version,
+            initial_config_version + 1,
+        )
         mock_refresh.assert_called_once()
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_active_refresh_does_not_bump_config(self, mock_load_tokens, mock_refresh):
+        initial_config_version = self.integration.tenant.pending_config_version
+        mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+
+        result = refresh_expiring_integrations_task()
+        self.integration.tenant.refresh_from_db()
+
+        self.assertEqual(result["refreshed"], 1)
+        self.assertEqual(self.integration.tenant.pending_config_version, initial_config_version)
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_unreadable_tokens_mark_error_not_expired(self, mock_load_tokens, mock_refresh):
+        mock_load_tokens.return_value = None
+
+        result = refresh_expiring_integrations_task()
+        self.integration.refresh_from_db()
+
+        self.assertEqual(result["errored"], 1)
+        self.assertEqual(result["expired"], 0)
+        self.assertEqual(self.integration.status, Integration.Status.ERROR)
+        mock_refresh.assert_not_called()
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_error_row_with_unreadable_tokens_stays_error(self, mock_load_tokens, mock_refresh):
+        self.integration.status = Integration.Status.ERROR
+        self.integration.token_expires_at = timezone.now() + timedelta(days=30)
+        self.integration.save(update_fields=["status", "token_expires_at", "updated_at"])
+        mock_load_tokens.return_value = None
+
+        result = refresh_expiring_integrations_task()
+        self.integration.refresh_from_db()
+
+        self.assertEqual(result["errored"], 1)
+        self.assertEqual(self.integration.status, Integration.Status.ERROR)
+        mock_refresh.assert_not_called()
 
     @patch("apps.integrations.tasks.refresh_integration_tokens")
     @patch("apps.integrations.tasks.load_tokens_from_key_vault")
