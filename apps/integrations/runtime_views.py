@@ -4089,7 +4089,8 @@ class RuntimeSituationTzOfferDismissView(APIView):
 
         situation = UserSituation.objects.filter(tenant=tenant).first()
         device_tz = (situation.device_tz or "").strip() if situation else ""
-        if not device_tz:
+        profile_tz = str(getattr(tenant.user, "timezone", "") or "").strip()
+        if not device_tz or device_tz == profile_tz:
             return Response({"ok": True, "dismissed_for": ""})
 
         situation.tz_offer_dismissed_for = device_tz

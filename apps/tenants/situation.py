@@ -149,11 +149,13 @@ def record_device_tz(
             situation.device_tz = clean_tz
             situation.device_tz_since = observed_at
             situation.device_tz_source_device = clean_source_device
+            situation.tz_offer_dismissed_for = ""
             update_fields.extend(
                 [
                     "device_tz",
                     "device_tz_since",
                     "device_tz_source_device",
+                    "tz_offer_dismissed_for",
                 ]
             )
         situation.save(update_fields=update_fields)

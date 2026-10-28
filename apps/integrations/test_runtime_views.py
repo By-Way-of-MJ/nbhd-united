@@ -447,6 +447,18 @@ class RuntimeSituationTzOfferDismissViewTest(TestCase):
         self.assertEqual(situation.tz_offer_dismissed_for, "America/New_York")
         self.assertIn(f"situation_tz_offer_dismissed tenant={self.tenant.id}", "\n".join(logs.output))
 
+    def test_device_timezone_matching_profile_is_not_stored(self):
+        self.tenant.user.timezone = "America/New_York"
+        self.tenant.user.save(update_fields=["timezone"])
+        UserSituation.objects.create(tenant=self.tenant, device_tz="America/New_York")
+
+        response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": ""})
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        self.assertEqual(situation.tz_offer_dismissed_for, "")
+
     def test_no_situation_returns_ok_with_empty_dismissed_for(self):
         response = self.client.post(self._url(), content_type="application/json", **self._headers())
 
