@@ -35,6 +35,26 @@ def clean_place_label(label: object) -> str:
     return clean
 
 
+def is_assignable_profile_timezone(tz_name: str) -> bool:
+    """Whether ``tz_name`` is a value the runtime profile endpoint accepts.
+
+    Mirrors ``RuntimeProfileUpdateView``'s accept rules: ``"UTC"`` or an
+    Area/Location IANA name that resolves via ``ZoneInfo``, never the ``Etc/*``
+    family (whose POSIX sign is inverted) and never a bare abbreviation.
+    """
+    if not isinstance(tz_name, str):
+        return False
+    if tz_name == "UTC":
+        return True
+    if "/" not in tz_name or tz_name.startswith("Etc/"):
+        return False
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
 def _is_throttled(last_observed_at, observed_at) -> bool:
     return bool(last_observed_at and observed_at - last_observed_at < OBSERVATION_WRITE_THROTTLE)
 

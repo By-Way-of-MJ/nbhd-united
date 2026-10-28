@@ -12,6 +12,7 @@ from apps.journal.models import JournalEntry, WeeklyReview
 from apps.lessons.models import Lesson, StarJournalEntry, TutoringSession
 from apps.tenants.models import UserSituation
 from apps.tenants.services import create_tenant
+from apps.tenants.situation import is_assignable_profile_timezone
 from apps.tenants.test_utils import seed_internal_key
 
 from .models import Integration, SautaiMealPlanJob
@@ -2929,3 +2930,40 @@ class RuntimeDocumentSingletonSlugTest(TestCase):
         resp = self.client.get(self._url() + "?kind=weekly&slug=2026-04-06", **self._headers())
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.json()["slug"], "2026-04-06")
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeProfileTimezoneAssignabilityTest(TestCase):
+    """The situation ask must only suggest zones this endpoint accepts."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="ProfileAssignable", telegram_chat_id=848484)
+        seed_internal_key(self.tenant)
+
+    def _patch(self, timezone_name):
+        return self.client.patch(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/profile/",
+            data={"timezone": timezone_name},
+            content_type="application/json",
+            HTTP_X_NBHD_INTERNAL_KEY="shared-key",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_endpoint_acceptance_matches_assignable_helper(self, _mock_update):
+        for timezone_name in [
+            "UTC",
+            "Asia/Tokyo",
+            "America/Indiana/Indianapolis",
+            "Etc/GMT+9",
+            "Etc/UTC",
+            "GMT",
+            "Japan",
+        ]:
+            with self.subTest(timezone=timezone_name):
+                response = self._patch(timezone_name)
+                self.assertEqual(
+                    response.status_code == 200,
+                    is_assignable_profile_timezone(timezone_name),
+                    response.content,
+                )
