@@ -198,12 +198,18 @@ async function callNbhdRuntimeRequest(api, { path, method = "GET", query, body }
       const normalized = asObject(payload);
       const code = asTrimmedString(normalized.error) || "runtime_request_failed";
       if (GOOGLE_NOT_CONNECTED_CODES.has(code)) {
+        const integrationStatus = (asTrimmedString(normalized.detail).match(/Integration status is (\w+)/) || [])[1] || (code === "integration_not_connected" ? "not_connected" : "unknown");
+        console.log(`[nbhd:google] unavailable reason=${code} integration_status=${integrationStatus}`);
+        const message =
+          integrationStatus === "error" || integrationStatus === "unknown"
+            ? "Google isn't working right now (a temporary problem reaching Google). Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, say Google access hit a problem and that reconnecting Google in the NBHD app under Settings → Integrations will restore it."
+            : "Google is not connected right now. Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, tell them they can connect or reconnect Google in the NBHD app under Settings → Integrations.";
         return {
           ok: false,
-          status: "google_not_connected",
+          status: "google_unavailable",
           reason: code,
-          message:
-            "Google is not connected right now. Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, tell them they can connect or reconnect Google in the NBHD app under Settings → Integrations.",
+          integration_status: integrationStatus,
+          message,
         };
       }
       // DRF commonly returns field errors at the top level, e.g.

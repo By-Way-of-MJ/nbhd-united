@@ -136,8 +136,10 @@ test("gmail resolves calmly when the Google connection is inactive", async () =>
 
   const result = await tool.execute("4", { q: "in:inbox" });
   const payload = JSON.parse(result.content[0].text);
-  assert.equal(payload.status, "google_not_connected");
+  assert.equal(payload.status, "google_unavailable");
   assert.equal(payload.reason, "integration_inactive");
+  assert.equal(payload.integration_status, "unknown");
+  assert.match(payload.message, /temporary problem/);
 });
 
 test("calendar resolves calmly when Google is not connected", async () => {
@@ -157,7 +159,80 @@ test("calendar resolves calmly when Google is not connected", async () => {
 
   const result = await tool.execute("5", { window_kind: "today" });
   const payload = JSON.parse(result.content[0].text);
-  assert.equal(payload.status, "google_not_connected");
+  assert.equal(payload.status, "google_unavailable");
+  assert.equal(payload.integration_status, "not_connected");
+});
+
+test("gmail reports a server-side Google error as temporarily unavailable", async () => {
+  process.env.NBHD_TENANT_ID = "tenant-google-error";
+  process.env.NBHD_INTERNAL_API_KEY = "shared-key";
+
+  const { api, tools } = buildApi();
+  global.fetch = async () =>
+    mockResponse({
+      status: 409,
+      payload: {
+        error: "integration_inactive",
+        detail: "Integration status is error for provider=google",
+      },
+    });
+
+  register(api);
+  const tool = tools.get("nbhd_gmail_list_messages");
+  assert.ok(tool, "gmail tool should be registered");
+
+  const result = await tool.execute("6", { q: "in:inbox" });
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.status, "google_unavailable");
+  assert.equal(payload.integration_status, "error");
+  assert.match(payload.message, /temporary problem/);
+});
+
+test("calendar reports an expired Google integration as not connected", async () => {
+  process.env.NBHD_TENANT_ID = "tenant-google-expired";
+  process.env.NBHD_INTERNAL_API_KEY = "shared-key";
+
+  const { api, tools } = buildApi();
+  global.fetch = async () =>
+    mockResponse({
+      status: 409,
+      payload: {
+        error: "integration_inactive",
+        detail: "Integration status is expired for provider=google",
+      },
+    });
+
+  register(api);
+  const tool = tools.get("nbhd_calendar_list_events");
+  assert.ok(tool, "calendar tool should be registered");
+
+  const result = await tool.execute("7", { window_kind: "today" });
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.status, "google_unavailable");
+  assert.equal(payload.integration_status, "expired");
+  assert.match(payload.message, /not connected/);
+});
+
+test("404 without an integration detail falls back to not_connected", async () => {
+  process.env.NBHD_TENANT_ID = "tenant-google-404";
+  process.env.NBHD_INTERNAL_API_KEY = "shared-key";
+
+  const { api, tools } = buildApi();
+  global.fetch = async () =>
+    mockResponse({
+      status: 404,
+      payload: { error: "integration_not_connected" },
+    });
+
+  register(api);
+  const tool = tools.get("nbhd_gmail_list_messages");
+  assert.ok(tool, "gmail tool should be registered");
+
+  const result = await tool.execute("8", { q: "in:inbox" });
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.status, "google_unavailable");
+  assert.equal(payload.integration_status, "not_connected");
+  assert.match(payload.message, /not connected/);
 });
 
 test("non-connection runtime errors still reject", async () => {
