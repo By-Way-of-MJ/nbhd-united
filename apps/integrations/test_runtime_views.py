@@ -32,6 +32,12 @@ _SITUATION_NEW_TRIP_GUIDANCE = (
     "Do not also compose a verbal offer. If the reply also carries a journal-link marker, "
     "put that line first and this quick-replies line last."
 )
+_SITUATION_TZ_GUIDANCE = (
+    "If this place is in a different timezone from the user's profile timezone ({profile_tz}), "
+    "ask once whether to move their reminders and check-ins to local time; if yes, call "
+    "nbhd_update_profile with that place's Area/City timezone. When they are back home, "
+    "offer to move them back the same way."
+)
 _TOUR_QUICK_REPLY_MARKER = "[[quick-replies: Things to do nearby]]"
 
 
@@ -132,7 +138,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         situation = UserSituation.objects.get(tenant=self.tenant)
         self.assertEqual(situation.current_place_label, "Osaka")
@@ -149,7 +159,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         )
         self.assertEqual(
             first.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         mock_push.reset_mock()
         self.tenant.tour_guide_enabled = True
@@ -191,6 +205,40 @@ class RuntimeSituationUpdateViewTest(TestCase):
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
 
     @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
+    def test_changed_away_label_appends_timezone_guidance(self, mock_push):
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+
+        response = self.client.post(
+            self._url(),
+            {"place_label": "Osaka"},
+            content_type="application/json",
+            **self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertIn("move their reminders and check-ins to local time", guidance)
+        self.assertIn("Asia/Tokyo", guidance)
+        mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+    @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
+    def test_changed_home_label_omits_timezone_guidance(self, mock_push):
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+
+        response = self.client.post(
+            self._url(),
+            {"place_label": "Tokyo"},
+            content_type="application/json",
+            **self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("move their reminders and check-ins to local time", response.json()["guidance"])
+        mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+    @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
     def test_changed_away_label_with_ready_tour_appends_new_trip_guidance(self, mock_push):
         self.tenant.tour_guide_enabled = True
         self.tenant.places_search_manifest_ok = True
@@ -209,7 +257,10 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_NEW_TRIP_GUIDANCE}",
+                "guidance": (
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_NEW_TRIP_GUIDANCE}"
+                ),
             },
         )
         self.assertIn(_TOUR_QUICK_REPLY_MARKER, response.json()["guidance"])
@@ -234,7 +285,10 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_NEW_TRIP_GUIDANCE}",
+                "guidance": (
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_NEW_TRIP_GUIDANCE}"
+                ),
             },
         )
         self.assertIn(_TOUR_QUICK_REPLY_MARKER, response.json()["guidance"])
@@ -255,7 +309,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
 
@@ -342,7 +400,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         self.tenant.user.refresh_from_db()
         self.assertEqual(self.tenant.user.location_lat, original_lat)

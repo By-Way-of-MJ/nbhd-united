@@ -14,7 +14,12 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.pii.redactor import RedactionOutcome
-from apps.tenants.envelope import render_privacy_placeholders, render_safe_user_md, render_situation
+from apps.tenants.envelope import (
+    SITUATION_MAX_CHARS,
+    render_privacy_placeholders,
+    render_safe_user_md,
+    render_situation,
+)
 from apps.tenants.models import UserSituation
 from apps.tenants.services import create_tenant
 
@@ -157,7 +162,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=None,
             current_place_last_observed_at=None,
             device_tz="America/New_York",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
             device_tz_source_device="healthkit",
         )
@@ -165,6 +170,52 @@ class RightNowSectionTests(TestCase):
             render_situation(tenant),
             "Device timezone: America/New_York (profile: Asia/Tokyo).",
         )
+
+    def test_new_device_timezone_within_a_day_asks_to_move_reminders(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertIn("Ask once whether to move them to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York", body)
+
+    def test_device_timezone_ask_survives_char_cap(self):
+        tenant = self._tenant()
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="Osaka",
+            current_place_since=now - timedelta(days=6),
+            current_place_last_observed_at=now,
+            device_tz="America/New_York",
+            device_tz_since=now,
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertLessEqual(len(body), SITUATION_MAX_CHARS)
+        self.assertIn("Ask once whether to move them to local time", body)
+
+    def test_device_timezone_matching_profile_never_asks(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="Asia/Tokyo",
+            device_tz_since=now,
+            device_tz_last_observed_at=now,
+        )
+        self.assertNotIn("Ask once", render_situation(tenant))
 
     def test_same_or_stale_device_timezone_is_omitted(self):
         tenant = self._tenant(profile_tz="Asia/Tokyo")
@@ -215,7 +266,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=now - timedelta(days=6),
             current_place_last_observed_at=now,
             device_tz="America/Indiana/Indianapolis",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
         )
         body = render_situation(tenant)
@@ -234,7 +285,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=now - timedelta(days=6),
             current_place_last_observed_at=now,
             device_tz="America/Indiana/Indianapolis",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
         )
         body = render_situation(tenant)
