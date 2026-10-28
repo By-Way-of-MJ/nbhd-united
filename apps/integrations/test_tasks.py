@@ -82,7 +82,7 @@ class RefreshExpiringIntegrationsTaskTest(TestCase):
 
         self.assertEqual(
             result,
-            {"checked": 0, "refreshed": 0, "expired": 0, "errored": 0},
+            {"checked": 0, "refreshed": 0, "expired": 0, "errored": 0, "retried_errors": 0},
         )
         self.assertEqual(sautai.status, Integration.Status.ACTIVE)
         self.assertEqual(sautai.updated_at, original_updated_at)
@@ -128,3 +128,64 @@ class RefreshExpiringIntegrationsTaskTest(TestCase):
 
         self.assertEqual(result["expired"], 1)
         self.assertEqual(self.integration.status, Integration.Status.EXPIRED)
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_retries_error_integration_and_heals(self, mock_load_tokens, mock_refresh):
+        self.integration.status = Integration.Status.ERROR
+        self.integration.token_expires_at = timezone.now() + timedelta(days=30)
+        self.integration.save(update_fields=["status", "token_expires_at", "updated_at"])
+        mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+
+        result = refresh_expiring_integrations_task()
+
+        self.assertEqual(result["refreshed"], 1)
+        self.assertEqual(result["retried_errors"], 1)
+        mock_refresh.assert_called_once()
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_error_integration_with_http_401_becomes_expired(self, mock_load_tokens, mock_refresh):
+        self.integration.status = Integration.Status.ERROR
+        self.integration.token_expires_at = timezone.now() + timedelta(days=30)
+        self.integration.save(update_fields=["status", "token_expires_at", "updated_at"])
+        mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+        req = httpx.Request("POST", "https://oauth2.googleapis.com/token")
+        resp = httpx.Response(401, request=req)
+        mock_refresh.side_effect = httpx.HTTPStatusError(
+            "unauthorized",
+            request=req,
+            response=resp,
+        )
+
+        result = refresh_expiring_integrations_task()
+        self.integration.refresh_from_db()
+
+        self.assertEqual(result["expired"], 1)
+        self.assertEqual(result["retried_errors"], 0)
+        self.assertEqual(self.integration.status, Integration.Status.EXPIRED)
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_expired_integration_is_not_retried(self, mock_load_tokens, mock_refresh):
+        self.integration.status = Integration.Status.EXPIRED
+        self.integration.token_expires_at = timezone.now() + timedelta(days=30)
+        self.integration.save(update_fields=["status", "token_expires_at", "updated_at"])
+        mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+
+        result = refresh_expiring_integrations_task()
+
+        self.assertEqual(result["checked"], 0)
+        mock_refresh.assert_not_called()
+
+    @patch("apps.integrations.tasks.refresh_integration_tokens")
+    @patch("apps.integrations.tasks.load_tokens_from_key_vault")
+    def test_active_not_expiring_is_still_skipped(self, mock_load_tokens, mock_refresh):
+        self.integration.token_expires_at = timezone.now() + timedelta(days=30)
+        self.integration.save(update_fields=["token_expires_at", "updated_at"])
+        mock_load_tokens.return_value = {"refresh_token": "refresh-token"}
+
+        result = refresh_expiring_integrations_task()
+
+        self.assertEqual(result["checked"], 0)
+        mock_refresh.assert_not_called()

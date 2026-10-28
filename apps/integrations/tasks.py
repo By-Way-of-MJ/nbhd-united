@@ -27,24 +27,31 @@ SAUTAI_POLL_RECOVERY_BATCH_SIZE = 200
 
 
 def refresh_expiring_integrations_task() -> dict[str, int]:
-    """Refresh integrations that are close to expiring.
+    """Refresh integrations that are close to expiring or previously errored.
 
     Intended to be triggered by QStash on a recurring cadence.
+
+    ERROR rows are retried on every run so transient provider/server failures
+    self-heal. EXPIRED/REVOKED rows still need the user to reconnect.
     """
     threshold = timezone.now() + timedelta(minutes=REFRESH_LEAD_MINUTES)
     integrations = (
         Integration.objects.select_related("tenant")
         .filter(
-            status=Integration.Status.ACTIVE,
+            (
+                Q(status=Integration.Status.ACTIVE)
+                & (Q(token_expires_at__isnull=True) | Q(token_expires_at__lte=threshold))
+            )
+            | Q(status=Integration.Status.ERROR)
         )
         .exclude(provider__in=COMPOSIO_MANAGED_PROVIDERS | M2M_PROVIDERS)
-        .filter(Q(token_expires_at__isnull=True) | Q(token_expires_at__lte=threshold))
     )
 
-    checked = refreshed = expired = errored = 0
+    checked = refreshed = expired = errored = retried_errors = 0
 
     for integration in integrations:
         checked += 1
+        was_error = integration.status == Integration.Status.ERROR
         client_id, client_secret = get_provider_client_credentials(integration.provider)
         if not client_id or not client_secret:
             integration.status = Integration.Status.ERROR
@@ -80,6 +87,8 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
                 client_secret=client_secret,
             )
             refreshed += 1
+            if was_error:
+                retried_errors += 1
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             integration.status = Integration.Status.EXPIRED if status_code in (400, 401) else Integration.Status.ERROR
@@ -109,6 +118,7 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
         "refreshed": refreshed,
         "expired": expired,
         "errored": errored,
+        "retried_errors": retried_errors,
     }
 
 
