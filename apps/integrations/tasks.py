@@ -7,8 +7,10 @@ from datetime import timedelta
 
 import httpx
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
+
+from apps.tenants.models import Tenant
 
 from .models import Integration
 from .services import (
@@ -98,15 +100,27 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
             )
             refreshed += 1
             if was_error:
-                retried_errors += 1
                 try:
-                    integration.tenant.bump_pending_config()
+                    Tenant.objects.filter(pk=integration.tenant_id).update(
+                        pending_config_version=F("pending_config_version") + 1
+                    )
                 except Exception:
+                    integration.status = Integration.Status.ERROR
+                    try:
+                        integration.save(update_fields=["status", "updated_at"])
+                    except Exception:
+                        logger.exception(
+                            "Could not mark %s/%s ERROR after failed config bump",
+                            integration.tenant_id,
+                            integration.provider,
+                        )
                     logger.exception(
-                        "Could not bump pending config after healing %s/%s",
+                        "Could not bump pending config after healing %s/%s; will retry",
                         integration.tenant_id,
                         integration.provider,
                     )
+                else:
+                    retried_errors += 1
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             integration.status = Integration.Status.EXPIRED if status_code in (400, 401) else Integration.Status.ERROR
