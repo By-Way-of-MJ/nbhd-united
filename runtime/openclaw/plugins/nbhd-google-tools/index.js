@@ -30,6 +30,11 @@ function asTrimmedString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function integrationStatusFromDetail(detail) {
+  const match = typeof detail === "string" ? detail.match(/Integration status is (\w+)/) : null;
+  return match ? match[1] : "";
+}
+
 function asStringArray(value, { maxItems = 10 } = {}) {
   if (value === undefined || value === null) {
     return [];
@@ -198,11 +203,11 @@ async function callNbhdRuntimeRequest(api, { path, method = "GET", query, body }
       const normalized = asObject(payload);
       const code = asTrimmedString(normalized.error) || "runtime_request_failed";
       if (GOOGLE_NOT_CONNECTED_CODES.has(code)) {
-        const integrationStatus = (asTrimmedString(normalized.detail).match(/Integration status is (\w+)/) || [])[1] || (code === "integration_not_connected" ? "not_connected" : "unknown");
+        const integrationStatus = integrationStatusFromDetail(normalized.detail) || (code === "integration_not_connected" ? "not_connected" : "unknown");
         console.log(`[nbhd:google] unavailable reason=${code} integration_status=${integrationStatus}`);
         const message =
           integrationStatus === "error" || integrationStatus === "unknown"
-            ? "Google isn't working right now (a temporary problem reaching Google). Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, say Google access hit a problem and that reconnecting Google in the NBHD app under Settings → Integrations will restore it."
+            ? "Google isn't working right now because of a temporary problem on our side or Google's. Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, say Google access hit a temporary problem that usually clears on its own, and that reconnecting Google in the NBHD app under Settings → Integrations is worth trying if it keeps failing."
             : "Google is not connected right now. Skip Google email/calendar for this task and carry on with everything else. Do not mention it unless the user asks about Gmail or Google Calendar; if they do, tell them they can connect or reconnect Google in the NBHD app under Settings → Integrations.";
         return {
           ok: false,

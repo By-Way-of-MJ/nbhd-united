@@ -188,6 +188,35 @@ test("gmail reports a server-side Google error as temporarily unavailable", asyn
   assert.match(payload.message, /temporary problem/);
 });
 
+test("server-side Google error message does not promise reconnecting will fix it", async () => {
+  process.env.NBHD_TENANT_ID = "tenant-google-error-nopromise";
+  process.env.NBHD_INTERNAL_API_KEY = "shared-key";
+
+  const { api, tools } = buildApi();
+  global.fetch = async () =>
+    mockResponse({
+      status: 409,
+      payload: {
+        error: "integration_inactive",
+        detail: "Integration status is error for provider=google",
+      },
+    });
+
+  register(api);
+  const tool = tools.get("nbhd_gmail_list_messages");
+  assert.ok(tool, "gmail tool should be registered");
+
+  const result = await tool.execute("9", { q: "in:inbox" });
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.status, "google_unavailable");
+  assert.equal(payload.integration_status, "error");
+  assert.match(payload.message, /temporary problem/);
+  assert.ok(
+    !payload.message.includes("will restore it"),
+    "server-side error must not promise that reconnecting will restore access",
+  );
+});
+
 test("calendar reports an expired Google integration as not connected", async () => {
   process.env.NBHD_TENANT_ID = "tenant-google-expired";
   process.env.NBHD_INTERNAL_API_KEY = "shared-key";
