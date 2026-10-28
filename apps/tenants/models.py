@@ -1305,6 +1305,7 @@ class UserSituation(models.Model):
     device_tz_since = models.DateTimeField(null=True)
     device_tz_last_observed_at = models.DateTimeField(null=True)
     device_tz_source_device = models.CharField(max_length=64, blank=True, default="")
+    tz_offer_dismissed_for = models.CharField(max_length=64, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

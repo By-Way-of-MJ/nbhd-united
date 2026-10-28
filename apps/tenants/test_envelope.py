@@ -187,6 +187,43 @@ class RightNowSectionTests(TestCase):
         self.assertIn("Reminders run on Asia/Tokyo; phone is on America/New_York.", body)
         self.assertIn("ask once whether to move reminders to local time", body)
         self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+        self.assertIn("nbhd_dismiss_timezone_offer", body)
+
+    def test_dismissed_device_timezone_renders_plain_line_without_ask(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+            tz_offer_dismissed_for="America/New_York",
+        )
+        body = render_situation(tenant)
+        self.assertEqual(body, "Device timezone: America/New_York (profile: Asia/Tokyo).")
+        self.assertNotIn("ask once", body)
+        self.assertNotIn("nbhd_dismiss_timezone_offer", body)
+
+    def test_dismissal_for_another_zone_still_asks(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+            tz_offer_dismissed_for="Europe/London",
+        )
+        body = render_situation(tenant)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+        self.assertIn("nbhd_dismiss_timezone_offer", body)
 
     def test_device_timezone_ask_survives_char_cap(self):
         tenant = self._tenant()

@@ -302,11 +302,13 @@ def render_situation(tenant: Tenant) -> str:
             situation.device_tz_since
             and now - situation.device_tz_since <= TZ_ASK_WINDOW
             and is_assignable_profile_timezone(device_tz)
+            and (situation.tz_offer_dismissed_for or "") != device_tz
         ):
             tz_line = (
                 f"Reminders run on {profile_tz}; phone is on {device_tz}. "
                 "In a live conversation (not a scheduled run), ask once whether to move reminders to local time; "
-                f"if yes, call nbhd_update_profile with timezone={device_tz}."
+                f"if yes, call nbhd_update_profile with timezone={device_tz}. "
+                "If no, call nbhd_dismiss_timezone_offer."
             )
             tz_ask = True
         else:

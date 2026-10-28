@@ -62,7 +62,7 @@ from apps.router.document_write_guard import (
     record_runtime_write_activity,
     record_runtime_write_event,
 )
-from apps.tenants.models import Tenant
+from apps.tenants.models import Tenant, UserSituation
 from apps.tenants.rls import RLSRequestTransactionMixin
 
 from .apple_maps import search_places
@@ -4065,6 +4065,37 @@ class RuntimeSituationUpdateView(APIView):
             guidance = f"{guidance} {_SITUATION_NEW_TRIP_GUIDANCE}"
 
         return Response({"ok": True, "changed": changed, "guidance": guidance})
+
+
+class RuntimeSituationTzOfferDismissView(APIView):
+    """POST /api/v1/integrations/runtime/<tenant_id>/situation/tz-offer-dismiss/
+
+    Remembers that the user declined moving reminders to their phone's current
+    timezone, so the "ask once" instruction is not repeated for that zone.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+
+        tenant, tenant_failure = _load_tenant_or_404(tenant_id)
+        if tenant_failure is not None or tenant is None:
+            return tenant_failure
+        record_runtime_write_activity(tenant)
+
+        situation = UserSituation.objects.filter(tenant=tenant).first()
+        device_tz = (situation.device_tz or "").strip() if situation else ""
+        if not device_tz:
+            return Response({"ok": True, "dismissed_for": ""})
+
+        situation.tz_offer_dismissed_for = device_tz
+        situation.save(update_fields=["tz_offer_dismissed_for", "updated_at"])
+        logger.info("situation_tz_offer_dismissed tenant=%s", tenant.id)
+        return Response({"ok": True, "dismissed_for": device_tz})
 
 
 _RECONCILE_STOPWORDS = frozenset(

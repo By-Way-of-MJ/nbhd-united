@@ -415,6 +415,47 @@ class RuntimeSituationUpdateViewTest(TestCase):
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeSituationTzOfferDismissViewTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Tz Dismiss", telegram_chat_id=838383)
+        seed_internal_key(self.tenant)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "HTTP_X_NBHD_INTERNAL_KEY": "shared-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def _url(self) -> str:
+        return f"/api/v1/integrations/runtime/{self.tenant.id}/situation/tz-offer-dismiss/"
+
+    def test_requires_internal_auth(self):
+        response = self.client.post(self._url(), content_type="application/json")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "internal_auth_failed")
+
+    def test_dismisses_offer_for_current_device_timezone(self):
+        UserSituation.objects.create(tenant=self.tenant, device_tz="America/New_York")
+
+        with self.assertLogs("apps.integrations.runtime_views", level="INFO") as logs:
+            response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": "America/New_York"})
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        self.assertEqual(situation.tz_offer_dismissed_for, "America/New_York")
+        self.assertIn(f"situation_tz_offer_dismissed tenant={self.tenant.id}", "\n".join(logs.output))
+
+    def test_no_situation_returns_ok_with_empty_dismissed_for(self):
+        response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": ""})
+        self.assertFalse(UserSituation.objects.filter(tenant=self.tenant).exists())
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
 class RuntimeIntegrationViewsTest(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Runtime", telegram_chat_id=717171)
