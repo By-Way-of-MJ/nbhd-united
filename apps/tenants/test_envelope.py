@@ -13,10 +13,17 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
+from apps.orchestrator.envelope_registry import suppress_refresh
 from apps.pii.redactor import RedactionOutcome
-from apps.tenants.envelope import render_privacy_placeholders, render_safe_user_md, render_situation
+from apps.tenants.envelope import (
+    SITUATION_MAX_CHARS,
+    render_privacy_placeholders,
+    render_safe_user_md,
+    render_situation,
+)
 from apps.tenants.models import UserSituation
 from apps.tenants.services import create_tenant
+from apps.tenants.situation import record_device_tz
 
 
 class SafeUserMdRenderTests(TestCase):
@@ -157,7 +164,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=None,
             current_place_last_observed_at=None,
             device_tz="America/New_York",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
             device_tz_source_device="healthkit",
         )
@@ -165,6 +172,168 @@ class RightNowSectionTests(TestCase):
             render_situation(tenant),
             "Device timezone: America/New_York (profile: Asia/Tokyo).",
         )
+
+    def test_new_device_timezone_within_a_day_asks_to_move_reminders(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertIn("Reminders run on Asia/Tokyo; phone is on America/New_York.", body)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+        self.assertIn("nbhd_dismiss_timezone_offer", body)
+
+    def test_dismissed_device_timezone_renders_plain_line_without_ask(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+            tz_offer_dismissed_for="America/New_York",
+        )
+        body = render_situation(tenant)
+        self.assertEqual(body, "Device timezone: America/New_York (profile: Asia/Tokyo).")
+        self.assertNotIn("ask once", body)
+        self.assertNotIn("nbhd_dismiss_timezone_offer", body)
+
+    def test_dismissal_for_another_zone_still_asks(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="America/New_York",
+            device_tz_since=now - timedelta(hours=2),
+            device_tz_last_observed_at=now,
+            tz_offer_dismissed_for="Europe/London",
+        )
+        body = render_situation(tenant)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+        self.assertIn("nbhd_dismiss_timezone_offer", body)
+
+    def test_device_timezone_ask_survives_char_cap(self):
+        tenant = self._tenant()
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="Osaka",
+            current_place_since=now - timedelta(days=6),
+            current_place_last_observed_at=now,
+            device_tz="America/New_York",
+            device_tz_since=now,
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertLessEqual(len(body), SITUATION_MAX_CHARS)
+        self.assertIn("Reminders run on Asia/Tokyo; phone is on America/New_York.", body)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+
+    def test_long_values_keep_whole_tz_ask_under_cap(self):
+        tenant = self._tenant(
+            home="Llanfairpwllgwyngyll, Isle of Anglesey, Wales",
+            profile_tz="America/Argentina/Buenos_Aires",
+        )
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="San Fernando del Valle de Catamarca, Argentina",
+            current_place_since=now - timedelta(days=6),
+            current_place_last_observed_at=now,
+            device_tz="America/Indiana/Indianapolis",
+            device_tz_since=now,
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertLessEqual(len(body), SITUATION_MAX_CHARS)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/Indiana/Indianapolis.", body)
+        self.assertIn("Current location", body)
+
+    def test_unassignable_device_timezone_never_asks(self):
+        now = timezone.now()
+        for device_tz in ("Etc/GMT+9", "GMT", "Japan"):
+            with self.subTest(device_tz=device_tz):
+                tenant = self._tenant(profile_tz="Asia/Tokyo")
+                self._situation(
+                    tenant,
+                    current_place_label="",
+                    current_place_since=None,
+                    current_place_last_observed_at=None,
+                    device_tz=device_tz,
+                    device_tz_since=now,
+                    device_tz_last_observed_at=now,
+                )
+                body = render_situation(tenant)
+                self.assertNotIn("ask once", body)
+                self.assertEqual(body, f"Device timezone: {device_tz} (profile: Asia/Tokyo).")
+
+    def test_decline_does_not_survive_a_return_to_the_same_zone(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now().replace(microsecond=0)
+        with suppress_refresh():
+            record_device_tz(
+                tenant,
+                "America/New_York",
+                source_device="healthkit",
+                observed_at=now - timedelta(hours=3),
+            )
+        situation = UserSituation.objects.get(tenant=tenant)
+        situation.tz_offer_dismissed_for = "America/New_York"
+        situation.save(update_fields=["tz_offer_dismissed_for"])
+        tenant.refresh_from_db()
+        self.assertNotIn("ask once", render_situation(tenant))
+
+        with suppress_refresh():
+            record_device_tz(
+                tenant,
+                "Asia/Tokyo",
+                source_device="healthkit",
+                observed_at=now - timedelta(hours=2),
+            )
+            record_device_tz(
+                tenant,
+                "America/New_York",
+                source_device="healthkit",
+                observed_at=now - timedelta(hours=1),
+            )
+
+        tenant.refresh_from_db()
+        body = render_situation(tenant)
+        self.assertIn("ask once whether to move reminders to local time", body)
+        self.assertIn("nbhd_update_profile with timezone=America/New_York.", body)
+
+    def test_device_timezone_matching_profile_never_asks(self):
+        tenant = self._tenant(profile_tz="Asia/Tokyo")
+        now = timezone.now()
+        self._situation(
+            tenant,
+            current_place_label="",
+            current_place_since=None,
+            current_place_last_observed_at=None,
+            device_tz="Asia/Tokyo",
+            device_tz_since=now,
+            device_tz_last_observed_at=now,
+        )
+        body = render_situation(tenant)
+        self.assertNotIn("ask once", body)
+        self.assertNotIn("nbhd_update_profile", body)
 
     def test_same_or_stale_device_timezone_is_omitted(self):
         tenant = self._tenant(profile_tz="Asia/Tokyo")
@@ -215,7 +384,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=now - timedelta(days=6),
             current_place_last_observed_at=now,
             device_tz="America/Indiana/Indianapolis",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
         )
         body = render_situation(tenant)
@@ -234,7 +403,7 @@ class RightNowSectionTests(TestCase):
             current_place_since=now - timedelta(days=6),
             current_place_last_observed_at=now,
             device_tz="America/Indiana/Indianapolis",
-            device_tz_since=now,
+            device_tz_since=now - timedelta(days=2),
             device_tz_last_observed_at=now,
         )
         body = render_situation(tenant)

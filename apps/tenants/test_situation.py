@@ -96,6 +96,29 @@ class SituationServiceTests(TestCase):
         self.assertEqual(situation.device_tz, "Asia/Tokyo")
         self.assertEqual(situation.device_tz_last_observed_at, self.now)
 
+    def test_device_timezone_change_clears_dismissed_offer(self):
+        self.assertTrue(self._device_tz("America/New_York", observed_at=self.now))
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        situation.tz_offer_dismissed_for = "America/New_York"
+        situation.save(update_fields=["tz_offer_dismissed_for"])
+
+        self.assertTrue(self._device_tz("Asia/Tokyo", observed_at=self.now + timedelta(hours=1)))
+        situation.refresh_from_db()
+        self.assertEqual(situation.device_tz, "Asia/Tokyo")
+        self.assertEqual(situation.tz_offer_dismissed_for, "")
+
+    def test_same_device_timezone_reobservation_keeps_dismissed_offer(self):
+        self.assertTrue(self._device_tz("America/New_York", observed_at=self.now))
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        situation.tz_offer_dismissed_for = "America/New_York"
+        situation.save(update_fields=["tz_offer_dismissed_for"])
+
+        observed_again = self.now + timedelta(minutes=11)
+        self.assertFalse(self._device_tz("America/New_York", observed_at=observed_again))
+        situation.refresh_from_db()
+        self.assertEqual(situation.device_tz_last_observed_at, observed_again)
+        self.assertEqual(situation.tz_offer_dismissed_for, "America/New_York")
+
     def test_invalid_iana_timezone_is_debug_noop(self):
         with self.assertLogs("apps.tenants.situation", level="DEBUG") as logs:
             self.assertFalse(self._device_tz("Not/AZone", observed_at=self.now))

@@ -14,12 +14,14 @@ from django.utils import timezone
 from apps.common.tenant_tz import tenant_tz
 from apps.orchestrator.envelope_registry import register_section
 from apps.tenants.models import Tenant, User, UserSituation
+from apps.tenants.situation import is_assignable_profile_timezone
 
 logger = logging.getLogger(__name__)
 
 PLACE_DECAY = timedelta(hours=48)
 STALE_NUDGE_WINDOW = timedelta(days=14)
 DEVICE_TZ_TTL = timedelta(days=7)
+TZ_ASK_WINDOW = timedelta(hours=24)
 AWAY_NUDGE_AFTER = timedelta(days=5)
 SITUATION_MAX_CHARS = 400
 _PLACE_PURPOSE_LINE = (
@@ -200,6 +202,8 @@ def _cap_situation_lines(
     purpose_line: str,
     tz_line: str,
     nudge_line: str,
+    *,
+    tz_priority: bool = False,
 ) -> str:
     lines = [line for line in (place_line, purpose_line, tz_line, nudge_line) if line]
     body = "\n".join(lines)
@@ -209,13 +213,27 @@ def _cap_situation_lines(
     if nudge_line and nudge_line in lines:
         lines.remove(nudge_line)
         body = "\n".join(lines)
-    if len(body) > SITUATION_MAX_CHARS and tz_line and tz_line in lines:
-        lines.remove(tz_line)
-        body = "\n".join(lines)
-    if len(body) > SITUATION_MAX_CHARS and purpose_line and purpose_line in lines:
-        lines.remove(purpose_line)
-        body = "\n".join(lines)
-    if len(body) > SITUATION_MAX_CHARS:
+    if tz_priority:
+        if len(body) > SITUATION_MAX_CHARS and purpose_line and purpose_line in lines:
+            lines.remove(purpose_line)
+            body = "\n".join(lines)
+        if len(body) > SITUATION_MAX_CHARS and place_line and place_line in lines:
+            # The tz ask is the whole reason this render is tz-prioritized, so
+            # it must survive whole. Trim the place line instead.
+            place_index = lines.index(place_line)
+            remainder = "\n".join(lines[:place_index] + lines[place_index + 1 :])
+            budget = SITUATION_MAX_CHARS - len(remainder) - (1 if remainder else 0)
+            if budget > 0:
+                lines[place_index] = place_line[: max(0, budget - 1)].rstrip() + "…"
+                body = "\n".join(lines)
+    else:
+        if len(body) > SITUATION_MAX_CHARS and tz_line and tz_line in lines:
+            lines.remove(tz_line)
+            body = "\n".join(lines)
+        if len(body) > SITUATION_MAX_CHARS and purpose_line and purpose_line in lines:
+            lines.remove(purpose_line)
+            body = "\n".join(lines)
+    if len(body) > SITUATION_MAX_CHARS and not tz_priority:
         body = body[: SITUATION_MAX_CHARS - 1].rstrip() + "…"
     return body
 
@@ -278,14 +296,29 @@ def render_situation(tenant: Tenant) -> str:
         and now - situation.device_tz_last_observed_at <= DEVICE_TZ_TTL
     )
     tz_line = ""
+    tz_ask = False
     if device_tz_fresh and device_tz != profile_tz:
-        tz_line = f"Device timezone: {device_tz} (profile: {profile_tz})."
+        if (
+            situation.device_tz_since
+            and now - situation.device_tz_since <= TZ_ASK_WINDOW
+            and is_assignable_profile_timezone(device_tz)
+            and (situation.tz_offer_dismissed_for or "") != device_tz
+        ):
+            tz_line = (
+                f"Reminders run on {profile_tz}; phone is on {device_tz}. "
+                "In a live conversation (not a scheduled run), ask once whether to move reminders to local time; "
+                f"if yes, call nbhd_update_profile with timezone={device_tz}. "
+                "If no, call nbhd_dismiss_timezone_offer."
+            )
+            tz_ask = True
+        else:
+            tz_line = f"Device timezone: {device_tz} (profile: {profile_tz})."
 
     nudge_line = ""
     if traveling and situation.current_place_since and now - situation.current_place_since >= AWAY_NUDGE_AFTER:
         nudge_line = "(Away 5+ days — consider asking whether to update the home base or shift the schedule.)"
 
-    body = _cap_situation_lines(place_line, purpose_line, tz_line, nudge_line)
+    body = _cap_situation_lines(place_line, purpose_line, tz_line, nudge_line, tz_priority=tz_ask)
     if body:
         logger.info(
             "situation_rendered tenant=%s fresh=%d traveling=%d age_s=%d",

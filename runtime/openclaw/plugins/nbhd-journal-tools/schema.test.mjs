@@ -498,6 +498,44 @@ test("situation tool posts only place_label and reports rejected labels graceful
   }
 });
 
+test("dismiss timezone offer tool is registered, contracted, and posts an empty body", async (t) => {
+  const tools = collectTools();
+  const tool = tools["nbhd_dismiss_timezone_offer"];
+  assert.ok(tool, "nbhd_dismiss_timezone_offer should be registered");
+  assert.deepEqual(tool.parameters, { type: "object", additionalProperties: false, properties: {} });
+  assert.match(tool.description, /declines moving their reminders to local time/);
+  assert.match(tool.description, /Do not call it for any other reason/);
+
+  const manifest = JSON.parse(
+    readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
+  );
+  assert.ok(manifest.contracts.tools.includes("nbhd_dismiss_timezone_offer"));
+
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  let request;
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    request = { url: String(url), options };
+    return {
+      ok: true,
+      status: 200,
+      async text() { return JSON.stringify({ ok: true, dismissed_for: "America/New_York" }); },
+    };
+  });
+
+  const result = await tool.execute("call-1", {});
+  assert.equal(
+    request.url,
+    "https://nbhd.test/api/v1/integrations/runtime/tenant-test/situation/tz-offer-dismiss/",
+  );
+  assert.equal(request.options.method, "POST");
+  assert.deepEqual(JSON.parse(request.options.body), {});
+  assert.deepEqual(result.details.json, { ok: true, dismissed_for: "America/New_York" });
+});
+
 
 test("send_to_user forwards runtime cron identity even without model job_name", async (t) => {
   t.mock.method(globalThis, "fetch", async (_url, options) => {

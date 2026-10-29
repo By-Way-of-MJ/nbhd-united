@@ -60,6 +60,7 @@ from .runtime_views import (
     RuntimeSessionMarkProcessedView,
     RuntimeSessionsPendingView,
     RuntimeSessionsRecentView,
+    RuntimeSituationTzOfferDismissView,
     RuntimeSituationUpdateView,
     RuntimeTaskCompleteView,
     RuntimeTaskDeferView,
@@ -349,6 +350,11 @@ urlpatterns = [
         "runtime/<uuid:tenant_id>/situation/",
         RuntimeSituationUpdateView.as_view(),
         name="runtime-situation-update",
+    ),
+    path(
+        "runtime/<uuid:tenant_id>/situation/tz-offer-dismiss/",
+        RuntimeSituationTzOfferDismissView.as_view(),
+        name="runtime-situation-tz-offer-dismiss",
     ),
     # Workspace runtime endpoints — switch/ MUST come before <slug>/ to avoid catching it
     path(

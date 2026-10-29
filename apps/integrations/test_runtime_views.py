@@ -12,6 +12,7 @@ from apps.journal.models import JournalEntry, WeeklyReview
 from apps.lessons.models import Lesson, StarJournalEntry, TutoringSession
 from apps.tenants.models import UserSituation
 from apps.tenants.services import create_tenant
+from apps.tenants.situation import is_assignable_profile_timezone
 from apps.tenants.test_utils import seed_internal_key
 
 from .models import Integration, SautaiMealPlanJob
@@ -31,6 +32,12 @@ _SITUATION_NEW_TRIP_GUIDANCE = (
     "[[quick-replies: Things to do nearby]] — the app renders it as a tappable chip. "
     "Do not also compose a verbal offer. If the reply also carries a journal-link marker, "
     "put that line first and this quick-replies line last."
+)
+_SITUATION_TZ_GUIDANCE = (
+    "If this place is in a different timezone from the user's profile timezone ({profile_tz}), "
+    "ask once whether to move their reminders and check-ins to local time; if yes, call "
+    "nbhd_update_profile with that place's Area/City timezone. When they are back home, "
+    "offer to move them back the same way."
 )
 _TOUR_QUICK_REPLY_MARKER = "[[quick-replies: Things to do nearby]]"
 
@@ -132,7 +139,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         situation = UserSituation.objects.get(tenant=self.tenant)
         self.assertEqual(situation.current_place_label, "Osaka")
@@ -149,7 +160,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         )
         self.assertEqual(
             first.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         mock_push.reset_mock()
         self.tenant.tour_guide_enabled = True
@@ -191,6 +206,40 @@ class RuntimeSituationUpdateViewTest(TestCase):
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
 
     @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
+    def test_changed_away_label_appends_timezone_guidance(self, mock_push):
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+
+        response = self.client.post(
+            self._url(),
+            {"place_label": "Osaka"},
+            content_type="application/json",
+            **self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertIn("move their reminders and check-ins to local time", guidance)
+        self.assertIn("Asia/Tokyo", guidance)
+        mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+    @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
+    def test_changed_home_label_omits_timezone_guidance(self, mock_push):
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+
+        response = self.client.post(
+            self._url(),
+            {"place_label": "Tokyo"},
+            content_type="application/json",
+            **self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("move their reminders and check-ins to local time", response.json()["guidance"])
+        mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+    @patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
     def test_changed_away_label_with_ready_tour_appends_new_trip_guidance(self, mock_push):
         self.tenant.tour_guide_enabled = True
         self.tenant.places_search_manifest_ok = True
@@ -209,7 +258,10 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_NEW_TRIP_GUIDANCE}",
+                "guidance": (
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_NEW_TRIP_GUIDANCE}"
+                ),
             },
         )
         self.assertIn(_TOUR_QUICK_REPLY_MARKER, response.json()["guidance"])
@@ -234,7 +286,10 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_NEW_TRIP_GUIDANCE}",
+                "guidance": (
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_NEW_TRIP_GUIDANCE}"
+                ),
             },
         )
         self.assertIn(_TOUR_QUICK_REPLY_MARKER, response.json()["guidance"])
@@ -255,7 +310,11 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
 
@@ -342,13 +401,70 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"ok": True, "changed": True, "guidance": _SITUATION_CAPTURE_GUIDANCE},
+            {
+                "ok": True,
+                "changed": True,
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+            },
         )
         self.tenant.user.refresh_from_db()
         self.assertEqual(self.tenant.user.location_lat, original_lat)
         self.assertEqual(self.tenant.user.location_lon, original_lon)
         self.assertEqual(UserSituation.objects.get(tenant=self.tenant).current_place_label, "Kyoto")
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeSituationTzOfferDismissViewTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Tz Dismiss", telegram_chat_id=838383)
+        seed_internal_key(self.tenant)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "HTTP_X_NBHD_INTERNAL_KEY": "shared-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def _url(self) -> str:
+        return f"/api/v1/integrations/runtime/{self.tenant.id}/situation/tz-offer-dismiss/"
+
+    def test_requires_internal_auth(self):
+        response = self.client.post(self._url(), content_type="application/json")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "internal_auth_failed")
+
+    def test_dismisses_offer_for_current_device_timezone(self):
+        UserSituation.objects.create(tenant=self.tenant, device_tz="America/New_York")
+
+        with self.assertLogs("apps.integrations.runtime_views", level="INFO") as logs:
+            response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": "America/New_York"})
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        self.assertEqual(situation.tz_offer_dismissed_for, "America/New_York")
+        self.assertIn(f"situation_tz_offer_dismissed tenant={self.tenant.id}", "\n".join(logs.output))
+
+    def test_device_timezone_matching_profile_is_not_stored(self):
+        self.tenant.user.timezone = "America/New_York"
+        self.tenant.user.save(update_fields=["timezone"])
+        UserSituation.objects.create(tenant=self.tenant, device_tz="America/New_York")
+
+        response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": ""})
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        self.assertEqual(situation.tz_offer_dismissed_for, "")
+
+    def test_no_situation_returns_ok_with_empty_dismissed_for(self):
+        response = self.client.post(self._url(), content_type="application/json", **self._headers())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "dismissed_for": ""})
+        self.assertFalse(UserSituation.objects.filter(tenant=self.tenant).exists())
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")
@@ -2867,3 +2983,40 @@ class RuntimeDocumentSingletonSlugTest(TestCase):
         resp = self.client.get(self._url() + "?kind=weekly&slug=2026-04-06", **self._headers())
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.json()["slug"], "2026-04-06")
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeProfileTimezoneAssignabilityTest(TestCase):
+    """The situation ask must only suggest zones this endpoint accepts."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="ProfileAssignable", telegram_chat_id=848484)
+        seed_internal_key(self.tenant)
+
+    def _patch(self, timezone_name):
+        return self.client.patch(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/profile/",
+            data={"timezone": timezone_name},
+            content_type="application/json",
+            HTTP_X_NBHD_INTERNAL_KEY="shared-key",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    def test_endpoint_acceptance_matches_assignable_helper(self, _mock_update):
+        for timezone_name in [
+            "UTC",
+            "Asia/Tokyo",
+            "America/Indiana/Indianapolis",
+            "Etc/GMT+9",
+            "Etc/UTC",
+            "GMT",
+            "Japan",
+        ]:
+            with self.subTest(timezone=timezone_name):
+                response = self._patch(timezone_name)
+                self.assertEqual(
+                    response.status_code == 200,
+                    is_assignable_profile_timezone(timezone_name),
+                    response.content,
+                )

@@ -1345,6 +1345,28 @@ export default function register(api) {
     },
   }));
 
+  // ── Dismiss the timezone move offer ─────────────────────────────────
+  api.registerTool(wrap({
+    name: "nbhd_dismiss_timezone_offer",
+    description:
+      "Call this when the user declines moving their reminders to local time after you offered it. Records the answer so the offer is not repeated for this timezone. Do not call it for any other reason.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+    },
+    async execute(_id, _params) {
+      const payload = await callRuntime(api, {
+        path: tenantPath(api, "/situation/tz-offer-dismiss/"),
+        method: "POST",
+        body: {},
+      });
+      return renderPayload(payload);
+    },
+  }),
+    { optional: true },
+  );
+
   // ── Workspace: List ──────────────────────────────────────────────────
   api.registerTool(wrap({
       name: "nbhd_workspace_list",
