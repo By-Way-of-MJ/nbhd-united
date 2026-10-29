@@ -764,6 +764,8 @@ def apply_pending_configs(request):
             .exclude(
                 container_image_tag=desired_tag,
             )
+            # A tag whose wake refresh already failed health is never retried automatically (same rule as the wake path).
+            .exclude(image_refresh_blocked_tag=desired_tag)
             .filter(
                 models.Q(last_message_at__isnull=True) | models.Q(last_message_at__lt=cutoff),
             )

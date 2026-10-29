@@ -389,6 +389,40 @@ class ApplyPendingConfigsImageTests(TestCase):
         self.assertEqual(len(config_calls), 0)
         self.assertEqual(len(image_calls), 1)
 
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
+    def test_config_pending_image_blocked_tag_gets_config_task_only(
+        self,
+        mock_batch,
+        _mock_verify,
+        _mock_guard,
+    ):
+        """A tag blocked after a failed wake health check is never retried by
+        the hourly sweep; the tenant falls through to a plain config write.
+        """
+        now = timezone.now()
+        tenant = _create_tenant_with_state(
+            user_suffix=1,
+            pending_config_version=2,
+            config_version=1,
+            last_message_at=now - timedelta(minutes=20),
+            container_image_tag="oldtag",
+        )
+        Tenant.objects.filter(pk=tenant.pk).update(image_refresh_blocked_tag="abc123")
+
+        response = self.client.post("/api/v1/cron/apply-pending-configs/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["image_enqueued"], 0)
+
+        config_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_config")
+        image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
+        self.assertEqual(len(image_calls), 0)
+        self.assertEqual(len(config_calls), 1)
+        self.assertEqual(config_calls[0][1][0], str(tenant.id))
+
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
     def test_config_pending_image_current_tenant_gets_config_task_only(
