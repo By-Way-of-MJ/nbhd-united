@@ -7,8 +7,10 @@ from datetime import timedelta
 
 import httpx
 from django.conf import settings
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
+
+from apps.tenants.models import Tenant
 
 from .models import Integration
 from .services import (
@@ -27,24 +29,31 @@ SAUTAI_POLL_RECOVERY_BATCH_SIZE = 200
 
 
 def refresh_expiring_integrations_task() -> dict[str, int]:
-    """Refresh integrations that are close to expiring.
+    """Refresh integrations that are close to expiring or previously errored.
 
     Intended to be triggered by QStash on a recurring cadence.
+
+    ERROR rows are retried on every run so transient provider/server failures
+    self-heal. EXPIRED/REVOKED rows still need the user to reconnect.
     """
     threshold = timezone.now() + timedelta(minutes=REFRESH_LEAD_MINUTES)
     integrations = (
         Integration.objects.select_related("tenant")
         .filter(
-            status=Integration.Status.ACTIVE,
+            (
+                Q(status=Integration.Status.ACTIVE)
+                & (Q(token_expires_at__isnull=True) | Q(token_expires_at__lte=threshold))
+            )
+            | Q(status=Integration.Status.ERROR)
         )
         .exclude(provider__in=COMPOSIO_MANAGED_PROVIDERS | M2M_PROVIDERS)
-        .filter(Q(token_expires_at__isnull=True) | Q(token_expires_at__lte=threshold))
     )
 
-    checked = refreshed = expired = errored = 0
+    checked = refreshed = expired = errored = retried_errors = 0
 
     for integration in integrations:
         checked += 1
+        was_error = integration.status == Integration.Status.ERROR
         client_id, client_secret = get_provider_client_credentials(integration.provider)
         if not client_id or not client_secret:
             integration.status = Integration.Status.ERROR
@@ -58,6 +67,16 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
             continue
 
         raw_tokens = load_tokens_from_key_vault(integration.tenant, integration.provider)
+        if raw_tokens is None:
+            integration.status = Integration.Status.ERROR
+            integration.save(update_fields=["status", "updated_at"])
+            errored += 1
+            logger.warning(
+                "Could not load tokens for %s/%s; will retry",
+                integration.tenant_id,
+                integration.provider,
+            )
+            continue
         tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
@@ -80,6 +99,28 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
                 client_secret=client_secret,
             )
             refreshed += 1
+            if was_error:
+                try:
+                    Tenant.objects.filter(pk=integration.tenant_id).update(
+                        pending_config_version=F("pending_config_version") + 1
+                    )
+                except Exception:
+                    integration.status = Integration.Status.ERROR
+                    try:
+                        integration.save(update_fields=["status", "updated_at"])
+                    except Exception:
+                        logger.exception(
+                            "Could not mark %s/%s ERROR after failed config bump",
+                            integration.tenant_id,
+                            integration.provider,
+                        )
+                    logger.exception(
+                        "Could not bump pending config after healing %s/%s; will retry",
+                        integration.tenant_id,
+                        integration.provider,
+                    )
+                else:
+                    retried_errors += 1
         except httpx.HTTPStatusError as exc:
             status_code = exc.response.status_code if exc.response is not None else 0
             integration.status = Integration.Status.EXPIRED if status_code in (400, 401) else Integration.Status.ERROR
@@ -109,6 +150,7 @@ def refresh_expiring_integrations_task() -> dict[str, int]:
         "refreshed": refreshed,
         "expired": expired,
         "errored": errored,
+        "retried_errors": retried_errors,
     }
 
 
