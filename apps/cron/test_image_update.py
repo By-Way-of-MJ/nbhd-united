@@ -90,12 +90,14 @@ class ApplyPendingConfigsImageTests(TestCase):
         self.assertEqual(_extract_batch_tasks(mock_batch, "apply_single_tenant_image"), [])
         self.assertIn(str(tenant.id), logs.output[0])
 
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
     def test_apply_pending_configs_enqueues_stale_images(
         self,
         mock_batch,
         _mock_verify,
+        _mock_guard,
     ):
         now = timezone.now()
         # Config-pending AND on a stale image: routed to the image task ONLY —
@@ -236,12 +238,14 @@ class ApplyPendingConfigsImageTests(TestCase):
         self.assertEqual(body["config_enqueued"], 2)
         self.assertEqual(body["config_failed"], 0)
 
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=Exception("QStash down"))
     def test_batch_failure_reports_all_tasks_as_failed(
         self,
         mock_batch,
         _mock_verify,
+        _mock_guard,
     ):
         now = timezone.now()
         # One pure config-pending tenant (config task) + one stale-image tenant
@@ -307,6 +311,7 @@ class ApplyPendingConfigsImageTests(TestCase):
         image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
         self.assertEqual(len(image_calls), 0)
 
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
     @patch(
@@ -318,6 +323,7 @@ class ApplyPendingConfigsImageTests(TestCase):
         mock_defer,
         mock_batch,
         _mock_verify,
+        _mock_guard,
     ):
         """Two stale-image tenants: one has an imminent cron (defer), one
         is quiet (bump). Counters track each independently.
@@ -348,12 +354,14 @@ class ApplyPendingConfigsImageTests(TestCase):
         image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
         self.assertEqual(len(image_calls), 1)
 
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
     @patch("apps.cron.views.verify_qstash_signature", return_value=True)
     @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
     def test_config_pending_image_stale_tenant_gets_image_task_only(
         self,
         mock_batch,
         _mock_verify,
+        _mock_guard,
     ):
         """A tenant that is BOTH config-pending and on a stale image gets an
         image task ONLY. Its config is written by apply_single_tenant_image_task
@@ -411,3 +419,64 @@ class ApplyPendingConfigsImageTests(TestCase):
         image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
         self.assertEqual(len(config_calls), 1)
         self.assertEqual(len(image_calls), 0)
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=False)
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
+    def test_image_bump_skipped_on_family_change(
+        self,
+        mock_batch,
+        _mock_verify,
+        _mock_guard,
+    ):
+        """A stale tenant whose target crosses runtime families is not rolled."""
+        now = timezone.now()
+        tenant = _create_tenant_with_state(
+            user_suffix=1,
+            pending_config_version=0,
+            config_version=0,
+            last_message_at=now - timedelta(minutes=20),
+            container_image_tag="2026.5.28-old",
+        )
+
+        response = self.client.post("/api/v1/cron/apply-pending-configs/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["image_enqueued"], 0)
+        self.assertEqual(body["image_skipped_family"], 1)
+
+        image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
+        self.assertEqual(len(image_calls), 0)
+        self.assertNotIn(str(tenant.id), [task[1][0] for task in image_calls])
+
+    @patch("apps.orchestrator.runtime_guard.image_only_update_allowed", return_value=True)
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.cron.publish.publish_batch", side_effect=_batch_return_len)
+    def test_image_bump_proceeds_when_family_guard_allows(
+        self,
+        mock_batch,
+        _mock_verify,
+        mock_guard,
+    ):
+        """A same-family stale tenant still gets the image task."""
+        now = timezone.now()
+        tenant = _create_tenant_with_state(
+            user_suffix=1,
+            pending_config_version=0,
+            config_version=0,
+            last_message_at=now - timedelta(minutes=20),
+            container_image_tag="2026.5.28-old",
+        )
+
+        response = self.client.post("/api/v1/cron/apply-pending-configs/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["image_enqueued"], 1)
+        self.assertEqual(body["image_skipped_family"], 0)
+
+        image_calls = _extract_batch_tasks(mock_batch, "apply_single_tenant_image")
+        self.assertEqual(len(image_calls), 1)
+        self.assertEqual(image_calls[0][1][0], str(tenant.id))
+        mock_guard.assert_called_once()
