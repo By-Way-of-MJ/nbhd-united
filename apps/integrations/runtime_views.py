@@ -7,7 +7,6 @@ import logging
 import re
 from datetime import date, datetime, timedelta
 from uuid import UUID
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -4583,20 +4582,11 @@ class RuntimeReconcileScanView(KnownValueResponseGuardMixin, APIView):
 class RuntimeCronPhase2SummaryView(KnownValueResponseGuardMixin, APIView):
     """POST /api/v1/integrations/runtime/<tenant_id>/cron-phase2-summary/
 
-    DEPRECATED 2026-07-11: seed-prompt emission of the phase2 sync block was
-    removed (config_generator._build_cron_message) — superseded by the
-    deterministic ProactiveOutbound bridge. Kept live because hibernated
-    tenants wake on stale configs whose prompts still call this tool; remove
-    the endpoint only after fleet config convergence.
-
-    Receives a 2-3 sentence summary from a foreground cron run that messaged
-    the user, and creates the corresponding ``_sync:<job_name>`` one-shot
-    cron with ``sessionTarget=main`` so the user's main chat session learns
-    what just happened. The agent only provides the summary; Django owns
-    cron expression math, payload composition, and self-removal text — a
-    deliberate split that keeps the model out of failure-prone tool-param
-    assembly. See ``apps/orchestrator/config_generator.py:_phase2_sync_block``
-    for the prompt-side contract.
+    DEPRECATED 2026-07-11: this endpoint is retired. The call is acknowledged
+    as a no-op so stale prompts that still invoke ``nbhd_cron_phase2_summary``
+    stop erroring. The deterministic ProactiveOutbound bridge carries
+    cron-fired messages into the next conversation. Remove the endpoint once
+    no prompts reference ``nbhd_cron_phase2_summary``.
     """
 
     permission_classes = [AllowAny]
@@ -4630,60 +4620,8 @@ class RuntimeCronPhase2SummaryView(KnownValueResponseGuardMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Compute a cron expr ~2 minutes from now in the user's tz. Two
-        # minutes is enough buffer for the cron run jsonl to flush and the
-        # main session to be available, and short enough that the sync
-        # arrives while the user is still likely engaged with the message.
-        tz_name = _tenant_timezone_name(tenant)
-        try:
-            user_tz = ZoneInfo(tz_name)
-        except ZoneInfoNotFoundError:
-            user_tz = ZoneInfo("UTC")
-            tz_name = "UTC"
-        fire_at = datetime.now(user_tz) + timedelta(minutes=2)
-        # Date-specific expression: this minute, this hour, this day, this
-        # month — matches once and then never again, which is what we want
-        # for a one-shot whose payload also self-removes.
-        cron_expr = f"{fire_at.minute} {fire_at.hour} {fire_at.day} {fire_at.month} *"
-
-        sync_name = f"_sync:{job_name}"
-        payload_text = f"[Sync — {job_name}] {summary} After noting this, run: cron remove {sync_name}"
-
-        from apps.cron.gateway_client import GatewayError, invoke_gateway_tool
-
-        try:
-            invoke_gateway_tool(
-                tenant,
-                "cron.add",
-                {
-                    "name": sync_name,
-                    "schedule": {"kind": "cron", "expr": cron_expr, "tz": tz_name},
-                    "sessionTarget": "main",
-                    "wakeMode": "now",
-                    "payload": {"kind": "systemEvent", "text": payload_text},
-                    "enabled": True,
-                },
-            )
-        except GatewayError as exc:
-            logger.warning(
-                "Phase 2 sync cron.add failed for tenant=%s job=%s: %s",
-                tenant.id,
-                job_name,
-                exc,
-            )
-            return Response(
-                {"error": "gateway_failed", "detail": str(exc)},
-                status=status.HTTP_502_BAD_GATEWAY,
-            )
-
-        return Response(
-            {
-                "ok": True,
-                "sync_cron_name": sync_name,
-                "fires_at": fire_at.isoformat(),
-            },
-            status=status.HTTP_200_OK,
-        )
+        logger.info("cron_phase2_summary_noop tenant=%s job=%s", tenant.id, job_name)
+        return Response({"ok": True, "status": "noted"}, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

@@ -2401,12 +2401,12 @@ class SautaiCurrentPlanViewTests(TestCase):
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")
 class RuntimeCronPhase2SummaryViewTest(TestCase):
-    """Tool-delegation contract for the Phase 2 sync flow.
+    """No-op acknowledgement contract for the retired Phase 2 sync flow.
 
-    Agent calls ``nbhd_cron_phase2_summary`` with summary + job_name; Django
-    constructs the ``_sync:<job>`` one-shot, computes the cron expression,
-    and registers it with the OpenClaw gateway. The agent contributes only
-    the summary text — every other parameter is server-owned.
+    Stale prompts may still call ``nbhd_cron_phase2_summary`` with summary +
+    job_name. The endpoint validates and acknowledges the call without ever
+    contacting the OpenClaw gateway, so retired cron.add failures can no
+    longer surface as 502s.
     """
 
     def setUp(self):
@@ -2448,8 +2448,7 @@ class RuntimeCronPhase2SummaryViewTest(TestCase):
         self.assertEqual(response.json()["error"], "job_name_required")
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
-    def test_success_creates_sync_cron_via_gateway(self, mock_invoke):
-        mock_invoke.return_value = {"ok": True}
+    def test_success_is_noop_ack(self, mock_invoke):
         response = self.client.post(
             f"/api/v1/integrations/runtime/{self.tenant.id}/cron-phase2-summary/",
             data={
@@ -2460,36 +2459,11 @@ class RuntimeCronPhase2SummaryViewTest(TestCase):
             **self._headers(),
         )
         self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["ok"])
-        self.assertEqual(body["sync_cron_name"], "_sync:Evening Check-in")
-
-        # Gateway was called with cron.add carrying the canonical sync shape.
-        self.assertEqual(mock_invoke.call_count, 1)
-        args, _ = mock_invoke.call_args
-        self.assertEqual(args[1], "cron.add")
-        job = args[2]
-        self.assertEqual(job["name"], "_sync:Evening Check-in")
-        self.assertEqual(job["sessionTarget"], "main")
-        self.assertEqual(job["wakeMode"], "now")
-        self.assertEqual(job["payload"]["kind"], "systemEvent")
-        # Payload text carries the summary and the self-removal instruction.
-        self.assertIn(
-            "Wrote today's evening reflection",
-            job["payload"]["text"],
-        )
-        self.assertIn(
-            "cron remove _sync:Evening Check-in",
-            job["payload"]["text"],
-        )
-        # Schedule is a one-shot date-specific expression — five parts,
-        # last part is the wildcard day-of-week.
-        expr = job["schedule"]["expr"]
-        self.assertEqual(len(expr.split()), 5)
-        self.assertTrue(expr.endswith(" *"))
+        self.assertEqual(response.json(), {"ok": True, "status": "noted"})
+        mock_invoke.assert_not_called()
 
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
-    def test_gateway_failure_returns_502(self, mock_invoke):
+    def test_never_returns_502_even_if_gateway_would_fail(self, mock_invoke):
         from apps.cron.gateway_client import GatewayError
 
         mock_invoke.side_effect = GatewayError("gateway down")
@@ -2502,8 +2476,8 @@ class RuntimeCronPhase2SummaryViewTest(TestCase):
             content_type="application/json",
             **self._headers(),
         )
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["error"], "gateway_failed")
+        self.assertEqual(response.status_code, 200)
+        mock_invoke.assert_not_called()
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")
