@@ -753,6 +753,7 @@ def apply_pending_configs(request):
     desired_tag = getattr(settings, "OPENCLAW_IMAGE_TAG", "latest")
     image_count = 0
     image_skipped_imminent_cron = 0
+    image_skipped_family = 0
     if desired_tag and desired_tag != "latest":
         stale_image_tenants = (
             Tenant.objects.filter(
@@ -763,6 +764,8 @@ def apply_pending_configs(request):
             .exclude(
                 container_image_tag=desired_tag,
             )
+            # A tag whose wake refresh already failed health is never retried automatically (same rule as the wake path).
+            .exclude(image_refresh_blocked_tag=desired_tag)
             .filter(
                 models.Q(last_message_at__isnull=True) | models.Q(last_message_at__lt=cutoff),
             )
@@ -773,6 +776,7 @@ def apply_pending_configs(request):
 
         from apps.orchestrator.hibernation import _cron_active_or_imminent
         from apps.orchestrator.image_rollout import image_rollout_allowed
+        from apps.orchestrator.runtime_guard import image_only_update_allowed
 
         for tenant in stale_image_tenants:
             # Per-tenant rollout allowlist. A deploy bumps OPENCLAW_IMAGE_TAG on
@@ -795,6 +799,16 @@ def apply_pending_configs(request):
                     "apply_pending_configs: deferring image bump for tenant %s (%s)",
                     str(tenant.id)[:8],
                     defer_reason,
+                )
+                continue
+            # Same family guard as the wake path: an image-only refresh must not
+            # move a tenant across OpenClaw runtime families (a migration).
+            if not image_only_update_allowed(tenant, desired_tag):
+                image_skipped_family += 1
+                logger.info(
+                    "apply_pending_configs: skipping image bump for tenant %s "
+                    "(family change or unverifiable live image)",
+                    str(tenant.id)[:8],
                 )
                 continue
             image_tasks.append(("apply_single_tenant_image", (str(tenant.id), desired_tag), {}))
@@ -867,6 +881,7 @@ def apply_pending_configs(request):
             "image_enqueued": image_count if success else 0,
             "image_failed": 0 if success else image_count,
             "image_skipped_imminent_cron": image_skipped_imminent_cron,
+            "image_skipped_family": image_skipped_family,
             "cron_seed_enqueued": cron_seed_count if success else 0,
             "cron_seed_failed": 0 if success else cron_seed_count,
             "batch_total": len(all_tasks),

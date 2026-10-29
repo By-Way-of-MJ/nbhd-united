@@ -15,6 +15,14 @@ a deploy that bumps the tag never moves a tenant on its own. A staged rollout
 sets ``OPENCLAW_IMAGE_ROLLOUT_TENANT_IDS`` to a comma-separated list of tenant
 UUIDs (canary -> soak -> wider), or ``*`` once the image is fleet-verified.
 
+Both auto-roll paths (the hourly ``apply_pending_configs`` cron and
+``wake_hibernated_tenant``) also require
+``apps.orchestrator.runtime_guard.image_only_update_allowed``: the target tag,
+the tenant's DB ``container_image_tag`` and ``openclaw_version``, and the live
+Azure container image must all be in the same OpenClaw runtime family. So even
+``*`` never performs a family jump (e.g. 2026.5.x -> 2026.9.x) — that is a
+migration, not a refresh.
+
 Explicit operator actions (``rollout-atomic-bump`` with a ``tenant_id``, the
 ``bump_openclaw_version`` command, provisioning a NEW tenant) are NOT gated by
 this — they already name their target. This only guards the fleet-wide *auto*
