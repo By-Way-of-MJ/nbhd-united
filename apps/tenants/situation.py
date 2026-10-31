@@ -20,7 +20,6 @@ from apps.tenants.models import Tenant, UserSituation
 logger = logging.getLogger(__name__)
 
 OBSERVATION_WRITE_THROTTLE = timedelta(minutes=10)
-PLACE_TZ_TIMEOUT_SECONDS = 3.0
 _MARKDOWN_SIGNIFICANT = frozenset("#*`[]()>|_~")
 
 
@@ -93,7 +92,7 @@ def _normalize_place_text(value: object) -> str:
 def _lookup_place_timezone(label: str) -> PlaceTz:
     from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
 
-    key = f"situation_place_tz:v2:{label.casefold()}"
+    key = f"situation_place_tz:v3:{label.casefold()}"
     cached = cache.get(key)
     if isinstance(cached, PlaceTz):
         return cached
@@ -105,7 +104,7 @@ def _lookup_place_timezone(label: str) -> PlaceTz:
         return PlaceTz(kind="unknown")
 
     url = f"{GEOCODE_URL}?{urlencode({'name': name, 'count': 10, 'language': 'en', 'format': 'json'})}"
-    with httpx.Client(timeout=PLACE_TZ_TIMEOUT_SECONDS) as client:
+    with httpx.Client(timeout=httpx.Timeout(2.0, connect=1.0)) as client:
         response = client.get(url)
         response.raise_for_status()
         data = response.json()
@@ -128,10 +127,21 @@ def _lookup_place_timezone(label: str) -> PlaceTz:
                 continue
         exact.append(item)
 
-    if any(
-        str(item.get("feature_code") or "").startswith("PCL") or item.get("feature_code") == "ADM1" for item in exact
-    ):
-        result = PlaceTz(kind="region")
+    administrative = [
+        item
+        for item in exact
+        if str(item.get("feature_code") or "").startswith("PCL") or item.get("feature_code") == "ADM1"
+    ]
+    if administrative:
+        admin_timezones = {str(item.get("timezone") or "") for item in administrative}
+        if len(admin_timezones) == 1:
+            admin_tz = next(iter(admin_timezones))
+            if is_assignable_profile_timezone(admin_tz):
+                result = PlaceTz(kind="zone", tz=admin_tz)
+            else:
+                result = PlaceTz(kind="region")
+        else:
+            result = PlaceTz(kind="region")
     else:
         kept: list[tuple[int, str]] = []
         for item in exact:

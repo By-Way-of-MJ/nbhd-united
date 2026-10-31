@@ -717,13 +717,15 @@ class DeviceTimezoneView(APIView):
         from apps.orchestrator.envelope_registry import suppress_refresh
         from apps.orchestrator.workspace_envelope import TRIGGER_PLACE_OBSERVATION, push_user_md_in_background
 
-        from .situation import record_device_tz, self_heal_profile_timezone
+        from .situation import record_device_tz
 
         # One explicit push owns this report: UserSituation and User are both
         # registry-wired, so their per-row refresh would otherwise push a
-        # second USER.md for the same observation.
+        # second USER.md for the same observation. Profile timezone is not
+        # changed here: moving the profile also requires cron rows and
+        # container config, and the envelope's "move reminders?" ask must
+        # stay open for the user to confirm through the assistant.
         with suppress_refresh():
-            self_heal_profile_timezone(tenant, device_tz)
             changed = record_device_tz(tenant, device_tz, "app")
 
         if changed:

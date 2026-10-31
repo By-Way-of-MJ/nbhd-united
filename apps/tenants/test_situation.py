@@ -393,6 +393,24 @@ class PlaceTimezoneResolveTests(TestCase):
 
         self.assertEqual(result, PlaceTz(kind="region"))
 
+    def test_single_zone_country_resolves_to_its_zone(self):
+        client = self._geocode_client(
+            [{"name": "Japan", "feature_code": "PCLI", "timezone": "Asia/Tokyo", "country_code": "JP"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Japan")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="Asia/Tokyo"))
+
+    def test_country_with_null_timezone_resolves_to_region(self):
+        client = self._geocode_client(
+            [{"name": "Canada", "feature_code": "PCLI", "timezone": None, "country_code": "CA"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Canada")
+
+        self.assertEqual(result, PlaceTz(kind="region"))
+
     def test_exact_name_match_beats_a_smaller_partial_match(self):
         client = self._geocode_client(
             [

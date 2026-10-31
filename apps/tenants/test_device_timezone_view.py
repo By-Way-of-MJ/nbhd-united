@@ -72,15 +72,19 @@ class DeviceTimezoneViewTests(TestCase):
         self.user.refresh_from_db()
         self.assertEqual(self.user.timezone, "UTC")
 
-    def test_self_heals_an_untouched_utc_profile(self):
+    def test_app_report_does_not_change_an_untouched_utc_profile(self):
         self.user.timezone = "UTC"
         self.user.save(update_fields=["timezone"])
 
-        response = self._post({"device_tz": "Asia/Tokyo"})
+        with patch("apps.orchestrator.workspace_envelope.push_user_md_in_background") as push:
+            response = self._post({"device_tz": "Asia/Tokyo"})
 
         self.assertEqual(response.status_code, 200, response.data)
         self.user.refresh_from_db()
-        self.assertEqual(self.user.timezone, "Asia/Tokyo")
+        self.assertEqual(self.user.timezone, "UTC")
+        situation = UserSituation.objects.get(tenant=self.tenant)
+        self.assertEqual(situation.device_tz, "Asia/Tokyo")
+        push.assert_called_once()
 
     def test_does_not_override_an_explicit_profile_timezone(self):
         self.user.timezone = "Asia/Tokyo"
