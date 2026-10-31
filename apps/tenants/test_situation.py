@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
+from django.core.cache import cache
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
@@ -11,7 +13,7 @@ from django.utils import timezone
 
 from apps.orchestrator.envelope_registry import suppress_refresh
 from apps.tenants.models import Tenant, User, UserSituation
-from apps.tenants.situation import record_device_tz, record_place_observation
+from apps.tenants.situation import PlaceTz, record_device_tz, record_place_observation, resolve_place_timezone
 
 
 class SituationServiceTests(TestCase):
@@ -149,3 +151,37 @@ class SituationServiceTests(TestCase):
         away_line = "\n".join(away_logs.output)
         self.assertIn("differs_home=1", away_line)
         self.assertNotIn("fukuoka", away_line.lower())
+
+
+class PlaceTimezoneResolveTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
+
+    @staticmethod
+    def _geocode_client(results: list[dict]) -> MagicMock:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": results}
+        client.get.return_value = response
+        return client
+
+    def test_non_assignable_timezone_is_unknown(self):
+        client = self._geocode_client(
+            [{"name": "Nowhere", "feature_code": "PPL", "timezone": "Etc/GMT+5", "country_code": "XX"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Nowhere")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+        self.assertEqual(result.tz, "")
+
+    def test_empty_results_are_unknown(self):
+        client = self._geocode_client([])
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Atlantis")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+        self.assertEqual(result.tz, "")

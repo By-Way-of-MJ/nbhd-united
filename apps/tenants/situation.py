@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Literal
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
@@ -15,7 +20,16 @@ from apps.tenants.models import Tenant, UserSituation
 logger = logging.getLogger(__name__)
 
 OBSERVATION_WRITE_THROTTLE = timedelta(minutes=10)
+PLACE_TZ_TIMEOUT_SECONDS = 3.0
 _MARKDOWN_SIGNIFICANT = frozenset("#*`[]()>|_~")
+
+
+@dataclass(frozen=True)
+class PlaceTz:
+    """What a stated place label resolves to for timezone guidance."""
+
+    kind: Literal["zone", "region", "unknown"]
+    tz: str = ""
 
 
 def _capture_enabled(tenant: Tenant) -> bool:
@@ -53,6 +67,53 @@ def is_assignable_profile_timezone(tz_name: str) -> bool:
     except (ZoneInfoNotFoundError, ValueError):
         return False
     return True
+
+
+def resolve_place_timezone(label: str) -> PlaceTz:
+    """Resolve a stated place label to a zone, a multi-zone region, or unknown.
+
+    One Open-Meteo geocoding lookup, cached by label. Never raises: any lookup,
+    cache, or shape failure is ``kind="unknown"`` so the caller can fall back
+    to the model's own judgement.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return PlaceTz(kind="unknown")
+    try:
+        return _lookup_place_timezone(label)
+    except Exception:
+        return PlaceTz(kind="unknown")
+
+
+def _lookup_place_timezone(label: str) -> PlaceTz:
+    from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
+
+    key = f"situation_place_tz:v1:{label.casefold()}"
+    cached = cache.get(key)
+    if isinstance(cached, PlaceTz):
+        return cached
+
+    url = f"{GEOCODE_URL}?{urlencode({'name': label, 'count': 1, 'language': 'en', 'format': 'json'})}"
+    with httpx.Client(timeout=PLACE_TZ_TIMEOUT_SECONDS) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+    results = data.get("results") if isinstance(data, dict) else None
+    first = results[0] if isinstance(results, list) and results else None
+    if not isinstance(first, dict):
+        result = PlaceTz(kind="unknown")
+    else:
+        feature_code = str(first.get("feature_code") or "")
+        if feature_code.startswith("PCL") or feature_code == "ADM1":
+            result = PlaceTz(kind="region")
+        else:
+            tz_name = str(first.get("timezone") or "")
+            result = (
+                PlaceTz(kind="zone", tz=tz_name) if is_assignable_profile_timezone(tz_name) else PlaceTz(kind="unknown")
+            )
+
+    cache.set(key, result, GEOCODE_CACHE_SECONDS)
+    return result
 
 
 def _is_throttled(last_observed_at, observed_at) -> bool:
