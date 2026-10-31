@@ -261,12 +261,18 @@ LOGGING = {
         "redact_telegram_token": {
             "()": "apps.router.logging_filters.RedactTelegramToken",
         },
+        # Strips query strings from httpx request lines. Queries can carry user
+        # data (e.g. geocode place names in ?name=<city>); host, path, and
+        # status are kept.
+        "redact_httpx_query": {
+            "()": "apps.router.logging_filters.RedactHttpxQuery",
+        },
     },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
-            "filters": ["redact_byo_paste_body", "redact_telegram_token"],
+            "filters": ["redact_byo_paste_body", "redact_telegram_token", "redact_httpx_query"],
         },
     },
     "loggers": {
