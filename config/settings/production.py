@@ -149,6 +149,11 @@ TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 # tenant UUIDs or "*"; empty/unset means nobody.
 EVENING_TOMORROW_PREP_TENANT_IDS = env("EVENING_TOMORROW_PREP_TENANT_IDS", default="")
 
+# Hourly Jev "worth a message?" SHADOW check — mirror of the base.py name so
+# the Container App env vars are documented here. Comma-separated tenant UUIDs
+# or "*"; empty/unset means nobody. Logs Jev's decision only — never sends.
+JEV_HEARTBEAT_SHADOW_TENANT_IDS = env("JEV_HEARTBEAT_SHADOW_TENANT_IDS", default="")
+
 # Storage key cache canary gate. Container App env var names MUST match;
 # empty keeps the existing per-operation listKeys behavior.
 AZURE_STORAGE_KEY_CACHE_TENANT_IDS = env("AZURE_STORAGE_KEY_CACHE_TENANT_IDS", default="")
