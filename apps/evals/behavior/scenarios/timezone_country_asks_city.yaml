@@ -1,0 +1,18 @@
+# "I'm in America" names a multi-zone COUNTRY, not a city. Silently picking a
+# US zone (or moving the profile at all) is the failure this guards: the assistant
+# must keep the Tokyo profile and ask which city the user is in.
+# setup puts the tenant on Asia/Tokyo first so "still Tokyo" is a meaningful
+# assertion even after a previous run left another zone behind.
+id: timezone_country_asks_city
+persona: >
+  A casual traveler who mentions they are in America for a few weeks but gives no
+  city, and expects the assistant to ask rather than guess their time zone.
+setup: reset_timezone_tokyo
+script:
+  - "I'm in America right now for a few weeks."
+hard_assertions:
+  # OBSERVABLE: profile still Asia/Tokyo AND the last reply asks which city.
+  - type: asks_which_city
+  # The assistant actually replied (guards the 'went silent' failure).
+  - type: reply_nonempty
+soft_dimensions: []

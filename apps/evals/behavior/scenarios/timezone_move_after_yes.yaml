@@ -1,0 +1,22 @@
+# The user states a durable move and then explicitly says YES to moving their
+# reminders. The assistant must actually save the Chicago profile timezone (the
+# nbhd_update_profile tool), not merely say it will — the OBSERVABLE evidence is
+# the DB: User.timezone AND every cron row that carries a tz.
+# setup puts the tenant on Asia/Tokyo first, so the move is real (an absolute
+# target), and a previous run's Chicago residue cannot make this read green.
+id: timezone_move_after_yes
+persona: >
+  A warm, easygoing traveler who has just landed in Chicago and will be there a
+  couple of weeks. They confirm the offer to move their reminders and check-ins
+  to local time and expect it to actually happen, not just be acknowledged.
+setup: reset_timezone_tokyo
+script:
+  - "I just landed in Chicago and I'll be here for the next two weeks."
+  - "Yes please, move my reminders and check-ins to Chicago time."
+hard_assertions:
+  # OBSERVABLE: profile timezone + every cron row's tz == America/Chicago.
+  - type: timezone_is
+    value: America/Chicago
+  # The assistant actually replied (guards the 'went silent' failure).
+  - type: reply_nonempty
+soft_dimensions: []
