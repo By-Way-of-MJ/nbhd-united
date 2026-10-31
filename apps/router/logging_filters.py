@@ -1,4 +1,4 @@
-"""Logging filter that scrubs Telegram bot tokens out of log records.
+"""Logging filters that scrub secrets out of log records.
 
 Why this exists: every Telegram Bot API call is made over httpx with the bot
 token embedded in the URL *path* — e.g.
@@ -24,6 +24,12 @@ belt-and-suspenders backstop in the same spirit as
 The numeric bot id is preserved (it identifies the single shared bot and is not
 itself the secret); only the auth secret after the colon is replaced, so log
 lines stay readable as URLs while the credential is gone.
+
+Separately, ``RedactHttpxQuery`` strips query strings from httpx request lines.
+Queries routinely carry user data — the weather/geocoding calls in
+``apps.tenants.situation`` and ``apps.orchestrator.briefing_weather`` send the
+user's city as ``?name=<city>`` — and those lines otherwise flow at INFO into
+Log Analytics. Host, path, and status stay readable; only the query is replaced.
 """
 
 from __future__ import annotations
@@ -41,11 +47,23 @@ import re
 _TELEGRAM_TOKEN_RE = re.compile(r"(\d{6,}):[A-Za-z0-9_-]{30,}")
 _REPLACEMENT = r"\1:[REDACTED]"
 
+# httpx's request line: ``HTTP Request: GET https://host/path?query "HTTP/1.1 200 OK"``.
+# Match an http(s) URL's host/path, then its ``?query`` up to whitespace or the
+# closing quote, replacing only that query. The host/path and status stay intact.
+_HTTPX_QUERY_RE = re.compile(r'(https?://[^\s"?]*)\?[^\s"]*')
+_QUERY_REPLACEMENT = r"\1?[REDACTED]"
+
 
 def scrub_telegram_token(text: str) -> str:
     """Return ``text`` with the secret half of any Telegram bot token replaced
     by ``[REDACTED]``, keeping the (non-secret) numeric bot id for readability."""
     return _TELEGRAM_TOKEN_RE.sub(_REPLACEMENT, text)
+
+
+def scrub_httpx_query(text: str) -> str:
+    """Return ``text`` with every http(s) URL query string replaced by
+    ``[REDACTED]``, preserving the host, path, and surrounding log text."""
+    return _HTTPX_QUERY_RE.sub(_QUERY_REPLACEMENT, text)
 
 
 class RedactTelegramToken(logging.Filter):
@@ -90,5 +108,38 @@ class RedactTelegramToken(logging.Filter):
             if record.stack_info:
                 record.stack_info = scrub_telegram_token(record.stack_info)
         except Exception:
+            pass
+        return True
+
+
+class RedactHttpxQuery(logging.Filter):
+    """Strip query strings from httpx request records before a handler emits them.
+
+    httpx logs every outbound request at INFO as
+    ``HTTP Request: GET <url> "<status>"``. Query strings routinely carry user
+    data — e.g. the geocoding lookups in ``apps.tenants.situation`` and
+    ``apps.orchestrator.briefing_weather`` put the user's city in
+    ``?name=<city>`` — so production root logging at INFO would stream that data
+    into Log Analytics. Host, path, and status remain useful and are kept.
+
+    Only records from the ``httpx`` logger (or an ``httpx.*`` child) are
+    considered. As with ``RedactTelegramToken``, the URL usually rides in
+    ``record.args`` as an ``httpx.URL`` object, so it is not a string until the
+    record is formatted. We render via ``record.getMessage()`` and, *only when*
+    an http(s) URL with a query is present, collapse the record onto the
+    redacted, fully-rendered text (``record.msg``) and clear ``record.args``.
+    Records without such a URL — and every other logger — are left untouched,
+    args included. Always returns True — this filter redacts, it never drops.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if record.name == "httpx" or record.name.startswith("httpx."):
+                message = record.getMessage()
+                if _HTTPX_QUERY_RE.search(message):
+                    record.msg = scrub_httpx_query(message)
+                    record.args = ()
+        except Exception:
+            # A formatting error here must never suppress the log record.
             pass
         return True
