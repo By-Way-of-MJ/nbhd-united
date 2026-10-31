@@ -1317,10 +1317,10 @@ class ResetTimezoneTokyoSetupTest(TestCase):
             tz_offer_dismissed_for="America/Chicago",
         )
 
-        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md_in_background") as push:
+        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md") as push:
             reset_timezone_tokyo(self.tenant)
 
-        push.assert_called_once_with(self.tenant, trigger=TRIGGER_MANUAL)
+        push.assert_called_once_with(self.tenant, force=True, trigger=TRIGGER_MANUAL)
 
         self.assertEqual(User.objects.get(pk=self.tenant.user_id).timezone, TOKYO)
         # The ZONE moved on every recurring row; the absolute row is untouched.
@@ -1340,10 +1340,20 @@ class ResetTimezoneTokyoSetupTest(TestCase):
         self.assertEqual(situation.tz_offer_dismissed_for, "")
 
     def test_creates_no_situation_row_when_none_exists(self):
-        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md_in_background"):
+        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md"):
             reset_timezone_tokyo(self.tenant)
         self.assertFalse(UserSituation.objects.filter(tenant=self.tenant).exists())
         self.assertEqual(User.objects.get(pk=self.tenant.user_id).timezone, TOKYO)
+
+    def test_propagates_push_failure_so_the_suite_records_it(self):
+        with (
+            mock.patch(
+                "apps.orchestrator.workspace_envelope.push_user_md",
+                side_effect=RuntimeError("container unreachable"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            reset_timezone_tokyo(self.tenant)
 
 
 # --------------------------------------------------------------------------- #

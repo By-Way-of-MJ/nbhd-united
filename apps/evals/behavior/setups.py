@@ -12,8 +12,8 @@ Contract:
     catches the exception and records the scenario as FAILED with reason
     ``setup:<error>`` (never a silent skip, INVARIANT #3).
   * Hooks write only control-plane state (profile + situation + cron rows) and
-    issue ONE explicit USER.md push, so the container sees the reset state before
-    the scenario's first turn.
+    issue ONE explicit synchronous USER.md push, so the container sees the reset
+    state before the scenario's first turn.
   * Name validation lives in ``schema.VALID_SETUPS``; ``SETUPS`` here must have
     exactly the same keys (a test pins the two sets equal).
 """
@@ -43,13 +43,14 @@ def reset_timezone_tokyo(tenant) -> None:
         cannot pre-answer the "move to local time?" question: the current-place
         fields, ``tz_offer_dismissed_for`` and the device-timezone fields (see
         ``apps.tenants.models.UserSituation``);
-      * one explicit USER.md push, so the container reads Tokyo before the first
-        turn. Writes are wrapped in ``suppress_refresh`` (same pattern as
-        ``DeviceTimezoneView``) so the registry-wired ``User``/``UserSituation``
-        saves do not each push their own stale-by-a-beat envelope.
+      * one explicit synchronous USER.md push, so the container reads Tokyo
+        before the first turn. Writes are wrapped in ``suppress_refresh`` (same
+        pattern as ``DeviceTimezoneView``) so the registry-wired
+        ``User``/``UserSituation`` saves do not each push their own
+        stale-by-a-beat envelope.
     """
     from apps.orchestrator.envelope_registry import suppress_refresh
-    from apps.orchestrator.workspace_envelope import TRIGGER_MANUAL, push_user_md_in_background
+    from apps.orchestrator.workspace_envelope import TRIGGER_MANUAL, push_user_md
     from apps.tenants.models import UserSituation
     from apps.tenants.views import _sync_cron_row_timezones
 
@@ -76,9 +77,11 @@ def reset_timezone_tokyo(tenant) -> None:
 
     # TRIGGER_MANUAL: an operator/eval-driven reset, and it is a
     # forced-freshness trigger (apps.orchestrator.workspace_envelope), so the
-    # Tokyo profile cannot be dropped by the leading-edge debounce and leave the
-    # container on the pre-setup envelope for the scenario's first turn.
-    push_user_md_in_background(tenant, trigger=TRIGGER_MANUAL)
+    # Tokyo profile cannot be dropped by the leading-edge debounce. The push is
+    # synchronous: the reset envelope is in the container before the scenario's
+    # first turn, not racing a daemon thread.
+    if not push_user_md(tenant, force=True, trigger=TRIGGER_MANUAL):
+        logger.warning("behavior setup reset_timezone_tokyo push_not_confirmed tenant=%s", tenant.id)
     logger.info("behavior setup reset_timezone_tokyo tenant=%s cron_rows_moved=%d", tenant.id, moved)
 
 
