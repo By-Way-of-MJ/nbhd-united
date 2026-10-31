@@ -16,10 +16,14 @@ heartbeat keeps owning the user-facing check-in flow.
 
 from __future__ import annotations
 
-from django.test import TestCase
+from unittest.mock import patch
+
+from django.test import TestCase, override_settings
 
 from apps.orchestrator.config_generator import (
+    _HEARTBEAT_CHECKIN_PROMPT,
     _build_commitments_config,
+    _build_heartbeat_checkin_prompt,
     _build_heartbeat_cron,
     _build_heartbeat_defaults,
     generate_openclaw_config,
@@ -123,3 +127,34 @@ class BuiltInHeartbeatOnTest(TestCase):
         self.assertEqual(hb["every"], "1h")
         self.assertEqual(config["commitments"]["enabled"], True)
         self.assertEqual(config["commitments"]["maxPerDay"], 3)
+
+
+class HeartbeatNudgeAboutPromptTest(TestCase):
+    """The ``[about: ...]`` instruction is gated, leaving other prompts intact."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="HeartbeatAboutPrompt", telegram_chat_id=720003)
+        self.tenant.situational_context_enabled = False
+        self.tenant.save(update_fields=["situational_context_enabled"])
+
+    @patch("apps.orchestrator.config_generator.datebook_delivery_ready", return_value=True)
+    def test_allowed_tenant_prompt_names_about_marker(self, _mock_ready):
+        with override_settings(HEARTBEAT_NUDGE_DEDUP_TENANT_IDS=str(self.tenant.id)):
+            prompt = _build_heartbeat_checkin_prompt(self.tenant)
+
+        self.assertIn("[about: event:<id>]", prompt)
+        self.assertIn("[about: reminder:<id>]", prompt)
+        self.assertIn("duplicate_suppressed", prompt)
+
+    @patch("apps.orchestrator.config_generator.datebook_delivery_ready", return_value=True)
+    def test_tenant_not_on_list_prompt_is_unchanged(self, _mock_ready):
+        expected = _HEARTBEAT_CHECKIN_PROMPT.replace(
+            "Calendar — any events in the next 2-3 hours? (`nbhd_calendar_list_events`)",
+            "Calendar — call `nbhd_datebook_read` with `days_ahead=0, entity='events'`, "
+            "then check the returned times for events in the next 2-3 hours",
+        )
+        with override_settings(HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="11111111-1111-1111-1111-111111111111"):
+            prompt = _build_heartbeat_checkin_prompt(self.tenant)
+
+        self.assertEqual(prompt, expected)
+        self.assertNotIn("[about:", prompt)
