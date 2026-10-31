@@ -40,6 +40,11 @@ _SITUATION_TZ_GUIDANCE = (
     "nbhd_update_profile with that place's Area/City timezone. When they are back home, "
     "offer to move them back the same way."
 )
+_SITUATION_TZ_UNKNOWN_GUIDANCE = (
+    f"{_SITUATION_TZ_GUIDANCE} "
+    "If the place is a country or a region with more than one time zone, ask which city they are in, "
+    "then call nbhd_update_situation again with that city."
+)
 _TOUR_QUICK_REPLY_MARKER = "[[quick-replies: Things to do nearby]]"
 
 
@@ -149,7 +154,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         situation = UserSituation.objects.get(tenant=self.tenant)
@@ -170,7 +175,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         mock_push.reset_mock()
@@ -266,7 +271,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
                 "ok": True,
                 "changed": True,
                 "guidance": (
-                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')} "
                     f"{_SITUATION_NEW_TRIP_GUIDANCE}"
                 ),
             },
@@ -294,7 +299,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
                 "ok": True,
                 "changed": True,
                 "guidance": (
-                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')} "
                     f"{_SITUATION_NEW_TRIP_GUIDANCE}"
                 ),
             },
@@ -320,7 +325,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
@@ -411,7 +416,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         self.tenant.user.refresh_from_db()
@@ -468,7 +473,15 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
 
     def test_city_resolving_to_a_different_zone_appends_known_guidance(self):
         client = self._geocode_client(
-            [{"name": "New York", "feature_code": "PPL", "timezone": "America/New_York", "country_code": "US"}]
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
             response = self._post("New York")
@@ -482,7 +495,15 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
         self.tenant.user.timezone = "America/New_York"
         self.tenant.user.save(update_fields=["timezone"])
         client = self._geocode_client(
-            [{"name": "New York", "feature_code": "PPL", "timezone": "America/New_York", "country_code": "US"}]
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
             response = self._post("New York")
@@ -495,15 +516,52 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
 
     def test_country_result_asks_which_city(self):
         client = self._geocode_client(
-            [{"name": "United States", "feature_code": "PCLI", "timezone": "America/New_York", "country_code": "US"}]
+            [{"name": "United States", "feature_code": "PCLI", "timezone": None, "country_code": "US"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("United States")
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertIn("ask which city", guidance)
+        self.assertIn("country or region with more than one time zone", guidance)
+
+    def test_weak_match_appends_unknown_guidance(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Americana",
+                    "feature_code": "PPL",
+                    "timezone": "America/Sao_Paulo",
+                    "country_code": "BR",
+                    "population": 246655,
+                },
+                {
+                    "name": "America",
+                    "feature_code": "PPL",
+                    "timezone": "Europe/Amsterdam",
+                    "country_code": "NL",
+                    "population": 1175,
+                },
+                {
+                    "name": "América",
+                    "feature_code": "PPL",
+                    "timezone": "America/Argentina/Buenos_Aires",
+                    "country_code": "AR",
+                    "population": 13619,
+                },
+            ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
             response = self._post("America")
 
         self.assertEqual(response.status_code, 200)
         guidance = response.json()["guidance"]
+        self.assertEqual(
+            guidance,
+            f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
+        )
         self.assertIn("ask which city", guidance)
-        self.assertIn("country or region with more than one time zone", guidance)
 
     def test_lookup_failure_falls_back_to_the_existing_guidance(self):
         with patch("apps.tenants.situation.httpx.Client", side_effect=RuntimeError("boom")):
@@ -511,11 +569,21 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["ok"], True)
-        self.assertIn(_SITUATION_TZ_GUIDANCE.format(profile_tz="UTC"), response.json()["guidance"])
+        guidance = response.json()["guidance"]
+        self.assertIn(_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz="UTC"), guidance)
+        self.assertIn("ask which city", guidance)
 
     def test_repeated_label_uses_the_cached_lookup(self):
         client = self._geocode_client(
-            [{"name": "New York", "feature_code": "PPL", "timezone": "America/New_York", "country_code": "US"}]
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
             first = self._post("New York")

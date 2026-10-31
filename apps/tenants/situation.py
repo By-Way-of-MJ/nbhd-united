@@ -84,33 +84,76 @@ def resolve_place_timezone(label: str) -> PlaceTz:
         return PlaceTz(kind="unknown")
 
 
+def _normalize_place_text(value: object) -> str:
+    """Casefold ``value`` and strip accents so ``Uşak`` matches ``usak``."""
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
 def _lookup_place_timezone(label: str) -> PlaceTz:
     from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
 
-    key = f"situation_place_tz:v1:{label.casefold()}"
+    key = f"situation_place_tz:v2:{label.casefold()}"
     cached = cache.get(key)
     if isinstance(cached, PlaceTz):
         return cached
 
-    url = f"{GEOCODE_URL}?{urlencode({'name': label, 'count': 1, 'language': 'en', 'format': 'json'})}"
+    name, _, qualifier = label.partition(",")
+    name = name.strip()
+    qualifier = qualifier.strip()
+    if not name:
+        return PlaceTz(kind="unknown")
+
+    url = f"{GEOCODE_URL}?{urlencode({'name': name, 'count': 10, 'language': 'en', 'format': 'json'})}"
     with httpx.Client(timeout=PLACE_TZ_TIMEOUT_SECONDS) as client:
         response = client.get(url)
         response.raise_for_status()
         data = response.json()
 
-    results = data.get("results") if isinstance(data, dict) else None
-    first = results[0] if isinstance(results, list) and results else None
-    if not isinstance(first, dict):
-        result = PlaceTz(kind="unknown")
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    results = raw_results if isinstance(raw_results, list) else []
+
+    normalized_name = _normalize_place_text(name)
+    normalized_qualifier = _normalize_place_text(qualifier)
+    exact: list[dict] = []
+    for item in results:
+        if not isinstance(item, dict) or _normalize_place_text(item.get("name")) != normalized_name:
+            continue
+        if normalized_qualifier:
+            qualifiers = {
+                _normalize_place_text(value)
+                for value in (item.get("admin1"), item.get("country"), item.get("country_code"))
+            }
+            if normalized_qualifier not in qualifiers:
+                continue
+        exact.append(item)
+
+    if any(
+        str(item.get("feature_code") or "").startswith("PCL") or item.get("feature_code") == "ADM1" for item in exact
+    ):
+        result = PlaceTz(kind="region")
     else:
-        feature_code = str(first.get("feature_code") or "")
-        if feature_code.startswith("PCL") or feature_code == "ADM1":
-            result = PlaceTz(kind="region")
+        kept: list[tuple[int, str]] = []
+        for item in exact:
+            feature_code = str(item.get("feature_code") or "")
+            if not feature_code.startswith("PPL"):
+                continue
+            tz_name = str(item.get("timezone") or "")
+            if not is_assignable_profile_timezone(tz_name):
+                continue
+            population = item.get("population")
+            if not isinstance(population, int) or isinstance(population, bool):
+                continue
+            kept.append((population, tz_name))
+
+        if not kept:
+            result = PlaceTz(kind="unknown")
         else:
-            tz_name = str(first.get("timezone") or "")
-            result = (
-                PlaceTz(kind="zone", tz=tz_name) if is_assignable_profile_timezone(tz_name) else PlaceTz(kind="unknown")
+            top_population, top_tz = max(kept, key=lambda place: place[0])
+            clear_winner = top_population >= 100_000 and all(
+                tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
             )
+            result = PlaceTz(kind="zone", tz=top_tz) if clear_winner else PlaceTz(kind="unknown")
 
     cache.set(key, result, GEOCODE_CACHE_SECONDS)
     return result
