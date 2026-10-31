@@ -270,6 +270,8 @@ TASK_MAP = {
     # Neighborhood: weekly Mission digest (one warm nudge per member, idempotent)
     "mission_weekly_digest": "apps.friends.tasks.mission_weekly_digest_task",
     "project_due_nudges": "apps.friends.tasks.project_due_nudges_task",
+    # Hourly Jev "worth a message?" shadow check — log only, never sends.
+    "jev_heartbeat_shadow": "apps.orchestrator.jev_heartbeat_shadow.jev_heartbeat_shadow_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)

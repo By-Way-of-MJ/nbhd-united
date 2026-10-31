@@ -336,6 +336,14 @@ CHAT_SHAPE_PANELS = env(
 # Talk routing: explicit tenant UUID allowlist, no wildcard; dark by default.
 TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
 
+# Evening Check-in tomorrow-prep step: comma-separated tenant UUIDs or "*";
+# empty/unset means nobody, keeping the existing prompt byte-for-byte identical.
+EVENING_TOMORROW_PREP_TENANT_IDS = env("EVENING_TOMORROW_PREP_TENANT_IDS", default="")
+
+# Hourly Jev "worth a message?" SHADOW check: comma-separated tenant UUIDs or
+# "*"; empty/unset means nobody. Logs Jev's decision only — never sends.
+JEV_HEARTBEAT_SHADOW_TENANT_IDS = env("JEV_HEARTBEAT_SHADOW_TENANT_IDS", default="")
+
 # Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
 # (empty = nobody, exact "*" = everyone). Container App env var name MUST match.
 WEB_REDESIGN_TENANT_IDS = env("WEB_REDESIGN_TENANT_IDS", default="")

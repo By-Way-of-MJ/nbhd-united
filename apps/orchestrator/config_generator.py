@@ -163,6 +163,21 @@ def tool_search_directory_enabled(tenant: Tenant) -> bool:
     return False
 
 
+def evening_tomorrow_prep_enabled(tenant: Tenant | None) -> bool:
+    """Return whether the Evening Check-in gets the tomorrow-prep step.
+
+    ``EVENING_TOMORROW_PREP_TENANT_IDS`` is a comma-separated allowlist; ``*``
+    opens it to every tenant and empty/whitespace means nobody.
+    """
+    raw = str(getattr(settings, "EVENING_TOMORROW_PREP_TENANT_IDS", "") or "")
+    allowed = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    if not allowed or tenant is None:
+        return False
+    if "*" in allowed or str(tenant.id).lower() in allowed:
+        return True
+    return False
+
+
 _CRON_CONTEXT_PREAMBLE = (
     "**MANDATORY — do this BEFORE following the instructions below:**\n"
     "1. Load today's daily note (`nbhd_daily_note_get`). Read EVERY section — "
@@ -955,9 +970,35 @@ _EVENING_CHECKIN_PROMPT = (
 )
 
 
+_EVENING_TOMORROW_PREP_STEP = (
+    '5d. TOMORROW PREP. Call `nbhd_datebook_read` with `days_ahead=1` and `entity="events"`, then keep only the entries dated tomorrow in the user\'s timezone. Also read the\n'
+    "`## People & Context` section of the memory document (from `nbhd_journal_context`) to see who the user cares for,\n"
+    "such as a young child. Decide whether anything tomorrow needs preparing tonight: a long day away from home, an\n"
+    "early start, travel, or an event like a funeral, wedding or all-day outing — especially when a child or other\n"
+    "dependent is coming. If yes, in step 6 add a short block after the recap that starts with `For tomorrow:` and\n"
+    "lists 2-4 concrete things to pack or do tonight (for example a toothbrush kit, snacks and a change of clothes for\n"
+    "a child on a long day). Base every item only on what the calendar and memory actually say; never invent events,\n"
+    "people or plans. If the event is a sad one (funeral, memorial, hospital visit), keep the words plain and gentle:\n"
+    "no cheerful tone, no exclamation marks, no emoji. If nothing tomorrow needs preparing, add nothing. Do not create\n"
+    "reminders, tasks or calendar entries unless the user asks.\n\n"
+)
+
+
 def _build_evening_checkin_prompt(tenant) -> str:
+    prompt = _EVENING_CHECKIN_PROMPT
+    if evening_tomorrow_prep_enabled(tenant):
+        marker = "6. Send the user exactly ONE message via `nbhd_send_to_user`."
+        marker_count = prompt.count(marker)
+        if marker_count == 1:
+            prompt = prompt.replace(marker, f"{_EVENING_TOMORROW_PREP_STEP}{marker}", 1)
+        else:
+            logger.warning(
+                "evening check-in prompt: expected exactly one step-6 marker, found %d — "
+                "tomorrow prep step not inserted",
+                marker_count,
+            )
     return _with_contextual_location_confirm_ask(
-        _EVENING_CHECKIN_PROMPT,
+        prompt,
         tenant,
     )
 

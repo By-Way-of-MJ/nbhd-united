@@ -158,6 +158,10 @@ SYSTEM_CRONS = [
     # Hourly at :07 — Projects v2 "due tomorrow" reminder, sent at 09:00 in each
     # owner's own time zone; one per (owner, step, due date) via a CAS claim.
     ("project-due-nudges", "7 * * * *", "/api/cron/trigger/project_due_nudges/"),
+    # Hourly at :23 — SHADOW ONLY: asks TypeSafe Jev whether anything is worth
+    # messaging and logs the decision. Never sends or wakes a container; gated
+    # by JEV_HEARTBEAT_SHADOW_TENANT_IDS.
+    ("jev-heartbeat-shadow", "23 * * * *", "/api/cron/trigger/jev_heartbeat_shadow/"),
     # Monthly on 1st at 06:00 UTC — write FinanceSnapshot for every
     # finance-enabled active tenant. Idempotent per (tenant, date).
     # Powers the /api/v1/finance/snapshots/ endpoint (monthly debt/savings

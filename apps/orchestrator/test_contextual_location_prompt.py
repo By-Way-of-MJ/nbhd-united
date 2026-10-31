@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -7,6 +8,7 @@ from django.test import TestCase, override_settings
 from apps.orchestrator.config_generator import (
     _CONTEXTUAL_LOCATION_CONFIRM_ASK_BLOCK,
     _EVENING_CHECKIN_PROMPT,
+    _EVENING_TOMORROW_PREP_STEP,
     _HEARTBEAT_CHECKIN_PROMPT,
     _HEARTBEAT_CONTEXTUAL_LOCATION_RULE,
     _MORNING_BRIEFING_AWAY_TOUR_PILL_BLOCK,
@@ -19,8 +21,10 @@ from apps.orchestrator.config_generator import (
     _build_heartbeat_checkin_prompt,
     _build_morning_briefing_prompt,
     _render_morning_briefing_template,
+    _with_contextual_location_confirm_ask,
     _with_morning_briefing_away_tour_pill,
     build_cron_seed_jobs,
+    evening_tomorrow_prep_enabled,
 )
 from apps.tenants.services import create_tenant
 
@@ -269,3 +273,55 @@ class BriefingWeatherToolLaneTest(TestCase):
             _MORNING_BRIEFING_TOOL_WEATHER_STEP.encode(),
             _PINNED_MORNING_BRIEFING_TOOL_WEATHER_STEP.encode(),
         )
+
+
+class EveningTomorrowPrepPromptTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(
+            display_name="Evening Tomorrow Prep",
+            telegram_chat_id=86120004,
+        )
+
+    def test_flag_off_default_prompt_omits_tomorrow_prep(self):
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=""):
+            prompt = _build_evening_checkin_prompt(self.tenant)
+
+        self.assertEqual(
+            prompt,
+            _with_contextual_location_confirm_ask(_EVENING_CHECKIN_PROMPT, self.tenant),
+        )
+        self.assertNotIn("TOMORROW PREP", prompt)
+        self.assertNotIn(_EVENING_TOMORROW_PREP_STEP, prompt)
+        # The insertion must still exist on the enabled path, so removing it
+        # cannot leave this test green.
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS="*"):
+            self.assertIn(_EVENING_TOMORROW_PREP_STEP, _build_evening_checkin_prompt(self.tenant))
+
+    def test_wildcard_inserts_step_once_before_step_6(self):
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS="*"):
+            prompt = _build_evening_checkin_prompt(self.tenant)
+
+        marker = "6. Send the user exactly ONE message via `nbhd_send_to_user`."
+        self.assertEqual(prompt.count("5d. TOMORROW PREP"), 1)
+        self.assertEqual(prompt.count(_EVENING_TOMORROW_PREP_STEP), 1)
+        self.assertEqual(prompt.count(marker), 1)
+        self.assertLess(prompt.index("5d. TOMORROW PREP"), prompt.index(marker))
+        self.assertIn(f"{_EVENING_TOMORROW_PREP_STEP}{marker}", prompt)
+        self.assertTrue(_EVENING_TOMORROW_PREP_STEP.endswith("\n\n"))
+        self.assertIn("days_ahead=1", prompt)
+        self.assertNotIn("for tomorrow's date", prompt)
+
+    def test_tenant_id_enables_only_that_tenant(self):
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=str(self.tenant.id)):
+            self.assertTrue(evening_tomorrow_prep_enabled(self.tenant))
+            self.assertIn(
+                "5d. TOMORROW PREP",
+                _build_evening_checkin_prompt(self.tenant),
+            )
+
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=str(uuid.uuid4())):
+            self.assertFalse(evening_tomorrow_prep_enabled(self.tenant))
+            self.assertNotIn(
+                "5d. TOMORROW PREP",
+                _build_evening_checkin_prompt(self.tenant),
+            )
