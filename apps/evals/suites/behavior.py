@@ -59,6 +59,7 @@ from apps.evals.behavior.judge import (
     build_default_judge,
 )
 from apps.evals.behavior.schema import MARKER_TOKEN, Scenario, load_all_scenarios
+from apps.evals.behavior.setups import SETUPS
 from apps.evals.behavior.targets import BehaviorConfigError, resolve_behavior_tenant
 from apps.evals.behavior.transport import (
     DEFAULT_DEADLINE_SECONDS,
@@ -102,6 +103,12 @@ MAX_JUDGED_SCENARIOS_PER_RUN = 12
 # still-alive control plane is absorbed by the suite's 15s budget headroom, and a
 # control plane sicker than that is already failing the turns themselves.
 SCOPE_OPEN_BUDGET_SECONDS = 5.0
+
+# A scenario with a ``setup`` hook runs control-plane writes (profile + situation
+# + managed cron rows), a config refresh, and a synchronous USER.md push before its
+# first turn. Reserve a bounded allowance so budget gating accounts for that work
+# instead of starting a scenario it cannot finish inside the ceiling.
+SETUP_BUDGET_SECONDS = 20.0
 
 # Sentinel distinguishing "caller did not pass a judge → build the default" from
 # "caller explicitly passed ``judge=None`` → force judge-off (skip soft dims)".
@@ -159,10 +166,13 @@ def _drive_scenario(scenario: Scenario, transport: BehaviorTransport) -> Scenari
 
 
 def _scenario_worst_case_seconds(scenario: Scenario, *, will_judge: bool) -> float:
-    """Worst-case wall clock for one scenario: the fresh-scope open, the sum of its
-    per-turn poll deadlines, plus (when it would be judged) the judge call's
-    timeout. Used to gate STARTING a scenario against the remaining run budget."""
+    """Worst-case wall clock for one scenario: the fresh-scope open, the optional
+    setup hook's control-plane/config/push work, the sum of its per-turn poll
+    deadlines, plus (when it would be judged) the judge call's timeout. Used to gate
+    STARTING a scenario against the remaining run budget."""
     total = SCOPE_OPEN_BUDGET_SECONDS  # a fresh conversation scope is opened first
+    if scenario.setup:
+        total += SETUP_BUDGET_SECONDS
     total += len(scenario.script) * DEFAULT_DEADLINE_SECONDS
     if will_judge:
         total += float(JUDGE_TIMEOUT_SECONDS)
@@ -251,6 +261,24 @@ def _record_soft(
     )
 
 
+def _record_setup_failed(run: EvalRun, scenario: Scenario, code: str) -> None:
+    """Record a scenario whose ``setup`` hook raised as a GATING failed row.
+
+    ``kind='hard'`` so it fails the run (a scenario that could not be put in its
+    asserted-from state proved nothing), with ``isolated=False``: no conversation
+    scope was opened because no turn was ever driven. ``code`` is the exception's
+    type name (e.g. ``RuntimeError``) — never the exception message (which could
+    carry data). The ``setup`` assertion name supplies the printed prefix.
+    """
+    record(
+        run,
+        f"{scenario.id}::hard:setup",
+        EvalResult.Kind.BEHAVIOR,
+        passed=False,
+        details={"kind": "hard", "assertion": "setup", "code": code, "turns": 0, "isolated": False},
+    )
+
+
 def _record_scenario_skipped(run: EvalRun, scenario: Scenario, reason: str) -> None:
     """Record one visible row for a scenario the run did NOT drive (e.g. out of
     budget). ``passed=True`` so it never gates, but ``details.kind='skipped'`` +
@@ -263,6 +291,29 @@ def _record_scenario_skipped(run: EvalRun, scenario: Scenario, reason: str) -> N
         passed=True,
         details={"kind": "skipped", "reason": reason, "turns": 0},
     )
+
+
+def _select_only(scenario_list: list[Scenario], only: list[str]) -> list[Scenario]:
+    """Resolve the explicit ``only`` id list to scenarios, in the caller's order.
+
+    Unknown ids are a caller bug — a typo must never silently drive nothing — so
+    they raise ``BehaviorConfigError`` naming them. Duplicates collapse to their
+    first position: driving one scenario twice would double its side effects.
+    """
+    by_id = {scenario.id: scenario for scenario in scenario_list}
+    unknown = [scenario_id for scenario_id in only if scenario_id not in by_id]
+    if unknown:
+        raise BehaviorConfigError(
+            f"unknown behavior scenario id(s): {', '.join(unknown)} (known: {', '.join(sorted(by_id))})"
+        )
+    selected: list[Scenario] = []
+    for scenario_id in only:
+        scenario = by_id[scenario_id]
+        if scenario not in selected:
+            selected.append(scenario)
+    if not selected:
+        raise BehaviorConfigError("only=[] selects no scenarios — the run would assert nothing")
+    return selected
 
 
 def _rotation_cursor_before(run: EvalRun, scenario_count: int) -> int:
@@ -285,6 +336,7 @@ def run_behavior_suite(
     max_judged_scenarios: int = MAX_JUDGED_SCENARIOS_PER_RUN,
     budget_seconds: float = SUITE_BUDGET_SECONDS,
     trigger: str = EvalRun.Trigger.MANUAL,
+    only: list[str] | None = None,
 ) -> EvalRun:
     """Run the behavior suite and return the CLOSED run.
 
@@ -297,6 +349,18 @@ def run_behavior_suite(
 
     ``judge`` is a tri-state: unset → build the default judge; ``None`` → force
     judge-off (soft dims skipped-with-reason); a Judge → use it.
+
+    ``only`` drives exactly the named scenario ids, in the given order, and leaves
+    the persisted rotation cursor untouched (the run stores ``scenario_cursor=None``,
+    which the next rotating fire ignores) — the on-demand path behind ``manage.py
+    run_behavior_scenarios``. Because the caller names a bounded set to run NOW, an
+    ``only`` run does not apply the rotation budget gate; every turn still runs
+    under its own HTTP deadline. ``only=None`` (the default) keeps the rotation +
+    budget behavior exactly as before.
+
+    Every scenario's optional ``setup`` hook runs right before its turns are
+    driven; a setup that raises records the scenario FAILED with the exception
+    type as its code and moves on (never a silent skip, INVARIANT #3).
     """
     with record_run(SUITE, trigger) as run:  # runtime suite → image_tag auto-infers the fleet tag
         tenant = resolve_behavior_tenant()
@@ -316,32 +380,60 @@ def run_behavior_suite(
                 f"behavior pre-warm failed before scenarios (deadline {PREWARM_DEADLINE_SECONDS:.0f}s, reason {reason})"
             )
 
-        cursor_before = _rotation_cursor_before(run, len(scenario_list))
-        rotated_scenarios = scenario_list[cursor_before:] + scenario_list[:cursor_before]
+        if only is None:
+            cursor_before = _rotation_cursor_before(run, len(scenario_list))
+            rotated_scenarios = scenario_list[cursor_before:] + scenario_list[:cursor_before]
+        else:
+            # Explicit selection: the caller's order, cursor left at NULL.
+            cursor_before = None
+            rotated_scenarios = _select_only(scenario_list, only)
         t0 = time.monotonic()
         judged_count = 0
         drove_any = False
         driven_ids: list[str] = []
 
         for index, scenario in enumerate(rotated_scenarios):
-            will_judge = (
-                bool(scenario.soft_dimensions) and active_judge is not None and judged_count < max_judged_scenarios
-            )
-            worst_case = _scenario_worst_case_seconds(scenario, will_judge=will_judge)
-            remaining = budget_seconds - (time.monotonic() - t0)
-            if worst_case > remaining:
-                # Out of budget: record THIS and every remaining scenario as
-                # skipped-with-reason, then stop starting scenarios (time only moves
-                # forward, so nothing later can fit either under worst-case gating).
-                logger.warning(
-                    "behavior: budget exhausted — skipping %d scenario(s) (remaining %.0fs < worst case %.0fs)",
-                    len(rotated_scenarios) - index,
-                    remaining,
-                    worst_case,
+            if only is None:
+                will_judge = (
+                    bool(scenario.soft_dimensions) and active_judge is not None and judged_count < max_judged_scenarios
                 )
-                for skipped in rotated_scenarios[index:]:
-                    _record_scenario_skipped(run, skipped, "budget")
-                break
+                worst_case = _scenario_worst_case_seconds(scenario, will_judge=will_judge)
+                remaining = budget_seconds - (time.monotonic() - t0)
+                if worst_case > remaining:
+                    # Out of budget: record THIS and every remaining scenario as
+                    # skipped-with-reason, then stop starting scenarios (time only
+                    # moves forward, so nothing later can fit either under
+                    # worst-case gating).
+                    logger.warning(
+                        "behavior: budget exhausted — skipping %d scenario(s) (remaining %.0fs < worst case %.0fs)",
+                        len(rotated_scenarios) - index,
+                        remaining,
+                        worst_case,
+                    )
+                    for skipped in rotated_scenarios[index:]:
+                        _record_scenario_skipped(run, skipped, "budget")
+                    break
+
+            # Per-scenario setup hook: puts the tenant in the state this scenario
+            # asserts from (e.g. "on Tokyo time, no travel situation"). It runs
+            # before the fresh scope is opened so the container already holds the
+            # reset profile on turn one. A raising setup is a FAILED scenario with
+            # a machine code — never a silent skip, never a run ERROR.
+            if scenario.setup:
+                try:
+                    SETUPS[scenario.setup](tenant)
+                except Exception as exc:  # noqa: BLE001 — setup failure = failed scenario, not a broken run
+                    logger.warning(
+                        "behavior: setup %r failed for scenario %s (recorded as failed)",
+                        scenario.setup,
+                        scenario.id,
+                    )
+                    _record_setup_failed(run, scenario, type(exc).__name__)
+                    # Count it as handled so the rotation moves PAST a persistently
+                    # failing setup instead of retrying it first on every fire.
+                    drove_any = True
+                    driven_ids.append(scenario.id)
+                    continue
 
             # ISOLATION (the run-33 fix): open a FRESH conversation scope so this
             # scenario runs in its own OpenClaw session and cannot see an earlier
@@ -432,14 +524,19 @@ def run_behavior_suite(
                 f"budget {budget_seconds:.0f}s cannot fit the first scenario's worst case"
             )
 
-        cursor_after = (cursor_before + len(driven_ids)) % len(scenario_list)
-        run.scenario_cursor = cursor_after
-        run.save(update_fields=["scenario_cursor"])
-        logger.info(
-            "behavior: rotation cursor before=%d after=%d ran=%s",
-            cursor_before,
-            cursor_after,
-            ",".join(driven_ids),
-        )
+        if cursor_before is None:
+            # On-demand (``only``) run: the persisted rotation cursor is untouched
+            # (scenario_cursor stays NULL; rotating fires ignore NULL rows).
+            logger.info("behavior: only-mode ran=%s (rotation cursor untouched)", ",".join(driven_ids))
+        else:
+            cursor_after = (cursor_before + len(driven_ids)) % len(scenario_list)
+            run.scenario_cursor = cursor_after
+            run.save(update_fields=["scenario_cursor"])
+            logger.info(
+                "behavior: rotation cursor before=%d after=%d ran=%s",
+                cursor_before,
+                cursor_after,
+                ",".join(driven_ids),
+            )
 
     return run

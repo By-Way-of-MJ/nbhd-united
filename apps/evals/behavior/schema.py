@@ -41,10 +41,16 @@ VALID_HARD_TYPES: frozenset[str] = frozenset(
         "redacted_identity_clarified",
         "unchecked_claim_honest",
         "sleep_logged_5h",
+        "timezone_is",
+        "asks_which_city",
     }
 )
 VALID_SOFT_DIMENSIONS: frozenset[str] = frozenset(rubric_v1.DIMENSIONS)
 VALID_CHANNELS: frozenset[str] = frozenset({"ios", "telegram", "line"})
+# Optional per-scenario setup hooks (implemented in setups.py, called by the suite
+# right before the scenario is driven). A fixture naming any other hook is
+# rejected at load — a typo must never silently start from a stale state.
+VALID_SETUPS: frozenset[str] = frozenset({"reset_timezone_tokyo"})
 
 # The placeholder a scenario script uses to plant a fresh per-run marker.
 MARKER_TOKEN = "{{marker}}"
@@ -53,7 +59,7 @@ MARKER_TOKEN = "{{marker}}"
 # the chassis' 64-char cap without truncation-collisions (record() truncates).
 _MAX_ID_LEN = 32
 _ALLOWED_TOP_KEYS = frozenset(
-    {"id", "persona", "script", "hard_assertions", "soft_dimensions", "channel", "document_turns"}
+    {"id", "persona", "script", "hard_assertions", "soft_dimensions", "channel", "document_turns", "setup"}
 )
 
 
@@ -71,6 +77,7 @@ class HardAssertion:
 
     type: str
     forbidden: tuple[str, ...] = ()  # only for type == "forbidden_absent"
+    value: str = ""  # only for type == "timezone_is" (the expected IANA zone)
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,8 @@ class Scenario:
     soft_dimensions: tuple[str, ...]
     channel: str = "ios"
     document_turns: tuple[int, ...] = ()
+    # Name of the per-scenario setup hook to call before driving (None = none).
+    setup: str | None = None
 
     @property
     def uses_marker(self) -> bool:
@@ -127,9 +136,22 @@ def _parse_hard_assertion(raw: object, source: str, script: list[str]) -> HardAs
             f"'marker_absent' requires the script to plant {MARKER_TOKEN}",
         )
 
-    unexpected = set(raw) - {"type", "forbidden"}
+    value = ""
+    if a_type == "timezone_is":
+        raw_value = raw.get("value")
+        _require(
+            isinstance(raw_value, str) and bool(raw_value.strip()),
+            source,
+            "'timezone_is' requires a non-empty 'value' IANA timezone string (e.g. 'America/Chicago')",
+        )
+        assert isinstance(raw_value, str)
+        value = raw_value.strip()
+    elif "value" in raw:
+        _require(False, source, f"'value' is only valid for 'timezone_is', not {a_type!r}")
+
+    unexpected = set(raw) - {"type", "forbidden", "value"}
     _require(not unexpected, source, f"unexpected keys in hard assertion: {sorted(unexpected)}")
-    return HardAssertion(type=a_type, forbidden=forbidden)
+    return HardAssertion(type=a_type, forbidden=forbidden, value=value)
 
 
 def parse_scenario(data: object, *, source: str) -> Scenario:
@@ -204,6 +226,13 @@ def parse_scenario(data: object, *, source: str) -> Scenario:
     assert isinstance(raw_hard, list)
     hard = tuple(_parse_hard_assertion(item, source, script) for item in raw_hard)
 
+    raw_setup = data.get("setup")
+    _require(
+        raw_setup is None or (isinstance(raw_setup, str) and raw_setup in VALID_SETUPS),
+        source,
+        f"'setup' must be one of {sorted(VALID_SETUPS)}, got {raw_setup!r}",
+    )
+
     raw_soft = data.get("soft_dimensions", [])
     _require(isinstance(raw_soft, list), source, "'soft_dimensions' must be a list")
     assert isinstance(raw_soft, list)
@@ -224,6 +253,7 @@ def parse_scenario(data: object, *, source: str) -> Scenario:
         soft_dimensions=soft,
         channel=channel,
         document_turns=document_turns,
+        setup=raw_setup,
     )
 
 

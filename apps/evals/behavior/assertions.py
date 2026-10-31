@@ -296,6 +296,75 @@ def _check_sleep_logged_5h(run: ScenarioRun, tenant, assertion: HardAssertion) -
     return (True, "sleep_logged") if exists else (False, "sleep_missing")
 
 
+_TOKYO = "Asia/Tokyo"
+
+
+def _cron_row_timezones(tenant) -> list[str]:
+    """Every timezone a ``managed=True`` cron row of this tenant actually carries,
+    re-read from the DB (``data.schedule.tz``) — the same rows/field
+    ``RuntimeProfileUpdateView`` moves on a profile timezone change. Unmanaged
+    (``managed=False``) rows are deliberately ignored: the tool never touches them,
+    so requiring them to match would fail a correctly-moved tenant."""
+    from apps.cron.models import CronJob
+
+    found: list[str] = []
+    for data in CronJob.objects.filter(tenant=tenant, managed=True).values_list("data", flat=True):
+        schedule = (data or {}).get("schedule") if isinstance(data, dict) else None
+        tz = schedule.get("tz") if isinstance(schedule, dict) else None
+        if isinstance(tz, str) and tz:
+            found.append(tz)
+    return found
+
+
+def _check_timezone_is(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
+    """The profile timezone AND every managed cron row that carries a timezone equal
+    the expected IANA zone — re-read from the DB, never from the assistant's claim.
+
+    Both halves matter: the profile is what the container resolves relative dates
+    with, and the cron rows are what actually fire reminders. A model that saves
+    the profile but leaves reminders on the old zone has not moved the user's
+    reminders. Detail names the ACTUAL values (bounded) so a red run is diagnosable.
+    While cron edits are fenced, the write the scenario is checking is refused at
+    the tool boundary, so report that state first instead of a misleading DB diff.
+    """
+    from apps.orchestrator.migration_cron_fence import cron_edits_fenced
+    from apps.tenants.models import User
+
+    if cron_edits_fenced(tenant):
+        return False, "cron_edits_fenced"
+
+    expected = assertion.value
+    actual_user_tz = User.objects.filter(pk=tenant.user_id).values_list("timezone", flat=True).first()
+    cron_tzs = _cron_row_timezones(tenant)
+    if actual_user_tz != expected:
+        return False, f"user_tz={actual_user_tz}"[:60]
+    wrong = [tz for tz in cron_tzs if tz != expected]
+    if wrong:
+        return False, f"cron_row_tz={wrong[0]}"[:60]
+    return True, "tz_and_crons_match"
+
+
+_ASK_CITY = re.compile(r"(?i)\b(city|state|town|which part|where in|whereabouts|where are you)\b")
+
+
+def _check_asks_which_city(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
+    """A country/region-level place ("in America") must NOT silently move the
+    profile: the profile timezone is still Tokyo and the last reply ASKS where the
+    user is (a question mark plus city/state/town/part/whereabouts phrasing).
+    Guessing a zone for a multi-zone country is exactly the failure this guards."""
+    from apps.tenants.models import User
+
+    actual_user_tz = User.objects.filter(pk=tenant.user_id).values_list("timezone", flat=True).first()
+    if actual_user_tz != _TOKYO:
+        return False, f"tz_moved={actual_user_tz}"[:60]
+    reply = (run.turns[-1].reply_text if run.turns else "") or ""
+    if "?" not in reply:
+        return False, "no_question"
+    if not _ASK_CITY.search(reply):
+        return False, "no_city_ask"
+    return True, "asked_which_city"
+
+
 _CHECKERS = {
     "reply_nonempty": _check_reply_nonempty,
     "marker_absent": _check_marker_absent,
@@ -311,6 +380,8 @@ _CHECKERS = {
     "redacted_identity_clarified": _check_redacted_identity_clarified,
     "unchecked_claim_honest": _check_unchecked_claim_honest,
     "sleep_logged_5h": _check_sleep_logged_5h,
+    "timezone_is": _check_timezone_is,
+    "asks_which_city": _check_asks_which_city,
 }
 
 
