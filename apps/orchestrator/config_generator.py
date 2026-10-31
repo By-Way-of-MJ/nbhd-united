@@ -175,12 +175,6 @@ def evening_tomorrow_prep_enabled(tenant: Tenant | None) -> bool:
         return False
     if "*" in allowed or str(tenant.id).lower() in allowed:
         return True
-    logger.info(
-        "evening_tomorrow_prep: tenant %s is not in EVENING_TOMORROW_PREP_TENANT_IDS "
-        "(%d id(s) configured) — tomorrow prep disabled",
-        str(tenant.id)[:8],
-        len(allowed),
-    )
     return False
 
 
@@ -977,7 +971,7 @@ _EVENING_CHECKIN_PROMPT = (
 
 
 _EVENING_TOMORROW_PREP_STEP = (
-    "5d. TOMORROW PREP. Call `nbhd_datebook_read` for tomorrow's date in the user's timezone. Also read the\n"
+    '5d. TOMORROW PREP. Call `nbhd_datebook_read` with `days_ahead=1` and `entity="events"`, then keep only the entries dated tomorrow in the user\'s timezone. Also read the\n'
     "`## People & Context` section of the memory document (from `nbhd_journal_context`) to see who the user cares for,\n"
     "such as a young child. Decide whether anything tomorrow needs preparing tonight: a long day away from home, an\n"
     "early start, travel, or an event like a funeral, wedding or all-day outing — especially when a child or other\n"

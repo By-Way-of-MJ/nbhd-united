@@ -59,6 +59,7 @@ class ShadowResult(jev.StrictModel):
     commitments: int = 0
     people_chars: int = 0
     latency_ms: int = 0
+    in_heartbeat_window: bool = False
     reason: Literal["ok", "outside_hours", "no_state", "redaction_unconfirmed", "unavailable"] = "unavailable"
 
 
@@ -94,7 +95,7 @@ def _calendar_text(tenant) -> tuple[str, int]:
     from apps.datebook.agenda import agenda_items
 
     tz = tenant_tz(tenant)
-    items, _truncated = agenda_items(tenant, days_back=0, days_ahead=2, entity="events", limit=40)
+    items, _truncated = agenda_items(tenant, days_back=0, days_ahead=1, entity="events", limit=40)
     lines = [_local_event_line(item, tz) for item in items]
     return "\n".join(lines), len(items)
 
@@ -192,6 +193,18 @@ def _run_shadow(tenant) -> ShadowResult:
     )
 
 
+def _in_heartbeat_window(tenant) -> bool:
+    """Mirror _heartbeat_cron_expr in config_generator.py, including wrap past midnight."""
+    try:
+        if not tenant.heartbeat_enabled:
+            return False
+        hour = timezone.now().astimezone(tenant_tz(tenant)).hour
+        hours = {(tenant.heartbeat_start_hour + i) % 24 for i in range(tenant.heartbeat_window_hours)}
+        return hour in hours
+    except Exception:
+        return False
+
+
 def run_shadow_for_tenant(tenant) -> ShadowResult:
     """Ask Jev whether this tenant is worth a message now. Never re-raises."""
     started = monotonic()
@@ -203,6 +216,7 @@ def run_shadow_for_tenant(tenant) -> ShadowResult:
             result = _run_shadow(tenant)
     except Exception:
         result = ShadowResult(reason="unavailable")
+    result.in_heartbeat_window = _in_heartbeat_window(tenant)
     result.latency_ms = max(0, round((monotonic() - started) * 1000))
     return result
 
@@ -231,10 +245,11 @@ def jev_heartbeat_shadow_task() -> dict:
         tenants += 1
         result = run_shadow_for_tenant(tenant)
         logger.info(
-            "jev_heartbeat_shadow tenant=%s local_hour=%d decision=%s p=%.3f "
+            "jev_heartbeat_shadow tenant=%s local_hour=%d in_hb_window=%d decision=%s p=%.3f "
             "events=%d commitments=%d people_chars=%d latency_ms=%d reason=%s",
             str(tenant.id)[:8],
             _local_hour(tenant),
+            int(result.in_heartbeat_window),
             result.decision,
             result.p,
             result.events,

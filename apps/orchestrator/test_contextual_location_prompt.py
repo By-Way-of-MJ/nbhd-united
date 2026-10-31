@@ -21,6 +21,7 @@ from apps.orchestrator.config_generator import (
     _build_heartbeat_checkin_prompt,
     _build_morning_briefing_prompt,
     _render_morning_briefing_template,
+    _with_contextual_location_confirm_ask,
     _with_morning_briefing_away_tour_pill,
     build_cron_seed_jobs,
     evening_tomorrow_prep_enabled,
@@ -285,7 +286,10 @@ class EveningTomorrowPrepPromptTest(TestCase):
         with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=""):
             prompt = _build_evening_checkin_prompt(self.tenant)
 
-        self.assertEqual(prompt, _build_evening_checkin_prompt(self.tenant))
+        self.assertEqual(
+            prompt,
+            _with_contextual_location_confirm_ask(_EVENING_CHECKIN_PROMPT, self.tenant),
+        )
         self.assertNotIn("TOMORROW PREP", prompt)
         self.assertNotIn(_EVENING_TOMORROW_PREP_STEP, prompt)
         # The insertion must still exist on the enabled path, so removing it
@@ -304,6 +308,8 @@ class EveningTomorrowPrepPromptTest(TestCase):
         self.assertLess(prompt.index("5d. TOMORROW PREP"), prompt.index(marker))
         self.assertIn(f"{_EVENING_TOMORROW_PREP_STEP}{marker}", prompt)
         self.assertTrue(_EVENING_TOMORROW_PREP_STEP.endswith("\n\n"))
+        self.assertIn("days_ahead=1", prompt)
+        self.assertNotIn("for tomorrow's date", prompt)
 
     def test_tenant_id_enables_only_that_tenant(self):
         with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=str(self.tenant.id)):

@@ -128,6 +128,31 @@ class JevHeartbeatShadowTests(TestCase):
         self.assertNotIn(OTHER_TEXT, state["calendar"])
         self.assertNotIn(OTHER_TEXT, state["commitments"])
 
+    def test_calendar_reads_today_and_tomorrow(self):
+        self._state()
+        with patch("apps.datebook.agenda.agenda_items", return_value=([], False)) as agenda:
+            result = run_shadow_for_tenant(self.tenant)
+        self.assertEqual(result.reason, "ok")
+        agenda.assert_called_once()
+        self.assertEqual(agenda.call_args.kwargs["days_ahead"], 1)
+
+    def test_in_heartbeat_window_matches_cron_hours(self):
+        self.tenant.heartbeat_enabled = True
+        self.tenant.heartbeat_start_hour = 8
+        self.tenant.heartbeat_window_hours = 6
+        self.tenant.save(update_fields=["heartbeat_enabled", "heartbeat_start_hour", "heartbeat_window_hours"])
+        self._state()
+
+        self.assertTrue(run_shadow_for_tenant(self.tenant).in_heartbeat_window)
+
+        self.clock.return_value = self.now.replace(hour=15)
+        self.assertFalse(run_shadow_for_tenant(self.tenant).in_heartbeat_window)
+
+        self.tenant.heartbeat_enabled = False
+        self.tenant.save(update_fields=["heartbeat_enabled"])
+        self.clock.return_value = self.now
+        self.assertFalse(run_shadow_for_tenant(self.tenant).in_heartbeat_window)
+
     def test_decide_failure_is_unavailable_and_never_escapes_task(self):
         self._state()
         self.decide.side_effect = RuntimeError("private")
@@ -157,6 +182,7 @@ class JevHeartbeatShadowTests(TestCase):
             jev_heartbeat_shadow_task()
         output = "\n".join(logs.output)
         self.assertIn("jev_heartbeat_shadow tenant=", output)
+        self.assertIn("in_hb_window=1", output)
         self.assertIn("reason=ok", output)
         self.assertNotIn(EVENT_TITLE, output)
         self.assertNotIn(PEOPLE_TEXT, output)
