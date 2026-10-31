@@ -55,6 +55,10 @@ _NOTES_LIMIT = 200
 class ShadowResult(jev.StrictModel):
     decision: Worth | None = None
     p: float = 0.0
+    p_nothing: float = 0.0
+    p_prep_upcoming: float = 0.0
+    p_due_commitment: float = 0.0
+    p_time_sensitive_today: float = 0.0
     events: int = 0
     commitments: int = 0
     people_chars: int = 0
@@ -186,6 +190,10 @@ def _run_shadow(tenant) -> ShadowResult:
     return ShadowResult(
         decision=answer.choice,
         p=answer.probabilities[answer.choice],
+        p_nothing=answer.probabilities.get("nothing", 0.0),
+        p_prep_upcoming=answer.probabilities.get("prep_upcoming", 0.0),
+        p_due_commitment=answer.probabilities.get("due_commitment", 0.0),
+        p_time_sensitive_today=answer.probabilities.get("time_sensitive_today", 0.0),
         events=events,
         commitments=commitments,
         people_chars=people_chars,
@@ -246,12 +254,17 @@ def jev_heartbeat_shadow_task() -> dict:
         result = run_shadow_for_tenant(tenant)
         logger.info(
             "jev_heartbeat_shadow tenant=%s local_hour=%d in_hb_window=%d decision=%s p=%.3f "
+            "p_nothing=%.3f p_prep=%.3f p_due=%.3f p_time=%.3f "
             "events=%d commitments=%d people_chars=%d latency_ms=%d reason=%s",
             str(tenant.id)[:8],
             _local_hour(tenant),
             int(result.in_heartbeat_window),
             result.decision,
             result.p,
+            result.p_nothing,
+            result.p_prep_upcoming,
+            result.p_due_commitment,
+            result.p_time_sensitive_today,
             result.events,
             result.commitments,
             result.people_chars,
