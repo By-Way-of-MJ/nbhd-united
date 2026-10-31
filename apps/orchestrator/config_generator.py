@@ -35,6 +35,7 @@ from apps.orchestrator.tour_guide import (
     places_search_delivery_ready,
     tour_guide_delivery_ready,
 )
+from apps.router.chat_gates import _tenant_allowed
 from apps.tenants.models import Tenant
 
 # Per-file workspace bootstrap budget (chars). OpenClaw silently truncates each
@@ -3432,7 +3433,10 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                     _doc_taint_gate_raw_mode,
                 )
                 _doc_taint_gate_mode = "log_only"
-            plugin_config["entries"][doc_taint_guard_id]["config"] = {"mode": _doc_taint_gate_mode}
+            _doc_taint_config = {"mode": _doc_taint_gate_mode}
+            if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
+                _doc_taint_config["carryBareConfirm"] = True
+            plugin_config["entries"][doc_taint_guard_id]["config"] = _doc_taint_config
 
         paths = [ppath for _, ppath in _active_plugins if ppath]
         if paths:

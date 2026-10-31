@@ -16,7 +16,8 @@
         "type": "string",
         "enum": ["log_only", "enforce"],
         "description": "log_only: log what the exfil gate would have blocked but let the call proceed. enforce: hard-block the call. Default log_only."
-      }
+      },
+      "carryBareConfirm": {"type": "boolean", "description": "Keep a flagged turn's limits when the next message is only a bare yes."}
     }
   }
 }

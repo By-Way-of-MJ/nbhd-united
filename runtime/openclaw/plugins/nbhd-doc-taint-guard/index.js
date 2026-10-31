@@ -61,6 +61,52 @@ export function promptIsDocumentTainted(prompt) {
   return DOCUMENT_MARKERS.some((marker) => prompt.includes(marker));
 }
 
+// Bare replies that count as "yes" to the previous turn's proposal. Only used
+// to carry a flagged turn's limits one turn forward (opt-in via config); a
+// real sentence always clears the flag exactly as before.
+export const BARE_CONFIRMATIONS = new Set([
+  "ok",
+  "okay",
+  "k",
+  "yes",
+  "yep",
+  "yeah",
+  "yup",
+  "sure",
+  "go",
+  "go ahead",
+  "do it",
+  "please do",
+  "sounds good",
+  "confirm",
+  "approved",
+  "はい",
+  "うん",
+  "ええ",
+  "お願い",
+  "お願いします",
+  "いいよ",
+  "よろしく",
+  "どうぞ",
+]);
+
+const BARE_CONFIRMATION_EDGES = /^[\s.!?,。！？、~ー]+|[\s.!?,。！？、~ー]+$/g;
+
+/** Pure: is the last non-empty line of this prompt just a bare yes? */
+export function isBareConfirmation(prompt) {
+  if (typeof prompt !== "string" || prompt.length === 0) return false;
+  const lines = prompt.split(/\r?\n/);
+  let lastLine = "";
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i].trim().length > 0) {
+      lastLine = lines[i];
+      break;
+    }
+  }
+  const normalized = lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
+  return BARE_CONFIRMATIONS.has(normalized);
+}
+
 // ── toolSearch meta-dispatch unwrap ──────────────────────────────────────
 // Mirrors nbhd-routing-context/index.js TOOL_DISPATCH_META / extractDispatchedToolId.
 
@@ -130,6 +176,12 @@ function describeExfilAction(realId) {
 }
 
 function buildBlockReason(realId, source = "document") {
+  if (source === "carried") {
+    return (
+      "You only said yes to something that came from a shared project or an upload. " +
+      `I won't ${describeExfilAction(realId)} on that alone. Tell me what you want in your own words and I'll do it.`
+    );
+  }
   const what =
     source === "project"
       ? "Text from a shared project was read this turn and may contain hidden instructions from someone else. "
@@ -155,10 +207,11 @@ export function decideExfilGate({ event, mode, tainted }) {
     return { realId, action: "ignore" };
   }
   if (mode === "enforce") {
+    const source = tainted === "project" ? "project" : tainted === "carried" ? "carried" : "document";
     return {
       realId,
       action: "block",
-      result: { block: true, blockReason: buildBlockReason(realId, tainted === "project" ? "project" : "document") },
+      result: { block: true, blockReason: buildBlockReason(realId, source) },
     };
   }
   return { realId, action: "log" };
@@ -265,6 +318,7 @@ function setWithCap(map, key, value, cap) {
 
 const MAX_TAINTED_RUNS = 2000;
 const MAX_TRACKED_TOOL_CALLS = 500;
+const CARRY_TTL_MS = 30 * 60 * 1000;
 
 // Shared run-scoped state. The sub-agent bridge asks this exported seam before
 // allowing sessions_spawn, closing the former "child gets a new runId" gap.
@@ -282,6 +336,7 @@ export default function register(api) {
 
   const cfg = api.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {};
   const mode = cfg.mode === "enforce" ? "enforce" : "log_only";
+  const carryBareConfirm = cfg.carryBareConfirm === true;
 
   // runId -> true, for turns whose prompt carried an upload marker. The bridge
   // blocks sessions_spawn while this parent run is tainted, so the child-runId
@@ -290,6 +345,10 @@ export default function register(api) {
   // before_tool_call (which sees params.id) to tool_result_persist (which
   // doesn't).
   const toolCallResolvedId = new Map();
+  // sessionKey -> expiry ms for a flagged turn whose limits should survive one
+  // bare "ok"; runId -> sessionKey so agent_end can re-arm the chain.
+  const carriedSessions = new Map();
+  const runSessions = new Map();
 
   try {
     api.logger.warn(`NBHD document taint guard plugin registered (mode=${mode})`);
@@ -303,6 +362,21 @@ export default function register(api) {
       if (!runId) return undefined;
       if (promptIsDocumentTainted(event && event.prompt)) {
         setWithCap(taintedRuns, runId, true, MAX_TAINTED_RUNS);
+      }
+      if (carryBareConfirm && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
+        const sessionKey = ctx.sessionKey;
+        setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
+        const expiry = carriedSessions.get(sessionKey);
+        carriedSessions.delete(sessionKey);
+        if (
+          expiry !== undefined &&
+          expiry > Date.now() &&
+          isBareConfirmation(event && event.prompt) &&
+          !taintedRuns.get(runId)
+        ) {
+          setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
+          api.logger.warn(`taint_carried run=${runId}`);
+        }
       }
       return undefined;
     } catch (err) {
@@ -406,7 +480,15 @@ export default function register(api) {
   api.on("agent_end", (event) => {
     try {
       const runId = event && event.runId;
-      if (runId) taintedRuns.delete(runId);
+      if (runId) {
+        const flagged = taintedRuns.get(runId);
+        const sessionKey = runSessions.get(runId);
+        runSessions.delete(runId);
+        if (carryBareConfirm && flagged && typeof sessionKey === "string" && sessionKey.length > 0) {
+          setWithCap(carriedSessions, sessionKey, Date.now() + CARRY_TTL_MS, MAX_TAINTED_RUNS);
+        }
+        taintedRuns.delete(runId);
+      }
       return undefined;
     } catch (err) {
       try {

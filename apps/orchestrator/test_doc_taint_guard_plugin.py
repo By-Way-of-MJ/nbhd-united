@@ -80,6 +80,18 @@ class DocTaintGuardPluginGatingTest(TestCase):
         entry = config["plugins"]["entries"][PLUGIN_ID]
         self.assertEqual(entry.get("config"), {"mode": "log_only"})
 
+    def test_allowlisted_tenant_gets_carry_bare_confirm(self):
+        with override_settings(TAINT_CARRY_TENANT_IDS=str(self.tenant.id)):
+            config = generate_openclaw_config(self.tenant)
+        entry = config["plugins"]["entries"][PLUGIN_ID]
+        self.assertEqual(entry.get("config"), {"mode": "log_only", "carryBareConfirm": True})
+
+    @override_settings(TAINT_CARRY_TENANT_IDS="00000000-0000-0000-0000-000000000000")
+    def test_tenant_not_on_carry_list_gets_only_mode(self):
+        config = generate_openclaw_config(self.tenant)
+        entry = config["plugins"]["entries"][PLUGIN_ID]
+        self.assertEqual(entry.get("config"), {"mode": "log_only"})
+
     @override_settings(DOC_TAINT_GATE_MODE="banana")
     def test_invalid_mode_falls_back_to_log_only_and_logs_error(self):
         # The plugin's manifest declares mode as enum:["log_only","enforce"]
