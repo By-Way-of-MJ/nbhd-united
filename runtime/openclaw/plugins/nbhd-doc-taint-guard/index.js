@@ -92,6 +92,9 @@ export const BARE_CONFIRMATIONS = new Set([
 
 const BARE_CONFIRMATION_EDGES = /^[\s.!?,。！？、~ー]+|[\s.!?,。！？、~ー]+$/g;
 
+// Batched messages arrive prefixed with a numeric marker like `[2] (14:03:22) `.
+const BATCHED_MESSAGE_PREFIX = /^\[\d+\](?:\s*\(\d{2}:\d{2}:\d{2}\))?\s*/;
+
 /** Pure: is the last non-empty line of this prompt just a bare yes? */
 export function isBareConfirmation(prompt) {
   if (typeof prompt !== "string" || prompt.length === 0) return false;
@@ -103,8 +106,14 @@ export function isBareConfirmation(prompt) {
       break;
     }
   }
+  lastLine = lastLine.replace(BATCHED_MESSAGE_PREFIX, "");
   const normalized = lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
   return BARE_CONFIRMATIONS.has(normalized);
+}
+
+/** Is the opt-in bare-yes carry enabled for this process? Read at call time. */
+function carryEnabled() {
+  return process.env.NBHD_TAINT_CARRY_BARE_CONFIRM === "1";
 }
 
 // ── toolSearch meta-dispatch unwrap ──────────────────────────────────────
@@ -336,7 +345,6 @@ export default function register(api) {
 
   const cfg = api.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {};
   const mode = cfg.mode === "enforce" ? "enforce" : "log_only";
-  const carryBareConfirm = cfg.carryBareConfirm === true;
 
   // runId -> true, for turns whose prompt carried an upload marker. The bridge
   // blocks sessions_spawn while this parent run is tainted, so the child-runId
@@ -363,7 +371,7 @@ export default function register(api) {
       if (promptIsDocumentTainted(event && event.prompt)) {
         setWithCap(taintedRuns, runId, true, MAX_TAINTED_RUNS);
       }
-      if (carryBareConfirm && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
+      if (carryEnabled() && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
         const sessionKey = ctx.sessionKey;
         setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
         const expiry = carriedSessions.get(sessionKey);
@@ -477,14 +485,14 @@ export default function register(api) {
     }
   });
 
-  api.on("agent_end", (event) => {
+  api.on("agent_end", (event, ctx) => {
     try {
-      const runId = event && event.runId;
+      const runId = (ctx && ctx.runId) || (event && event.runId);
       if (runId) {
         const flagged = taintedRuns.get(runId);
         const sessionKey = runSessions.get(runId);
         runSessions.delete(runId);
-        if (carryBareConfirm && flagged && typeof sessionKey === "string" && sessionKey.length > 0) {
+        if (carryEnabled() && flagged && typeof sessionKey === "string" && sessionKey.length > 0) {
           setWithCap(carriedSessions, sessionKey, Date.now() + CARRY_TTL_MS, MAX_TAINTED_RUNS);
         }
         taintedRuns.delete(runId);

@@ -3433,10 +3433,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                     _doc_taint_gate_raw_mode,
                 )
                 _doc_taint_gate_mode = "log_only"
-            _doc_taint_config = {"mode": _doc_taint_gate_mode}
-            if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
-                _doc_taint_config["carryBareConfirm"] = True
-            plugin_config["entries"][doc_taint_guard_id]["config"] = _doc_taint_config
+            plugin_config["entries"][doc_taint_guard_id]["config"] = {"mode": _doc_taint_gate_mode}
 
         paths = [ppath for _, ppath in _active_plugins if ppath]
         if paths:
@@ -3502,6 +3499,9 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
             env["NBHD_API_BASE_URL"] = api_base or ""
     except Exception:
         pass  # Don't break config generation if integration check fails
+
+    if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
+        config.setdefault("env", {})["NBHD_TAINT_CARRY_BARE_CONFIRM"] = "1"
 
     # OpenClaw >= 2026.4.15 auto-generates models.json with the wrong
     # OpenRouter base URL (/v1 instead of /api/v1). Inject the override.

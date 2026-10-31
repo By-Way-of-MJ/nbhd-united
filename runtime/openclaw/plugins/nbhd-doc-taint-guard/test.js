@@ -4,7 +4,7 @@
  * Run with: node --test runtime/openclaw/plugins/nbhd-doc-taint-guard/test.js
  */
 
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import register, {
   promptIsDocumentTainted,
@@ -467,7 +467,7 @@ describe("project text taints the turn like an upload", () => {
 // ── isBareConfirmation ────────────────────────────────────────────────────
 
 describe("isBareConfirmation", () => {
-  for (const prompt of ["ok", "OK.", "yes!", "はい", "お願いします。", "Sounds good\nok", "  ok  \n\n"]) {
+  for (const prompt of ["ok", "OK.", "yes!", "はい", "お願いします。", "Sounds good\nok", "  ok  \n\n", "[2] (14:03:22) ok", "[3] ok"]) {
     it(`is true for ${JSON.stringify(prompt)}`, () => {
       assert.equal(isBareConfirmation(prompt), true);
     });
@@ -514,6 +514,14 @@ describe("isBareConfirmation", () => {
 // ── carryBareConfirm: a bare yes keeps the previous turn's flag ──────────
 
 describe("carryBareConfirm", () => {
+  beforeEach(() => {
+    process.env.NBHD_TAINT_CARRY_BARE_CONFIRM = "1";
+  });
+
+  afterEach(() => {
+    delete process.env.NBHD_TAINT_CARRY_BARE_CONFIRM;
+  });
+
   function makeFakeApi(pluginConfig) {
     const handlers = {};
     const warns = [];
@@ -535,7 +543,7 @@ describe("carryBareConfirm", () => {
       { prompt: "[Document attached: /workspace/doc.pdf]\nSummarize this." },
       { runId, sessionKey },
     );
-    api._handlers.agent_end({ runId });
+    api._handlers.agent_end({ messages: [], success: true }, { runId, sessionKey });
   }
 
   function nextTurn(api, { runId, sessionKey, prompt }) {
@@ -543,7 +551,7 @@ describe("carryBareConfirm", () => {
   }
 
   it("blocks an exfil tool after a bare ok in the same session, with the carried reason", () => {
-    const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+    const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "carry-1", sessionKey: "session-1" });
     nextTurn(api, { runId: "carry-2", sessionKey: "session-1", prompt: "ok" });
@@ -555,7 +563,7 @@ describe("carryBareConfirm", () => {
   });
 
   it("allows an exfil tool when the next message is a real sentence", () => {
-    const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+    const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "real-1", sessionKey: "session-2" });
     nextTurn(api, { runId: "real-2", sessionKey: "session-2", prompt: "Please post this to Reddit." });
@@ -564,13 +572,13 @@ describe("carryBareConfirm", () => {
   });
 
   it("keeps carrying through a chain of bare ok turns", () => {
-    const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+    const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "chain-1", sessionKey: "session-3" });
 
     nextTurn(api, { runId: "chain-2", sessionKey: "session-3", prompt: "ok" });
     assert.equal(api._handlers.before_tool_call(exfilEvent, { runId: "chain-2" })?.block, true);
-    api._handlers.agent_end({ runId: "chain-2" });
+    api._handlers.agent_end({ messages: [], success: true }, { runId: "chain-2", sessionKey: "session-3" });
 
     nextTurn(api, { runId: "chain-3", sessionKey: "session-3", prompt: "ok" });
     assert.equal(api._handlers.before_tool_call(exfilEvent, { runId: "chain-3" })?.block, true);
@@ -581,7 +589,7 @@ describe("carryBareConfirm", () => {
     let now = 1700000000000;
     Date.now = () => now;
     try {
-      const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+      const api = makeFakeApi({ mode: "enforce" });
       register(api);
       flaggedTurn(api, { runId: "ttl-1", sessionKey: "session-4" });
 
@@ -594,7 +602,7 @@ describe("carryBareConfirm", () => {
   });
 
   it("does NOT carry into a different session", () => {
-    const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+    const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "other-1", sessionKey: "session-5" });
     nextTurn(api, { runId: "other-2", sessionKey: "session-6", prompt: "ok" });
@@ -603,6 +611,7 @@ describe("carryBareConfirm", () => {
   });
 
   it("does nothing when carryBareConfirm is off", () => {
+    delete process.env.NBHD_TAINT_CARRY_BARE_CONFIRM;
     const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "off-1", sessionKey: "session-7" });
@@ -611,8 +620,27 @@ describe("carryBareConfirm", () => {
     assert.equal(api._handlers.before_tool_call(exfilEvent, { runId: "off-2" }), undefined);
   });
 
+  it("allows a later run in the same session with a real sentence after a real-shape agent_end", () => {
+    const api = makeFakeApi({ mode: "enforce" });
+    register(api);
+    api._handlers.before_agent_run(
+      { prompt: "[Document attached: /workspace/doc.pdf]\nSummarize this." },
+      { runId: "sentence-1", sessionKey: "session-9" },
+    );
+    api._handlers.agent_end(
+      { messages: [], success: true },
+      { runId: "sentence-1", sessionKey: "session-9" },
+    );
+
+    api._handlers.before_agent_run(
+      { prompt: "Please post this to Reddit." },
+      { runId: "sentence-2", sessionKey: "session-9" },
+    );
+    assert.equal(api._handlers.before_tool_call(exfilEvent, { runId: "sentence-2" }), undefined);
+  });
+
   it("logs only the run id on taint_carried, never the prompt text", () => {
-    const api = makeFakeApi({ mode: "enforce", carryBareConfirm: true });
+    const api = makeFakeApi({ mode: "enforce" });
     register(api);
     flaggedTurn(api, { runId: "log-1", sessionKey: "session-8" });
     nextTurn(api, { runId: "log-2", sessionKey: "session-8", prompt: "OK." });
