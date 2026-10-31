@@ -689,6 +689,7 @@ OPENCLAW_CRON_ENFORCEMENT_PLUGIN_PATH = env(
 # apply-pending-configs, no per-tenant migration. See the rollout plan in
 # docs/upload-security-threat-model.md.
 DOC_TAINT_GATE_MODE = env("DOC_TAINT_GATE_MODE", default="log_only")
+TAINT_CARRY_TENANT_IDS = env("TAINT_CARRY_TENANT_IDS", default="")
 COMPOSIO_REDDIT_AUTH_CONFIG_ID = env("COMPOSIO_REDDIT_AUTH_CONFIG_ID", default="")
 
 OPENCLAW_CONTAINER_SECRET_BACKEND = env(

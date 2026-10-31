@@ -35,6 +35,7 @@ from apps.orchestrator.tour_guide import (
     places_search_delivery_ready,
     tour_guide_delivery_ready,
 )
+from apps.router.chat_gates import _tenant_allowed
 from apps.tenants.models import Tenant
 
 # Per-file workspace bootstrap budget (chars). OpenClaw silently truncates each
@@ -3509,6 +3510,9 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
             env["NBHD_API_BASE_URL"] = api_base or ""
     except Exception:
         pass  # Don't break config generation if integration check fails
+
+    if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
+        config.setdefault("env", {})["NBHD_TAINT_CARRY_BARE_CONFIRM"] = "1"
 
     # OpenClaw >= 2026.4.15 auto-generates models.json with the wrong
     # OpenRouter base URL (/v1 instead of /api/v1). Inject the override.
