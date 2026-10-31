@@ -161,6 +161,7 @@ export default function register(api) {
     wrap({
       name: "nbhd_journal_template_update",
       description:
+        "Replace the user's daily-note template once they approve. " +
         "After reading the current template, showing the exact replacement sections, and getting explicit user agreement, replace the default daily-note template's complete sections list. This changes future notes only and never modifies existing journal notes.",
       parameters: {
         type: "object",

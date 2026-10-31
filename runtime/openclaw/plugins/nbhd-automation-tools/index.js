@@ -327,6 +327,7 @@ export default function register(api) {
     (toolContext) => wrap({
       name: "nbhd_cron_create_pure_reminder",
       description:
+        "Schedule a reminder that sends fixed text at a set time. " +
         "May require approval; never claim the scheduled task exists while approval is pending. " +
         "Create a scheduled REMINDER that sends a fixed text to the user at the scheduled time. Use this when the user asks to be reminded of something simple with no live state lookup needed (e.g. 'remind me to take out the trash every Tuesday at 8am', 'remind me at 3pm tomorrow to call Mom'). The text you provide will be sent verbatim — write it in second person as if the user is reading it. If the user wants a summary of something that changes (their fuel progress, their open tasks, etc.) use nbhd_cron_create_domain_summary instead. If the user wants you to quote their own words back to them, use nbhd_cron_create_quote_user_intent. This tool sends chat pings; it is NOT the Apple Reminders app. For datebook-ready tenants, prefer nbhd_datebook_add_apple_reminder for 'remind me' asks. Use this tool only when the user explicitly requests an in-chat ping, nudge, or message, or when recurring scheduled check-in content is inherently conversational.",
       parameters: {
@@ -368,6 +369,7 @@ export default function register(api) {
     (toolContext) => wrap({
       name: "nbhd_cron_create_quote_user_intent",
       description:
+        "Schedule a message that repeats the user's own words later. " +
         "May require approval; never claim the scheduled task exists while approval is pending. " +
         "Create a scheduled message that quotes the user's stored words back to them at the scheduled time. Use this when the user said something they want to be reminded of in their own words later (e.g. 'every Friday remind me about my cardiologist appointment Tuesday at 3pm'). Optionally specify refresh_facts_via to pull current calendar/tasks/etc. context at fire time so the assistant can frame the quote against today's state — but the user's verbatim words still appear in the outbound message.",
       parameters: {
@@ -426,6 +428,7 @@ export default function register(api) {
     (toolContext) => wrap({
       name: "nbhd_cron_create_domain_summary",
       description:
+        "Schedule a recurring summary of tasks, goals or calendar. " +
         "May require approval; never claim the scheduled task exists while approval is pending. " +
         "Create a scheduled summary of a specific domain's current state at fire time (tasks, goals, lessons, journal, calendar). Use this when the user wants a recurring rollup of state that changes over time (e.g. 'every Sunday show me my open tasks', 'every morning summarise my calendar for the day'). At fire time the assistant will call the query_tool first, then render the result. The query_tool must be from the supported set; render_block is the matching block type for that tool.",
       parameters: {

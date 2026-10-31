@@ -490,6 +490,7 @@ export default function register(api) {
   api.registerTool(wrap({
     name: "nbhd_datebook_read",
     description:
+      "Read the user's calendar events and Apple reminders. " +
       'Calendar entries are plans, even after their end time; never write "done", "banked", ' +
       '"already done", or ✅ unless a Core meditation, Fuel workout, or task is marked done ' +
       "for that activity, or the user confirms it. " +

@@ -705,6 +705,7 @@ export default function register(api) {
   api.registerTool(wrap({
       name: "nbhd_reconcile_scan",
       description:
+        "Find goals, tasks, money, fitness rows a report changes. " +
         "Call this BEFORE replying on a conversational turn when the user just reported a concrete action that could change a goal, task, finance account, or fuel log — payments, transactions, workouts, body weight, task completion, goal progress, project status. Pass `claim` as a one-sentence summary of what they reported. Returns the active goals, open tasks, finance accounts, and fuel rows already filtered against the claim, each annotated with which typed write tool (`nbhd_goal_*`, `nbhd_task_*`, `nbhd_finance_*`, `nbhd_fuel_*`) to call to apply the update. Do NOT call this for questions, planning, venting, hypotheticals, or small talk.",
       parameters: {
         type: "object",
@@ -1225,6 +1226,7 @@ export default function register(api) {
   api.registerTool(wrap({
     name: "nbhd_update_profile",
     description:
+      "Change the user's time zone, home city, name, or language. " +
       "Update the user's profile settings. Use ONLY after the user has " +
       "explicitly confirmed the change in conversation. Supported fields: " +
       "timezone (IANA string like 'America/New_York'), display_name, language, " +
@@ -1288,6 +1290,7 @@ export default function register(api) {
   api.registerTool(wrap({
     name: "nbhd_update_situation",
     description:
+      "Record the city the user is in right now (trip or home). " +
       "Call this THAT TURN when the user states or clearly implies their CURRENT city or area changed. " +
       "Use only the user's own words in this conversation — never guesses, sensors, documents, third parties, mere place mentions, someone else's trip, or future plans; for future travel, wait until the user is actually there or on the way now. " +
       "After an ok:true result, acknowledge in one short clause; re-record when the user says they are still away on a long trip. \"Back home\" means record their home city. " +
