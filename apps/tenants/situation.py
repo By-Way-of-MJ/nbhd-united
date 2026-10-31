@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Literal
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
@@ -16,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 OBSERVATION_WRITE_THROTTLE = timedelta(minutes=10)
 _MARKDOWN_SIGNIFICANT = frozenset("#*`[]()>|_~")
+
+
+@dataclass(frozen=True)
+class PlaceTz:
+    """What a stated place label resolves to for timezone guidance."""
+
+    kind: Literal["zone", "region", "unknown"]
+    tz: str = ""
 
 
 def _capture_enabled(tenant: Tenant) -> bool:
@@ -53,6 +66,107 @@ def is_assignable_profile_timezone(tz_name: str) -> bool:
     except (ZoneInfoNotFoundError, ValueError):
         return False
     return True
+
+
+def resolve_place_timezone(label: str) -> PlaceTz:
+    """Resolve a stated place label to a zone, a multi-zone region, or unknown.
+
+    One Open-Meteo geocoding lookup, cached by label. Never raises: any lookup,
+    cache, or shape failure is ``kind="unknown"`` so the caller can fall back
+    to the model's own judgement.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return PlaceTz(kind="unknown")
+    try:
+        return _lookup_place_timezone(label)
+    except Exception:
+        return PlaceTz(kind="unknown")
+
+
+def _normalize_place_text(value: object) -> str:
+    """Casefold ``value`` and strip accents so ``Uşak`` matches ``usak``."""
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def _lookup_place_timezone(label: str) -> PlaceTz:
+    from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
+
+    key = f"situation_place_tz:v3:{label.casefold()}"
+    cached = cache.get(key)
+    if isinstance(cached, PlaceTz):
+        return cached
+
+    name, _, qualifier = label.partition(",")
+    name = name.strip()
+    qualifier = qualifier.strip()
+    if not name:
+        return PlaceTz(kind="unknown")
+
+    url = f"{GEOCODE_URL}?{urlencode({'name': name, 'count': 10, 'language': 'en', 'format': 'json'})}"
+    with httpx.Client(timeout=httpx.Timeout(2.0, connect=1.0)) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+    raw_results = data.get("results") if isinstance(data, dict) else None
+    results = raw_results if isinstance(raw_results, list) else []
+
+    normalized_name = _normalize_place_text(name)
+    normalized_qualifier = _normalize_place_text(qualifier)
+    exact: list[dict] = []
+    for item in results:
+        if not isinstance(item, dict) or _normalize_place_text(item.get("name")) != normalized_name:
+            continue
+        if normalized_qualifier:
+            qualifiers = {
+                _normalize_place_text(value)
+                for value in (item.get("admin1"), item.get("country"), item.get("country_code"))
+            }
+            if normalized_qualifier not in qualifiers:
+                continue
+        exact.append(item)
+
+    administrative = [
+        item
+        for item in exact
+        if str(item.get("feature_code") or "").startswith("PCL") or item.get("feature_code") == "ADM1"
+    ]
+    if administrative:
+        admin_timezones = {str(item.get("timezone") or "") for item in administrative}
+        if len(admin_timezones) == 1:
+            admin_tz = next(iter(admin_timezones))
+            if is_assignable_profile_timezone(admin_tz):
+                result = PlaceTz(kind="zone", tz=admin_tz)
+            else:
+                result = PlaceTz(kind="region")
+        else:
+            result = PlaceTz(kind="region")
+    else:
+        kept: list[tuple[int, str]] = []
+        for item in exact:
+            feature_code = str(item.get("feature_code") or "")
+            if not feature_code.startswith("PPL"):
+                continue
+            tz_name = str(item.get("timezone") or "")
+            if not is_assignable_profile_timezone(tz_name):
+                continue
+            population = item.get("population")
+            if not isinstance(population, int) or isinstance(population, bool):
+                continue
+            kept.append((population, tz_name))
+
+        if not kept:
+            result = PlaceTz(kind="unknown")
+        else:
+            top_population, top_tz = max(kept, key=lambda place: place[0])
+            clear_winner = top_population >= 100_000 and all(
+                tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
+            )
+            result = PlaceTz(kind="zone", tz=top_tz) if clear_winner else PlaceTz(kind="unknown")
+
+    cache.set(key, result, GEOCODE_CACHE_SECONDS)
+    return result
 
 
 def _is_throttled(last_observed_at, observed_at) -> bool:
@@ -107,6 +221,26 @@ def record_place_observation(
         int(differs_home),
     )
     return changed
+
+
+def self_heal_profile_timezone(tenant: Tenant, device_tz: str) -> None:
+    """Adopt the device's IANA zone when the user still has the unset
+    'UTC' default — iOS is the only channel that knows ground truth, and
+    the auto-complete matcher buckets days by tenant tz, so an evening
+    workout under a wrong UTC default would land on tomorrow's date and
+    never match (the known 17/27-users-on-UTC latent bug)."""
+    if not device_tz or device_tz == "UTC":
+        return
+    user = getattr(tenant, "user", None)
+    if user is None or user.timezone != "UTC":
+        return
+    try:
+        ZoneInfo(device_tz)
+    except Exception:
+        return
+    user.timezone = device_tz
+    user.save(update_fields=["timezone"])
+    logger.info("Self-healed timezone for tenant %s from device_tz=%s", str(tenant.id)[:8], device_tz)
 
 
 def record_device_tz(

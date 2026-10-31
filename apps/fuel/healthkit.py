@@ -37,7 +37,6 @@ import math
 import threading
 from datetime import UTC, timedelta
 from decimal import Decimal
-from zoneinfo import ZoneInfo
 
 from django.db import IntegrityError, transaction
 from django.utils import timezone as dj_timezone
@@ -689,33 +688,13 @@ def _ingest_daily(tenant, item, tz) -> dict:
     return {"date": day.isoformat(), "status": "upserted"}
 
 
-def _maybe_self_heal_timezone(tenant, device_tz: str) -> None:
-    """Adopt the device's IANA zone when the user still has the unset
-    'UTC' default — iOS is the only channel that knows ground truth, and
-    the auto-complete matcher buckets days by tenant tz, so an evening
-    workout under a wrong UTC default would land on tomorrow's date and
-    never match (the known 17/27-users-on-UTC latent bug)."""
-    if not device_tz or device_tz == "UTC":
-        return
-    user = getattr(tenant, "user", None)
-    if user is None or user.timezone != "UTC":
-        return
-    try:
-        ZoneInfo(device_tz)
-    except Exception:
-        return
-    user.timezone = device_tz
-    user.save(update_fields=["timezone"])
-    logger.info("Self-healed timezone for tenant %s from device_tz=%s", str(tenant.id)[:8], device_tz)
-
-
 def ingest_healthkit_payload(tenant, payload: dict) -> dict:
     """Process one sync request. The view enforces caps/auth/gates and the
     signal-suppression contexts; this function owns the data work."""
-    device_tz = str(payload.get("device_tz") or "").strip()
-    _maybe_self_heal_timezone(tenant, device_tz)
+    from apps.tenants.situation import record_device_tz, self_heal_profile_timezone
 
-    from apps.tenants.situation import record_device_tz
+    device_tz = str(payload.get("device_tz") or "").strip()
+    self_heal_profile_timezone(tenant, device_tz)
 
     situation_changed = record_device_tz(
         tenant,

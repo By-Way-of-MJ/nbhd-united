@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import MagicMock, patch
 
+from django.core.cache import cache
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
@@ -11,7 +13,7 @@ from django.utils import timezone
 
 from apps.orchestrator.envelope_registry import suppress_refresh
 from apps.tenants.models import Tenant, User, UserSituation
-from apps.tenants.situation import record_device_tz, record_place_observation
+from apps.tenants.situation import PlaceTz, record_device_tz, record_place_observation, resolve_place_timezone
 
 
 class SituationServiceTests(TestCase):
@@ -149,3 +151,286 @@ class SituationServiceTests(TestCase):
         away_line = "\n".join(away_logs.output)
         self.assertIn("differs_home=1", away_line)
         self.assertNotIn("fukuoka", away_line.lower())
+
+
+class PlaceTimezoneResolveTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
+
+    @staticmethod
+    def _geocode_client(results: list[dict]) -> MagicMock:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": results}
+        client.get.return_value = response
+        return client
+
+    def test_non_assignable_timezone_is_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Nowhere",
+                    "feature_code": "PPL",
+                    "timezone": "Etc/GMT+5",
+                    "country_code": "XX",
+                    "population": 200000,
+                }
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Nowhere")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+        self.assertEqual(result.tz, "")
+
+    def test_empty_results_are_unknown(self):
+        client = self._geocode_client([])
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Atlantis")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+        self.assertEqual(result.tz, "")
+
+    def test_ambiguous_country_label_is_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Americana",
+                    "feature_code": "PPL",
+                    "timezone": "America/Sao_Paulo",
+                    "country_code": "BR",
+                    "population": 246655,
+                },
+                {
+                    "name": "America",
+                    "feature_code": "PPL",
+                    "timezone": "Europe/Amsterdam",
+                    "country_code": "NL",
+                    "population": 1175,
+                },
+                {
+                    "name": "América",
+                    "feature_code": "PPL",
+                    "timezone": "America/Argentina/Buenos_Aires",
+                    "country_code": "AR",
+                    "population": 13619,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("America")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+    def test_country_code_label_without_a_populous_exact_match_is_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Uşak",
+                    "feature_code": "PPLA",
+                    "timezone": "Europe/Istanbul",
+                    "country_code": "TR",
+                    "population": 369433,
+                },
+                {
+                    "name": "Usa",
+                    "feature_code": "PPLA2",
+                    "timezone": "Asia/Tokyo",
+                    "country_code": "JP",
+                    "population": None,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("USA")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+    def test_small_state_name_matches_are_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "California",
+                    "feature_code": "PPLA2",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "admin1": "Missouri",
+                    "population": 4396,
+                },
+                {
+                    "name": "California",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "admin1": "Pennsylvania",
+                    "population": 11857,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("California")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+    def test_two_populous_same_name_cities_are_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Springfield",
+                    "feature_code": "PPL",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "population": 170188,
+                },
+                {
+                    "name": "Springfield",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 154341,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Springfield")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+    def test_clear_populous_exact_match_wins(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Portland",
+                    "feature_code": "PPL",
+                    "timezone": "America/Los_Angeles",
+                    "country_code": "US",
+                    "population": 652503,
+                },
+                {
+                    "name": "Portland",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 66881,
+                },
+                {
+                    "name": "Portland",
+                    "feature_code": "PPL",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "population": 16116,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Portland")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="America/Los_Angeles"))
+
+    def test_qualified_match_below_the_population_floor_is_unknown(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Portland",
+                    "feature_code": "PPL",
+                    "timezone": "America/Los_Angeles",
+                    "country_code": "US",
+                    "admin1": "Oregon",
+                    "population": 652503,
+                },
+                {
+                    "name": "Portland",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "admin1": "Maine",
+                    "population": 66881,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Portland, Maine")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+    def test_qualified_country_match_wins_with_its_city(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Paris",
+                    "feature_code": "PPLC",
+                    "timezone": "Europe/Paris",
+                    "country_code": "FR",
+                    "admin1": "Île-de-France",
+                    "country": "France",
+                    "population": 2138551,
+                },
+                {
+                    "name": "Paris",
+                    "feature_code": "PPL",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "admin1": "Texas",
+                    "country": "United States",
+                    "population": 24782,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Paris, France")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="Europe/Paris"))
+
+    def test_country_is_a_region(self):
+        client = self._geocode_client(
+            [{"name": "United States", "feature_code": "PCLI", "timezone": None, "country_code": "US"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("United States")
+
+        self.assertEqual(result, PlaceTz(kind="region"))
+
+    def test_single_zone_country_resolves_to_its_zone(self):
+        client = self._geocode_client(
+            [{"name": "Japan", "feature_code": "PCLI", "timezone": "Asia/Tokyo", "country_code": "JP"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Japan")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="Asia/Tokyo"))
+
+    def test_country_with_null_timezone_resolves_to_region(self):
+        client = self._geocode_client(
+            [{"name": "Canada", "feature_code": "PCLI", "timezone": None, "country_code": "CA"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("Canada")
+
+        self.assertEqual(result, PlaceTz(kind="region"))
+
+    def test_exact_name_match_beats_a_smaller_partial_match(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                },
+                {
+                    "name": "York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 7864,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            result = resolve_place_timezone("New York")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="America/New_York"))

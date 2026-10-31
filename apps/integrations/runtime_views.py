@@ -147,6 +147,22 @@ _SITUATION_TZ_GUIDANCE = (
     "nbhd_update_profile with that place's Area/City timezone. When they are back home, "
     "offer to move them back the same way."
 )
+_SITUATION_TZ_UNKNOWN_GUIDANCE = (
+    f"{_SITUATION_TZ_GUIDANCE} "
+    "If the place is a country or a region with more than one time zone, ask which city they are in, "
+    "then call nbhd_update_situation again with that city."
+)
+_SITUATION_TZ_KNOWN_GUIDANCE = (
+    "This place is on {place_tz}; reminders and check-ins run on {profile_tz}. "
+    "In this same reply, ask once whether to move them to {place_tz}. "
+    "If yes, call nbhd_update_profile with timezone={place_tz}. "
+    "When they are back home, offer to move them back the same way."
+)
+_SITUATION_TZ_REGION_GUIDANCE = (
+    "That is a country or region with more than one time zone. In this same reply, "
+    "ask which city they are in. When they answer, call nbhd_update_situation again "
+    "with that city."
+)
 
 _JOURNAL_EGRESS_TEXT_FIELDS = frozenset(
     {
@@ -4034,7 +4050,7 @@ class RuntimeSituationUpdateView(APIView):
             return Response({"ok": False, "reason": "invalid_label"})
 
         from apps.orchestrator.envelope_registry import suppress_refresh
-        from apps.tenants.situation import record_place_observation
+        from apps.tenants.situation import record_place_observation, resolve_place_timezone
 
         # UserSituation is registry-wired for out-of-band writes, but this
         # request owns the explicit background push below. Suppress the model
@@ -4054,7 +4070,23 @@ class RuntimeSituationUpdateView(APIView):
         home_city = str(getattr(tenant.user, "location_city", "") or "").strip()
         if changed and (not home_city or place_label.casefold() != home_city.casefold()):
             profile_tz = str(getattr(tenant.user, "timezone", "") or "UTC")
-            guidance = f"{guidance} {_SITUATION_TZ_GUIDANCE.format(profile_tz=profile_tz)}"
+            place_tz = resolve_place_timezone(place_label)
+            kind = place_tz.kind
+            differs = kind == "zone" and place_tz.tz != profile_tz
+            logger.info(
+                "situation_place_tz tenant=%s kind=%s differs=%d",
+                str(tenant.id)[:8],
+                kind,
+                int(differs),
+            )
+            if differs:
+                guidance = (
+                    f"{guidance} {_SITUATION_TZ_KNOWN_GUIDANCE.format(place_tz=place_tz.tz, profile_tz=profile_tz)}"
+                )
+            elif kind == "region":
+                guidance = f"{guidance} {_SITUATION_TZ_REGION_GUIDANCE}"
+            elif kind == "unknown":
+                guidance = f"{guidance} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz=profile_tz)}"
         if (
             changed
             and home_city

@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
+from django.core.cache import cache
 from django.test import TestCase
 from django.test.utils import override_settings
 
@@ -12,7 +13,7 @@ from apps.journal.models import JournalEntry, WeeklyReview
 from apps.lessons.models import Lesson, StarJournalEntry, TutoringSession
 from apps.tenants.models import UserSituation
 from apps.tenants.services import create_tenant
-from apps.tenants.situation import is_assignable_profile_timezone
+from apps.tenants.situation import PlaceTz, is_assignable_profile_timezone
 from apps.tenants.test_utils import seed_internal_key
 
 from .models import Integration, SautaiMealPlanJob
@@ -38,6 +39,11 @@ _SITUATION_TZ_GUIDANCE = (
     "ask once whether to move their reminders and check-ins to local time; if yes, call "
     "nbhd_update_profile with that place's Area/City timezone. When they are back home, "
     "offer to move them back the same way."
+)
+_SITUATION_TZ_UNKNOWN_GUIDANCE = (
+    f"{_SITUATION_TZ_GUIDANCE} "
+    "If the place is a country or a region with more than one time zone, ask which city they are in, "
+    "then call nbhd_update_situation again with that city."
 )
 _TOUR_QUICK_REPLY_MARKER = "[[quick-replies: Things to do nearby]]"
 
@@ -111,6 +117,12 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.tenant.save(update_fields=["situational_context_enabled"])
         self.tenant.user.location_city = "Tokyo"
         self.tenant.user.save(update_fields=["location_city"])
+        resolver = patch(
+            "apps.tenants.situation.resolve_place_timezone",
+            return_value=PlaceTz(kind="unknown"),
+        )
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -142,7 +154,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         situation = UserSituation.objects.get(tenant=self.tenant)
@@ -163,7 +175,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         mock_push.reset_mock()
@@ -259,7 +271,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
                 "ok": True,
                 "changed": True,
                 "guidance": (
-                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')} "
                     f"{_SITUATION_NEW_TRIP_GUIDANCE}"
                 ),
             },
@@ -287,7 +299,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
                 "ok": True,
                 "changed": True,
                 "guidance": (
-                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')} "
+                    f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')} "
                     f"{_SITUATION_NEW_TRIP_GUIDANCE}"
                 ),
             },
@@ -313,7 +325,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
@@ -404,7 +416,7 @@ class RuntimeSituationUpdateViewTest(TestCase):
             {
                 "ok": True,
                 "changed": True,
-                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_GUIDANCE.format(profile_tz='UTC')}",
+                "guidance": f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
             },
         )
         self.tenant.user.refresh_from_db()
@@ -412,6 +424,186 @@ class RuntimeSituationUpdateViewTest(TestCase):
         self.assertEqual(self.tenant.user.location_lon, original_lon)
         self.assertEqual(UserSituation.objects.get(tenant=self.tenant).current_place_label, "Kyoto")
         mock_push.assert_called_once_with(self.tenant, trigger="place_observation")
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="shared-key")
+class RuntimeSituationPlaceTimezoneTest(TestCase):
+    """The situation endpoint turns a stated place into definite timezone guidance."""
+
+    def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.tenant = create_tenant(display_name="Place TZ", telegram_chat_id=828284)
+        seed_internal_key(self.tenant)
+        self.tenant.situational_context_enabled = True
+        self.tenant.save(update_fields=["situational_context_enabled"])
+        self.tenant.user.location_city = "Tokyo"
+        self.tenant.user.timezone = "UTC"
+        self.tenant.user.save(update_fields=["location_city", "timezone"])
+        push = patch("apps.orchestrator.workspace_envelope.push_user_md_in_background")
+        push.start()
+        self.addCleanup(push.stop)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "HTTP_X_NBHD_INTERNAL_KEY": "shared-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+        }
+
+    def _url(self) -> str:
+        return f"/api/v1/integrations/runtime/{self.tenant.id}/situation/"
+
+    def _post(self, place_label: str):
+        return self.client.post(
+            self._url(),
+            {"place_label": place_label},
+            content_type="application/json",
+            **self._headers(),
+        )
+
+    @staticmethod
+    def _geocode_client(results: list[dict]) -> MagicMock:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": results}
+        client.get.return_value = response
+        return client
+
+    def test_city_resolving_to_a_different_zone_appends_known_guidance(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("New York")
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertIn("This place is on America/New_York", guidance)
+        self.assertIn("timezone=America/New_York", guidance)
+
+    def test_city_resolving_to_the_profile_zone_appends_no_timezone_guidance(self):
+        self.tenant.user.timezone = "America/New_York"
+        self.tenant.user.save(update_fields=["timezone"])
+        client = self._geocode_client(
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("New York")
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertEqual(guidance, _SITUATION_CAPTURE_GUIDANCE)
+        self.assertNotIn("time zone", guidance.lower())
+        self.assertNotIn("timezone", guidance.lower())
+
+    def test_country_result_asks_which_city(self):
+        client = self._geocode_client(
+            [{"name": "United States", "feature_code": "PCLI", "timezone": None, "country_code": "US"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("United States")
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertIn("ask which city", guidance)
+        self.assertIn("country or region with more than one time zone", guidance)
+
+    def test_weak_match_appends_unknown_guidance(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Americana",
+                    "feature_code": "PPL",
+                    "timezone": "America/Sao_Paulo",
+                    "country_code": "BR",
+                    "population": 246655,
+                },
+                {
+                    "name": "America",
+                    "feature_code": "PPL",
+                    "timezone": "Europe/Amsterdam",
+                    "country_code": "NL",
+                    "population": 1175,
+                },
+                {
+                    "name": "América",
+                    "feature_code": "PPL",
+                    "timezone": "America/Argentina/Buenos_Aires",
+                    "country_code": "AR",
+                    "population": 13619,
+                },
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("America")
+
+        self.assertEqual(response.status_code, 200)
+        guidance = response.json()["guidance"]
+        self.assertEqual(
+            guidance,
+            f"{_SITUATION_CAPTURE_GUIDANCE} {_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz='UTC')}",
+        )
+        self.assertIn("ask which city", guidance)
+
+    def test_lookup_failure_falls_back_to_the_existing_guidance(self):
+        with patch("apps.tenants.situation.httpx.Client", side_effect=RuntimeError("boom")):
+            response = self._post("New York")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["ok"], True)
+        guidance = response.json()["guidance"]
+        self.assertIn(_SITUATION_TZ_UNKNOWN_GUIDANCE.format(profile_tz="UTC"), guidance)
+        self.assertIn("ask which city", guidance)
+
+    def test_repeated_label_uses_the_cached_lookup(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "New York",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 8804190,
+                }
+            ]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            first = self._post("New York")
+            UserSituation.objects.filter(tenant=self.tenant).delete()
+            second = self._post("New York")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(client.get.call_count, 1)
+
+    def test_home_city_does_not_look_up_a_timezone(self):
+        client = self._geocode_client(
+            [{"name": "Tokyo", "feature_code": "PPL", "timezone": "Asia/Tokyo", "country_code": "JP"}]
+        )
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            response = self._post("Tokyo")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["guidance"], _SITUATION_CAPTURE_GUIDANCE)
+        client.get.assert_not_called()
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="shared-key")
