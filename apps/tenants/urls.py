@@ -17,6 +17,7 @@ from .views import (
     CancelDeletionView,
     ConstellationSettingsView,
     DeleteAccountView,
+    DeviceTimezoneView,
     EntityRegistryBulkDeleteView,
     EntityRegistryItemView,
     EntityRegistryListView,
@@ -44,6 +45,7 @@ router.register("", TenantViewSet, basename="tenant")
 urlpatterns = [
     path("onboard/", OnboardTenantView.as_view(), name="tenant-onboard"),
     path("profile/", ProfileView.as_view(), name="user-profile"),
+    path("device-timezone/", DeviceTimezoneView.as_view(), name="device-timezone"),
     path("provisioning-status/", ProvisioningStatusView.as_view(), name="tenant-provisioning-status"),
     path("retry-provisioning/", RetryProvisioningView.as_view(), name="tenant-retry-provisioning"),
     path("personas/", PersonaListView.as_view(), name="persona-list"),

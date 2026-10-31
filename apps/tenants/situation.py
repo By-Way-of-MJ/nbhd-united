@@ -213,6 +213,26 @@ def record_place_observation(
     return changed
 
 
+def self_heal_profile_timezone(tenant: Tenant, device_tz: str) -> None:
+    """Adopt the device's IANA zone when the user still has the unset
+    'UTC' default — iOS is the only channel that knows ground truth, and
+    the auto-complete matcher buckets days by tenant tz, so an evening
+    workout under a wrong UTC default would land on tomorrow's date and
+    never match (the known 17/27-users-on-UTC latent bug)."""
+    if not device_tz or device_tz == "UTC":
+        return
+    user = getattr(tenant, "user", None)
+    if user is None or user.timezone != "UTC":
+        return
+    try:
+        ZoneInfo(device_tz)
+    except Exception:
+        return
+    user.timezone = device_tz
+    user.save(update_fields=["timezone"])
+    logger.info("Self-healed timezone for tenant %s from device_tz=%s", str(tenant.id)[:8], device_tz)
+
+
 def record_device_tz(
     tenant: Tenant,
     tz_name: object,

@@ -10,6 +10,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from apps.common.cache import tenant_cache
@@ -678,6 +679,58 @@ class ProfileView(APIView):
         response_data = dict(serializer.data)
         response_data["applied"] = applied_state
         return Response(response_data)
+
+
+class DeviceTimezoneHourThrottle(SimpleRateThrottle):
+    """Per-user rate limit for the app's open-time timezone report."""
+
+    scope = "device_tz_hour"
+    rate = "30/hour"
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+
+
+class DeviceTimezoneView(APIView):
+    """POST: record the phone's IANA zone outside the Apple Health sync.
+
+    HealthKit is the only other path a device zone reaches the server, so
+    users without Health sync never see the "move your reminders to local
+    time?" ask. The app reports its zone here when it opens.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [DeviceTimezoneHourThrottle]
+
+    def post(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if tenant is None:
+            return Response({"error": "no_tenant"}, status=status.HTTP_404_NOT_FOUND)
+
+        data = request.data if isinstance(request.data, dict) else None
+        device_tz = data.get("device_tz") if data is not None else None
+        if not isinstance(device_tz, str):
+            return Response({"error": "invalid_body"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.orchestrator.envelope_registry import suppress_refresh
+        from apps.orchestrator.workspace_envelope import TRIGGER_PLACE_OBSERVATION, push_user_md_in_background
+
+        from .situation import record_device_tz, self_heal_profile_timezone
+
+        # One explicit push owns this report: UserSituation and User are both
+        # registry-wired, so their per-row refresh would otherwise push a
+        # second USER.md for the same observation.
+        with suppress_refresh():
+            self_heal_profile_timezone(tenant, device_tz)
+            changed = record_device_tz(tenant, device_tz, "app")
+
+        if changed:
+            push_user_md_in_background(tenant, trigger=TRIGGER_PLACE_OBSERVATION)
+
+        logger.info("device_tz_report tenant=%s changed=%d", str(tenant.id)[:8], int(changed))
+        return Response({"ok": True, "changed": changed})
 
 
 def _sync_cron_row_timezones(tenant, new_tz: str) -> int:
