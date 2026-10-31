@@ -1221,6 +1221,17 @@ def _build_heartbeat_checkin_prompt(tenant) -> str:
             "Calendar — call `nbhd_datebook_read` with `days_ahead=0, entity='events'`, "
             "then check the returned times for events in the next 2-3 hours",
         )
+        from apps.router.chat_gates import _tenant_allowed
+
+        if _tenant_allowed(tenant, "HEARTBEAT_NUDGE_DEDUP_TENANT_IDS"):
+            prompt = prompt.replace(
+                "a. Send the user exactly ONE brief message via `nbhd_send_to_user`.\n",
+                "a. Send the user exactly ONE brief message via `nbhd_send_to_user`. If it is about one "
+                "calendar event or reminder from `nbhd_datebook_read`, start the message with "
+                "`[about: event:<id>]` or `[about: reminder:<id>]` using that item's `id`. The marker is "
+                "removed before the user sees it. If the tool result says `duplicate_suppressed`, you "
+                "already raised this today: do not resend it, reply `HEARTBEAT_OK` and STOP.\n",
+            )
     return _with_contextual_location_confirm_ask(
         prompt,
         tenant,

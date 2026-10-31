@@ -304,6 +304,19 @@ def _record_send(tenant_id: str) -> None:
 # — see apps/cron/patterns. Takes the rest of a marker-only line with it.
 _BLOCK_MARKER_RE = re.compile(r"\[block:\s*[a-z][a-z0-9_]*\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
 
+# ``[about: event:<id>]`` names what a heartbeat nudge is about. Always removed
+# before any transport, including malformed ones, so it can never reach a person.
+_ABOUT_MARKER_RE = re.compile(r"\[about:\s*([^\]\n]{0,100})\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
+_ABOUT_REF_RE = re.compile(r"(?:event|reminder):[0-9a-f-]{8,64}", re.IGNORECASE)
+
+
+def _about_occurrence_key(*, tenant, ref: str) -> str:
+    """One nudge per thing per tenant-local day."""
+    from apps.common.tenant_tz import tenant_today
+
+    material = f"{tenant.id}|about|{ref.strip().lower()}|{tenant_today(tenant)}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
 
 def _is_morning_briefing_send(*, tenant, job_name: str) -> bool:
     try:
@@ -584,6 +597,11 @@ class CronDeliveryView(APIView):
 
         insight_source_text = placeholder_message_text
         placeholder_message_text = INSIGHT_MARKER_RE.sub(lambda m: (m.group(2) or "").strip(), placeholder_message_text)
+        about_match = _ABOUT_MARKER_RE.search(placeholder_message_text)
+        about_ref = about_match.group(1).strip() if about_match is not None else ""
+        if not _ABOUT_REF_RE.fullmatch(about_ref):
+            about_ref = ""
+        placeholder_message_text = _ABOUT_MARKER_RE.sub("", placeholder_message_text).lstrip()
         # ``[block: <pattern>]`` is the typed-cron render marker. The prompt asks
         # for it and the runtime gate checks it BEFORE this send arrives; nothing
         # downstream reads it, so it is spent by the time we get here.
@@ -673,11 +691,17 @@ class CronDeliveryView(APIView):
             )
         # An explicit runtime provenance key deliberately opts into dedup even
         # when the tenant-wide degraded cron dedup feature flag is disabled.
-        if explicit_occurrence_key or _delivery_dedup_enabled(tenant):
-            occurrence_key = explicit_occurrence_key or degraded_occurrence_key(
-                tenant_id=tenant.id,
-                job_name=job_name,
-                fired_at=received_at,
+        about_occurrence_key = ""
+        if about_ref:
+            from apps.router.chat_gates import _tenant_allowed
+
+            if _tenant_allowed(tenant, "HEARTBEAT_NUDGE_DEDUP_TENANT_IDS"):
+                about_occurrence_key = _about_occurrence_key(tenant=tenant, ref=about_ref)
+        if explicit_occurrence_key or about_occurrence_key or _delivery_dedup_enabled(tenant):
+            occurrence_key = (
+                explicit_occurrence_key
+                or about_occurrence_key
+                or degraded_occurrence_key(tenant_id=tenant.id, job_name=job_name, fired_at=received_at)
             )
             delivery_attempt, duplicate_response = _claim_delivery_attempt(
                 tenant=tenant,

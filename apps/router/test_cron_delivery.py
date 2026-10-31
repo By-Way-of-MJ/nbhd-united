@@ -1138,3 +1138,152 @@ class MorningBriefingJournalFallbackTest(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "sent")
         self.assertIsNone(ProactiveOutbound.objects.get(tenant=self.tenant).journal_link)
+
+
+@override_settings(
+    TELEGRAM_BOT_TOKEN="test-token",
+    NBHD_INTERNAL_API_KEY="test-key",
+)
+class HeartbeatNudgeAboutDedupTest(TestCase):
+    """``[about: ...]`` marker dedup, gated per tenant by setting."""
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="heartbeat-about-dedup",
+            password="pass",
+            timezone="Asia/Tokyo",
+        )
+        self.user.telegram_chat_id = 12345
+        self.user.save(update_fields=["telegram_chat_id"])
+        self.tenant = Tenant.objects.create(user=self.user, status=Tenant.Status.ACTIVE)
+        seed_internal_key(self.tenant)
+        gate = override_settings(
+            HEARTBEAT_NUDGE_DEDUP_TENANT_IDS=str(self.tenant.id),
+            NBHD_DELIVERY_DEDUP_TENANTS="",
+        )
+        gate.enable()
+        self.addCleanup(gate.disable)
+        self.client = APIClient()
+        self.url = f"/api/v1/integrations/runtime/{self.tenant.id}/send-to-user/"
+        self.event_id = "7f3b2c1a-1111-4a2b-8c3d-123456789abc"
+        self.reminder_id = "9e8d7c6b-2222-4b3c-9d4e-abcdef123456"
+        self.fired_at = datetime(2026, 7, 31, 3, 17, 42, tzinfo=ZoneInfo("UTC"))
+        _rate_counts.clear()
+
+    def _headers(self, job_name="hourly-heartbeat"):
+        return {
+            "HTTP_X_NBHD_INTERNAL_KEY": "test-key",
+            "HTTP_X_NBHD_TENANT_ID": str(self.tenant.id),
+            "HTTP_X_NBHD_JOB_NAME": job_name,
+        }
+
+    def _post(self, message, *, fired_at=None):
+        with patch("apps.router.cron_delivery.timezone.now", return_value=fired_at or self.fired_at):
+            return self.client.post(
+                self.url,
+                {"message": message},
+                format="json",
+                **self._headers(),
+            )
+
+    def _successful_http(self, mock_client_cls):
+        mock_http = MagicMock()
+        mock_response = MagicMock()
+        mock_response.is_success = True
+        mock_response.status_code = 200
+        mock_response.text = ""
+        mock_response.json.return_value = {}
+        mock_http.post.return_value = mock_response
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+        return mock_http
+
+    @override_settings(HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="11111111-1111-1111-1111-111111111111")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_about_marker_sends_plain_text_when_tenant_not_allowed(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        response = self._post(f"[about: event:{self.event_id}] Hi")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_args.kwargs["json"]["text"], "Hi")
+        self.assertEqual(ProactiveOutbound.objects.get(tenant=self.tenant).message_text, "Hi")
+        self.assertFalse(DeliveryAttempt.objects.filter(tenant=self.tenant).exists())
+
+    @override_settings(HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="11111111-1111-1111-1111-111111111111")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_malformed_about_marker_sends_plain_text_when_tenant_not_allowed(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        response = self._post("[about: project:x] Hi")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_args.kwargs["json"]["text"], "Hi")
+        self.assertFalse(DeliveryAttempt.objects.filter(tenant=self.tenant).exists())
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_same_ref_twice_same_local_day_is_suppressed(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        message = f"[about: event:{self.event_id}] Calendar nudge"
+
+        first = self._post(message)
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING"):
+            duplicate = self._post(message)
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.json()["status"], "duplicate_suppressed")
+        self.assertEqual(mock_http.post.call_count, 1)
+        self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 1)
+        attempt = DeliveryAttempt.objects.get(tenant=self.tenant)
+        self.assertEqual(attempt.state, DeliveryAttempt.State.SENT)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_different_refs_both_send(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        event = self._post(f"[about: event:{self.event_id}] Event nudge")
+        reminder = self._post(f"[about: reminder:{self.reminder_id}] Reminder nudge")
+
+        self.assertEqual(event.json()["status"], "sent")
+        self.assertEqual(reminder.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+        self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 2)
+        self.assertEqual(DeliveryAttempt.objects.filter(tenant=self.tenant).count(), 2)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_same_ref_next_tenant_local_day_sends_again(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        message = f"[about: reminder:{self.reminder_id}] Reminder nudge"
+        # 23:30 and 00:30 Asia/Tokyo on consecutive local days; both are July 31 UTC.
+        late_first_day = datetime(2026, 7, 31, 14, 30, tzinfo=ZoneInfo("UTC"))
+        early_next_day = datetime(2026, 7, 31, 15, 30, tzinfo=ZoneInfo("UTC"))
+
+        first = self._post(message, fired_at=late_first_day)
+        second = self._post(message, fired_at=early_next_day)
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(second.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+        self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 2)
+        self.assertEqual(DeliveryAttempt.objects.filter(tenant=self.tenant).count(), 2)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_malformed_ref_is_stripped_and_always_sends(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        first = self._post("[about: project:x] Hi")
+        second = self._post("[about: project:x] Hi")
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(second.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_args.kwargs["json"]["text"], "Hi")
+        self.assertEqual(mock_http.post.call_count, 2)
+        self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 2)
+        self.assertFalse(DeliveryAttempt.objects.filter(tenant=self.tenant).exists())
