@@ -1287,3 +1287,58 @@ class HeartbeatNudgeAboutDedupTest(TestCase):
         self.assertEqual(mock_http.post.call_count, 2)
         self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 2)
         self.assertFalse(DeliveryAttempt.objects.filter(tenant=self.tenant).exists())
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_markdown_link_label_is_sent_unchanged(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        message = "See [about: the trip](https://example.com/a) now"
+
+        response = self._post(message)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(ProactiveOutbound.objects.get(tenant=self.tenant).message_text, message)
+        # Telegram renders the surviving markdown link; the label must be intact.
+        self.assertIn("about: the trip", mock_http.post.call_args.kwargs["json"]["text"])
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_inline_marker_is_sent_unchanged_without_attempt(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+        message = f"Note [about: event:{self.event_id}] here"
+
+        response = self._post(message)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_args.kwargs["json"]["text"], message)
+        self.assertFalse(DeliveryAttempt.objects.filter(tenant=self.tenant).exists())
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_marker_at_start_of_later_line_is_stripped(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        response = self._post(f"Line one\n[about: event:{self.event_id}] Line two")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_args.kwargs["json"]["text"], "Line one\nLine two")
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_tenant_on_both_lists_keeps_hourly_claim(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        with override_settings(NBHD_DELIVERY_DEDUP_TENANTS=str(self.tenant.id)):
+            first = self._post(f"[about: event:{self.event_id}] Calendar nudge")
+            with self.assertLogs("apps.router.cron_delivery", level="WARNING"):
+                second = self._post("Calendar nudge")
+
+        expected_key = degraded_occurrence_key(
+            tenant_id=self.tenant.id,
+            job_name="hourly-heartbeat",
+            fired_at=self.fired_at,
+        )
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["status"], "duplicate_suppressed")
+        self.assertEqual(mock_http.post.call_count, 1)
+        self.assertEqual(DeliveryAttempt.objects.get(tenant=self.tenant).occurrence_key, expected_key)

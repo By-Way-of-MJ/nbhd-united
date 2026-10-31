@@ -304,9 +304,12 @@ def _record_send(tenant_id: str) -> None:
 # — see apps/cron/patterns. Takes the rest of a marker-only line with it.
 _BLOCK_MARKER_RE = re.compile(r"\[block:\s*[a-z][a-z0-9_]*\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
 
-# ``[about: event:<id>]`` names what a heartbeat nudge is about. Always removed
-# before any transport, including malformed ones, so it can never reach a person.
-_ABOUT_MARKER_RE = re.compile(r"\[about:\s*([^\]\n]{0,100})\][ \t]*(?:—|:)?[ \t]*\n?", re.IGNORECASE)
+# ``[about: event:<id>]`` names what a heartbeat nudge is about. Only a marker
+# at the start of a line is removed; inline mentions and links are left alone.
+_ABOUT_MARKER_RE = re.compile(
+    r"^[ \t]*\[about:\s*([^\]\n]{0,100})\](?!\()[ \t]*(?:—|:)?[ \t]*\n?",
+    re.IGNORECASE | re.MULTILINE,
+)
 _ABOUT_REF_RE = re.compile(r"(?:event|reminder):[0-9a-f-]{8,64}", re.IGNORECASE)
 
 
@@ -692,7 +695,8 @@ class CronDeliveryView(APIView):
         # An explicit runtime provenance key deliberately opts into dedup even
         # when the tenant-wide degraded cron dedup feature flag is disabled.
         about_occurrence_key = ""
-        if about_ref:
+        # Tenants on NBHD_DELIVERY_DEDUP_TENANTS keep their hourly claim.
+        if about_ref and not _delivery_dedup_enabled(tenant):
             from apps.router.chat_gates import _tenant_allowed
 
             if _tenant_allowed(tenant, "HEARTBEAT_NUDGE_DEDUP_TENANT_IDS"):
