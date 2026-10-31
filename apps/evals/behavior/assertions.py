@@ -300,14 +300,15 @@ _TOKYO = "Asia/Tokyo"
 
 
 def _cron_row_timezones(tenant) -> list[str]:
-    """Every timezone a cron row of this tenant actually carries, re-read from the
-    DB (``data.schedule.tz``) — the same field ``_sync_cron_row_timezones`` moves.
-    Rows with no schedule clock (``at`` / ``every``) carry no ``tz`` and are
-    skipped: they have nothing to move."""
+    """Every timezone a ``managed=True`` cron row of this tenant actually carries,
+    re-read from the DB (``data.schedule.tz``) — the same rows/field
+    ``RuntimeProfileUpdateView`` moves on a profile timezone change. Unmanaged
+    (``managed=False``) rows are deliberately ignored: the tool never touches them,
+    so requiring them to match would fail a correctly-moved tenant."""
     from apps.cron.models import CronJob
 
     found: list[str] = []
-    for data in CronJob.objects.filter(tenant=tenant).values_list("data", flat=True):
+    for data in CronJob.objects.filter(tenant=tenant, managed=True).values_list("data", flat=True):
         schedule = (data or {}).get("schedule") if isinstance(data, dict) else None
         tz = schedule.get("tz") if isinstance(schedule, dict) else None
         if isinstance(tz, str) and tz:
@@ -316,15 +317,21 @@ def _cron_row_timezones(tenant) -> list[str]:
 
 
 def _check_timezone_is(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
-    """The profile timezone AND every cron row that carries a timezone equal the
-    expected IANA zone — re-read from the DB, never from the assistant's claim.
+    """The profile timezone AND every managed cron row that carries a timezone equal
+    the expected IANA zone — re-read from the DB, never from the assistant's claim.
 
     Both halves matter: the profile is what the container resolves relative dates
     with, and the cron rows are what actually fire reminders. A model that saves
     the profile but leaves reminders on the old zone has not moved the user's
     reminders. Detail names the ACTUAL values (bounded) so a red run is diagnosable.
+    While cron edits are fenced, the write the scenario is checking is refused at
+    the tool boundary, so report that state first instead of a misleading DB diff.
     """
+    from apps.orchestrator.migration_cron_fence import cron_edits_fenced
     from apps.tenants.models import User
+
+    if cron_edits_fenced(tenant):
+        return False, "cron_edits_fenced"
 
     expected = assertion.value
     actual_user_tz = User.objects.filter(pk=tenant.user_id).values_list("timezone", flat=True).first()
@@ -337,14 +344,14 @@ def _check_timezone_is(run: ScenarioRun, tenant, assertion: HardAssertion) -> tu
     return True, "tz_and_crons_match"
 
 
-_ASK_CITY = re.compile(r"(?i)\b(city|which part|where in)\b")
+_ASK_CITY = re.compile(r"(?i)\b(city|state|town|which part|where in|whereabouts|where are you)\b")
 
 
 def _check_asks_which_city(run: ScenarioRun, tenant, assertion: HardAssertion) -> tuple[bool, str]:
     """A country/region-level place ("in America") must NOT silently move the
-    profile: the profile timezone is still Tokyo and the last reply ASKS which city
-    (a question mark plus city/which part/where in). Guessing a zone for a
-    multi-zone country is exactly the failure this guards."""
+    profile: the profile timezone is still Tokyo and the last reply ASKS where the
+    user is (a question mark plus city/state/town/part/whereabouts phrasing).
+    Guessing a zone for a multi-zone country is exactly the failure this guards."""
     from apps.tenants.models import User
 
     actual_user_tz = User.objects.filter(pk=tenant.user_id).values_list("timezone", flat=True).first()

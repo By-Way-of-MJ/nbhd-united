@@ -307,15 +307,28 @@ def _driven_run(*replies: str) -> ScenarioRun:
     return run
 
 
-def _cron_with_tz(tenant: Tenant, tz: str | None) -> CronJob:
+def _cron_with_tz(
+    tenant: Tenant,
+    tz: str | None,
+    *,
+    kind: str = "cron",
+    managed: bool = True,
+) -> CronJob:
     """A legacy CronJob row whose ``data.schedule`` carries (or omits) a tz."""
-    schedule: dict = {"kind": "cron", "expr": "0 9 * * *"}
+    schedule: dict = {"kind": kind}
+    if kind == "cron":
+        schedule["expr"] = "0 9 * * *"
+    elif kind == "every":
+        schedule["every"] = "1h"
+    elif kind == "at":
+        schedule["at"] = "2026-11-03T15:00:00Z"
     if tz is not None:
         schedule["tz"] = tz
     return CronJob.objects.create(
         tenant=tenant,
         name=f"tz-{secrets.token_hex(4)}",
         creation_path="legacy",
+        managed=managed,
         data={"schedule": schedule},
     )
 
@@ -1018,6 +1031,17 @@ class RunBehaviorSuiteTest(TestCase):
         self.assertEqual(15 + PREWARM_DEADLINE_SECONDS + SUITE_BUDGET_SECONDS, 285)
         self.assertLessEqual(_scenario_worst_case_seconds(largest, will_judge=True), SUITE_BUDGET_SECONDS)
 
+    def test_worst_case_includes_setup_budget_only_when_a_setup_is_declared(self):
+        from apps.evals.suites.behavior import SETUP_BUDGET_SECONDS, _scenario_worst_case_seconds
+
+        without_setup = _scenario(scenario_id="plain", script=("one",))
+        with_setup = _scenario(scenario_id="seeded", script=("one",), setup="reset_timezone_tokyo")
+
+        plain = _scenario_worst_case_seconds(without_setup, will_judge=False)
+        seeded = _scenario_worst_case_seconds(with_setup, will_judge=False)
+        self.assertEqual(seeded - plain, SETUP_BUDGET_SECONDS)
+        self.assertEqual(SETUP_BUDGET_SECONDS, 20.0)
+
     def test_prewarm_failure_errors_before_any_scenario(self):
         class FailedPrewarmTransport(BenignTransport):
             def prewarm(self):
@@ -1241,6 +1265,26 @@ class TimezoneIsAssertionTest(TestCase):
         self.assertEqual(self.tenant.user.timezone, "UTC")  # stale in-memory copy
         self.assertEqual(self._check(), (True, "tz_and_crons_match"))
 
+    def test_ignores_unmanaged_rows_but_still_fails_a_managed_mismatch(self):
+        self._set_profile_tz("America/Chicago")
+        _cron_with_tz(self.tenant, "Asia/Tokyo", managed=False)
+        self.assertEqual(self._check(), (True, "tz_and_crons_match"))
+
+        managed = _cron_with_tz(self.tenant, "America/Chicago")
+        managed.data = {"schedule": {**managed.data["schedule"], "tz": "Asia/Tokyo"}}
+        managed.save()
+        passed, code = self._check()
+        self.assertFalse(passed)
+        self.assertEqual(code, "cron_row_tz=Asia/Tokyo")
+
+    def test_reports_the_fence_before_reading_the_db(self):
+        self._set_profile_tz("America/Chicago")
+        with mock.patch(
+            "apps.orchestrator.migration_cron_fence.cron_edits_fenced",
+            return_value=True,
+        ):
+            self.assertEqual(self._check(), (False, "cron_edits_fenced"))
+
 
 class AsksWhichCityAssertionTest(TestCase):
     """``asks_which_city``: country/region-level travel must keep Tokyo and ASK."""
@@ -1261,6 +1305,12 @@ class AsksWhichCityAssertionTest(TestCase):
 
     def test_passes_on_where_in_phrasing(self):
         self.assertEqual(self._check("Where in the US are you?"), (True, "asked_which_city"))
+
+    def test_passes_on_state_phrasing(self):
+        self.assertEqual(self._check("Which state are you in?"), (True, "asked_which_city"))
+
+    def test_passes_on_whereabouts_phrasing(self):
+        self.assertEqual(self._check("Whereabouts are you staying?"), (True, "asked_which_city"))
 
     def test_fails_without_a_question(self):
         passed, code = self._check("Noted — America. I'll leave your reminders as they are.")
@@ -1299,9 +1349,7 @@ class ResetTimezoneTokyoSetupTest(TestCase):
 
         chicago = _cron_with_tz(self.tenant, "America/Chicago")
         already_tokyo = _cron_with_tz(self.tenant, "Asia/Tokyo")
-        absolute = _cron_with_tz(self.tenant, None)  # an ``at``-style row: no tz to move
-        absolute.data = {"schedule": {"kind": "at", "at": "2026-11-03T15:00:00Z"}}
-        absolute.save()
+        absolute = _cron_with_tz(self.tenant, None, kind="at")  # managed, no tz yet
 
         now = dj_timezone.now()
         UserSituation.objects.create(
@@ -1317,16 +1365,20 @@ class ResetTimezoneTokyoSetupTest(TestCase):
             tz_offer_dismissed_for="America/Chicago",
         )
 
-        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md") as push:
+        with (
+            mock.patch("apps.orchestrator.services.update_tenant_config"),
+            mock.patch("apps.orchestrator.workspace_envelope.push_user_md") as push,
+        ):
             reset_timezone_tokyo(self.tenant)
 
         push.assert_called_once_with(self.tenant, force=True, trigger=TRIGGER_MANUAL)
 
         self.assertEqual(User.objects.get(pk=self.tenant.user_id).timezone, TOKYO)
-        # The ZONE moved on every recurring row; the absolute row is untouched.
+        # Any managed row moves — even an ``at`` row that carried no tz — exactly
+        # like RuntimeProfileUpdateView. An already-Tokyo row is left alone.
         self.assertEqual(CronJob.objects.get(pk=chicago.pk).data["schedule"]["tz"], TOKYO)
         self.assertEqual(CronJob.objects.get(pk=already_tokyo.pk).data["schedule"]["tz"], TOKYO)
-        self.assertNotIn("tz", CronJob.objects.get(pk=absolute.pk).data["schedule"])
+        self.assertEqual(CronJob.objects.get(pk=absolute.pk).data["schedule"]["tz"], TOKYO)
 
         situation = UserSituation.objects.get(tenant=self.tenant)
         self.assertEqual(situation.current_place_label, "")
@@ -1339,14 +1391,82 @@ class ResetTimezoneTokyoSetupTest(TestCase):
         self.assertEqual(situation.device_tz_source_device, "")
         self.assertEqual(situation.tz_offer_dismissed_for, "")
 
+    def test_moves_managed_every_and_at_rows_but_not_unmanaged_rows(self):
+        every = _cron_with_tz(self.tenant, "America/Chicago", kind="every")
+        at = _cron_with_tz(self.tenant, "America/Chicago", kind="at")
+        unmanaged = _cron_with_tz(self.tenant, "America/Chicago", kind="cron", managed=False)
+
+        with (
+            mock.patch("apps.orchestrator.services.update_tenant_config"),
+            mock.patch("apps.orchestrator.workspace_envelope.push_user_md"),
+        ):
+            reset_timezone_tokyo(self.tenant)
+
+        for row in (every, at):
+            row.refresh_from_db()
+            self.assertEqual(row.data["schedule"]["tz"], TOKYO)
+        unmanaged.refresh_from_db()
+        self.assertEqual(unmanaged.data["schedule"]["tz"], "America/Chicago")
+
+    def test_refreshes_config_after_writes_and_before_the_push(self):
+        from apps.orchestrator.workspace_envelope import TRIGGER_MANUAL
+
+        manager = mock.Mock()
+        with (
+            mock.patch.object(Tenant, "bump_pending_config", manager.bump_pending_config),
+            mock.patch("apps.orchestrator.services.update_tenant_config", manager.update_tenant_config),
+            mock.patch("apps.orchestrator.workspace_envelope.push_user_md", manager.push_user_md),
+        ):
+            reset_timezone_tokyo(self.tenant)
+
+        self.assertEqual(
+            manager.mock_calls,
+            [
+                mock.call.bump_pending_config(),
+                mock.call.update_tenant_config(str(self.tenant.id)),
+                mock.call.push_user_md(self.tenant, force=True, trigger=TRIGGER_MANUAL),
+            ],
+        )
+
+    def test_refuses_a_non_eval_tenant_without_writing(self):
+        Tenant.objects.filter(pk=self.tenant.pk).update(is_eval_sink=False)
+        self.tenant.refresh_from_db()
+        cron = _cron_with_tz(self.tenant, "America/Chicago")
+        situation = UserSituation.objects.create(
+            tenant=self.tenant,
+            current_place_label="Chicago",
+            current_place_source="app",
+        )
+
+        with (
+            mock.patch.object(Tenant, "bump_pending_config") as bump,
+            mock.patch("apps.orchestrator.services.update_tenant_config") as update,
+            mock.patch("apps.orchestrator.workspace_envelope.push_user_md") as push,
+            self.assertRaisesRegex(RuntimeError, "refuses a non-eval tenant"),
+        ):
+            reset_timezone_tokyo(self.tenant)
+
+        bump.assert_not_called()
+        update.assert_not_called()
+        push.assert_not_called()
+        self.assertEqual(User.objects.get(pk=self.tenant.user_id).timezone, "America/Chicago")
+        cron.refresh_from_db()
+        self.assertEqual(cron.data["schedule"]["tz"], "America/Chicago")
+        situation.refresh_from_db()
+        self.assertEqual(situation.current_place_label, "Chicago")
+
     def test_creates_no_situation_row_when_none_exists(self):
-        with mock.patch("apps.orchestrator.workspace_envelope.push_user_md"):
+        with (
+            mock.patch("apps.orchestrator.services.update_tenant_config"),
+            mock.patch("apps.orchestrator.workspace_envelope.push_user_md"),
+        ):
             reset_timezone_tokyo(self.tenant)
         self.assertFalse(UserSituation.objects.filter(tenant=self.tenant).exists())
         self.assertEqual(User.objects.get(pk=self.tenant.user_id).timezone, TOKYO)
 
     def test_propagates_push_failure_so_the_suite_records_it(self):
         with (
+            mock.patch("apps.orchestrator.services.update_tenant_config"),
             mock.patch(
                 "apps.orchestrator.workspace_envelope.push_user_md",
                 side_effect=RuntimeError("container unreachable"),
@@ -1467,7 +1587,7 @@ class OnlySelectionTest(TestCase):
         self.assertEqual(len(bad_rows), 1)
         self.assertFalse(bad_rows[0].passed)
         self.assertEqual(bad_rows[0].details["assertion"], "setup")
-        self.assertEqual(bad_rows[0].details["code"], "setup:RuntimeError")
+        self.assertEqual(bad_rows[0].details["code"], "RuntimeError")
 
 
 # --------------------------------------------------------------------------- #
@@ -1528,6 +1648,26 @@ class RunBehaviorScenariosCommandTest(TestCase):
                 "timezone_country_asks_city PASS asks_which_city:asked_which_city",
             ],
         )
+
+    def test_prints_a_setup_failure_with_a_single_setup_prefix(self):
+        tenant = _synthetic_tenant()
+
+        def boom(_tenant):
+            raise RuntimeError("control plane unavailable")
+
+        out = mock.MagicMock()
+        with (
+            override_settings(EVAL_BEHAVIOR_TENANT_ID=str(tenant.id)),
+            mock.patch(
+                "apps.evals.suites.behavior.build_behavior_transport",
+                return_value=BenignTransport(),
+            ),
+            mock.patch.dict(SETUPS, {"reset_timezone_tokyo": boom}),
+        ):
+            call_command("run_behavior_scenarios", "timezone_country_asks_city", stdout=out)
+
+        lines = [call.args[0].rstrip("\n") for call in out.write.call_args_list]
+        self.assertEqual(lines, ["timezone_country_asks_city FAIL setup:RuntimeError"])
 
 
 # --------------------------------------------------------------------------- #

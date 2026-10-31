@@ -9,8 +9,8 @@ hard assertions read green (or red) for the wrong reason.
 
 Contract:
   * Hooks receive the ``Tenant`` and return ``None``. They may raise — the suite
-    catches the exception and records the scenario as FAILED with reason
-    ``setup:<error>`` (never a silent skip, INVARIANT #3).
+    catches the exception and records the scenario as FAILED with the exception
+    type as the code (never a silent skip, INVARIANT #3).
   * Hooks write only control-plane state (profile + situation + cron rows) and
     issue ONE explicit synchronous USER.md push, so the container sees the reset
     state before the scenario's first turn.
@@ -35,31 +35,47 @@ def reset_timezone_tokyo(tenant) -> None:
     previous run (or a real user of the synthetic tenant) left behind. Applies:
 
       * ``user.timezone = "Asia/Tokyo"`` — saves ONLY that field;
-      * every recurring (``data.schedule.kind == "cron"``) CronJob row onto
-        Tokyo, via the SAME helper the profile endpoint uses
-        (``apps.tenants.views._sync_cron_row_timezones`` — imported, never
-        reimplemented, so a fix there reaches this hook too);
+      * every ``managed=True`` CronJob row onto Tokyo, exactly as
+        ``RuntimeProfileUpdateView`` does after a profile timezone change: the
+        row's ``data.schedule.tz`` moves regardless of schedule kind (``cron``,
+        ``every`` or ``at``), and rows already on Tokyo are left alone;
       * clears the travel situation so an old run's place/device observation
         cannot pre-answer the "move to local time?" question: the current-place
         fields, ``tz_offer_dismissed_for`` and the device-timezone fields (see
         ``apps.tenants.models.UserSituation``);
+      * refreshes the container config (``bump_pending_config`` +
+        ``update_tenant_config``) so the agent picks up the Tokyo profile before
+        the first turn — same sequence as the runtime view;
       * one explicit synchronous USER.md push, so the container reads Tokyo
         before the first turn. Writes are wrapped in ``suppress_refresh`` (same
         pattern as ``DeviceTimezoneView``) so the registry-wired
         ``User``/``UserSituation`` saves do not each push their own
         stale-by-a-beat envelope.
     """
+    if not tenant.is_eval_sink:
+        raise RuntimeError("reset_timezone_tokyo refuses a non-eval tenant")
+
+    from apps.cron.models import CronJob
     from apps.orchestrator.envelope_registry import suppress_refresh
     from apps.orchestrator.workspace_envelope import TRIGGER_MANUAL, push_user_md
     from apps.tenants.models import UserSituation
-    from apps.tenants.views import _sync_cron_row_timezones
 
     user = tenant.user
     with suppress_refresh():
         user.timezone = TOKYO
         user.save(update_fields=["timezone"])
 
-        moved = _sync_cron_row_timezones(tenant, TOKYO)
+        moved = 0
+        for row in CronJob.objects.filter(tenant=tenant, managed=True):
+            data = dict(row.data or {})
+            sched = dict(data.get("schedule") or {})
+            if sched.get("tz") == TOKYO:
+                continue
+            sched["tz"] = TOKYO
+            data["schedule"] = sched
+            row.data = data
+            row.save(update_fields=["data", "updated_at"])
+            moved += 1
 
         # Queryset.update() writes the reset row without firing the registry's
         # post_save push — the explicit push below is the only one for this reset.
@@ -74,6 +90,14 @@ def reset_timezone_tokyo(tenant) -> None:
             device_tz_source_device="",
             tz_offer_dismissed_for="",
         )
+
+    # Same post-timezone-change config refresh as RuntimeProfileUpdateView. Let
+    # failures propagate: the suite records a setup failure instead of silently
+    # driving the scenario against a container that still holds the old zone.
+    tenant.bump_pending_config()
+    from apps.orchestrator.services import update_tenant_config
+
+    update_tenant_config(str(tenant.id))
 
     # TRIGGER_MANUAL: an operator/eval-driven reset, and it is a
     # forced-freshness trigger (apps.orchestrator.workspace_envelope), so the

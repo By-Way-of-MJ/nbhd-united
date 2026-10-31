@@ -1,8 +1,8 @@
-# "I'm in America" names a multi-zone COUNTRY, not a city. Silently picking a
-# US zone (or moving the profile at all) is the failure this guards: the assistant
-# must keep the Tokyo profile and ask which city the user is in.
-# setup puts the tenant on Asia/Tokyo first so "still Tokyo" is a meaningful
-# assertion even after a previous run left another zone behind.
+# This tenant is an eval sink, so nbhd_update_situation returns
+# situational_context_disabled (runtime_views.py ~4037) and the server's "ask
+# which city" guidance never reaches the model. This scenario probes the model's
+# own behavior: it must not silently move the profile to a guessed zone, and it
+# should ask where exactly the user is.
 id: timezone_country_asks_city
 persona: >
   A casual traveler who mentions they are in America for a few weeks but gives no

@@ -104,6 +104,12 @@ MAX_JUDGED_SCENARIOS_PER_RUN = 12
 # control plane sicker than that is already failing the turns themselves.
 SCOPE_OPEN_BUDGET_SECONDS = 5.0
 
+# A scenario with a ``setup`` hook runs control-plane writes (profile + situation
+# + managed cron rows), a config refresh, and a synchronous USER.md push before its
+# first turn. Reserve a bounded allowance so budget gating accounts for that work
+# instead of starting a scenario it cannot finish inside the ceiling.
+SETUP_BUDGET_SECONDS = 20.0
+
 # Sentinel distinguishing "caller did not pass a judge → build the default" from
 # "caller explicitly passed ``judge=None`` → force judge-off (skip soft dims)".
 _JUDGE_UNSET = object()
@@ -160,10 +166,13 @@ def _drive_scenario(scenario: Scenario, transport: BehaviorTransport) -> Scenari
 
 
 def _scenario_worst_case_seconds(scenario: Scenario, *, will_judge: bool) -> float:
-    """Worst-case wall clock for one scenario: the fresh-scope open, the sum of its
-    per-turn poll deadlines, plus (when it would be judged) the judge call's
-    timeout. Used to gate STARTING a scenario against the remaining run budget."""
+    """Worst-case wall clock for one scenario: the fresh-scope open, the optional
+    setup hook's control-plane/config/push work, the sum of its per-turn poll
+    deadlines, plus (when it would be judged) the judge call's timeout. Used to gate
+    STARTING a scenario against the remaining run budget."""
     total = SCOPE_OPEN_BUDGET_SECONDS  # a fresh conversation scope is opened first
+    if scenario.setup:
+        total += SETUP_BUDGET_SECONDS
     total += len(scenario.script) * DEFAULT_DEADLINE_SECONDS
     if will_judge:
         total += float(JUDGE_TIMEOUT_SECONDS)
@@ -257,8 +266,9 @@ def _record_setup_failed(run: EvalRun, scenario: Scenario, code: str) -> None:
 
     ``kind='hard'`` so it fails the run (a scenario that could not be put in its
     asserted-from state proved nothing), with ``isolated=False``: no conversation
-    scope was opened because no turn was ever driven. ``code`` is the machine label
-    ``setup:<ErrorType>`` — never the exception message (which could carry data).
+    scope was opened because no turn was ever driven. ``code`` is the exception's
+    type name (e.g. ``RuntimeError``) — never the exception message (which could
+    carry data). The ``setup`` assertion name supplies the printed prefix.
     """
     record(
         run,
@@ -349,8 +359,8 @@ def run_behavior_suite(
     budget behavior exactly as before.
 
     Every scenario's optional ``setup`` hook runs right before its turns are
-    driven; a setup that raises records the scenario FAILED with the
-    ``setup:<error>`` code and moves on (never a silent skip, INVARIANT #3).
+    driven; a setup that raises records the scenario FAILED with the exception
+    type as its code and moves on (never a silent skip, INVARIANT #3).
     """
     with record_run(SUITE, trigger) as run:  # runtime suite → image_tag auto-infers the fleet tag
         tenant = resolve_behavior_tenant()
@@ -359,7 +369,6 @@ def run_behavior_suite(
             # Zero scenarios would record zero cases → a vacuous 'error' close. Fail
             # loudly with a clear cause instead (INVARIANT #3).
             raise BehaviorConfigError("no behavior scenarios found — the suite would assert nothing")
-        scenarios_to_run = _select_only(scenario_list, only) if only is not None else scenario_list
 
         active_transport = transport if transport is not None else build_behavior_transport(tenant)
         active_judge: Judge | None = build_default_judge() if judge is _JUDGE_UNSET else judge
@@ -377,7 +386,7 @@ def run_behavior_suite(
         else:
             # Explicit selection: the caller's order, cursor left at NULL.
             cursor_before = None
-            rotated_scenarios = scenarios_to_run
+            rotated_scenarios = _select_only(scenario_list, only)
         t0 = time.monotonic()
         judged_count = 0
         drove_any = False
@@ -419,7 +428,7 @@ def run_behavior_suite(
                         scenario.setup,
                         scenario.id,
                     )
-                    _record_setup_failed(run, scenario, f"setup:{type(exc).__name__}")
+                    _record_setup_failed(run, scenario, type(exc).__name__)
                     # Count it as handled so the rotation moves PAST a persistently
                     # failing setup instead of retrying it first on every fire.
                     drove_any = True
