@@ -173,6 +173,49 @@ class JevHeartbeatShadowTests(TestCase):
         self.decide.assert_called_once()
         send.assert_not_called()
 
+    def test_result_keeps_every_option_score(self):
+        self._state()
+        probabilities = {
+            "nothing": 0.1,
+            "prep_upcoming": 0.2,
+            "due_commitment": 0.3,
+            "time_sensitive_today": 0.4,
+        }
+        self.decide.return_value = type(
+            "MockDecision",
+            (),
+            {
+                "answers": {
+                    "worth": jev.ChoiceAnswer(
+                        type="choice",
+                        choice="time_sensitive_today",
+                        probabilities=probabilities,
+                        confidence=0.0,
+                    )
+                }
+            },
+        )()
+        result = run_shadow_for_tenant(self.tenant)
+        self.assertEqual(result.p, 0.4)
+        self.assertEqual(result.p_nothing, 0.1)
+        self.assertEqual(result.p_prep_upcoming, 0.2)
+        self.assertEqual(result.p_due_commitment, 0.3)
+        self.assertEqual(result.p_time_sensitive_today, 0.4)
+
+    def test_log_line_contains_every_option_score(self):
+        self._state()
+        self.decide.return_value = answer(choice="time_sensitive_today", p=0.4)
+        with (
+            override_settings(**{FLAG: "*"}),
+            self.assertLogs("apps.orchestrator.jev_heartbeat_shadow", level="INFO") as logs,
+        ):
+            jev_heartbeat_shadow_task()
+        output = "\n".join(logs.output)
+        self.assertIn("p_nothing=0.200", output)
+        self.assertIn("p_prep=0.200", output)
+        self.assertIn("p_due=0.200", output)
+        self.assertIn("p_time=0.400", output)
+
     def test_log_line_is_content_free(self):
         self._state()
         with (
