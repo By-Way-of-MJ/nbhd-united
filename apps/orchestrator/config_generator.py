@@ -2218,7 +2218,7 @@ def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
                 ),
             },
             "delivery": {"mode": "none"},
-            "enabled": True,
+            "enabled": False,
         },
         {
             "name": "Weekly Reflection",

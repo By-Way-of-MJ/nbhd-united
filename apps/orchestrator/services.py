@@ -2428,6 +2428,8 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
                     {"jobId": gateway_job_id},
                 )
                 replacement = dict(desired)
+                if name == "Personal Question":
+                    replacement["enabled"] = bool(existing.get("enabled", False))
                 if name in SEND_TEST_MANAGED_JOBS:
                     replacement["payload"] = desired_payload
                 invoke_gateway_tool(tenant, "cron.add", {"job": replacement})

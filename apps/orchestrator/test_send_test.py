@@ -30,6 +30,37 @@ class SendTestRefreshTests(TestCase):
     def rows(self):
         return {j.name: j for j in CronJob.objects.filter(tenant=self.tenant)}
 
+    def test_personal_question_seed_disabled_and_refresh_never_enables_it(self):
+        from apps.cron.share_cron_sync import _desired_jobs
+        from apps.orchestrator.cron_reconcile import _row_to_cron_dict
+
+        row = self.rows()["Personal Question"]
+        self.assertFalse(row.enabled)
+        self.assertFalse(row.data["enabled"])
+        self.assertNotIn("Personal Question", SEND_TEST_JOBS)
+        refresh_system_cron_rows_from_seed(self.tenant)
+        row.refresh_from_db()
+        self.assertFalse(row.enabled)
+        self.assertFalse(_row_to_cron_dict(row)["enabled"])
+        self.assertNotIn("Personal Question", {j["name"] for j in _desired_jobs(self.tenant)})
+
+    def test_runtime_prompt_replacement_preserves_disabled_personal_question(self):
+        jobs = copy.deepcopy(build_cron_seed_jobs(self.tenant))
+        for i, job in enumerate(jobs):
+            job["id"] = f"local-{i}"
+        personal = next(j for j in jobs if j["name"] == "Personal Question")
+        personal["enabled"] = False
+        personal["payload"]["model"] = "openrouter/old-model"
+        with patch("apps.orchestrator.services.invoke_gateway_tool", return_value={"jobs": jobs}) as gateway:
+            update_system_cron_prompts(self.tenant)
+        replacements = [
+            c.args[2]["job"]
+            for c in gateway.call_args_list
+            if c.args[1] == "cron.add" and c.args[2]["job"]["name"] == "Personal Question"
+        ]
+        self.assertEqual(len(replacements), 1)
+        self.assertFalse(replacements[0]["enabled"])
+
     def test_flag_flip_converges_once_and_reverts_without_drift(self):
         before = {name: copy.deepcopy(row.data) for name, row in self.rows().items()}
         with override_settings(SEND_TEST_TENANT_IDS="*"):
