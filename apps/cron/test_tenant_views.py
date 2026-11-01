@@ -15,6 +15,7 @@ from apps.cron.tenant_views import (
     _strip_phase2_block,
     _wrap_message_with_phase2,
 )
+from apps.orchestrator.config_generator import PHASE2_SYNC_MARKER
 from apps.tenants.models import Tenant, User
 from apps.tenants.test_utils import seed_internal_key
 
@@ -56,6 +57,24 @@ class CronJobListCreateTest(TestCase):
         mock_invoke.assert_called_once_with(self.tenant, "cron.list", {})
 
     @patch("apps.cron.tenant_views.invoke_gateway_tool")
+    def test_list_marks_jobs_foreground_without_phase2_marker(self, mock_invoke):
+        """After the Phase 2 retirement, every visible job reports foreground."""
+        mock_invoke.return_value = {
+            "jobs": [
+                {
+                    "name": "Morning Briefing",
+                    "enabled": True,
+                    "payload": {"kind": "agentTurn", "message": "plain prompt"},
+                },
+            ],
+        }
+        resp = self.client.get("/api/v1/cron-jobs/")
+        self.assertEqual(resp.status_code, 200)
+        job = resp.json()["jobs"][0]
+        self.assertNotIn(PHASE2_SYNC_MARKER, job["payload"]["message"])
+        self.assertIs(job["foreground"], True)
+
+    @patch("apps.cron.tenant_views.invoke_gateway_tool")
     def test_create_cron_job(self, mock_invoke):
         # First call: cron.list (cap check), second call: cron.add
         mock_invoke.side_effect = [
@@ -76,17 +95,18 @@ class CronJobListCreateTest(TestCase):
         # First call: cap check
         self.assertEqual(mock_invoke.call_args_list[0][0][1], "cron.list")
         # Second call: actual create — must be normalized to isolated/agentTurn
-        # and message must be wrapped with the Phase 2 sync block (foreground default)
+        # and the message must stay free of the retired Phase 2 sync block
+        # (foreground defaults to True, but the wrapper is strip-only).
         self.assertEqual(mock_invoke.call_args_list[1][0][1], "cron.add")
         created_job = mock_invoke.call_args_list[1][0][2]["job"]
         self.assertEqual(created_job["name"], "New Job")
         self.assertEqual(created_job["sessionTarget"], "isolated")
         self.assertNotIn("wakeMode", created_job)
         self.assertEqual(created_job["payload"]["kind"], "agentTurn")
-        # Phase 2 sync block should be appended (foreground default = True)
-        self.assertIn("nbhd_cron_phase2_summary", created_job["payload"]["message"])
-        self.assertIn('"New Job"', created_job["payload"]["message"])
-        self.assertIn("do thing", created_job["payload"]["message"])
+        message = created_job["payload"]["message"]
+        self.assertNotIn(PHASE2_SYNC_MARKER, message)
+        self.assertNotIn("nbhd_cron_phase2_summary", message)
+        self.assertIn("do thing", message)
 
     @patch("apps.cron.tenant_views.invoke_gateway_tool")
     def test_create_cron_job_background_skips_phase2_wrap(self, mock_invoke):
@@ -519,8 +539,8 @@ class CronJobUpdateSnapshotFallbackTest(TestCase):
         self.assertNotIn("foreground", created_job)
 
     @patch("apps.cron.tenant_views.invoke_gateway_tool")
-    def test_foreground_toggle_on_appends_phase2_block(self, mock_invoke):
-        """PATCH {foreground: true} on a background job must append the Phase 2 block."""
+    def test_foreground_toggle_on_does_not_append_phase2_block(self, mock_invoke):
+        """PATCH {foreground: true} on a background job must NOT re-add the block."""
         mock_invoke.side_effect = [
             {
                 "jobs": [
@@ -545,9 +565,9 @@ class CronJobUpdateSnapshotFallbackTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         created_job = mock_invoke.call_args_list[2][0][2]["job"]
         msg = created_job["payload"]["message"]
-        self.assertIn("nbhd_cron_phase2_summary", msg)
-        self.assertIn('"My Task"', msg)
-        self.assertTrue(msg.startswith("quiet maintenance"))
+        self.assertEqual(msg, "quiet maintenance")
+        self.assertNotIn(PHASE2_SYNC_MARKER, msg)
+        self.assertNotIn("nbhd_cron_phase2_summary", msg)
 
     @patch("apps.cron.tenant_views.invoke_gateway_tool")
     def test_update_existing_job_still_uses_delete_recreate(self, mock_invoke):
@@ -700,22 +720,25 @@ class NormalizationHelperTest(SimpleTestCase):
 class Phase2WrapHelperTest(SimpleTestCase):
     """Unit tests for _wrap_message_with_phase2 / _strip_phase2_block."""
 
-    def test_foreground_appends_block(self):
-        wrapped = _wrap_message_with_phase2("base prompt", "Test Job", foreground=True)
-        self.assertTrue(wrapped.startswith("base prompt"))
-        self.assertIn("FINAL STEP", wrapped)
-        self.assertIn("nbhd_cron_phase2_summary", wrapped)
-        self.assertIn('"Test Job"', wrapped)
+    @staticmethod
+    def _legacy_wrapped(message: str) -> str:
+        return message + "\n\n---\n**" + PHASE2_SYNC_MARKER + ":**\nlegacy wrapper content"
 
-    def test_foreground_idempotent(self):
+    def test_foreground_does_not_append_block(self):
+        wrapped = _wrap_message_with_phase2("base prompt", "Test Job", foreground=True)
+        self.assertEqual(wrapped, "base prompt")
+        self.assertNotIn(PHASE2_SYNC_MARKER, wrapped)
+        self.assertNotIn("nbhd_cron_phase2_summary", wrapped)
+
+    def test_foreground_strip_only_is_idempotent(self):
         once = _wrap_message_with_phase2("base", "Test Job", foreground=True)
         twice = _wrap_message_with_phase2(once, "Test Job", foreground=True)
-        self.assertEqual(once, twice)
-        # Marker should appear exactly once
-        self.assertEqual(twice.count("FINAL STEP — conditional sync"), 1)
+        self.assertEqual(once, "base")
+        self.assertEqual(twice, "base")
+        self.assertEqual(twice.count(PHASE2_SYNC_MARKER), 0)
 
     def test_background_strips_existing_block(self):
-        wrapped = _wrap_message_with_phase2("base", "Test Job", foreground=True)
+        wrapped = self._legacy_wrapped("base")
         self.assertTrue(_message_has_phase2_marker(wrapped))
         unwrapped = _wrap_message_with_phase2(wrapped, "Test Job", foreground=False)
         self.assertEqual(unwrapped, "base")
@@ -730,8 +753,8 @@ class Phase2WrapHelperTest(SimpleTestCase):
         self.assertEqual(_strip_phase2_block(""), "")
 
     def test_marker_detection(self):
-        wrapped = _wrap_message_with_phase2("base", "Test Job", foreground=True)
-        self.assertTrue(_message_has_phase2_marker(wrapped))
+        legacy = self._legacy_wrapped("base")
+        self.assertTrue(_message_has_phase2_marker(legacy))
         self.assertFalse(_message_has_phase2_marker("base"))
         self.assertFalse(_message_has_phase2_marker(""))
 
@@ -943,7 +966,7 @@ class PostgresCanonicalReadTest(TestCase):
                 "payload": {"kind": "agentTurn", "message": "user underscore"},
                 "delivery": {"mode": "none"},
                 "enabled": True,
-                "foreground": False,
+                "foreground": True,
             },
         )
         self.assertEqual(
@@ -954,7 +977,7 @@ class PostgresCanonicalReadTest(TestCase):
                 "payload": {"kind": "agentTurn", "message": "seeded"},
                 "delivery": {"mode": "none"},
                 "enabled": True,
-                "foreground": False,
+                "foreground": True,
             },
         )
         mock_invoke.assert_not_called()

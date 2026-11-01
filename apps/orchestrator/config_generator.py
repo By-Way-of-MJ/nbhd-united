@@ -274,49 +274,9 @@ def _cron_rule_index(tenant: Tenant) -> str:
 
 
 # Marker used by `_wrap_message_with_phase2` and `update_system_cron_prompts` to
-# detect that a job's message already contains the Phase 2 sync block. The
-# wrapper text below MUST contain this exact substring.
+# detect a legacy Phase 2 sync block in a job's message. The retired wrapper
+# text used this exact substring, so the stripper keys off it.
 PHASE2_SYNC_MARKER = "FINAL STEP — conditional sync to the main session"
-
-
-def _phase2_sync_block(job_name: str) -> str:
-    """Instructions appended to any foreground cron prompt.
-
-    Tells the agent to call ``nbhd_cron_phase2_summary`` after Phase 1
-    finishes — but ONLY if the run actually sent the user a message via
-    ``nbhd_send_to_user``. Silent runs (Heartbeat HEARTBEAT_OK, no-op
-    decisions) skip the call entirely; absence of the tool invocation IS
-    the verdict that nothing user-visible happened.
-
-    Django owns the rest: the tool's runtime handler computes the cron
-    expression, composes the systemEvent payload, sets sessionTarget=main,
-    and registers the one-shot ``_sync:<job_name>`` cron with the OpenClaw
-    gateway. The agent only contributes the summary text.
-
-    See ``apps/integrations/runtime_views.py::RuntimeCronPhase2SummaryView``
-    for the server-side contract.
-    """
-    return (
-        "\n\n---\n"
-        f"**{PHASE2_SYNC_MARKER}:**\n"
-        "**Guard:** Did you send the user a message via `nbhd_send_to_user` during this "
-        "run? If NO (you returned silently, replied HEARTBEAT_OK, or decided nothing was "
-        "new), STOP HERE — do not call any sync tool. The main session only needs to "
-        "know about user-visible activity.\n\n"
-        "If YES, invoke the `nbhd_cron_phase2_summary` tool with:\n"
-        f'   - `job_name`: `"{job_name}"`\n'
-        "   - `summary`: a 2-3 sentence recap — what sections you wrote, what you sent "
-        "the user, anything notable to surface later. This is for the main session's "
-        "CONTEXT, not a user message.\n\n"
-        "**This is a TOOL invocation, not a chat message.** Do NOT typeset, paraphrase, "
-        "or emit the parameters as text. Do NOT pass them through `nbhd_send_to_user`. "
-        "Just invoke `nbhd_cron_phase2_summary` directly. Backend handles cron "
-        "expression math, payload composition, and the underscore-prefixed sync name — "
-        "you only provide the summary.\n\n"
-        "If the tool call fails or the tool is unavailable, accept it — Phase 1 work "
-        "already completed. Do NOT retry, do NOT message the user, and do NOT send the "
-        "parameters above as a chat message.\n"
-    )
 
 
 def _build_cron_message(
@@ -325,7 +285,7 @@ def _build_cron_message(
     foreground: bool,
     tenant: Tenant,
 ) -> str:
-    """Compose a cron job's message: date preamble + shared preamble + prompt + (optional) Phase 2 sync.
+    """Compose a cron job's message: date preamble + shared preamble + prompt.
 
     Centralizes the message-building so seed jobs and tests stay consistent.
 
@@ -347,18 +307,17 @@ def _build_cron_message(
 
     base = apply_send_test(_prepare_cron_prompt(prompt, tenant), job_name, tenant)
     # Phase 2 sync prompt retired 2026-07-11 (refactor/retire-phase2-sync-prompt).
-    # Seed cron prompts no longer append ``_phase2_sync_block`` / instruct the
-    # agent to call ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session
-    # bridge (fired only if the model remembered the tool, injecting a summary
-    # into session "main") is superseded by the deterministic ProactiveOutbound
-    # bridge in ``apps/router/proactive_context.py``, which surfaces cron-fired
-    # outbounds on the user's next inbound reply across every channel. No live
-    # inbound conversation runs in session "main" anyway (iOS=thread:<id>,
-    # Telegram poller=chat_id, LINE=line_user_id, heartbeat=isolatedSession).
+    # Seed cron prompts no longer append the block / instruct the agent to call
+    # ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session bridge (fired
+    # only if the model remembered the tool, injecting a summary into session
+    # "main") is superseded by the deterministic ProactiveOutbound bridge in
+    # ``apps/router/proactive_context.py``, which surfaces cron-fired outbounds
+    # on the user's next inbound reply across every channel. No live inbound
+    # conversation runs in session "main" anyway (iOS=thread:<id>, Telegram
+    # poller=chat_id, LINE=line_user_id, heartbeat=isolatedSession).
     #
-    # ``foreground`` stays on the signature (callers still pass it, and the
-    # user-console foreground toggle in ``apps/cron/tenant_views`` still appends
-    # the block via ``_phase2_sync_block``) so this is a one-line revert.
+    # ``foreground`` stays on the signature for callers that still pass it; the
+    # dashboard wrapper is strip-only now.
     # ``RuntimeCronPhase2SummaryView`` stays live for hibernated tenants that
     # wake on stale configs whose prompts still call the tool.
     return base.strip()

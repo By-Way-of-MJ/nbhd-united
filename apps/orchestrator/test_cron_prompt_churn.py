@@ -6,7 +6,7 @@ wake. The trigger was a single-byte mismatch in the comparison: OpenClaw
 ``.trim()``s ``payload.message`` on store (see
 ``coercePayload`` in ``openclaw-tools-*.js``), but Django's
 ``_build_cron_message`` returned a string ending with ``\n`` (from the
-trailing newline in ``_phase2_sync_block``). Stored without trailing
+trailing newline in the retired Phase 2 sync block). Stored without trailing
 ``\n``, generated with → string equality fails → delete+create cycle for
 every system job → 16 gateway mutations per wake → gateway thrash → SIGTERM
 right when the scheduled cron tried to fire. See
