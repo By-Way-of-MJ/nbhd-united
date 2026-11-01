@@ -2938,6 +2938,12 @@ def _drain_ios_batch(
 
     content, user_param = frame_chat_content(tenant, batch, content, user_param)
 
+    # Server instructions enter after every PII pass, including side context.
+    # Prepending preserves the taint guard's last-line confirmation/label check.
+    from apps.router.reply_shape import frame_reply_shape
+
+    content = frame_reply_shape(tenant, content)
+
     url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
 

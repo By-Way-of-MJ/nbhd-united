@@ -5,6 +5,19 @@ import re
 
 from apps.router.chat_gates import _tenant_allowed
 
+ONE_QUESTION_NOTE = (
+    "[NBHD reply: Ask ONE question maximum this turn. Small pick: last line "
+    "[[quick-replies: A | B]] with 2–4 short labels. Open question: no buttons.]"
+)
+
+
+def frame_reply_shape(tenant, content: str) -> str:
+    """Prepend the ephemeral rule without changing the last user-message line."""
+    if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+        return ONE_QUESTION_NOTE + "\n" + content
+    return content
+
+
 logger = logging.getLogger(__name__)
 
 

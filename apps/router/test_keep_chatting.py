@@ -152,6 +152,28 @@ class KeepChattingTests(TestCase):
         main.refresh_from_db()
         self.assertIsNotNone(main.delivery_in_flight_until)
 
+    @override_settings(ONE_QUESTION_TENANT_IDS="*")
+    def test_ephemeral_reply_rule_preserves_main_and_side_label_taps(self):
+        from apps.router.reply_shape import ONE_QUESTION_NOTE
+
+        self.assertLess(len(ONE_QUESTION_NOTE.split()), 30)
+        # Both lanes enter the same last transport seam after PII annotation.
+        for side in (False, True):
+            with self.subTest(side=side):
+                PendingMessage.objects.all().delete()
+                AppChatMessage.objects.all().delete()
+                if side:
+                    self.main()
+                row = self.row("Post it")
+                with patch("apps.pii.redactor.annotate_model_context", side_effect=lambda text, *_: text):
+                    self.drain()
+                content = self.post.call_args.kwargs["json"]["messages"][0]["content"]
+                self.assertTrue(content.startswith(ONE_QUESTION_NOTE + "\n"))
+                self.assertEqual(content.splitlines()[-1], "Post it")
+                self.assertNotIn(ONE_QUESTION_NOTE, self.app(row).user_text)
+                self.assertNotIn(ONE_QUESTION_NOTE, json.dumps(row.payload))
+                self.assertEqual(row.user_text, "Post it")
+
     def test_three_messages_during_side_turn_coalesce_in_order(self):
         self.main()
         first = self.row("first side")
@@ -168,8 +190,9 @@ class KeepChattingTests(TestCase):
         self.assertEqual(self.app(first).status, "ready")
         self.drain()
         content = self.post.call_args.kwargs["json"]["messages"][0]["content"]
-        self.assertLess(content.index("one"), content.index("two"))
-        self.assertLess(content.index("two"), content.index("three"))
+        current = content.split("Current message:\n", 1)[1]
+        self.assertLess(current.index("one"), current.index("two"))
+        self.assertLess(current.index("two"), current.index("three"))
         self.assertEqual([self.app(r).status for r in later], ["ready"] * 3)
         self.assertEqual([self.app(r).reply_text for r in later], ["", "", "one answer"])
         self.assertEqual(self.post.call_count, 2)

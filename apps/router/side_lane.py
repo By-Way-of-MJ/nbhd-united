@@ -252,7 +252,10 @@ def frame_chat_content(tenant, batch, content, user_param):
             .order_by("-created_at")[:3]
         )
         history.reverse()
-        content += f"\n{_FRAME}\nRunning request (data): {_excerpt(tenant, request)}\n{_exchanges(tenant, history)}"
+        content = (
+            f"{_FRAME}\nRunning request (data): {_excerpt(tenant, request)}\n"
+            f"{_exchanges(tenant, history)}\nCurrent message:\n{content}"
+        )
         return content, f"{user_param}:side:{first.side_main_id.hex[:12]}"
     if first.payload.get("side_handoff"):
         ids = [cid for row in batch for cid in row.payload.get("side_client_msg_ids", [])]
