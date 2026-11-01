@@ -128,10 +128,12 @@ def check_batch(tenant, batch, job_id, main_ids, request):
         entry = thread.side_jobs[str(job_id)]
         entry.pop("checking_until", None)
         # A side request already answered after publication follows the ordinary path.
+        was_suppressed = entry.get("suppressed", entry["finished"] and entry["kind"] != "none" and not entry["helpers"])
         landed = (
-            AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=entry["main_ids"], status="ready")
-            .exclude(reply_text="")
-            .exists()
+            not was_suppressed
+            and AppChatMessage.objects.filter(
+                tenant=tenant, client_msg_id__in=entry["main_ids"], status="ready"
+            ).exists()
         )
         if not landed or entry["helpers"]:
             if decision.kind == "cancel" or (decision.kind == "change" and entry["kind"] != "cancel"):
@@ -191,9 +193,10 @@ def finish_main(tenant, batch):
         )
     )
     entry["finished"] = True
+    entry["suppressed"] = entry["kind"] != "none" and not entry["helpers"]
     thread.save(update_fields=["side_jobs"])
     queue_changed_job(tenant, thread, batch[0].id)
-    return entry["kind"] != "none" and not entry["helpers"]
+    return entry["suppressed"]
 
 
 def mark_suppressed_main(tenant, batch):

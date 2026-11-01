@@ -74,7 +74,9 @@ class JobPublicationTests(TestCase):
         self.drain()
         self.drain()
         self.assertEqual(self.post.call_count, 2)
-        self.assertFalse(AppChatMessage.objects.filter(reply_text__contains="CANCELLED FULL PLAN").exists())
+        self.assertFalse(
+            any("CANCELLED FULL PLAN" in text for text in AppChatMessage.objects.values_list("reply_text", flat=True))
+        )
 
     def test_cancelled_job_cannot_refill_partial_preview(self):
         from apps.router.side_lane import progress_rows
@@ -98,7 +100,9 @@ class JobPublicationTests(TestCase):
         self.post.return_value = _ok_chat_response("Here is THE CANCELLED FULL PLAN anyway")
         self.drain()
         self.assertEqual(self.post.call_count, 2)
-        self.assertFalse(AppChatMessage.objects.filter(reply_text__contains="CANCELLED FULL PLAN").exists())
+        self.assertFalse(
+            any("CANCELLED FULL PLAN" in text for text in AppChatMessage.objects.values_list("reply_text", flat=True))
+        )
         self.assertFalse(AppChatMessage.objects.filter(client_msg_id__startswith="side-resume-").exists())
 
     def test_status_never_posts_recap_and_next_main_gets_passive_context_once(self):
