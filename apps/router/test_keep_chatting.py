@@ -459,3 +459,22 @@ class KeepChattingTests(TestCase):
         row = PendingMessage.objects.get(pk=row_id)
         self.assertEqual(row.lane, PendingMessage.Lane.MAIN)
         self.assertIsNone(row.lease_token)
+
+    def test_a_handoff_that_becomes_long_work_still_allows_side_chat(self):
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        original = self.main()
+        self.row("redo that long job using the latest numbers")
+        self.drain()
+        _store_ios_turn_reply(self.tenant, [original], "original result")
+        PendingMessage.objects.filter(pk=original.pk).delete()
+        handoff, _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+        self.assertTrue(handoff[0].payload["side_handoff"])
+        PendingMessage.objects.filter(pk=handoff[0].pk).update(turn_started_at=timezone.now() - timedelta(seconds=12))
+        question = self.row("quick question during the changed job")
+        self.drain()
+        self.assertEqual(self.app(question).status, "ready")
+        payload = self.post.call_args.kwargs["json"]
+        self.assertEqual(payload["user"], f"thread:{self.thread.id}:side:{handoff[0].id.hex[:12]}")
+        self.assertIn("redo that long job using the latest numbers", payload["messages"][0]["content"])
+        self.assertGreater(PendingMessage.objects.get(pk=handoff[0].pk).delivery_in_flight_until, timezone.now())

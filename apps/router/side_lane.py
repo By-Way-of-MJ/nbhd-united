@@ -114,11 +114,11 @@ def claim_chat_batch(tenant, thread_id, timeout):
         side = next((r for r in rows if r.lane == "side"), None)
         lane = "main"
         if main:
-            # A resume is itself a main turn, but never opens another side job.
+            # A resume can itself become a long job; it follows the same lane rule.
             started = main.turn_started_at or main.created_at
             age = (now - started).total_seconds()
             eligible = [r for r in rows if r.lane == "main" and r.created_at > main.created_at and _eligible(r)]
-            if main.payload.get("side_handoff") or not (eligible or side):
+            if not (eligible or side):
                 return [], {}
             if age < SIDE_LANE_MIN_MAIN_AGE_SECONDS:
                 return [], {"side_delay": max(1, math.ceil(SIDE_LANE_MIN_MAIN_AGE_SECONDS - age))}
@@ -127,6 +127,24 @@ def claim_chat_batch(tenant, thread_id, timeout):
             ).exists()
             if tenant.hibernated_at is not None or waking or not live:
                 return [], {}
+            main_members = [
+                r
+                for r in rows
+                if r.lane == "main"
+                and r.lease_token == main.lease_token
+                and r.delivery_in_flight_until
+                and r.delivery_in_flight_until > now
+            ]
+            request_ids = [
+                cid
+                for member in main_members
+                for cid in (
+                    member.payload.get("side_client_msg_ids", [])
+                    if member.payload.get("side_handoff")
+                    else [member.payload.get("client_msg_id", "")]
+                )
+                if cid
+            ]
             # Do not steal other rows belonging to the live main batch.
             for row in eligible:
                 if row.delivery_in_flight_until and row.delivery_in_flight_until > now:
@@ -136,6 +154,7 @@ def claim_chat_batch(tenant, thread_id, timeout):
                 row.payload = {
                     **row.payload,
                     "side_main_client_msg_id": main.payload.get("client_msg_id", ""),
+                    "side_main_client_msg_ids": request_ids,
                     "side_main_started_at": started.isoformat(),
                 }
                 row.save(update_fields=["lane", "side_main_id", "payload"])
@@ -205,18 +224,27 @@ def frame_chat_content(tenant, batch, content, user_param):
     first = batch[0]
     if getattr(first, "lane", "main") == "side":
         main = PendingMessage.objects.filter(pk=first.side_main_id, tenant=tenant).first()
-        if main:
-            request = main.user_text
+        main_members = (
+            list(
+                _key_rows(tenant, first.channel_user_id)
+                .filter(lane="main", lease_token=main.lease_token, delivery_in_flight_until__gt=timezone.now())
+                .order_by("created_at", "id")
+            )
+            if main
+            else []
+        )
+        if main_members and not main.payload.get("side_handoff"):
+            request = "\n".join(member.user_text for member in main_members)
         else:
-            request = (
+            request_ids = first.payload.get("side_main_client_msg_ids") or [
+                first.payload.get("side_main_client_msg_id", "")
+            ]
+            request = "\n".join(
                 AppChatMessage.objects.filter(
-                    tenant=tenant,
-                    thread_id=first.channel_user_id,
-                    client_msg_id=first.payload.get("side_main_client_msg_id", ""),
+                    tenant=tenant, thread_id=first.channel_user_id, client_msg_id__in=request_ids
                 )
+                .order_by("created_at", "id")
                 .values_list("user_text", flat=True)
-                .first()
-                or ""
             )
         history = list(
             AppChatMessage.objects.filter(tenant=tenant, thread_id=first.channel_user_id, status="ready")
