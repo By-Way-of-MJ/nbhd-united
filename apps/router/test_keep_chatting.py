@@ -174,6 +174,21 @@ class KeepChattingTests(TestCase):
                 self.assertNotIn(ONE_QUESTION_NOTE, json.dumps(row.payload))
                 self.assertEqual(row.user_text, "Post it")
 
+    @override_settings(ONE_QUESTION_TENANT_IDS="*")
+    def test_handoff_reply_shape_is_logged_once_and_silence_is_not_a_reply(self):
+        from apps.router.side_lane import store_handoff_reply
+
+        row = self.row()
+        row.payload = {"side_handoff": True, "side_client_msg_ids": []}
+        row.save(update_fields=["payload"])
+        with self.assertNoLogs("apps.router.reply_shape"):
+            store_handoff_reply(self.tenant, [row], "[[side-recap-no-action]]")
+        with self.assertLogs("apps.router.reply_shape") as logs:
+            store_handoff_reply(self.tenant, [row], "Top three?\n[[quick-replies: A | B]]")
+            store_handoff_reply(self.tenant, [row], "Top three?\n[[quick-replies: A | B]]")
+        self.assertEqual(len(logs.records), 1)
+        self.assertTrue(logs.records[0].getMessage().endswith("questions=1 buttons=1"))
+
     def test_three_messages_during_side_turn_coalesce_in_order(self):
         self.main()
         first = self.row("first side")

@@ -312,7 +312,7 @@ def store_handoff_reply(tenant, batch, ai_text):
             row.save(update_fields=["payload"])
         if silent or not text:
             return None
-        AppChatMessage.objects.get_or_create(
+        _, created = AppChatMessage.objects.get_or_create(
             tenant=tenant,
             client_msg_id=client_id,
             defaults={
@@ -331,6 +331,10 @@ def store_handoff_reply(tenant, batch, ai_text):
     from apps.router.pending_queue import _dispatch_push
     from apps.router.push_views import notify_app_reply_ready
 
+    if created:
+        from apps.router.reply_shape import log_reply_shape
+
+        log_reply_shape(tenant, push_text, quick)
     _dispatch_push(notify_app_reply_ready, tenant, [client_id], push_text)
     return None
 
