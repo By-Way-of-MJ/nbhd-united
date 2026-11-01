@@ -243,6 +243,7 @@ class KeepChattingTests(TestCase):
         self.assertEqual(followup.reply_text, "I have applied that change")
         self.assertEqual(self.drain()["delivered"], 0)
         self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.usage.call_args.kwargs["event_type"], "chat_recap")
 
     def test_unconfirmed_context_is_omitted_and_full_text_checked_before_truncation(self):
         main = self.main()
@@ -355,3 +356,64 @@ class KeepChattingTests(TestCase):
         self.assertIn("earlier-from-you", self.post.call_args.kwargs["json"]["messages"][0]["content"])
         self.assertEqual(self.app(attachment).status, "pending")
         self.assertEqual(AppChatMessage.objects.filter(client_msg_id__startswith="side-resume-").count(), 0)
+
+    def test_expired_main_lease_reuses_request_identity_and_fences_old_reply(self):
+        main = self.row("long job")
+        old, _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+        PendingMessage.objects.filter(pk=main.pk).update(delivery_in_flight_until=timezone.now() - timedelta(seconds=1))
+        new, _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+        self.assertEqual(old[0].batch_id, new[0].batch_id)
+        self.assertNotEqual(old[0].lease_token, new[0].lease_token)
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        with self.assertRaises(LeaseLost):
+            _store_ios_turn_reply(self.tenant, old, "stale result")
+        with self.assertRaises(LeaseLost):
+            _store_ios_turn_reply(self.tenant, old, None)
+        _store_ios_turn_reply(self.tenant, new, "main result")
+        self.drain()
+        self.assertEqual(self.app(main).reply_text, "main result")
+        self.post.assert_not_called()
+
+    def test_failed_side_answer_still_hands_cancellation_to_main(self):
+        main = self.main()
+        side = self.row("cancel the job")
+        self.post.return_value = _ok_chat_response("")
+        self.drain()
+        self.assertEqual(self.app(side).error, "empty_response")
+        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.post.return_value = _ok_chat_response("I picked up the cancellation")
+        self.drain()
+        self.assertIn("cancel the job", self.post.call_args.kwargs["json"]["messages"][0]["content"])
+        self.assertEqual(
+            AppChatMessage.objects.get(client_msg_id__startswith="side-resume-").reply_text,
+            "I picked up the cancellation",
+        )
+
+    def test_side_conversation_does_not_release_running_document_write_guard(self):
+        from apps.router.document_write_guard import assert_write_allowed_for_document_turn
+
+        self.tenant.document_ingestion_enabled = True
+        main = self.main()
+        main.payload["is_document"] = True
+        main.save(update_fields=["payload"])
+        AppChatMessage.objects.filter(pk=self.app(main).pk).update(
+            attachment_path="workspace/media/inbound/doc_fixture.pdf"
+        )
+        self.row("a plain side question")
+        response = assert_write_allowed_for_document_turn(self.tenant)
+        self.assertEqual(response.status_code, 409)
+        with override_settings(KEEP_CHATTING_TENANT_IDS=""):
+            self.assertIsNone(assert_write_allowed_for_document_turn(self.tenant))
+
+    def test_successful_boot_probe_clears_waking_before_long_main_post(self):
+        main = self.row("slow first turn after waking")
+        AppChatMessage.objects.filter(pk=self.app(main).pk).update(waking_at=timezone.now())
+
+        def post(*args, **kwargs):
+            self.assertIsNone(self.app(main).waking_at)
+            return _ok_chat_response("answer")
+
+        self.post.side_effect = post
+        self.drain()
+        self.health.assert_called()

@@ -1177,6 +1177,18 @@ def _terminalize_pending_app_turns(
         if turn is None:
             continue
         should_retry = _is_silent_dropped_retry_candidate(turn, error, dropped_stamped_at=now)
+        from apps.router.chat_gates import keep_chatting_enabled
+
+        if (
+            should_retry
+            and keep_chatting_enabled(tenant)
+            and PendingMessage.objects.filter(
+                tenant=tenant, lane=PendingMessage.Lane.SIDE, payload__client_msg_id=client_msg_id
+            ).exists()
+        ):
+            # The durable main handoff owns this side request from here; a
+            # dropped-turn replay would also submit it as a new user turn.
+            should_retry = False
         update_values = {
             "status": AppChatMessage.Status.ERROR,
             "error": error,
@@ -1313,6 +1325,16 @@ def _terminalize_failed_queue_rows(
             row.delivery_status = PendingMessage.Status.FAILED
             row.delivered_at = committed_at
             row.delivery_in_flight_until = None
+
+        side_groups = {}
+        for row in terminalized_rows:
+            if row.lane == PendingMessage.Lane.SIDE:
+                side_groups.setdefault(row.batch_id or row.id, []).append(row)
+        if side_groups:
+            from apps.router.side_lane import queue_handoff
+
+            for side_batch in side_groups.values():
+                queue_handoff(locked_tenant, side_batch)
 
         _persist_pending_transcript_fail_open(locked_tenant, transcript_capture)
 
@@ -2166,7 +2188,7 @@ def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
 
 
 def _clear_ios_waking(channel: str, batch: list[PendingMessage]) -> None:
-    """A failed wake must not leave pending app turns advertising progress."""
+    """Clear the wake label after a failed wake or a confirmed ready gateway."""
     if channel != PendingMessage.Channel.IOS or not batch:
         return
     client_ids = _ios_client_msg_ids(batch)
@@ -2828,6 +2850,21 @@ def _drain_ios_batch(
         if check_budget(tenant):
             return DrainOutcome(Disposition.TERMINAL, DeliveryState.FAILED, reason="budget_exhausted")
 
+    if (
+        getattr(batch[0], "lease_token", None)
+        and tenant.hibernated_at is None
+        and AppChatMessage.objects.filter(
+            tenant=tenant,
+            client_msg_id__in=_ios_client_msg_ids(batch),
+            status=AppChatMessage.Status.PENDING,
+            waking_at__isnull=False,
+        ).exists()
+        and _is_tenant_container_live(tenant)
+    ):
+        # Boot completed: keep the cold-start spinner from blocking side chat
+        # throughout a healthy but slow model turn after the container wakes.
+        _clear_ios_waking("ios", batch)
+
     thread_id = batch[0].channel_user_id
     content, user_param, user_tz = _build_batch_chat_content(batch, thread_id, channel="ios", tenant=tenant)
 
@@ -2971,7 +3008,10 @@ def _drain_ios_batch(
         int((post_ended - post_started) * 1000),
         int(reply_write_ms) if reply_write_ms is not None else -1,
     )
-    _record_usage_safe(tenant, result, message_count=len(batch))
+    if batch[0].payload.get("side_handoff"):
+        _record_usage_safe(tenant, result, message_count=0, event_type="chat_recap")
+    else:
+        _record_usage_safe(tenant, result, message_count=len(batch))
     # Refresh the USER.md "Conversation so far" digest so isolated proactive /
     # cron sessions (Morning Briefing, Evening Check-in, the cron heartbeat)
     # ground on this iOS turn instead of an hours-stale snapshot — the verified
@@ -3166,12 +3206,21 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
             ).values_list("client_msg_id", "id")
         )
         retried_client_ids = list(retried_turns)
-        AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=client_ids).update(
-            status=AppChatMessage.Status.ERROR,
-            error="empty_response",
-            replied_at=now,
-            partial_text="",
-        )
+        with transaction.atomic():
+            if getattr(batch[0], "lease_token", None):
+                from apps.router.side_lane import lock_owned_batch
+
+                lock_owned_batch(tenant, batch)
+            AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=client_ids).update(
+                status=AppChatMessage.Status.ERROR,
+                error="empty_response",
+                replied_at=now,
+                partial_text="",
+            )
+            if getattr(batch[0], "lane", "main") == PendingMessage.Lane.SIDE:
+                from apps.router.side_lane import queue_handoff
+
+                queue_handoff(tenant, batch)
         # An empty terminal reply is still a turn the user is waiting on — push a
         # generic 'couldn't finish' so a backgrounded / Siri-escalated turn
         # doesn't go silent until the next foreground.
@@ -3679,7 +3728,7 @@ def _model_response_ref(result: Any) -> str:
     return str(value) if value is not None else ""
 
 
-def _record_usage_safe(tenant: Tenant, result: Any, *, message_count: int = 1) -> None:
+def _record_usage_safe(tenant: Tenant, result: Any, *, message_count: int = 1, event_type: str = "message") -> None:
     """Record token usage from a chat-completions response. Swallows
     errors so a billing failure can never wedge the queue.
 
@@ -3704,7 +3753,7 @@ def _record_usage_safe(tenant: Tenant, result: Any, *, message_count: int = 1) -
     try:
         record_usage(
             tenant=tenant,
-            event_type="message",
+            event_type=event_type,
             input_tokens=int(input_tokens),
             output_tokens=int(output_tokens),
             model_used=model_used,
