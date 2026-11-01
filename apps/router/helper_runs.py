@@ -1,6 +1,7 @@
 """Durable app-thread helper closure, independent of the tenant container."""
 
 import logging
+import time
 from datetime import timedelta
 
 from django.db import transaction
@@ -154,7 +155,32 @@ class HelperContextView(APIView):
         )
 
 
+class _JobChangePending(Exception):
+    pass
+
+
 def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expired_only=False, **content):
+    """Wait outside transactions for an admitted side decision before publishing."""
+    deadline = time.monotonic() + 60
+    while True:
+        try:
+            return _deliver_helper_once(
+                tenant=tenant,
+                occurrence_key=occurrence_key,
+                message_text=message_text,
+                thread_id=thread_id,
+                expired_only=expired_only,
+                **content,
+            )
+        except _JobChangePending:
+            if time.monotonic() >= deadline:
+                return Response({"error": "job_change_pending"}, status=503)
+            # No row lock or transaction spans this wait. A lost HTTP response
+            # remains safe: publication and closure still commit together.
+            time.sleep(0.1)
+
+
+def _deliver_helper_once(*, tenant, occurrence_key, message_text, thread_id=None, expired_only=False, **content):
     """Commit the app-feed row and closure together; rollback is safe to retry.
 
     The runtime only admits app-thread helpers. External transports have no
@@ -168,10 +194,17 @@ def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expi
     from apps.router.chat_gates import keep_chatting_enabled
 
     keep_on = keep_chatting_enabled(tenant)
+    target_thread_id = thread_id
+    if keep_on and not target_thread_id:
+        target_thread_id = (
+            HelperRun.objects.filter(tenant=tenant, occurrence_key=occurrence_key)
+            .values_list("thread_id", flat=True)
+            .first()
+        )
     with transaction.atomic():
         thread = (
-            ChatThread.objects.select_for_update().filter(tenant=tenant, pk=thread_id).first()
-            if keep_on and thread_id
+            ChatThread.objects.select_for_update().filter(tenant=tenant, pk=target_thread_id).first()
+            if keep_on and target_thread_id
             else None
         )
         row = HelperRun.objects.select_for_update().filter(tenant=tenant, occurrence_key=occurrence_key).first()
@@ -190,6 +223,8 @@ def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expi
         if keep_on:
             thread = thread or ChatThread.objects.select_for_update().get(pk=row.thread_id)
             entry = helper_entry(thread, occurrence_key)
+            if entry and entry.get("checking_until", 0) > timezone.now().timestamp():
+                raise _JobChangePending
             if entry and entry["kind"] == "cancel":
                 message_text = "Cancelled — I won't send that result."
                 content = {}

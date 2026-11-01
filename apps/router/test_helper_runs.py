@@ -2,7 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -264,6 +264,53 @@ class HelperClosureTests(TestCase):
 class HelperRaceTests(TransactionTestCase):
     def setUp(self):
         seed(self)
+
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_result_waits_for_in_progress_cancel_without_holding_a_transaction(self):
+        from apps.router import helper_runs
+
+        self.thread.side_jobs = {
+            "job": {
+                "main_ids": [],
+                "side_ids": [],
+                "kind": "none",
+                "finished": True,
+                "helpers": [self.key],
+                "checking_until": timezone.now().timestamp() + 10,
+            }
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        waiting = Event()
+        original = helper_runs._deliver_helper_once
+
+        def observed(**kwargs):
+            try:
+                return original(**kwargs)
+            except helper_runs._JobChangePending:
+                waiting.set()
+                raise
+
+        def deliver():
+            close_old_connections()
+            try:
+                tenant = Tenant.objects.select_related("user").get(pk=self.tenant.pk)
+                return deliver_helper(tenant=tenant, occurrence_key=self.key, message_text="RAW CANCELLED PLAN")
+            finally:
+                close_old_connections()
+
+        with (
+            patch("apps.router.helper_runs._deliver_helper_once", side_effect=observed),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            future = pool.submit(deliver)
+            self.assertTrue(waiting.wait(5))
+            with transaction.atomic():
+                thread = ChatThread.objects.select_for_update().get(pk=self.thread.pk)
+                thread.side_jobs["job"].pop("checking_until")
+                thread.side_jobs["job"]["kind"] = "cancel"
+                thread.save(update_fields=["side_jobs"])
+            self.assertEqual(future.result(timeout=5).data["status"], "sent")
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, "Cancelled — I won't send that result.")
 
     def send_concurrently(self, messages):
         barrier = Barrier(2)

@@ -99,9 +99,12 @@ def check_batch(tenant, batch, job_id, main_ids, request):
             return
         jobs = thread.side_jobs
         entry = _entry(jobs, job_id, main_ids)
+        entry.setdefault("timezone", first.payload.get("user_timezone", "UTC"))
         ids = [r.payload.get("client_msg_id") for r in batch if r.payload.get("client_msg_id")]
         entry["side_ids"] = list(dict.fromkeys(entry["side_ids"] + ids))
-        entry["checking_until"] = timezone.now().timestamp() + 8
+        # Checked redaction has its own bounded deadline before the six-second
+        # call. A main publication must wait for both, including a batched turn.
+        entry["checking_until"] = timezone.now().timestamp() + max(30, 11 + 5 * (len(batch) + 1))
         thread.side_jobs = jobs
         thread.save(update_fields=["side_jobs"])
         for row in batch:
@@ -163,7 +166,7 @@ def queue_changed_job(tenant, thread, job_id):
                 "side_job_id": str(job_id),
                 "side_client_msg_ids": entry["side_ids"],
                 "user_param": f"thread:{thread.pk}",
-                "user_timezone": "UTC",
+                "user_timezone": entry.get("timezone", "UTC"),
             },
         },
     )
@@ -222,6 +225,7 @@ def passive_context(tenant, batch):
             if (
                 entry["finished"]
                 and entry["kind"] == "none"
+                and not entry["helpers"]
                 and not entry.get("consumed")
                 and entry.get("recap_for", key) == key
             ):
@@ -268,7 +272,14 @@ def bind_helper(tenant, thread_id, occurrence_key):
             .first()
         )
         if main:
-            entry = _entry(thread.side_jobs, main.id, [main.payload.get("client_msg_id", "")])
+            ids = [
+                r.payload["client_msg_id"]
+                for r in PendingMessage.objects.filter(
+                    tenant=tenant, channel="ios", channel_user_id=str(thread_id), lease_token=main.lease_token
+                )
+                if r.payload.get("client_msg_id")
+            ]
+            entry = _entry(thread.side_jobs, main.id, ids)
             entry["helpers"] = list(dict.fromkeys(entry["helpers"] + [occurrence_key]))
             thread.save(update_fields=["side_jobs"])
 
