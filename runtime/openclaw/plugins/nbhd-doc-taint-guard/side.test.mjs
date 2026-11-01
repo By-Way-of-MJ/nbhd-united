@@ -14,7 +14,7 @@ for (const mode of ["enforce", "log_only"]) {
     for (const { event, ctx } of fixture.calls) {
       const realId = event.toolName === "tool_call" ? event.params.id : event.toolName;
       const side = ctx.sessionKey.endsWith(":side:aabbccddeeff");
-      const expected = side && (realId === "sessions_spawn" || (mode === "enforce" && EXFIL_TOOL_IDS.has(realId)));
+      const expected = side && (realId === "sessions_spawn" || EXFIL_TOOL_IDS.has(realId));
       const result = hooks.get("before_tool_call")(event, ctx);
       assert.equal(result?.block === true, expected, `${ctx.sessionKey}: ${realId}`);
       if (expected) assert.match(result.blockReason, /side conversation/i);

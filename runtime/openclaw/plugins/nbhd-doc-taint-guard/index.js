@@ -433,7 +433,7 @@ export default function register(api) {
   api.on("before_tool_call", (event, ctx) => {
     try {
       const realId = resolveRealToolId(event);
-      if (isSideSession(ctx) && (realId === "sessions_spawn" || (mode === "enforce" && EXFIL_TOOL_IDS.has(realId)))) {
+      if (isSideSession(ctx) && (realId === "sessions_spawn" || EXFIL_TOOL_IDS.has(realId))) {
         return { block: true, blockReason: SIDE_BLOCK_REASON };
       }
       const toolCallId = event && event.toolCallId;
