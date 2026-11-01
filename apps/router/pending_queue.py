@@ -972,6 +972,19 @@ def _claim_pending_batch_for_key(
                 models.Case(models.When(payload__side_handoff=True, then=0), default=1), "created_at", "id"
             )
         rows = list(qs)
+        if prioritize_handoffs:
+            # A recap may jump ahead of unrelated waiting work, but never the
+            # main request it follows, including a retry without a live lease.
+            pending_ids = set(
+                PendingMessage.objects.filter(
+                    tenant=tenant,
+                    channel=channel,
+                    channel_user_id=channel_user_id or "",
+                    lane=PendingMessage.Lane.MAIN,
+                    delivery_status=PendingMessage.Status.PENDING,
+                ).values_list("id", flat=True)
+            )
+            rows = [r for r in rows if not (r.payload.get("side_handoff") and r.side_main_id in pending_ids)]
         if not rows:
             return ([], claim_info)
 
@@ -1286,7 +1299,11 @@ def _terminalize_failed_queue_rows(
         from apps.router.chat_gates import keep_chatting_enabled
 
         if channel == "ios" and keep_chatting_enabled(locked_tenant):
-            ChatThread.objects.select_for_update().get(pk=channel_user_id, tenant=locked_tenant)
+            if not ChatThread.objects.select_for_update().filter(pk=channel_user_id, tenant=locked_tenant).exists():
+                from apps.router.side_lane import retire_thread_queue
+
+                retire_thread_queue(locked_tenant, channel_user_id)
+                return locked_tenant, [], False
 
         queue_rows = PendingMessage.objects.select_for_update().filter(
             tenant_id=tenant_id,
@@ -1325,6 +1342,16 @@ def _terminalize_failed_queue_rows(
             row.delivery_status = PendingMessage.Status.FAILED
             row.delivered_at = committed_at
             row.delivery_in_flight_until = None
+
+        from apps.router.side_lane import store_handoff_reply
+
+        for row in terminalized_rows:
+            if row.payload.get("side_handoff"):
+                store_handoff_reply(
+                    locked_tenant,
+                    [row],
+                    "I couldn't act on a note you sent while the job was running. Please send it again.",
+                )
 
         side_groups = {}
         for row in terminalized_rows:
@@ -1907,7 +1934,9 @@ def drain_pending_messages_for_tenant_task(
             }
 
     except LeaseLost:
-        return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": batch_size}
+        from apps.router.side_lane import skipped_lease_result
+
+        return skipped_lease_result(tenant, batch)
     except Exception as exc:
         container_down = _delivery_failure_has_down_container(tenant, exc)
         proxy_gateway_down = _delivery_failure_is_proxy_gateway_down(exc)
@@ -1972,9 +2001,14 @@ def drain_pending_messages_for_tenant_task(
                     if wake_failed:
                         _clear_ios_waking(channel, batch)
                 if woke:
-                    for row in batch:
-                        row.delivery_in_flight_until = None
-                        save_owned_row(row, update_fields=["delivery_in_flight_until"])
+                    try:
+                        for row in batch:
+                            row.delivery_in_flight_until = None
+                            save_owned_row(row, update_fields=["delivery_in_flight_until"])
+                    except LeaseLost:
+                        from apps.router.side_lane import skipped_lease_result
+
+                        return skipped_lease_result(tenant, batch)
                     logger.info(
                         "drain_pending: tenant %s hibernated (container down) — woke and deferring drain %ds",
                         tenant_id[:8],
@@ -2010,9 +2044,14 @@ def drain_pending_messages_for_tenant_task(
             and tenant.last_wake_at is not None
             and (timezone.now() - tenant.last_wake_at).total_seconds() < _WAKE_BOOT_GRACE_SECONDS
         ):
-            for row in batch:
-                row.delivery_in_flight_until = None
-                save_owned_row(row, update_fields=["delivery_in_flight_until"])
+            try:
+                for row in batch:
+                    row.delivery_in_flight_until = None
+                    save_owned_row(row, update_fields=["delivery_in_flight_until"])
+            except LeaseLost:
+                from apps.router.side_lane import skipped_lease_result
+
+                return skipped_lease_result(tenant, batch)
             boot_state = "gateway still booting behind proxy" if proxy_gateway_down else "still booting after wake"
             logger.info(
                 "drain_pending: tenant %s %s — deferring drain %ds (no attempt burned)",
@@ -2050,16 +2089,21 @@ def drain_pending_messages_for_tenant_task(
             batch[-1].delivery_attempts + 1,
             _MAX_DELIVERY_ATTEMPTS,
         )
-        for row in batch:
-            row.delivery_attempts += 1
-            row.delivery_in_flight_until = None
-            save_owned_row(
-                row,
-                update_fields=[
-                    "delivery_attempts",
-                    "delivery_in_flight_until",
-                ],
-            )
+        try:
+            for row in batch:
+                row.delivery_attempts += 1
+                row.delivery_in_flight_until = None
+                save_owned_row(
+                    row,
+                    update_fields=[
+                        "delivery_attempts",
+                        "delivery_in_flight_until",
+                    ],
+                )
+        except LeaseLost:
+            from apps.router.side_lane import skipped_lease_result
+
+            return skipped_lease_result(tenant, batch)
         failed = batch_size
 
     # Reconcile a stale hibernation flag. A healthy (non-credit-limit)
@@ -2882,7 +2926,7 @@ def _drain_ios_batch(
     # the container operates in placeholder space, so we do NOT rehydrate here.
     from apps.router.proactive_context import surface_proactive_context
 
-    proactive_block = surface_proactive_context(tenant=tenant)
+    proactive_block = surface_proactive_context(tenant=tenant) if batch[0].lane != PendingMessage.Lane.SIDE else ""
     if proactive_block:
         content = proactive_block + content
 
@@ -2899,10 +2943,10 @@ def _drain_ios_batch(
     # excluded so the recap never replays the turn being delivered.
     from apps.router.thread_recap import build_thread_recap_block
 
-    recap_block = build_thread_recap_block(
-        tenant,
-        thread_id,
-        exclude_client_msg_ids=_ios_client_msg_ids(batch),
+    recap_block = (
+        build_thread_recap_block(tenant, thread_id, exclude_client_msg_ids=_ios_client_msg_ids(batch))
+        if batch[0].lane != PendingMessage.Lane.SIDE
+        else ""
     )
     if recap_block:
         content = recap_block + content

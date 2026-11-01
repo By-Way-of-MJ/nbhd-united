@@ -42,10 +42,26 @@ class LeaseLost(RuntimeError):
 
 def lock_owned_batch(tenant, batch):
     """Fence writes using the same thread lock as claims and app ingress."""
-    ChatThread.objects.select_for_update().get(pk=batch[0].channel_user_id, tenant=tenant)
+    if not ChatThread.objects.select_for_update().filter(pk=batch[0].channel_user_id, tenant=tenant).exists():
+        raise LeaseLost("chat thread deleted")
     for row in batch:
         if not PendingMessage.objects.filter(pk=row.pk, lease_token=row.lease_token).exists():
             raise LeaseLost("chat lease replaced")
+
+
+def retire_thread_queue(tenant, thread_id):
+    """Retire orphaned work once so the minute reaper cannot republish it."""
+    return _key_rows(tenant, thread_id).update(
+        delivery_status=PendingMessage.Status.FAILED,
+        delivered_at=timezone.now(),
+        delivery_in_flight_until=None,
+    )
+
+
+def skipped_lease_result(tenant, batch):
+    if not ChatThread.objects.filter(pk=batch[0].channel_user_id, tenant=tenant).exists():
+        retire_thread_queue(tenant, batch[0].channel_user_id)
+    return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": len(batch)}
 
 
 def save_owned_row(row, *, update_fields):
@@ -89,7 +105,9 @@ def claim_chat_batch(tenant, thread_id, timeout):
     )
     live = _is_tenant_container_live(tenant) if snapshot else True
     with transaction.atomic():
-        ChatThread.objects.select_for_update().get(pk=thread_id, tenant=tenant)
+        if not ChatThread.objects.select_for_update().filter(pk=thread_id, tenant=tenant).exists():
+            retire_thread_queue(tenant, thread_id)
+            return [], {}
         now = timezone.now()
         rows = list(_key_rows(tenant, thread_id).order_by("created_at", "id"))
         # The reply and its handoff commit before the queue is retired. Recover
@@ -280,6 +298,7 @@ def queue_handoff(tenant, batch):
             "tenant": tenant,
             "channel": "ios",
             "channel_user_id": head.channel_user_id,
+            "side_main_id": head.side_main_id,
             "payload": {
                 "side_handoff": True,
                 "side_client_msg_ids": [r.payload["client_msg_id"] for r in batch],
@@ -298,14 +317,15 @@ def store_handoff_reply(tenant, batch, ai_text):
     if not (ai_text or "").strip():
         raise RuntimeError("side_handoff_empty_response")
     client_id = f"side-resume-{batch[0].id.hex}"
+    visible = (ai_text or "").replace("[[side-recap-no-action]]", "").strip()
     text, push_text, redactions, quick, link = _clean_assistant_text_for_app(
-        tenant, ai_text or "", artifact_dedup_key=client_id
+        tenant, visible, artifact_dedup_key=client_id
     )
     from apps.router import enc_columns
     from apps.router.chat_views import _encrypt_chat_value
 
     user_text_enc = _encrypt_chat_value(tenant, enc_columns.APP_CHAT_MESSAGE_USER_TEXT, "")
-    silent = (ai_text or "").strip() == "[[side-recap-no-action]]"
+    silent = not visible
     with transaction.atomic():
         lock_owned_batch(tenant, batch)
         for row in batch:
@@ -336,7 +356,7 @@ def store_handoff_reply(tenant, batch, ai_text):
         from apps.router.reply_shape import log_reply_shape
 
         log_reply_shape(tenant, push_text, quick)
-    _dispatch_push(notify_app_reply_ready, tenant, [client_id], push_text)
+    transaction.on_commit(lambda: _dispatch_push(notify_app_reply_ready, tenant, [client_id], push_text))
     return None
 
 

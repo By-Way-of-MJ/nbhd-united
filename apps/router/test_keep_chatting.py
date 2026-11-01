@@ -283,6 +283,139 @@ class KeepChattingTests(TestCase):
         self.assertEqual(self.post.call_count, 2)
         self.assertEqual(self.usage.call_args.kwargs["event_type"], "chat_recap")
 
+    def test_retrying_main_precedes_its_side_handoff_after_rejection(self):
+        main = self.main()
+        self.row("actually just give me three things")
+        self.drain()
+        handoff = PendingMessage.objects.get(payload__side_handoff=True)
+        self.assertEqual(handoff.side_main_id, main.id)
+        PendingMessage.objects.filter(pk=main.pk).update(delivery_in_flight_until=None)
+        self.post.side_effect = httpx.HTTPStatusError(
+            "rejected", request=httpx.Request("POST", "http://offline"), response=httpx.Response(503)
+        )
+        with self.assertRaises(RuntimeError):
+            self.drain()
+        self.post.side_effect = None
+        self.post.reset_mock()
+        self.drain()
+        self.assertNotIn("earlier-from-you", self.post.call_args.kwargs["json"]["messages"][0]["content"])
+        self.assertEqual(self.app(main).status, "ready")
+        self.drain()
+        self.assertIn("earlier-from-you", self.post.call_args.kwargs["json"]["messages"][0]["content"])
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_deleted_thread_retires_rows_before_claim_and_after_post(self):
+        for during_post in (False, True):
+            with self.subTest(during_post=during_post):
+                self.thread = ChatThread.objects.create(tenant=self.tenant, user=self.user)
+                row = self.row()
+                self.post.reset_mock()
+                if during_post:
+
+                    def post(*args, **kwargs):
+                        self.thread.delete()
+                        return _ok_chat_response("too late")
+
+                    self.post.side_effect = post
+                else:
+                    self.thread.delete()
+                # Deleting the object clears its in-memory pk; the queue still
+                # contains its original UUID, as a real stale drain does.
+                thread_id = row.channel_user_id
+                for _ in range(2):
+                    drain_pending_messages_for_tenant_task(str(self.tenant.id), "ios", thread_id)
+                row.refresh_from_db()
+                self.assertEqual(row.delivery_status, "failed")
+                self.assertIsNone(row.delivery_in_flight_until)
+                self.assertEqual(self.post.call_count, int(during_post))
+                self.post.side_effect = None
+
+    def test_deleted_thread_terminalizer_retires_without_handoff_or_post(self):
+        from apps.router.pending_queue import _terminalize_failed_queue_rows
+
+        row = self.row()
+        self.thread.delete()
+        for _ in range(2):
+            _terminalize_failed_queue_rows(
+                tenant=self.tenant,
+                tenant_id=str(self.tenant.id),
+                channel="ios",
+                channel_user_id=row.channel_user_id,
+                error="dropped",
+            )
+        self.assertEqual(PendingMessage.objects.get(pk=row.pk).delivery_status, "failed")
+        self.post.assert_not_called()
+        self.publish.assert_not_called()
+
+    def test_handoff_silent_marker_is_removed_inside_visible_text(self):
+        from apps.router.side_lane import store_handoff_reply
+
+        row = self.row()
+        row.payload = {"side_handoff": True, "side_client_msg_ids": []}
+        row.save(update_fields=["payload"])
+        store_handoff_reply(self.tenant, [row], "Noted. [[side-recap-no-action]]")
+        reply = AppChatMessage.objects.get(client_msg_id__startswith="side-resume-")
+        self.assertEqual(reply.reply_text, "Noted.")
+        self.assertEqual(reply.user_text, "")
+
+    def test_exhausted_handoff_writes_one_assistant_only_resend_notice(self):
+        main = self.main()
+        self.row("cancel that job")
+        self.drain()
+        main.delete()
+        self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, False, "failed")
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                self.drain()
+        for _ in range(2):
+            self.drain()
+        notice = AppChatMessage.objects.get(client_msg_id__startswith="side-resume-")
+        self.assertEqual(notice.thread_id, self.thread.id)
+        self.assertEqual(notice.user_text, "")
+        self.assertEqual(
+            notice.reply_text, "I couldn't act on a note you sent while the job was running. Please send it again."
+        )
+        self.assertEqual(notice.status, "ready")
+
+    def test_side_preserves_one_shot_context_for_main(self):
+        main = self.main()
+        self.row("quick one")
+        with (
+            patch(
+                "apps.router.proactive_context.surface_proactive_context", return_value="one-shot proactive\n"
+            ) as proactive,
+            patch("apps.router.thread_recap.build_thread_recap_block", return_value="one-shot recap\n") as recap,
+        ):
+            self.drain()
+            proactive.assert_not_called()
+            recap.assert_not_called()
+            PendingMessage.objects.filter(pk=main.pk).update(delivery_in_flight_until=None)
+            self.drain()
+            proactive.assert_called_once()
+            recap.assert_called_once()
+            content = self.post.call_args.kwargs["json"]["messages"][0]["content"]
+            self.assertIn("one-shot proactive", content)
+            self.assertIn("one-shot recap", content)
+
+    def test_lease_loss_during_failure_recovery_returns_the_outer_skip_result(self):
+        for recovery in ("ordinary", "boot", "wake"):
+            with self.subTest(recovery=recovery):
+                PendingMessage.objects.all().delete()
+                self.tenant.hibernated_at = timezone.now() if recovery == "wake" else None
+                self.tenant.last_wake_at = timezone.now() if recovery == "boot" else None
+                self.tenant.save(update_fields=["hibernated_at", "last_wake_at"])
+                self.row("retry")
+                self.post.side_effect = httpx.ReadTimeout("offline")
+                with (
+                    patch(
+                        "apps.router.pending_queue._delivery_failure_has_down_container",
+                        return_value=recovery != "ordinary",
+                    ),
+                    patch("apps.orchestrator.hibernation.wake_hibernated_tenant", return_value=True),
+                    patch("apps.router.pending_queue.save_owned_row", side_effect=LeaseLost("replaced")),
+                ):
+                    self.assertEqual(self.drain(), {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": 1})
+
     def test_unconfirmed_context_is_omitted_and_full_text_checked_before_truncation(self):
         main = self.main()
         full = "x" * 3000 + " private-tail"
