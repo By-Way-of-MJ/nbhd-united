@@ -175,7 +175,7 @@ class SubagentCanaryConfigTests(TestCase):
                     "reading or summarising a long document or many pages",
                     "multi-part plan, report, or comparison",
                     "find it via tool search",
-                    "On it — I'll let you know when it's ready.",
+                    "On it: comparing those three vacuums. Keep chatting, I'll send it when it's done.",
                     "After spawning, do not wait or poll for the helper — reply with the acknowledgement "
                     "and end your turn; the result arrives later as an internal completion event.",
                     "Answer directly for everything else",

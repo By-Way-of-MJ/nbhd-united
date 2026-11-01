@@ -133,6 +133,10 @@ class PendingMessage(models.Model):
         DELIVERED = "delivered"
         FAILED = "failed"
 
+    class Lane(models.TextChoices):
+        MAIN = "main"
+        SIDE = "side"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(
         "tenants.Tenant",
@@ -149,6 +153,12 @@ class PendingMessage(models.Model):
             "other."
         ),
     )
+    lane = models.CharField(max_length=8, choices=Lane.choices, default=Lane.MAIN, db_default=Lane.MAIN)
+    turn_started_at = models.DateTimeField(null=True, blank=True)
+    lease_token = models.UUIDField(null=True, blank=True)
+    batch_id = models.UUIDField(null=True, blank=True)
+    side_main_id = models.UUIDField(null=True, blank=True)
+
     payload = models.JSONField(
         help_text=(
             "Channel-specific bundle with everything the drain task needs "

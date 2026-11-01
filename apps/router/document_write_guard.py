@@ -108,14 +108,41 @@ def assert_write_allowed_for_document_turn(tenant, thread=None) -> Response | No
     record_runtime_write_activity(tenant)
     if not getattr(tenant, "document_ingestion_enabled", False):
         return None
+    from django.db.models.fields.json import KeyTextTransform
+
+    from apps.router.chat_gates import keep_chatting_enabled
     from apps.router.inbound_media import is_inbound_document_path
-    from apps.router.models import AppChatMessage
+    from apps.router.models import AppChatMessage, PendingMessage
 
     qs = AppChatMessage.objects.filter(tenant=tenant)
     if thread is not None:
         qs = qs.filter(thread=thread)
     latest = qs.order_by("-created_at").only("attachment_path", "attachment_paths").first()
-    if latest is None or not any(is_inbound_document_path(path) for path in latest.stored_attachment_paths):
+    active_document = False
+    if keep_chatting_enabled(tenant):
+        # A side conversation (or its assistant-only handoff) is newer in the
+        # feed but cannot consent on behalf of the still-running upload turn.
+        active_ids = (
+            PendingMessage.objects.annotate(client_id=KeyTextTransform("client_msg_id", "payload"))
+            .filter(
+                tenant=tenant,
+                channel=PendingMessage.Channel.IOS,
+                delivery_status=PendingMessage.Status.PENDING,
+                delivery_in_flight_until__gt=timezone.now(),
+                payload__is_document=True,
+            )
+            .values_list("client_id", flat=True)
+        )
+        active_document = any(
+            is_inbound_document_path(path)
+            for turn in AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=active_ids).only(
+                "attachment_path", "attachment_paths"
+            )
+            for path in turn.stored_attachment_paths
+        )
+    if not active_document and (
+        latest is None or not any(is_inbound_document_path(path) for path in latest.stored_attachment_paths)
+    ):
         return None
     logger.info("doc_write_blocked tenant=%s view=%s", str(tenant.id)[:8], _current_view_name())
     return Response(

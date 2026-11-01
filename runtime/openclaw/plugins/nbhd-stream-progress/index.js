@@ -82,7 +82,7 @@ function getRuntimeConfig() {
 
 // Fire-and-forget POST of the partial text. Returns a promise so callers can
 // `void` it; never rejects.
-export async function postPartial(text, seq, api) {
+export async function postPartial(text, seq, api, sessionKey) {
   const cfg = getRuntimeConfig();
   if (!cfg) return;
   const controller = new AbortController();
@@ -99,7 +99,7 @@ export async function postPartial(text, seq, api) {
         "X-NBHD-Internal-Key": cfg.internalKey,
         "X-NBHD-Tenant-Id": cfg.tenantId,
       },
-      body: JSON.stringify({ text, seq }),
+      body: JSON.stringify({ text, seq, ...(sessionKey ? { session_key: sessionKey } : {}) }),
       signal: controller.signal,
     });
   } catch (err) {
@@ -122,40 +122,38 @@ export default function register(api) {
   }
   api.logger.warn("NBHD stream-progress plugin registered");
 
-  // Per-run cumulative accumulator. Turns are serialized per container, so a
-  // single current-run buffer suffices; a run-id change resets it.
-  let runId = null;
-  let cumulative = "";
+  // Separate accumulators for concurrent sessions; bounded even if a run dies.
+  const runs = new Map();
 
   // Each completed model-call step → append its text and POST the cumulative
   // text-so-far. Never throw; always return undefined.
-  api.on("llm_output", (event) => {
+  api.on("llm_output", (event, ctx) => {
     try {
-      const evRunId = event && typeof event.runId === "string" ? event.runId : null;
-      if (evRunId !== runId) {
-        runId = evRunId;
-        cumulative = "";
-      }
-      cumulative = accumulate(cumulative, event && event.assistantTexts);
-      if (cumulative) void postPartial(cumulative, nextSeq(), api);
+      const runId = ctx?.runId || event?.runId;
+      if (!runId) return undefined;
+      const cumulative = accumulate(runs.get(runId) || "", event?.assistantTexts);
+      runs.set(runId, cumulative);
+      if (runs.size > 256) runs.delete(runs.keys().next().value);
+      if (cumulative) void postPartial(cumulative, nextSeq(), api, ctx?.sessionKey);
     } catch (_ignored) {
       // never let streaming break a turn
     }
     return undefined;
   });
 
+  api.on("agent_end", (event, ctx) => { runs.delete(ctx?.runId || event?.runId); });
+
   // The agent is wrapping up → POST the resolved final message as the last
   // pre-reply partial (falls back to the accumulator if the runtime didn't set
   // lastAssistantMessage). Return undefined so we never interfere with the
   // output-guard plugin's finalize decision.
-  api.on("before_agent_finalize", (event) => {
+  api.on("before_agent_finalize", (event, ctx) => {
     try {
       const finalText = event && typeof event.lastAssistantMessage === "string" ? event.lastAssistantMessage : "";
-      const text = capText(finalText || cumulative);
-      if (text) void postPartial(text, nextSeq(), api);
-      // Reset for the next turn.
-      runId = null;
-      cumulative = "";
+      const runId = ctx?.runId || event?.runId;
+      const text = capText(finalText || runs.get(runId) || "");
+      if (text) void postPartial(text, nextSeq(), api, ctx?.sessionKey);
+      runs.delete(runId);
     } catch (_ignored) {
       // no-op
     }

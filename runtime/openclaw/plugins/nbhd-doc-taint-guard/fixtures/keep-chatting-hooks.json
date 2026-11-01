@@ -1,0 +1,626 @@
+{
+  "version": "2026.9.4",
+  "sources": [
+    "http-utils-DhJ41GBs.mjs",
+    "agent-tools.before-tool-call-WtmCO7BO.mjs",
+    "builtin-openclaw-B-H-7lKk.mjs"
+  ],
+  "calls": [
+    {
+      "event": {
+        "toolName": "publish_portfolio_image",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-0"
+      },
+      "ctx": {
+        "toolName": "publish_portfolio_image",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-0"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "publish_portfolio_image",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-1"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-1"
+      }
+    },
+    {
+      "event": {
+        "toolName": "site_publish",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-2"
+      },
+      "ctx": {
+        "toolName": "site_publish",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-2"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "site_publish",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-3"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-3"
+      }
+    },
+    {
+      "event": {
+        "toolName": "shop_confirm",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-4"
+      },
+      "ctx": {
+        "toolName": "shop_confirm",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-4"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "shop_confirm",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-5"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-5"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_reddit_post",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-6"
+      },
+      "ctx": {
+        "toolName": "nbhd_reddit_post",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-6"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_reddit_post",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-7"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-7"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_reddit_reply",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-8"
+      },
+      "ctx": {
+        "toolName": "nbhd_reddit_reply",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-8"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_reddit_reply",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-9"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-9"
+      }
+    },
+    {
+      "event": {
+        "toolName": "web_fetch",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-10"
+      },
+      "ctx": {
+        "toolName": "web_fetch",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-10"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "web_fetch",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-11"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-11"
+      }
+    },
+    {
+      "event": {
+        "toolName": "sessions_spawn",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-12"
+      },
+      "ctx": {
+        "toolName": "sessions_spawn",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-12"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "sessions_spawn",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-13"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-13"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_daily_note_get",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-14"
+      },
+      "ctx": {
+        "toolName": "nbhd_daily_note_get",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-14"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_daily_note_get",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-15"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-15"
+      }
+    },
+    {
+      "event": {
+        "toolName": "publish_portfolio_image",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-16"
+      },
+      "ctx": {
+        "toolName": "publish_portfolio_image",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-16"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "publish_portfolio_image",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-17"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-17"
+      }
+    },
+    {
+      "event": {
+        "toolName": "site_publish",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-18"
+      },
+      "ctx": {
+        "toolName": "site_publish",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-18"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "site_publish",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-19"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-19"
+      }
+    },
+    {
+      "event": {
+        "toolName": "shop_confirm",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-20"
+      },
+      "ctx": {
+        "toolName": "shop_confirm",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-20"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "shop_confirm",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-21"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-21"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_reddit_post",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-22"
+      },
+      "ctx": {
+        "toolName": "nbhd_reddit_post",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-22"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_reddit_post",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-23"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-23"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_reddit_reply",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-24"
+      },
+      "ctx": {
+        "toolName": "nbhd_reddit_reply",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-24"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_reddit_reply",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-25"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-25"
+      }
+    },
+    {
+      "event": {
+        "toolName": "web_fetch",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-26"
+      },
+      "ctx": {
+        "toolName": "web_fetch",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-26"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "web_fetch",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-27"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-27"
+      }
+    },
+    {
+      "event": {
+        "toolName": "sessions_spawn",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-28"
+      },
+      "ctx": {
+        "toolName": "sessions_spawn",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-28"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "sessions_spawn",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-29"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-29"
+      }
+    },
+    {
+      "event": {
+        "toolName": "nbhd_daily_note_get",
+        "params": {},
+        "runId": "fixture-run",
+        "toolCallId": "call-30"
+      },
+      "ctx": {
+        "toolName": "nbhd_daily_note_get",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-30"
+      }
+    },
+    {
+      "event": {
+        "toolName": "tool_call",
+        "params": {
+          "id": "nbhd_daily_note_get",
+          "args": {}
+        },
+        "runId": "fixture-run",
+        "toolCallId": "call-31"
+      },
+      "ctx": {
+        "toolName": "tool_call",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "fixture-session",
+        "runId": "fixture-run",
+        "toolCallId": "call-31"
+      }
+    }
+  ],
+  "outputCalls": [
+    {
+      "event": {
+        "runId": "main-run",
+        "sessionId": "main-run",
+        "provider": "offline",
+        "model": "offline",
+        "resolvedRef": "offline/offline",
+        "assistantTexts": [
+          "main first"
+        ]
+      },
+      "ctx": {
+        "runId": "main-run",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "main-run"
+      }
+    },
+    {
+      "event": {
+        "runId": "side-run",
+        "sessionId": "side-run",
+        "provider": "offline",
+        "model": "offline",
+        "resolvedRef": "offline/offline",
+        "assistantTexts": [
+          "side"
+        ]
+      },
+      "ctx": {
+        "runId": "side-run",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555:side:aabbccddeeff",
+        "sessionId": "side-run"
+      }
+    },
+    {
+      "event": {
+        "runId": "main-run",
+        "sessionId": "main-run",
+        "provider": "offline",
+        "model": "offline",
+        "resolvedRef": "offline/offline",
+        "assistantTexts": [
+          "main second"
+        ]
+      },
+      "ctx": {
+        "runId": "main-run",
+        "agentId": "main",
+        "sessionKey": "agent:main:openai-user:thread:11111111-2222-4333-8444-555555555555",
+        "sessionId": "main-run"
+      }
+    }
+  ]
+}

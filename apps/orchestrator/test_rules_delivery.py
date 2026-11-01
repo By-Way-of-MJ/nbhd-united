@@ -87,7 +87,7 @@ class RulesDeliveryTest(TestCase):
                     "`sessions_spawn` FIRST, before doing the work",
                     "find it via tool search",
                     "reply immediately",
-                    "On it — I'll let you know when it's ready.",
+                    "On it: comparing those three vacuums. Keep chatting, I'll send it when it's done.",
                     'Never pass `context: "fork"`',
                     "helper is read-only, reports back",
                     "exactly one `nbhd_send_to_user`",

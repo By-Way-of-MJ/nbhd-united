@@ -154,6 +154,7 @@ ONE_QUESTION_TENANT_IDS = env("ONE_QUESTION_TENANT_IDS", default="")
 SEND_TEST_TENANT_IDS = env("SEND_TEST_TENANT_IDS", default="")
 # Enable only after the running journal-tools manifest includes attentionHoldsEnabled.
 ATTENTION_HOLD_TENANT_IDS = env("ATTENTION_HOLD_TENANT_IDS", default="")
+KEEP_CHATTING_TENANT_IDS = env("KEEP_CHATTING_TENANT_IDS", default="")
 
 # Hourly Jev "worth a message?" SHADOW check — mirror of the base.py name so
 # the Container App env vars are documented here. Comma-separated tenant UUIDs

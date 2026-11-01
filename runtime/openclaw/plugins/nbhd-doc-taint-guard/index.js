@@ -51,6 +51,13 @@ import {
  * before_tool_call discipline.
  */
 
+// Real gateway shape: http-utils-DhJ41GBs.mjs::resolveSessionKey and
+// agent-tools.before-tool-call-WtmCO7BO.mjs::buildToolContext (2026.9.4).
+export function isSideSession(ctx) {
+  return /^agent:[^:]+:openai-user:thread:[0-9a-f-]{36}:side:[0-9a-f]{12}$/.test(ctx?.sessionKey || "");
+}
+const SIDE_BLOCK_REASON = "A side conversation cannot publish, send data outward, or spawn helpers. Continue chatting here; job changes will be picked up when the running job finishes.";
+
 // ── Taint detection ──────────────────────────────────────────────────────
 
 const DOCUMENT_MARKERS = ["[Document attached:", "[Photo attached:"];
@@ -426,6 +433,9 @@ export default function register(api) {
   api.on("before_tool_call", (event, ctx) => {
     try {
       const realId = resolveRealToolId(event);
+      if (isSideSession(ctx) && (realId === "sessions_spawn" || (mode === "enforce" && EXFIL_TOOL_IDS.has(realId)))) {
+        return { block: true, blockReason: SIDE_BLOCK_REASON };
+      }
       const toolCallId = event && event.toolCallId;
 
       // (i) Track pdf/image calls so tool_result_persist can correlate,

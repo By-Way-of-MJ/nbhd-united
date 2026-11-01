@@ -1540,7 +1540,16 @@ class ChatProgressEventView(APIView):
         # holds; the low-sensitivity phase spinner may still ride the best-effort
         # newest-PENDING fallback below.
         partial_attributable = True
-        if client_msg_id:
+        from apps.router.chat_gates import keep_chatting_enabled
+        from apps.router.side_lane import progress_rows
+
+        progress_tenant = Tenant(pk=tenant_id)
+        lane_aware = keep_chatting_enabled(progress_tenant)
+        if lane_aware:
+            # Session keys come from the real hook ctx, not model content. A
+            # missing/ambiguous identity must never mix two active replies.
+            qs = progress_rows(base, tenant_id, request.data.get("session_key"), client_msg_id)
+        elif client_msg_id:
             qs = base.filter(client_msg_id=client_msg_id)
         else:
             # The runtime tool-call hook didn't say which turn it is narrating
