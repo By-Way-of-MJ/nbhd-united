@@ -102,6 +102,41 @@ describe("captured button carry", () => {
     invoke(h, "tapEnd", "batch-2", "batch");
   });
 
+  it("carries minted placeholders in either or both sides of a captured label tap", () => {
+    for (const [label, tap] of [
+      ["Email Bob", "Email [PERSON_7]"],
+      ["Email [PERSON_7]", "Email Bob"],
+      ["Email [PERSON_7]", "Email [PERSON_8]"],
+      ["Ask [PERSON_7] now", "Ask Bob [LOCATION_2]"],
+    ]) {
+      const h = harness(), session = `minted-${label}-${tap}`;
+      invoke(h, "before", session + "-offer", session);
+      invoke(h, "read", session + "-offer", session);
+      const end = frame("end", session + "-offer", session);
+      const block = end.event.messages.findLast(m => m.role === "assistant").content.find(b => b.type === "text");
+      block.text = block.text.replace(/\[\[quick-replies:[^\n]*\]\]/, `[[quick-replies: ${label} | Skip]]`);
+      h.handlers.agent_end(end.event, end.ctx);
+      invoke(h, "tap", session + "-tap", session, `Context\n[2] (14:03:22) ${tap}!!`);
+      assert.equal(exfil(h, session + "-tap", session)?.block, true, `${label} -> ${tap}`);
+      assert.equal(h.warnings.filter(x => x.startsWith("taint_carried")).length, 1);
+      invoke(h, "tapEnd", session + "-tap", session);
+      invoke(h, "tap", session + "-again", session, tap);
+      assert.equal(exfil(h, session + "-again", session), undefined);
+    }
+  });
+
+  it("a real sentence with different literal words still clears a placeholder label", () => {
+    const h = harness();
+    invoke(h, "before", "wild-offer", "wild");
+    invoke(h, "read", "wild-offer", "wild");
+    const end = frame("end", "wild-offer", "wild");
+    const block = end.event.messages.findLast(m => m.role === "assistant").content.find(b => b.type === "text");
+    block.text = block.text.replace(/\[\[quick-replies:[^\n]*\]\]/, "[[quick-replies: Email [PERSON_7] | Skip]]");
+    h.handlers.agent_end(end.event, end.ctx);
+    invoke(h, "tap", "wild-next", "wild", "Please explain the tax bill instead.");
+    assert.equal(exfil(h, "wild-next", "wild"), undefined);
+  });
+
   it("a real sentence consumes and clears the stored label", () => {
     const h = harness();
     offer(h, "sentence");

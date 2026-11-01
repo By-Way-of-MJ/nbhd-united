@@ -121,6 +121,30 @@ export function isBareConfirmation(prompt) {
   return BARE_CONFIRMATIONS.has(normalizedConfirmation(prompt));
 }
 
+function confirmationLabelsMatch(left, right) {
+  if (left === right) return true;
+  const placeholder = /\[[a-z][a-z0-9_]*_\d+\]/;
+  if (!placeholder.test(left) && !placeholder.test(right)) return false;
+  const tokens = (text) => text.split(/(\[[a-z][a-z0-9_]*_\d+\])/)
+    .flatMap(part => placeholder.test(part) ? [null] : Array.from(part));
+  const a = tokens(left), b = tokens(right);
+  // Intersection of two literal/wildcard strings. Either side can have newly
+  // minted placeholders, including different positions on both sides. Empty
+  // matches are deliberately conservative: retaining taint is the safe choice.
+  let below = new Uint8Array(b.length + 1);
+  for (let i = a.length; i >= 0; i--) {
+    const current = new Uint8Array(b.length + 1);
+    for (let j = b.length; j >= 0; j--) {
+      if (i === a.length && j === b.length) current[j] = 1;
+      else if (i < a.length && a[i] === null) current[j] = below[j] || (j < b.length && current[j + 1]);
+      else if (j < b.length && b[j] === null) current[j] = current[j + 1] || (i < a.length && below[j]);
+      else if (i < a.length && j < b.length && a[i] === b[j]) current[j] = below[j + 1];
+    }
+    below = current;
+  }
+  return Boolean(below[0]);
+}
+
 // openclaw@2026.9.4: builtin-openclaw-B-H-7lKk.mjs:4422 sends the
 // messagesSnapshot as event.messages. session-accessor.sqlite-transcript-store-
 // BczH1lRJ.mjs:273 preserves assistant content blocks in that projection.
@@ -412,7 +436,7 @@ export default function register(api) {
         if (
           carry !== undefined &&
           carry.expiry > Date.now() &&
-          (isBareConfirmation(event && event.prompt) || carry.labels.includes(normalizedConfirmation(event && event.prompt))) &&
+          (isBareConfirmation(event && event.prompt) || carry.labels.some(label => confirmationLabelsMatch(label, normalizedConfirmation(event && event.prompt)))) &&
           !taintedRuns.get(runId)
         ) {
           setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
