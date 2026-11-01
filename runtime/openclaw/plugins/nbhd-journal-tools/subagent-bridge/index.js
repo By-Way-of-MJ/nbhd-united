@@ -301,7 +301,7 @@ async function postRuntime(runtime, path, body, occurrenceKey = "") {
       });
       if (response.ok) {
         const data = await response.json();
-        if (["sent", "duplicate", "pending", "released"].includes(data?.status)) return;
+        if (["sent", "duplicate", "pending", "released"].includes(data?.status)) return data;
       }
       lastError = new Error(`runtime ${path} returned ${response.status} without acceptance`);
     } catch (error) {
@@ -441,13 +441,17 @@ export default function register(api) {
       const threadId = parsed?.threadId || (runtimeAnnounce && extractThreadId(asTrimmedString(ctx?.sessionKey)));
       if (!runId || !threadId) return undefined;
       if (parsed) markedRuns.set(runId, parsed);
-      return {
+      const build = (side = {}) => ({
         // Do not turn a runtime-only event into a synthetic persisted user
         // message. 9.4 supplies an empty prompt here plus trusted provenance.
         [parsed ? "appendContext" : "appendSystemContext"]:
           `This is an app-session sub-agent completion. Never reply with NO_REPLY. ` +
-          `Write one final update in your normal voice. The bridge delivers your final reply to app thread ${threadId}; do not call a send tool.`,
-      };
+          `Write one final update in your normal voice. The bridge delivers your final reply to app thread ${threadId}; do not call a send tool.` +
+          (typeof side?.context === "string" && side.context ? `\n${side.context}` : ""),
+      });
+      return runtimeAnnounce && process.env.NBHD_KEEP_CHATTING === "1"
+        ? postRuntime(runtime, "helpers/context/", { thread_id: threadId }).then(build).catch(() => build())
+        : build();
     } catch (error) {
       safeLog(api, "warn", `nbhd-subagent-bridge: announce marker detection failed: ${safeErrorText(error)}`);
       return undefined;

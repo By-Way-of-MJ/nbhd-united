@@ -52,6 +52,9 @@ class AttentionConfigTests(SimpleTestCase):
         self.assertEqual(flagged["agents"]["defaults"]["maxConcurrent"], 4)
         self.assertEqual(flagged["agents"]["defaults"]["subagents"]["maxConcurrent"], 2)
         flagged["agents"]["defaults"]["maxConcurrent"] = 2
+        self.assertEqual(flagged["env"]["vars"].pop("NBHD_KEEP_CHATTING"), "1")
+        if flagged["env"] == {"vars": {}}:
+            flagged.pop("env")
         self.assertEqual(flagged, baseline)
 
     def test_unflagged_config_and_agents_match_pre_feature_bytes(self):

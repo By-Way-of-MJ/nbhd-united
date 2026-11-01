@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from apps.platform_logs.views import PlatformIssueReportView as _PlatformIssueReportView
 from apps.router.cron_delivery import CronDeliveryView as _CronDeliveryView
-from apps.router.helper_runs import HelperAdmissionView, HelperReleaseView
+from apps.router.helper_runs import HelperAdmissionView, HelperContextView, HelperReleaseView
 
 from .link_views import SautaiLinkView
 from .runtime_views import (
@@ -381,6 +381,7 @@ urlpatterns = [
         name="runtime-workspace-detail",
     ),
     # Cron delivery — tenant agents send messages to users via Django
+    path("runtime/<uuid:tenant_id>/helpers/context/", HelperContextView.as_view(), name="runtime-helper-context"),
     path(
         "runtime/<uuid:tenant_id>/helpers/release/",
         HelperReleaseView.as_view(),

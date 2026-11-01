@@ -43,6 +43,30 @@ describe("captured 2026.9.4 app completion", () => {
     } finally { globalThis.fetch = previous; }
   });
 
+  it("adds durable side cancellation to the captured announce build without a plugin key", async () => {
+    const api = fakeApi(); registerBridge(api);
+    const previousFetch = globalThis.fetch;
+    const previousFlag = process.env.NBHD_KEEP_CHATTING;
+    process.env.NBHD_KEEP_CHATTING = "1";
+    const calls = [];
+    globalThis.fetch = async (url, options) => {
+      calls.push({url: String(url), body: JSON.parse(options.body)});
+      return {ok: true, json: async () => ({status: "pending", context: "[earlier-from-you: never mind, forget the plan]"})};
+    };
+    try {
+      const build = captured.before_prompt_build;
+      const result = await api._handlers.before_prompt_build(build.event, build.ctx);
+      assert.match(result.appendSystemContext, /never mind, forget the plan/);
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /helpers\/context\/$/);
+      assert.deepEqual(calls[0].body, {thread_id: build.ctx.sessionKey.split(":thread:")[1]});
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousFlag === undefined) delete process.env.NBHD_KEEP_CHATTING;
+      else process.env.NBHD_KEEP_CHATTING = previousFlag;
+    }
+  });
+
   it("backstops a silent parent with the captured child result", async () => {
     const api = fakeApi(); registerBridge(api);
     const previous = globalThis.fetch; let body;

@@ -27,6 +27,18 @@ they cannot retroactively receive the new watchdog guarantee.
 
 ### 2026.9.4 app completion repair
 
+Keep-chatting side decisions are durable identifier-only state on `ChatThread`.
+An admitted helper is tied to its running main row. Its acknowledgement stays
+visible; side exchanges do not start a recap turn. At the real announce build
+hook, the bridge fetches checked side context and appends it as system context
+when config env `NBHD_KEEP_CHATTING=1`. This uses the captured empty-prompt /
+`inputProvenance.sourceTool=subagent_announce` envelope cited below, without a
+new plugin configuration key. The delivery transaction also checks cancellation
+under the thread lock: a cancelled helper result becomes a plain cancellation
+acknowledgement, closes as a result, and never publishes the raw result or a
+later watchdog failure. Apply the additive router migration and Django before
+the new bridge/config.
+
 The old bridge missed real app completions: `before_prompt_build.prompt` is
 empty, with `ctx.inputProvenance.sourceTool="subagent_announce"`. At
 `before_agent_run`, the prompt starts with **"A background task completed. Use

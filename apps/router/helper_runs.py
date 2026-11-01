@@ -65,6 +65,9 @@ class HelperAdmissionView(APIView):
         # Retries never extend the deadline or reopen a closed obligation.
         if row.thread_id != thread.id or row.closed_at is not None or row.deadline <= timezone.now():
             return Response({"error": "helper_admission_closed"}, status=409)
+        from apps.router.job_changes import bind_helper
+
+        bind_helper(tenant, thread.id, row.occurrence_key)
         return Response({"status": "pending"})
 
 
@@ -99,6 +102,58 @@ class HelperReleaseView(APIView):
         return Response({"status": "released"})
 
 
+class HelperContextView(APIView):
+    """Return checked side context for a runtime-produced parent announcement."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, tenant_id):
+        try:
+            validate_internal_runtime_request(
+                provided_key=request.headers.get("X-NBHD-Internal-Key", ""),
+                provided_tenant_id=request.headers.get("X-NBHD-Tenant-Id", ""),
+                expected_tenant_id=str(tenant_id),
+            )
+        except InternalAuthError:
+            return Response({"error": "internal_auth_failed"}, status=401)
+        tenant = Tenant.objects.filter(pk=tenant_id).first()
+        from apps.router.chat_gates import keep_chatting_enabled
+        from apps.router.models import AppChatMessage
+        from apps.router.side_lane import _exchanges
+
+        if tenant is None or not keep_chatting_enabled(tenant):
+            return Response({"status": "pending", "context": ""})
+        thread = ChatThread.objects.filter(tenant=tenant, pk=request.data.get("thread_id")).first()
+        if thread is None:
+            return Response({"error": "thread_not_found"}, status=404)
+        open_keys = set(
+            HelperRun.objects.filter(tenant=tenant, thread=thread)
+            .exclude(closed_by=HelperRun.ClosedBy.RESULT)
+            .values_list("occurrence_key", flat=True)
+        )
+        entries = [e for e in thread.side_jobs.values() if open_keys.intersection(e["helpers"])]
+        ids = [cid for e in entries for cid in e["side_ids"]]
+        if not ids:
+            return Response({"status": "pending", "context": ""})
+        exchanges = _exchanges(
+            tenant,
+            AppChatMessage.objects.filter(tenant=tenant, thread=thread, client_msg_id__in=ids).order_by("created_at"),
+            handoff=True,
+        )
+        return Response(
+            {
+                "status": "pending",
+                "context": (
+                    "[earlier-from-you: these messages arrived while the requested helper worked. "
+                    "Follow the person's latest change or cancellation. Never re-send a cancelled result. "
+                    "Do not repeat the side answer or take outward or saving actions they did not request.]\n"
+                    + exchanges
+                ),
+            }
+        )
+
+
 def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expired_only=False, **content):
     """Commit the app-feed row and closure together; rollback is safe to retry.
 
@@ -110,7 +165,15 @@ def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expi
 
     # The ended hook and watchdog both send this fixed notice.
     is_failure = message_text == FAILURE_MESSAGE
+    from apps.router.chat_gates import keep_chatting_enabled
+
+    keep_on = keep_chatting_enabled(tenant)
     with transaction.atomic():
+        thread = (
+            ChatThread.objects.select_for_update().filter(tenant=tenant, pk=thread_id).first()
+            if keep_on and thread_id
+            else None
+        )
         row = HelperRun.objects.select_for_update().filter(tenant=tenant, occurrence_key=occurrence_key).first()
         if row is None:
             return Response({"error": "helper_not_found"}, status=404)
@@ -122,6 +185,15 @@ def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expi
             return Response({"status": "pending"})
         if tenant.status != Tenant.Status.ACTIVE or not tenant.user.is_active:
             return Response({"status": "blocked"})
+        from apps.router.job_changes import helper_entry
+
+        if keep_on:
+            thread = thread or ChatThread.objects.select_for_update().get(pk=row.thread_id)
+            entry = helper_entry(thread, occurrence_key)
+            if entry and entry["kind"] == "cancel":
+                message_text = "Cancelled — I won't send that result."
+                content = {}
+                is_failure = False
         outbound = record_proactive_outbound(
             tenant=tenant,
             channel="eval" if tenant.is_eval_sink else "app",

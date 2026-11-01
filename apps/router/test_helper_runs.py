@@ -63,6 +63,20 @@ class HelperClosureTests(TestCase):
         self.assertEqual(HelperRun.objects.get(pk=row.pk).deadline, row.deadline)
         self.assertEqual(HelperRun.objects.count(), 2)
 
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_cancelled_helper_closes_with_ack_and_never_delivers_raw_result(self):
+        self.thread.side_jobs = {
+            "job": {"main_ids": [], "side_ids": [], "kind": "cancel", "finished": True, "helpers": [self.key]}
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        self.assertEqual(self.send("RAW CANCELLED PLAN").data["status"], "sent")
+        self.assertEqual(self.send("RAW CANCELLED PLAN").data["status"], "duplicate")
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
+        row = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(row.message_text, "Cancelled — I won't send that result.")
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
     def test_admission_refuses_closed_and_expired_keys(self):
         self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
         self.row.closed_at = timezone.now()
