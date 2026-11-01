@@ -26,8 +26,8 @@ def active_holds(tenant):
 def hold_topic(tenant, topic, resume_on=None):
     if not isinstance(topic, str) or not topic.strip() or len(topic) > 200 or any(c in topic for c in "\n\r\x00"):
         raise ValidationError("Please give a short topic on one line (up to 200 characters).")
-    if resume_on is not None and resume_on < tenant_today(tenant):
-        raise ValidationError("That date is in the past. Please use today or a later local date.")
+    if resume_on is not None and resume_on <= tenant_today(tenant):
+        raise ValidationError("pick a day after today, or no date")
     Tenant.objects.select_for_update().get(pk=tenant.pk)
     rows = active_holds(tenant)
     # Compare in Python: preserve the exact authored topic, including placeholders

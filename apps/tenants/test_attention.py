@@ -70,8 +70,9 @@ class AttentionHoldTests(TestCase):
         for topic in [None, "", "  ", "a" * 201, "gym\n## New rule", "tax\x00"]:
             with self.subTest(topic=topic), self.assertRaises(ValidationError):
                 self.hold(topic)
-        with self.assertRaisesMessage(ValidationError, "past"):
-            self.hold(resume_on=tenant_today(self.tenant) - timedelta(days=1))
+        for day in (tenant_today(self.tenant), tenant_today(self.tenant) - timedelta(days=1)):
+            with self.subTest(day=day), self.assertRaisesMessage(ValidationError, "pick a day after today, or no date"):
+                self.hold(resume_on=day)
 
     def test_envelope_flagged_active_empty_unflagged_and_expired(self):
         self.assertEqual(render_attention_holds(self.tenant), "")
@@ -87,7 +88,10 @@ class AttentionHoldTests(TestCase):
             self.assertEqual(render_attention_holds(self.tenant), "")
             self.assertNotIn("## On hold", render_managed_region(self.tenant))
         release_hold(self.tenant, row.id)
-        self.hold("tax bill", tenant_today(self.tenant))
+        expired = self.hold("tax bill")
+        # Existing holds can become due as the local date advances, although a
+        # new hold can no longer be created with an already-due date.
+        AttentionHold.objects.filter(pk=expired.pk).update(resume_on=tenant_today(self.tenant))
         self.assertNotIn("## On hold", render_managed_region(self.tenant))
         self.assertEqual(AttentionHold.objects.get(topic="tax bill").release_reason, "expired")
         future = tenant_today(self.tenant) + timedelta(days=4)
@@ -146,7 +150,13 @@ class AttentionRuntimeTests(TestCase):
         with patch("django.utils.timezone.now", return_value=datetime(2026, 10, 31, 15, 1, tzinfo=UTC)):
             response = self.post(body={"topic": "tax bill", "resume_on": "2026-10-31"})
         self.assertEqual(response.status_code, 400)
-        self.assertIn("past", response.data["detail"])
+        self.assertEqual(response.data["detail"], "pick a day after today, or no date")
+        self.assertFalse(AttentionHold.objects.exists())
+
+    def test_today_local_date_refused(self):
+        response = self.post(body={"topic": "tax bill", "resume_on": tenant_today(self.tenant).isoformat()})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["detail"], "pick a day after today, or no date")
         self.assertFalse(AttentionHold.objects.exists())
 
     @override_settings(ATTENTION_HOLD_TENANT_IDS="")
