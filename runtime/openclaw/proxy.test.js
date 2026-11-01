@@ -251,6 +251,30 @@ test("an explicit unavailable response permits the next retry", async () => {
   await retryAfterRejection(503, { error: "unavailable" });
 });
 
+test("gateway errors and rejections are never replayed", async () => {
+  for (const status of [400, 403, 429, 500, 502, 504]) {
+    await retryAfterRejection(status, { error: "gateway failure" });
+  }
+});
+
+test("a lost gateway connection evicts its proxy-generated 502", async () => {
+  let calls = 0;
+  const gateway = http.createServer((req, res) => {
+    req.resume();
+    if (++calls === 1) req.socket.destroy();
+    else res.end('completed');
+  });
+  const port = await listen(createProxyServer({ gatewayPort: await listen(gateway) }));
+  const url = `http://127.0.0.1:${port}/v1/chat/completions`;
+  const options = { method: "POST", headers: { "X-NBHD-Chat-Request-Id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }, body: "{}" };
+  const failed = await fetch(url, options);
+  assert.equal(failed.status, 502);
+  assert.equal((await failed.json()).error, "chat_gateway_connection_lost");
+  assert.equal(await (await fetch(url, options)).text(), "completed");
+  assert.equal(await (await fetch(url, options)).text(), "completed");
+  assert.equal(calls, 2);
+});
+
 test("a raised credit ceiling can retry the rejected batch", async () => {
   await retryAfterRejection(402, { error: "payment_required" });
   await retryAfterRejection(500, { error: { message: "Quota exceeded" } });

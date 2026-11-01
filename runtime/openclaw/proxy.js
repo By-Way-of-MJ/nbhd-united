@@ -80,15 +80,6 @@ const CHAT_REPLAY_TTL_MS = 15 * 60 * 1000;
 // Covers the unchanged 300 sends/hour limit plus their internal recap turns.
 const CHAT_REPLAY_MAX_ENTRIES = 512;
 const CHAT_REPLAY_MAX_BYTES = 1024 * 1024;
-// These are explicit rejections, rather than completed or ambiguous work.
-// Credit strings match apps/router/pending_queue.py's credit-limit detector.
-function retryableChatRejection(reply) {
-  if ([400, 401, 403, 404, 405, 413, 415, 422, 429, 503].includes(reply.status)) return true;
-  if (reply.status === 402) return true;
-  if (reply.status < 400 || reply.status >= 600) return false;
-  const text = reply.body.toString("utf8").toLowerCase();
-  return ["insufficient credit", "insufficient_credit", "credit limit", "credit_limit", "quota exceeded", "quota_exceeded"].some((needle) => text.includes(needle));
-}
 function proxyChatOnce(req, res, targetPort, calls) {
   const requestId = req.headers["x-nbhd-chat-request-id"];
   const identity = createHash("sha256").update(String(req.headers.authorization || "") + ":" + requestId).digest("hex");
@@ -112,11 +103,13 @@ function proxyChatOnce(req, res, targetPort, calls) {
   calls.set(identity, entry);
   entry.promise.then((reply) => sendReplay(res, reply));
   let settled = false;
-  function complete(reply, rejected = false) {
+  function complete(reply) {
     if (settled) return;
     settled = true;
     entry.done = Date.now();
-    if (rejected && calls.get(identity) === entry) calls.delete(identity);
+    // Keep only in-flight work and finished successes. Every failure must be
+    // retryable just as it is without the stable request header.
+    if ((reply.status < 200 || reply.status >= 300) && calls.get(identity) === entry) calls.delete(identity);
     finish(reply);
   }
   const headers = stripForwardedHeaders(req.headers);
@@ -132,7 +125,7 @@ function proxyChatOnce(req, res, targetPort, calls) {
         complete({ status: 502, headers: {}, body: Buffer.from('{"error":"chat_reply_too_large"}') });
       } else {
         const reply = { status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) };
-        complete(reply, retryableChatRejection(reply));
+        complete(reply);
       }
     });
     response.on("error", fail);
@@ -145,7 +138,7 @@ function proxyChatOnce(req, res, targetPort, calls) {
     const body = refused
       ? { error: "bad_gateway", detail: `upstream ${targetPort} unreachable` }
       : { error: incomplete ? "chat_request_interrupted" : "chat_gateway_connection_lost" };
-    complete({ status: 502, headers: {}, body: Buffer.from(JSON.stringify(body)) }, refused || incomplete);
+    complete({ status: 502, headers: {}, body: Buffer.from(JSON.stringify(body)) });
   }
   upstream.on("error", fail);
   const abortIncomplete = () => {
