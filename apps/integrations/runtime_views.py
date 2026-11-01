@@ -4015,6 +4015,64 @@ class RuntimeProfileUpdateView(APIView):
         )
 
 
+class RuntimeAttentionHoldView(APIView):
+    """Save or explicitly lift a tenant's durable topic hold."""
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    release = False
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, failure = _load_tenant_or_404(tenant_id)
+        if failure is not None:
+            return failure
+        from apps.orchestrator.envelope_registry import suppress_refresh
+        from apps.orchestrator.workspace_envelope import TRIGGER_ATTENTION_HOLD, push_user_md
+        from apps.tenants.attention import attention_holds_enabled, hold_topic, release_hold
+        from apps.tenants.models import AttentionHold
+
+        if not attention_holds_enabled(tenant):
+            return Response({"detail": "Topic holds are not enabled for this workspace."}, status=403)
+        try:
+            # Suppress the registry signal: this request owns one immediate
+            # refresh after commit, including when the row was already released.
+            with transaction.atomic(), suppress_refresh():
+                if self.release:
+                    hold_id = request.data.get("hold_id")
+                    if isinstance(hold_id, bool) or not isinstance(hold_id, int) or hold_id < 1:
+                        return Response({"detail": "Please provide a valid hold id."}, status=400)
+                    row = release_hold(tenant, hold_id)
+                else:
+                    raw_date = request.data.get("resume_on")
+                    resume_on = date.fromisoformat(raw_date) if raw_date is not None else None
+                    row = hold_topic(tenant, request.data.get("topic"), resume_on)
+                transaction.on_commit(
+                    lambda: push_user_md(str(tenant_id), debounce_seconds=0, trigger=TRIGGER_ATTENTION_HOLD)
+                )
+        except AttentionHold.DoesNotExist:
+            return Response({"detail": "That hold was not found in this workspace."}, status=404)
+        except DjangoValidationError as exc:
+            return Response({"detail": " ".join(exc.messages)}, status=400)
+        except (TypeError, ValueError):
+            return Response({"detail": "Please use a local date in YYYY-MM-DD format."}, status=400)
+        return Response(
+            {
+                "ok": True,
+                "hold_id": row.id,
+                "topic": row.topic,
+                "resume_on": row.resume_on,
+                "released": row.released_at is not None,
+            }
+        )
+
+
+class RuntimeAttentionReleaseView(RuntimeAttentionHoldView):
+    release = True
+
+
 class RuntimeSituationUpdateView(APIView):
     """POST /api/v1/integrations/runtime/<tenant_id>/situation/
 

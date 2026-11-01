@@ -12,6 +12,8 @@ from .runtime_views import (
     RedditDisconnectView,
     RedditStatusView,
     RedditToolView,
+    RuntimeAttentionHoldView,
+    RuntimeAttentionReleaseView,
     RuntimeBYOErrorReportView,
     RuntimeCalendarEventsView,
     RuntimeCalendarFreeBusyView,
@@ -346,6 +348,12 @@ urlpatterns = [
         name="runtime-profile-update",
     ),
     # Agent-stated transient current location
+    path("runtime/<uuid:tenant_id>/attention/hold/", RuntimeAttentionHoldView.as_view(), name="runtime-attention-hold"),
+    path(
+        "runtime/<uuid:tenant_id>/attention/release/",
+        RuntimeAttentionReleaseView.as_view(),
+        name="runtime-attention-release",
+    ),
     path(
         "runtime/<uuid:tenant_id>/situation/",
         RuntimeSituationUpdateView.as_view(),

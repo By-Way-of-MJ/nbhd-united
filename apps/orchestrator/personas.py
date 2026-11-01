@@ -777,6 +777,18 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_editor_gate
 
+    from apps.tenants.attention import attention_holds_enabled
+
+    if attention_holds_enabled(tenant):
+        result["NBHD_AGENTS_MD"] += (
+            "\n\n## Topic holds\n\n"
+            "When the person asks not to hear about something for a while or until they say so, "
+            "call `nbhd_hold_topic` THIS TURN; then confirm in one short line naming the topic "
+            "and when it ends. Use their local date as the first day it may come up again. "
+            "Cancelling one specific reminder is not a hold. Questions or new information never "
+            "lift a hold; clear permission does, using `nbhd_release_hold`."
+        )
+
     # Current-location capture gate — behavioral, flag-gated, and imperative.
     # The tool being available is not enough under toolSearch: like the site-
     # publishing reconcile gate above, the agent needs an always-loaded cue to

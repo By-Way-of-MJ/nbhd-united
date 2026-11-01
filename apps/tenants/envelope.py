@@ -13,7 +13,8 @@ from django.utils import timezone
 
 from apps.common.tenant_tz import tenant_tz
 from apps.orchestrator.envelope_registry import register_section
-from apps.tenants.models import Tenant, User, UserSituation
+from apps.tenants.attention import active_holds, attention_holds_enabled
+from apps.tenants.models import AttentionHold, Tenant, User, UserSituation
 from apps.tenants.situation import is_assignable_profile_timezone
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,32 @@ def _cap_situation_lines(
     if len(body) > SITUATION_MAX_CHARS and not tz_priority:
         body = body[: SITUATION_MAX_CHARS - 1].rstrip() + "…"
     return body
+
+
+@register_section(
+    key="on_hold",
+    heading="## On hold",
+    enabled=attention_holds_enabled,
+    refresh_on=(AttentionHold,),
+    order=14,
+)
+def render_attention_holds(tenant: Tenant) -> str:
+    if not attention_holds_enabled(tenant):
+        return ""
+    holds = active_holds(tenant)
+    if not holds:
+        return ""
+    rule = (
+        "Do not raise these topics in any message you start. If the person raises one, "
+        "answer normally and keep the hold. Questions and new information do not lift it. "
+        "Only lift it when they clearly say so, using nbhd_release_hold."
+    )
+    lines = [
+        f"- Hold {h.id}: {h.topic} — "
+        + (f"may resume {h.resume_on.isoformat()} (local date)." if h.resume_on else "until they lift it.")
+        for h in holds
+    ]
+    return rule + "\n" + "\n".join(lines)
 
 
 @register_section(

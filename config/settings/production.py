@@ -150,6 +150,8 @@ TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 EVENING_TOMORROW_PREP_TENANT_IDS = env("EVENING_TOMORROW_PREP_TENANT_IDS", default="")
 TAINT_CARRY_TENANT_IDS = env("TAINT_CARRY_TENANT_IDS", default="")
 HEARTBEAT_NUDGE_DEDUP_TENANT_IDS = env("HEARTBEAT_NUDGE_DEDUP_TENANT_IDS", default="")
+# Enable only after the running journal-tools manifest includes attentionHoldsEnabled.
+ATTENTION_HOLD_TENANT_IDS = env("ATTENTION_HOLD_TENANT_IDS", default="")
 
 # Hourly Jev "worth a message?" SHADOW check — mirror of the base.py name so
 # the Container App env vars are documented here. Comma-separated tenant UUIDs

@@ -29,6 +29,8 @@
       "nbhd_cron_phase2_summary",
       "nbhd_update_profile",
       "nbhd_update_situation",
+      "nbhd_hold_topic",
+      "nbhd_release_hold",
       "nbhd_dismiss_timezone_offer",
       "nbhd_workspace_list",
       "nbhd_workspace_create",
@@ -66,6 +68,11 @@
       "apiBaseUrl": {
         "type": "string",
         "description": "Override NBHD API base URL. Defaults to NBHD_API_BASE_URL env var."
+      },
+      "attentionHoldsEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Expose hold tools only after the control plane verifies this manifest on the running image."
       },
       "panelsEnabled": {
         "type": "boolean",

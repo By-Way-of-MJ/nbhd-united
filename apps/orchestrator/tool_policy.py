@@ -203,3 +203,10 @@ def generate_tool_config(tier: str = "starter", version: str = OPENCLAW_CURRENT_
             },
         },
     }
+
+
+def attention_hold_tool_allow_overlay(tenant) -> tuple[str, ...]:
+    """Expose optional hold tools only for the attested tenant rollout."""
+    from apps.tenants.attention import attention_holds_enabled
+
+    return ("nbhd_hold_topic", "nbhd_release_hold") if attention_holds_enabled(tenant) else ()

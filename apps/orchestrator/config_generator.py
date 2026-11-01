@@ -2422,6 +2422,9 @@ def _build_tools_section(
 ) -> dict[str, Any]:
     """Build documented OpenClaw tools policy for subscriber tier."""
     tools = generate_tool_config(tier, version=version)
+    from apps.orchestrator.tool_policy import attention_hold_tool_allow_overlay
+
+    tools["allow"].extend(attention_hold_tool_allow_overlay(tenant))
     if subagents_on is None:
         subagents_on = subagents_enabled(tenant)
     if subagents_on:
@@ -3349,6 +3352,13 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         journal_tools_id = str(getattr(settings, "OPENCLAW_JOURNAL_PLUGIN_ID", "") or "").strip()
         if journal_tools_id in plugin_config["entries"] and chat_panels_tool_enabled(tenant):
             plugin_config["entries"][journal_tools_id]["config"] = {"panelsEnabled": True}
+
+        # ATTENTION_HOLD_TENANT_IDS also attests the running journal-tools
+        # manifest, just like the panels rollout above. Never enable on an old image.
+        from apps.tenants.attention import attention_holds_enabled
+
+        if journal_tools_id in plugin_config["entries"] and attention_holds_enabled(tenant):
+            plugin_config["entries"][journal_tools_id].setdefault("config", {})["attentionHoldsEnabled"] = True
 
         # Older settings-tools manifests hard-reject unknown plugin config at
         # LOAD (additionalProperties:false), so this block stays absent until
