@@ -20,6 +20,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from django.conf import settings
+
 from apps.fuel import catalog as fuel_catalog
 from apps.pii.config import ADDRESS_CONTEXT_LABELS, DEBERTA_LABEL_MAP, LABEL_SCORE_OVERRIDES, TIER_POLICIES
 from apps.pii.entity_registry import (
@@ -1264,11 +1266,57 @@ def metadata_in_placeholder_space(metadata: str, entity_map: dict[str, Any]) -> 
     return descriptor
 
 
+def _place_zone_label(name: object) -> str:
+    """Return a lookup-eligible place label, or "" for addresses/junk."""
+    try:
+        from apps.tenants.situation import clean_place_label
+
+        if not isinstance(name, str):
+            return ""
+        label = clean_place_label(name)
+        if not label or any(ch.isdigit() for ch in label) or len(label.split()) > 4:
+            return ""
+        return label
+    except Exception:
+        return ""
+
+
+def _place_zone_descriptor(name: str, *, allow_network: bool) -> str:
+    """Describe a place token's time zone without exposing the place name."""
+    try:
+        if not getattr(settings, "PII_PLACE_TZ_ANNOTATION_ENABLED", True):
+            return ""
+        label = _place_zone_label(name)
+        if not label:
+            return ""
+
+        from apps.tenants.situation import cached_place_timezone, resolve_place_timezone
+
+        place = cached_place_timezone(label)
+        if place is None and allow_network:
+            place = resolve_place_timezone(label)
+        if place is None:
+            return ""
+        if place.kind == "zone":
+            descriptor = f"tz {place.tz}"
+        elif place.kind == "region":
+            descriptor = "region with several time zones"
+        else:
+            return ""
+        if any(delimiter in descriptor for delimiter in "|[]"):
+            return ""
+        return descriptor
+    except Exception:
+        return ""
+
+
 def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
     """Annotate identity placeholders for model-bound context without PII.
 
     PERSON/ORG/PLACE tokens with a curated relationship carry that relationship
-    in placeholder space.  Tokens without one are explicitly ``unresolved``.
+    in placeholder space.  PLACE/LOCATION tokens also carry the place's time
+    zone when it is already cached (or when the per-call network budget allows
+    one lookup).  Tokens without either are explicitly ``unresolved``.
     Existing annotations are refreshed idempotently from the current registry.
     Other PII classes keep their historical bare form because a relationship is
     not meaningful for an email address, card number, and so on.
@@ -1277,6 +1325,29 @@ def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
         return text
 
     registry = entity_map or {}
+    network_budget = 2
+    network_names: set[str] = set()
+
+    def _allow_network(name: object) -> bool:
+        nonlocal network_budget
+        try:
+            label = _place_zone_label(name)
+            if not label:
+                return False
+            key = label.casefold()
+            if key in network_names:
+                return False
+            network_names.add(key)
+            from apps.tenants.situation import cached_place_timezone
+
+            if cached_place_timezone(label) is not None:
+                return False
+            if network_budget <= 0:
+                return False
+            network_budget -= 1
+            return True
+        except Exception:
+            return False
 
     def _annotate(match: re.Match) -> str:
         entity_type, number = match.group(1), match.group(2)
@@ -1286,6 +1357,18 @@ def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
         entry = registry.get(placeholder)
         relationship = entry.get("relationship") if isinstance(entry, dict) else ""
         descriptor = metadata_in_placeholder_space(relationship, registry) if isinstance(relationship, str) else ""
+        if entity_type in {"PLACE", "LOCATION"}:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+            elif isinstance(entry, str):
+                name = entry
+            else:
+                name = None
+            zone_descriptor = _place_zone_descriptor(name, allow_network=_allow_network(name))
+            if descriptor and zone_descriptor:
+                descriptor = f"{descriptor}; {zone_descriptor}"
+            else:
+                descriptor = descriptor or zone_descriptor
         return f"[{entity_type}_{number}|{descriptor or 'unresolved'}]"
 
     return _PLACEHOLDER_RE.sub(_annotate, text)

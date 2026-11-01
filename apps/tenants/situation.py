@@ -83,16 +83,32 @@ def resolve_place_timezone(label: str) -> PlaceTz:
         return PlaceTz(kind="unknown")
 
 
+def cached_place_timezone(label: str) -> PlaceTz | None:
+    """Cache-only read of resolve_place_timezone's result; None when not cached.
+
+    Never raises and never hits the network.
+    """
+    try:
+        cached = cache.get(_place_tz_cache_key(label))
+    except Exception:
+        return None
+    return cached if isinstance(cached, PlaceTz) else None
+
+
 def _normalize_place_text(value: object) -> str:
     """Casefold ``value`` and strip accents so ``Uşak`` matches ``usak``."""
     text = unicodedata.normalize("NFKD", str(value or "")).casefold()
     return "".join(ch for ch in text if not unicodedata.combining(ch))
 
 
+def _place_tz_cache_key(label: str) -> str:
+    return f"situation_place_tz:v3:{label.casefold()}"
+
+
 def _lookup_place_timezone(label: str) -> PlaceTz:
     from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
 
-    key = f"situation_place_tz:v3:{label.casefold()}"
+    key = _place_tz_cache_key(label)
     cached = cache.get(key)
     if isinstance(cached, PlaceTz):
         return cached

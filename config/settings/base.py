@@ -37,6 +37,8 @@ PII_DETECTOR_TRANSPORT = resolve_detector_transport(
 PII_BACKGROUND_DEADLINE_S = env.float("PII_BACKGROUND_DEADLINE_S", default=30)
 # Admission budget: finish the current string, defer all unstarted strings.
 PII_REPAIR_BUDGET_SECONDS = env.float("PII_REPAIR_BUDGET_SECONDS", default=120)
+# Hidden place tokens may carry a resolved IANA time zone in model-bound context.
+PII_PLACE_TZ_ANNOTATION_ENABLED = env.bool("PII_PLACE_TZ_ANNOTATION_ENABLED", default=True)
 
 
 def _positive_int_env(name: str, default: int) -> int:
