@@ -3048,6 +3048,9 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                     replied_at=now,
                     partial_text="",
                 )
+        from apps.router.reply_shape import log_reply_shape
+
+        log_reply_shape(tenant, push_text, quick_replies)
         # Notify the device the reply landed (closes the fire-and-forget gap for
         # Siri-escalated / backgrounded turns). No-op unless APNs is configured;
         # fail-open; idempotent (notified_at claim). The app suppresses the alert
@@ -3209,10 +3212,6 @@ def _clean_assistant_text_for_app(
     push_text = finalize_outbound_text(stored_text, entity_map, tenant_id=tenant.id, channel="ios_push")
     stored_text = clamp_reply_text(stored_text.strip())
     push_text = clamp_reply_text(push_text.strip())
-
-    from apps.router.reply_shape import log_reply_shape
-
-    log_reply_shape(tenant, push_text, quick_replies)
 
     return stored_text, push_text, reply_redactions, quick_replies, journal_link
 

@@ -783,11 +783,10 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
     if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
         one_question = (
             "\n\n## One question\n\n"
-            "Chat replies and messages you start must ask at most ONE question. "
-            "Never stack follow-ups or question-shaped examples. For a small pick, put "
-            "`[[quick-replies: A | B]]` alone on the last line, without backticks, using "
-            "2–4 short labels (at most 24 characters each). An open question gets no buttons. "
-            "Before sending, remove every question after the first."
+            "Every chat reply and message you start gets at most ONE question, including "
+            "rhetorical questions and list items. Before sending, count `?` and `？`; delete extra asks. "
+            "For a small pick, put `[[quick-replies: A | B]]` alone on the last line, without "
+            "backticks: 2–4 short labels, each ≤24 characters. An open question gets no buttons."
         )
         boundary = "\n\n## Reply Markers — Mandatory"
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"].replace(boundary, one_question + boundary, 1)

@@ -5,6 +5,8 @@ tappable choices instead of making the user type a short answer:
 
     [[quick-replies: Label A | Label B | Label C]]
 
+ONE_QUESTION_TENANT_IDS opts tenants into up to 4 labels; the default stays 3.
+
 This is deliberately distinct from LINE's ``[[button:label|data]]`` marker
 (``apps.router.line_flex.extract_quick_reply_buttons``): that one carries a
 callback payload and can appear anywhere in the text; this one carries plain

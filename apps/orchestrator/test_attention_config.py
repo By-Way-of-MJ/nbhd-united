@@ -95,7 +95,7 @@ class AttentionConfigTests(SimpleTestCase):
         self.assertLess(len(rule.split()), 70)
         self.assertIn("[[quick-replies: A | B]]", rule)
         self.assertIn("open question gets no buttons", rule)
-        self.assertIn("Chat replies and messages you start", rule)
+        self.assertIn("Every chat reply and message you start", rule)
         self.assertLess(changed_agents.index("## One question"), changed_agents.index("## Reply Markers"))
         self.assertEqual(changed_agents.replace("\n\n## One question\n\n" + rule, ""), agents)
         self.assertLess(len(changed_agents), BOOTSTRAP_MAX_CHARS - 1000)
@@ -141,7 +141,8 @@ class AttentionConfigTests(SimpleTestCase):
                     self.assertEqual(message.count(SEND_TEST_BLOCK), 1)
                     self.assertTrue(message.endswith(SEND_TEST_BLOCK))
                     self.assertNotIn("say so briefly", message)
-                    self.assertIn("Complete every note, save and journal report above first", message)
+                    self.assertIn("Every send below is conditional on passing the final Send test", message)
+                    self.assertIn("Finish all notes, saves and journal reports above first", message)
                     self.assertEqual(without_send_test(message), original[name]["payload"]["message"])
                 else:
                     self.assertEqual(job, original[name])

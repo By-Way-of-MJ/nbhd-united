@@ -80,6 +80,21 @@ class SendTestRefreshTests(TestCase):
         self.assertNotIn(SEND_TEST_BLOCK, row.data["payload"]["message"])
         self.assertTrue(row.data["payload"]["message"].endswith("Keep this edit."))
 
+    def test_previous_managed_send_rule_upgrades_once(self):
+        from apps.orchestrator.send_test import _PREVIOUS_SEND_TEST_BLOCK
+
+        with override_settings(SEND_TEST_TENANT_IDS="*"):
+            refresh_system_cron_rows_from_seed(self.tenant)
+            row = self.rows()["Personal Question"]
+            row.data["payload"]["message"] = row.data["payload"]["message"].replace(
+                SEND_TEST_BLOCK, _PREVIOUS_SEND_TEST_BLOCK
+            )
+            row.save(update_fields=["data"])
+            self.assertEqual(refresh_system_cron_rows_from_seed(self.tenant)["updated"], 1)
+            self.assertEqual(refresh_system_cron_rows_from_seed(self.tenant)["updated"], 0)
+        row.refresh_from_db()
+        self.assertEqual(row.data["payload"]["message"].count(SEND_TEST_BLOCK), 1)
+
     def test_management_command_scopes_one_tenant(self):
         with patch(
             "apps.orchestrator.management.commands.update_cron_prompts.refresh_system_cron_rows_from_seed"
