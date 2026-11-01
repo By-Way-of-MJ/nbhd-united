@@ -3103,7 +3103,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 },
                 "memorySearch": _build_memory_search_config(tenant),
                 "heartbeat": _build_heartbeat_defaults(tenant),
-                "maxConcurrent": 2,
+                "maxConcurrent": 4 if _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS") else 2,
                 "subagents": (
                     {
                         "maxConcurrent": 2,

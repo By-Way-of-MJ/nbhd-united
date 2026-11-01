@@ -21,6 +21,7 @@ from apps.tenants.models import Tenant, User
     HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="",
     ONE_QUESTION_TENANT_IDS="",
     SEND_TEST_TENANT_IDS="",
+    KEEP_CHATTING_TENANT_IDS="",
     OPENCLAW_JOURNAL_PLUGIN_ID="nbhd-journal-tools",
     OPENCLAW_JOURNAL_PLUGIN_PATH="/opt/nbhd/plugins/nbhd-journal-tools",
     TELEGRAM_WEBHOOK_SECRET="",
@@ -43,6 +44,15 @@ class AttentionConfigTests(SimpleTestCase):
         config = json.dumps(generate_openclaw_config(self.tenant), ensure_ascii=False, sort_keys=True)
         agents = render_workspace_files("neighbor", tenant=self.tenant)["NBHD_AGENTS_MD"]
         return config, agents
+
+    def test_keep_chatting_changes_only_main_lane_capacity(self):
+        baseline = generate_openclaw_config(self.tenant)
+        with override_settings(KEEP_CHATTING_TENANT_IDS="*"):
+            flagged = generate_openclaw_config(self.tenant)
+        self.assertEqual(flagged["agents"]["defaults"]["maxConcurrent"], 4)
+        self.assertEqual(flagged["agents"]["defaults"]["subagents"]["maxConcurrent"], 2)
+        flagged["agents"]["defaults"]["maxConcurrent"] = 2
+        self.assertEqual(flagged, baseline)
 
     def test_unflagged_config_and_agents_match_pre_feature_bytes(self):
         # Captured from the committed parent before implementing holds. This
