@@ -72,6 +72,17 @@ describe("captured button carry", () => {
     assert.deepEqual(finalQuickReplyLabels(event), [label, "skip"]);
   });
 
+  it("keeps the carry across a server handoff until the next real tap", () => {
+    const h = harness(), session = "handoff-session";
+    offer(h, session);
+    invoke(h, "before", "recap", session, "[earlier-from-you: side conversation]\nStatus only.");
+    assert.equal(exfil(h, "recap", session)?.block, true);
+    invoke(h, "tapEnd", "recap", session);
+    invoke(h, "before", "real-tap", session, "Post it");
+    assert.equal(exfil(h, "real-tap", session)?.block, true);
+    assert.ok(h.warnings.some(line => line === "taint_carried run=real-tap"));
+  });
+
   it("carries a real tapped label, logs only the run id, and blocks exfil", () => {
     const h = harness();
     offer(h, "tap");

@@ -430,8 +430,16 @@ export default function register(api) {
       }
       if (carryEnabled() && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
         const sessionKey = ctx.sessionKey;
-        setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
         const carry = carriedSessions.get(sessionKey);
+        // A server recap is not the next real user turn. Preserve its exact
+        // one-shot entry, and keep this turn tainted too (spoofing fails safe).
+        if (String(event?.prompt || "").includes("[earlier-from-you:")) {
+          if (carry && carry.expiry > Date.now()) {
+            setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
+          }
+          return undefined;
+        }
+        setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
         carriedSessions.delete(sessionKey);
         if (
           carry !== undefined &&
