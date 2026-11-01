@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from unittest.mock import patch
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from apps.tenants.models import Tenant, User
     CHAT_SHAPE_TENANT_IDS="",
     HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="",
     ONE_QUESTION_TENANT_IDS="",
+    SEND_TEST_TENANT_IDS="",
     OPENCLAW_JOURNAL_PLUGIN_ID="nbhd-journal-tools",
     OPENCLAW_JOURNAL_PLUGIN_PATH="/opt/nbhd/plugins/nbhd-journal-tools",
     TELEGRAM_WEBHOOK_SECRET="",
@@ -34,6 +36,8 @@ class AttentionConfigTests(SimpleTestCase):
         self.enterContext(patch("apps.billing.model_offers._offer", return_value=FreeModelOffer(enabled=False)))
         self.enterContext(patch("django.db.models.query.QuerySet.exists", return_value=False))
         self.enterContext(patch("apps.journal.services.get_default_template", return_value=None))
+        clock = self.enterContext(patch("apps.orchestrator.config_generator.datetime"))
+        clock.now.return_value = datetime(2026, 11, 1, 8, tzinfo=UTC)
 
     def rendered(self):
         config = json.dumps(generate_openclaw_config(self.tenant), ensure_ascii=False, sort_keys=True)
@@ -94,3 +98,49 @@ class AttentionConfigTests(SimpleTestCase):
         self.assertIn("chat replies and messages you start", rule)
         self.assertEqual(changed_agents.replace("\n\n## One question\n\n" + rule, ""), agents)
         self.assertLess(len(changed_agents), BOOTSTRAP_MAX_CHARS - 1000)
+
+    def test_all_unflagged_cron_bodies_match_job_c_parent(self):
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+
+        # Captured before Job C from 8afa16112fe98b9ffdfd7018a9e4d6ef6872e34d.
+        # Clock fixed to 2026-11-01 08:00 UTC; every prompt byte is pinned.
+        expected = {
+            "Morning Briefing": "182733306b27e0cea473c1cd73dc95fefc22d5ff9babdfe377f7fa304245c6d1",
+            "Evening Check-in": "bad0696232c5d00036cf3c5af9238ed61debcc9cd299e5f827b2685ac54d4660",
+            "Personal Question": "a8be5c8fade4cbfd3e1ca91ef17ea6e3ba5e8696a138a3b92de40398376725fe",
+            "Weekly Reflection": "ba8d99949a4f7d234b7ffa48b63d8db3ad7cbba581e68513ccedae5dad21f93d",
+            "Week Ahead Review": "5814857d4b31fb81a7f9f40707843805c6d9cddf4575c41cef6a7f5fdad76753",
+            "Project Check-in": "a17cd24854cc958402cc41223bf92800c3c04598379f115e204bcd915c1a1399",
+            "Background Tasks": "e5212badd1d433bd1c981ee06874ceb7ac2fd4264ddb1c0729c4aeadc4c23bc7",
+            "Heartbeat Check-in": "b89c65073fafa79495a11c3936fb5a8b6aa6da2bb2c12050a9f3e522f2437885",
+        }
+        jobs = build_cron_seed_jobs(self.tenant)
+        self.assertEqual(
+            {j["name"]: hashlib.sha256(j["payload"]["message"].encode()).hexdigest() for j in jobs},
+            expected,
+        )
+        with override_settings(ONE_QUESTION_TENANT_IDS="*"):
+            self.assertEqual(build_cron_seed_jobs(self.tenant), jobs)
+
+    def test_send_test_changes_only_six_prompts_and_no_agents_or_config(self):
+        from apps.orchestrator.config_generator import build_cron_seed_jobs
+        from apps.orchestrator.send_test import SEND_TEST_BLOCK, SEND_TEST_JOBS, without_send_test
+
+        original = {j["name"]: j for j in build_cron_seed_jobs(self.tenant)}
+        config, agents = self.rendered()
+        with override_settings(SEND_TEST_TENANT_IDS="*"):
+            changed = {j["name"]: j for j in build_cron_seed_jobs(self.tenant)}
+            self.assertEqual(self.rendered(), (config, agents))
+        self.assertEqual(original.keys(), changed.keys())
+        self.assertLess(len(SEND_TEST_BLOCK.split()), 60)
+        for name, job in changed.items():
+            with self.subTest(name=name):
+                if name in SEND_TEST_JOBS:
+                    message = job["payload"]["message"]
+                    self.assertEqual(message.count(SEND_TEST_BLOCK), 1)
+                    self.assertTrue(message.endswith(SEND_TEST_BLOCK))
+                    self.assertNotIn("say so briefly", message)
+                    self.assertIn("Complete every note, save and journal report above first", message)
+                    self.assertEqual(without_send_test(message), original[name]["payload"]["message"])
+                else:
+                    self.assertEqual(job, original[name])

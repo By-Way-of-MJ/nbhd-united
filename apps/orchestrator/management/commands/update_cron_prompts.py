@@ -18,10 +18,15 @@ from apps.tenants.models import Tenant
 class Command(BaseCommand):
     help = "Refresh system cron rows from seed for all active tenants"
 
+    def add_arguments(self, parser):
+        parser.add_argument("--tenant", type=str, help="Refresh only this tenant UUID")
+
     def handle(self, *args, **options):
         tenants = Tenant.objects.filter(
             status=Tenant.Status.ACTIVE,
         ).exclude(container_id="")
+        if options.get("tenant"):
+            tenants = tenants.filter(id=options["tenant"])
 
         total = tenants.count()
         self.stdout.write(f"Refreshing system cron rows for {total} tenant(s)...")

@@ -1986,6 +1986,7 @@ def refresh_system_cron_rows_from_seed(tenant: Tenant | str) -> dict:
     from apps.cron.models import CronJob, CronJobSource
 
     from .cron_drift import strip_date_line
+    from .send_test import SEND_TEST_JOBS, is_send_test_default, without_send_test
 
     seed_jobs = build_cron_seed_jobs(tenant)
     summary = {"created": 0, "updated": 0, "preserved_custom": 0, "unchanged": 0, "reaped": 0}
@@ -2008,12 +2009,20 @@ def refresh_system_cron_rows_from_seed(tenant: Tenant | str) -> dict:
             summary["created"] += 1
             continue
 
+        # A user's cron may share a seed name. Identity beats the display name,
+        # as in attention_holds._assistant_initiated at delivery time.
+        if name in SEND_TEST_JOBS and row.source != CronJobSource.SYSTEM:
+            summary["preserved_custom"] += 1
+            continue
+
         existing_payload = row.data.get("payload") if isinstance(row.data, dict) else None
         existing_message = ""
         if isinstance(existing_payload, dict):
             existing_message = existing_payload.get("message") or ""
         existing_body = strip_date_line(existing_message).strip()
         is_default = (not existing_body) or any(existing_body.startswith(prefix) for prefix in _KNOWN_DEFAULT_PREFIXES)
+        if name in SEND_TEST_JOBS:
+            is_default = (not existing_body) or is_send_test_default(existing_message, job["payload"]["message"])
 
         if is_default:
             # Safe to overwrite — message body matches a known default
@@ -2030,8 +2039,17 @@ def refresh_system_cron_rows_from_seed(tenant: Tenant | str) -> dict:
                 # Custom message wins; non-message payload fields come from seed.
                 if "message" in existing_payload:
                     merged_payload["message"] = existing_payload["message"]
+                    from apps.router.chat_gates import _tenant_allowed
+
+                    if name in SEND_TEST_JOBS and not _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS"):
+                        merged_payload["message"] = without_send_test(merged_payload["message"])
                 new_data["payload"] = merged_payload
             summary["preserved_custom"] += 1
+
+        if name in SEND_TEST_JOBS and strip_date_line(new_data["payload"]["message"]) == existing_body:
+            # A reconcile-time clock is not a prompt change. Retain the stored
+            # snapshot so a flag flip converges after exactly one row update.
+            new_data["payload"]["message"] = existing_message
 
         if row.data == new_data:
             summary["unchanged"] += 1
@@ -2140,6 +2158,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
 
     tenant_id = str(tenant.id)
     desired_jobs = build_cron_seed_jobs(tenant)
+    from .send_test import SEND_TEST_JOBS, is_send_test_default, without_send_test
 
     # Get existing jobs
     try:
@@ -2295,6 +2314,12 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
         job_id = existing.get("id", "")
         if not job_id:
             continue
+        if name in SEND_TEST_JOBS:
+            from apps.router.attention_holds import _assistant_initiated
+
+            if not _assistant_initiated(tenant, name, job_id):
+                skipped += 1
+                continue
 
         # Check what needs updating
         patch: dict = {}
@@ -2304,6 +2329,20 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
         existing_message = existing_payload.get("message", "")
         desired_payload = desired.get("payload", {})
         desired_message = desired_payload.get("message", "")
+        is_default = _is_default_prompt(existing_message)
+        if name in SEND_TEST_JOBS:
+            is_default = is_send_test_default(existing_message, desired_message)
+            if not is_default:
+                # Preserve edits even when model/kind/timezone need repair.
+                from apps.router.chat_gates import _tenant_allowed
+
+                desired_payload = dict(desired_payload)
+                desired_payload["message"] = (
+                    existing_message
+                    if _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS")
+                    else without_send_test(existing_message)
+                )
+                desired_message = desired_payload["message"]
 
         # Non-message payload drift (model, kind). These fields the user
         # can't customize — if they differ, the cron is either misrouted
@@ -2319,7 +2358,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
         # churn even when nothing semantic changed.
         message_differs = _strip_date_line(existing_message) != _strip_date_line(desired_message)
         if message_differs:
-            if _is_default_prompt(existing_message) or non_message_drift:
+            if is_default or non_message_drift or (name in SEND_TEST_JOBS and desired_message != existing_message):
                 patch["payload"] = desired_payload
                 if non_message_drift and not _is_default_prompt(existing_message):
                     logger.warning(
@@ -2380,7 +2419,10 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
                     "cron.remove",
                     {"jobId": gateway_job_id},
                 )
-                invoke_gateway_tool(tenant, "cron.add", {"job": desired})
+                replacement = dict(desired)
+                if name in SEND_TEST_JOBS:
+                    replacement["payload"] = desired_payload
+                invoke_gateway_tool(tenant, "cron.add", {"job": replacement})
                 updated += 1
                 logger.info(
                     "update_system_cron_prompts: recreated '%s' for tenant %s (payload changed — used delete+create)",

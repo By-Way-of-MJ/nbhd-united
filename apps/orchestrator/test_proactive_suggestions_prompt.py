@@ -157,7 +157,7 @@ class ProactiveSuggestionsPromptTests(TestCase):
         self.assertGreaterEqual(summary["updated"], 2)
         self.assertEqual(morning.data["payload"]["message"].count(_PROACTIVE_SUGGESTIONS_BLOCK), 1)
 
-    def test_seed_refresh_overwrites_appended_text_when_default_preamble_remains(self):
+    def test_seed_refresh_preserves_appended_text_when_default_preamble_remains(self):
         with override_settings(PROACTIVE_SUGGESTIONS_TENANT_IDS=""):
             refresh_system_cron_rows_from_seed(self.tenant)
         morning = CronJob.objects.get(tenant=self.tenant, name="Morning Briefing")
@@ -168,5 +168,5 @@ class ProactiveSuggestionsPromptTests(TestCase):
             summary = refresh_system_cron_rows_from_seed(self.tenant)
 
         morning.refresh_from_db()
-        self.assertEqual(summary["preserved_custom"], 0)
-        self.assertNotIn("USER APPENDED TEXT", morning.data["payload"]["message"])
+        self.assertEqual(summary["preserved_custom"], 1)
+        self.assertIn("USER APPENDED TEXT", morning.data["payload"]["message"])

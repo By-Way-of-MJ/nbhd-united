@@ -343,7 +343,9 @@ def _build_cron_message(
     every wake. See ``project_openclaw_cron_payload_shape.md`` for the
     full saga and the audit step to run on the next OpenClaw bump.
     """
-    base = _prepare_cron_prompt(prompt, tenant)
+    from .send_test import apply_send_test
+
+    base = apply_send_test(_prepare_cron_prompt(prompt, tenant), job_name, tenant)
     # Phase 2 sync prompt retired 2026-07-11 (refactor/retire-phase2-sync-prompt).
     # Seed cron prompts no longer append ``_phase2_sync_block`` / instruct the
     # agent to call ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session
