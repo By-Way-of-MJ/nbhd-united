@@ -78,6 +78,13 @@ def resolve_place_timezone(label: str) -> PlaceTz:
     if not isinstance(label, str) or not label.strip():
         return PlaceTz(kind="unknown")
     try:
+        from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS
+        from apps.tenants.place_tz_offline import offline_place_timezone
+
+        offline = offline_place_timezone(label)
+        if offline is not None:
+            cache.set(_place_tz_cache_key(label), offline, GEOCODE_CACHE_SECONDS)
+            return offline
         return _lookup_place_timezone(label)
     except Exception:
         return PlaceTz(kind="unknown")

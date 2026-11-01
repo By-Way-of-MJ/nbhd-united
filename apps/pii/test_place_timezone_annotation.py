@@ -27,10 +27,13 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         return PlaceTz(kind="zone", tz=tz)
 
     def test_location_dict_entry_carries_zone(self):
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=self._zone(),
-        ) as lookup:
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=self._zone(),
+            ) as lookup,
+        ):
             result = annotate_model_context(
                 "[LOCATION_1]",
                 {"[LOCATION_1]": {"name": "Chicago"}},
@@ -40,18 +43,24 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         lookup.assert_called_once_with("Chicago")
 
     def test_legacy_string_entry_carries_zone(self):
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=self._zone(),
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=self._zone(),
+            ),
         ):
             result = annotate_model_context("[LOCATION_1]", {"[LOCATION_1]": "Chicago"})
 
         self.assertEqual(result, "[LOCATION_1|tz America/Chicago]")
 
     def test_relationship_and_zone_are_joined(self):
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=self._zone(),
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=self._zone(),
+            ),
         ):
             result = annotate_model_context(
                 "[LOCATION_1]",
@@ -61,9 +70,12 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         self.assertEqual(result, "[LOCATION_1|home; tz America/Chicago]")
 
     def test_region_and_unknown_descriptors(self):
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=PlaceTz(kind="region"),
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=PlaceTz(kind="region"),
+            ),
         ):
             region = annotate_model_context(
                 "[LOCATION_1]",
@@ -72,9 +84,12 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         self.assertEqual(region, "[LOCATION_1|region with several time zones]")
 
         cache.clear()
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=PlaceTz(kind="unknown"),
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=PlaceTz(kind="unknown"),
+            ),
         ):
             unknown = annotate_model_context(
                 "[LOCATION_1]",
@@ -111,10 +126,13 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         entity_map = {f"[LOCATION_{index}]": {"name": name} for index, name in enumerate(names, start=1)}
         text = " ".join(entity_map)
 
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            return_value=self._zone(),
-        ) as lookup:
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=self._zone(),
+            ) as lookup,
+        ):
             result = annotate_model_context(text, entity_map)
 
         self.assertEqual(lookup.call_count, 2)
@@ -127,7 +145,10 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         # Warm the cache directly, then a second annotation makes no network calls.
         for name in names:
             cache.set(_place_tz_cache_key(name), self._zone(), 300)
-        with patch("apps.tenants.situation._lookup_place_timezone") as warm_lookup:
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch("apps.tenants.situation._lookup_place_timezone") as warm_lookup,
+        ):
             warm = annotate_model_context(text, entity_map)
 
         warm_lookup.assert_not_called()
@@ -145,9 +166,12 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
         lookup.assert_not_called()
 
     def test_lookup_exception_leaves_token_unresolved(self):
-        with patch(
-            "apps.tenants.situation._lookup_place_timezone",
-            side_effect=RuntimeError("geocoder down"),
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                side_effect=RuntimeError("geocoder down"),
+            ),
         ):
             result = annotate_model_context(
                 "[LOCATION_1]",
@@ -174,7 +198,10 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
             ]
         }
         client.get.return_value = response
-        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch("apps.tenants.situation.httpx.Client", return_value=client),
+        ):
             resolved = resolve_place_timezone("Chicago")
 
         self.assertEqual(resolved, self._zone())

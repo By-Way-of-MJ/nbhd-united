@@ -1290,9 +1290,12 @@ def _place_zone_descriptor(name: str, *, allow_network: bool) -> str:
         if not label:
             return ""
 
+        from apps.tenants.place_tz_offline import offline_place_timezone
         from apps.tenants.situation import cached_place_timezone, resolve_place_timezone
 
-        place = cached_place_timezone(label)
+        place = offline_place_timezone(label)
+        if place is None:
+            place = cached_place_timezone(label)
         if place is None and allow_network:
             place = resolve_place_timezone(label)
         if place is None:
@@ -1338,8 +1341,11 @@ def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
             if key in network_names:
                 return False
             network_names.add(key)
+            from apps.tenants.place_tz_offline import offline_place_timezone
             from apps.tenants.situation import cached_place_timezone
 
+            if offline_place_timezone(label) is not None:
+                return False
             if cached_place_timezone(label) is not None:
                 return False
             if network_budget <= 0:
