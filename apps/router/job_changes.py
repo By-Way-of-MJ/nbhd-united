@@ -100,6 +100,7 @@ def check_batch(tenant, batch, job_id, main_ids, request):
         jobs = thread.side_jobs
         entry = _entry(jobs, job_id, main_ids)
         entry.setdefault("timezone", first.payload.get("user_timezone", "UTC"))
+        entry.setdefault("adjustment", bool(first.payload.get("side_main_handoff")))
         ids = [r.payload.get("client_msg_id") for r in batch if r.payload.get("client_msg_id")]
         entry["side_ids"] = list(dict.fromkeys(entry["side_ids"] + ids))
         # Checked redaction has its own bounded deadline before the six-second
@@ -129,11 +130,12 @@ def check_batch(tenant, batch, job_id, main_ids, request):
         entry.pop("checking_until", None)
         # A side request already answered after publication follows the ordinary path.
         was_suppressed = entry.get("suppressed", entry["finished"] and entry["kind"] != "none" and not entry["helpers"])
+        publication_ids = (
+            [f"side-resume-{uuid.UUID(str(job_id)).hex}"] if entry.get("adjustment") else entry["main_ids"]
+        )
         landed = (
             not was_suppressed
-            and AppChatMessage.objects.filter(
-                tenant=tenant, client_msg_id__in=entry["main_ids"], status="ready"
-            ).exists()
+            and AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=publication_ids, status="ready").exists()
         )
         if not landed or entry["helpers"]:
             if decision.kind == "cancel" or (decision.kind == "change" and entry["kind"] != "cancel"):

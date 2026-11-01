@@ -178,6 +178,7 @@ def claim_chat_batch(tenant, thread_id, timeout):
                     "side_main_client_msg_id": main.payload.get("client_msg_id", ""),
                     "side_main_client_msg_ids": request_ids,
                     "side_main_started_at": started.isoformat(),
+                    "side_main_handoff": bool(main.payload.get("side_handoff")),
                 }
                 row.save(update_fields=["lane", "side_main_id", "payload"])
             lane = "side"
@@ -330,9 +331,11 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
     job_id = batch[0].payload.get("side_job_id")
     thread = ChatThread.objects.filter(tenant=tenant, pk=batch[0].channel_user_id).first() if job_id else None
     cancelled = bool(thread and thread.side_jobs.get(job_id, {}).get("kind") == "cancel")
+    own_entry = thread.side_jobs.get(str(batch[0].id), {}) if thread else {}
+    changed_again = own_entry.get("kind", "none") != "none" and not own_entry.get("helpers")
     # The side answer already acknowledges cancellation. A mistaken adjustment
     # reply cannot publish the cancelled plan under a new assistant-only id.
-    if cancelled and not terminal_notice:
+    if (cancelled or changed_again) and not terminal_notice:
         ai_text = "[[side-recap-no-action]]"
     if not (ai_text or "").strip():
         raise RuntimeError("side_handoff_empty_response")
@@ -349,6 +352,11 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
     silent = not visible
     with transaction.atomic():
         lock_owned_batch(tenant, batch)
+        if not terminal_notice:
+            from apps.router.job_changes import finish_main
+
+            if finish_main(tenant, batch):
+                silent = True
         for row in batch:
             row.payload = {**row.payload, "handoff_completed": True}
             row.save(update_fields=["payload"])

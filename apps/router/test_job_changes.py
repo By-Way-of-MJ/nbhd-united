@@ -149,3 +149,25 @@ class JobPublicationTests(TestCase):
         self.post.return_value = _ok_chat_response("You asked whether the plan was done.")
         self.drain()
         self.assertIn("is the plan done yet?", self.post.call_args.kwargs["json"]["messages"][0]["content"])
+
+    def test_cancel_during_a_long_adjustment_also_suppresses_its_result(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from apps.router.side_lane import claim_chat_batch, store_handoff_reply
+
+        main = self.main()
+        self.row("actually make it two weeks")
+        self.drain()
+        self.finish(main)
+        handoff, _ = claim_chat_batch(self.tenant, str(self.thread.pk), 120)
+        PendingMessage.objects.filter(pk=handoff[0].pk).update(turn_started_at=timezone.now() - timedelta(seconds=12))
+        self.change_check.side_effect = None
+        self.change_check.return_value = JobChange(changes_job=True, kind="cancel")
+        self.row("never mind, forget the plan")
+        self.drain()
+        with patch("apps.router.pending_queue._dispatch_push") as push:
+            store_handoff_reply(self.tenant, handoff, "THE CANCELLED TWO WEEK PLAN")
+        push.assert_not_called()
+        self.assertFalse(AppChatMessage.objects.filter(client_msg_id=f"side-resume-{handoff[0].id.hex}").exists())
