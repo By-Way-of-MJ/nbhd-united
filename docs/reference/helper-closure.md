@@ -45,6 +45,17 @@ current plain completion at `before_agent_run`, and delivers the parent's final
 text at `agent_end`. Silent or unsuccessful parent runs use the child result.
 This does not require model tool discovery or a phase-2 summary tool.
 
+The `Unknown tool id: nbhd_send_to_user` failures have a second, independent
+explanation. In `dist/requester-tool-policy-CWbJgIyg.mjs:38–75,103–108`, a
+verified completion handoff inherits the child's persisted tool-policy
+envelope (`source="completion-handoff"`). Our
+`config_generator._build_tools_config` supplies `SUBAGENT_READ_ONLY_TOOLS`,
+which excludes `nbhd_send_to_user` and note writers. The parent completion
+therefore cannot discover those tools even though `tool_policy.py` normally
+allows `group:plugins`. The fix preserves that read-only boundary: the parent
+writes its final answer and the bridge delivers it server-side. Expanding the
+completion's tool authority is unnecessary.
+
 Pinned image sources:
 
 - `dist/builtin-openclaw-B-H-7lKk.mjs:7076–7110`: removes the duplicate event
