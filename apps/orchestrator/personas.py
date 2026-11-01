@@ -546,7 +546,9 @@ _SUBAGENT_CHAT_INSTRUCTIONS = (
     "2+ web searches, reading or summarising a long document or many pages, or "
     "producing a multi-part plan, report, or comparison. If `sessions_spawn` isn't "
     "loaded, find it via tool search. After spawning, reply immediately: "
-    "\"On it — I'll let you know when it's ready.\" "
+    "one short line naming the actual job and saying the person can keep chatting. "
+    "For example: \"On it: comparing those three vacuums. Keep chatting, I'll send it when it's done.\" "
+    "Never use a generic acknowledgement. "
     "After spawning, do not wait or poll for the helper — reply with the acknowledgement "
     "and end your turn; the result arrives later as an internal completion event. "
     "Answer directly for everything else. "
@@ -554,9 +556,9 @@ _SUBAGENT_CHAT_INSTRUCTIONS = (
     'Never pass `context: "fork"`; '
     "give only bounded context. The helper is read-only, reports back to you, and must not "
     "send, create, publish, or act outward. On an `[Internal task completion event]`, "
-    "send exactly one `nbhd_send_to_user` update to the requester's `thread_id`, in your "
-    "normal voice, without raw run/session/delivery metadata. The bridge backstops delivery; "
-    "do not duplicate its sends. Never use `NO_REPLY`, `no_reply`, or `ANNOUNCE_SKIP` for "
+    "write one final reply in your normal voice, without raw run/session/delivery metadata. "
+    "The bridge delivers that reply to the requesting app thread; do not call a send tool "
+    "or duplicate its delivery. Never use `NO_REPLY`, `no_reply`, or `ANNOUNCE_SKIP` for "
     "completion. On timeout/failure, send a brief honest reason and offer to retry."
 )
 
@@ -776,6 +778,30 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
             "MJ. If site editing isn't configured, don't retry."
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_editor_gate
+
+    from apps.router.chat_gates import _tenant_allowed
+    from apps.tenants.attention import attention_holds_enabled
+
+    if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+        one_question = (
+            "\n\n## One question\n\n"
+            "Every chat reply and message you start gets at most ONE question, including "
+            "rhetorical questions and list items. Before sending, count `?` and `？`; delete extra asks. "
+            "For a small pick, put `[[quick-replies: A | B]]` alone on the last line, without "
+            "backticks: 2–4 short labels, each ≤24 characters. An open question gets no buttons."
+        )
+        boundary = "\n\n## Reply Markers — Mandatory"
+        result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"].replace(boundary, one_question + boundary, 1)
+
+    if attention_holds_enabled(tenant):
+        result["NBHD_AGENTS_MD"] += (
+            "\n\n## Topic holds\n\n"
+            "When the person asks not to hear about something for a while or until they say so, "
+            "call `nbhd_hold_topic` THIS TURN; then confirm in one short line naming the topic "
+            "and when it ends. Use their local date as the first day it may come up again. "
+            "Cancelling one specific reminder is not a hold. Questions or new information never "
+            "lift a hold; clear permission does, using `nbhd_release_hold`."
+        )
 
     # Current-location capture gate — behavioral, flag-gated, and imperative.
     # The tool being available is not enough under toolSearch: like the site-

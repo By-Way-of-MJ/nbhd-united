@@ -1286,6 +1286,50 @@ export default function register(api) {
     },
   }));
 
+  // The rollout flag attests this manifest. Off means no registration at all,
+  // including toolSearch; these tools cannot appear through group:plugins.
+  if (asObject(api.pluginConfig).attentionHoldsEnabled === true) {
+    api.registerTool(wrap({
+      name: "nbhd_hold_topic",
+      description:
+        "Save a topic the person does not want raised until a date or until they lift it. " +
+        "Call this turn when they request a topic hold. Keep the topic in placeholder space. " +
+        "resume_on is the first local day it may come up; omit for until lifted. " +
+        "Confirm briefly naming the topic and when it ends. Cancelling a single reminder is not a hold.",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["topic"],
+        properties: {
+          topic: { type: "string", minLength: 1, maxLength: 200 },
+          resume_on: { type: "string", format: "date", description: "First allowed local date, YYYY-MM-DD." },
+        },
+      },
+      async execute(_id, params) {
+        const input = asObject(params);
+        return renderPayload(await callRuntime(api, {
+          path: tenantPath(api, "/attention/hold/"), method: "POST",
+          body: { topic: input.topic, ...(input.resume_on !== undefined ? { resume_on: input.resume_on } : {}) },
+        }));
+      },
+    }), { optional: true });
+    api.registerTool(wrap({
+      name: "nbhd_release_hold",
+      description:
+        "Lift a saved hold when the person says the topic may come up again. " +
+        "Use the hold id from USER.md. Only clear permission lifts it; questions, new information " +
+        "and discussing the topic do not. Answer normally when they raise it and keep the hold.",
+      parameters: {
+        type: "object", additionalProperties: false, required: ["hold_id"],
+        properties: { hold_id: { type: "integer", minimum: 1 } },
+      },
+      async execute(_id, params) {
+        return renderPayload(await callRuntime(api, {
+          path: tenantPath(api, "/attention/release/"), method: "POST",
+          body: { hold_id: asObject(params).hold_id },
+        }));
+      },
+    }), { optional: true });
+  }
+
   // ── Update transient current situation ──────────────────────────────
   api.registerTool(wrap({
     name: "nbhd_update_situation",

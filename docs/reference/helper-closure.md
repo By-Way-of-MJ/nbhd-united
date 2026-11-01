@@ -25,15 +25,78 @@ occurrence key without in-memory mappings. The bridge injects **both**
 in-flight helpers without the admission label retain the legacy delivery path;
 they cannot retroactively receive the new watchdog guarantee.
 
+### 2026.9.4 app completion repair
+
+Keep-chatting side decisions are durable identifier-only state on `ChatThread`.
+An admitted helper is tied to its running main row. Its acknowledgement stays
+visible; side exchanges do not start a recap turn. At the real announce build
+hook, the bridge fetches checked side context and appends it as system context
+when config env `NBHD_KEEP_CHATTING=1`. This uses the captured empty-prompt /
+`inputProvenance.sourceTool=subagent_announce` envelope cited below, without a
+new plugin configuration key. Captured accepted `after_tool_call` results bind
+`details.childSessionKey` to the admission; announce provenance's
+`sourceSessionKey` selects only that job's exchanges, including across restart.
+The delivery transaction also checks cancellation
+under the thread lock: a cancelled helper result becomes a plain cancellation
+acknowledgement, closes as a result, and never publishes the raw result or a
+later watchdog failure. Apply the additive router migration and Django before
+the new bridge/config.
+
+The old bridge missed real app completions: `before_prompt_build.prompt` is
+empty, with `ctx.inputProvenance.sourceTool="subagent_announce"`. At
+`before_agent_run`, the prompt starts with **"A background task completed. Use
+this result to reply to the user in your normal assistant voice."**, rather
+than the protected completion marker. These are shared runtime paths, not a
+stage transport adaptation. Thus the problem also affects production tenants
+using this pinned runtime and bridge; no production access was used to establish
+that conclusion.
+
+The captured synthetic run is preserved in
+[`completion-2026.9.4.json`](../../runtime/openclaw/plugins/nbhd-journal-tools/subagent-bridge/fixtures/completion-2026.9.4.json).
+It contains the actual build/run/end hooks and rejected/accepted spawn results;
+historical messages and reasoning blocks are omitted. `runId` is in `ctx`.
+The bridge adds a system reminder using producer provenance, then parses the
+current plain completion at `before_agent_run`, and delivers the parent's final
+text at `agent_end`. The backstop stops at the announce carrier and excludes
+assistant text already present in the pre-run snapshot. If there is no new
+assistant text, or the parent is silent or unsuccessful, it uses the child result.
+This does not require model tool discovery or a phase-2 summary tool.
+
+The `Unknown tool id: nbhd_send_to_user` failures have a second, independent
+explanation. In `dist/requester-tool-policy-CWbJgIyg.mjs:38–75,103–108`, a
+verified completion handoff inherits the child's persisted tool-policy
+envelope (`source="completion-handoff"`). Our
+`config_generator._build_tools_config` supplies `SUBAGENT_READ_ONLY_TOOLS`,
+which excludes `nbhd_send_to_user` and note writers. The parent completion
+therefore cannot discover those tools even though `tool_policy.py` normally
+allows `group:plugins`. The fix preserves that read-only boundary: the parent
+writes its final answer and the bridge delivers it server-side. Expanding the
+completion's tool authority is unnecessary.
+
+Pinned image sources:
+
+- `dist/builtin-openclaw-B-H-7lKk.mjs:7076–7110`: removes the duplicate event
+  carrier before prompt-build hooks, retaining `inputProvenance` in context.
+- `dist/subagent-announce-delivery-Dcn7g21F.mjs:196–216,298–315`: formats the
+  protected/data/plain event representations and the plain transcript body.
+- `dist/builtin-openclaw-B-H-7lKk.mjs:5948–5956,4417–4436`: actual
+  `before_agent_run` prompt/messages and `agent_end.messages` dispatch.
+- `dist/lifecycle-hook-helpers-Bnm4Rpmf.mjs:10–36`: context supplies `runId`.
+
+A definite spawn rejection (`after_tool_call.result.details.status="error"`)
+releases its unused admission through the authenticated, tenant/thread-scoped
+`helpers/release/` endpoint. Accepted runs and ambiguous transport errors keep
+their obligations. Release is idempotent and never undoes a committed result.
+This prevents a corrected spawn's earlier validation failure from producing a
+second, misleading watchdog notice. Deploy Django before the bridge image.
+
 Result delivery, hook failure, and watchdog failure all lock the same
 `HelperRun` row. The existing proactive app-feed writer and `closed_at`/`closed_by` updates
 commit in one transaction. A crash rolls back both; a lost HTTP response after
-commit is a duplicate on retry. A failure notice closes the row as `failure`;
-one later result is still delivered, without a prefix, and changes closure to
-`result`. Once a result is delivered, all further deliveries are duplicates.
-Failure notices after either kind of closure create no message. Concurrent
-sends follow the same rules under the row lock: if failure wins, the answer
-can follow it; if the result wins, the failure is suppressed.
+commit is a duplicate on retry. Either a result or a failure closes the row
+permanently. Every later post is a duplicate, regardless of its text. Concurrent
+sends publish only the first closure under the row lock, preventing a timeout
+notice followed by the parent's apology.
 APNs dispatch is deferred until commit;
 the app-feed row is the durable user-visible delivery, independent of push
 permission or linked Telegram/LINE accounts. This avoids relying on the

@@ -343,7 +343,9 @@ def _build_cron_message(
     every wake. See ``project_openclaw_cron_payload_shape.md`` for the
     full saga and the audit step to run on the next OpenClaw bump.
     """
-    base = _prepare_cron_prompt(prompt, tenant)
+    from .send_test import apply_send_test
+
+    base = apply_send_test(_prepare_cron_prompt(prompt, tenant), job_name, tenant)
     # Phase 2 sync prompt retired 2026-07-11 (refactor/retire-phase2-sync-prompt).
     # Seed cron prompts no longer append ``_phase2_sync_block`` / instruct the
     # agent to call ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session
@@ -2216,7 +2218,7 @@ def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
                 ),
             },
             "delivery": {"mode": "none"},
-            "enabled": True,
+            "enabled": False,
         },
         {
             "name": "Weekly Reflection",
@@ -2422,6 +2424,14 @@ def _build_tools_section(
 ) -> dict[str, Any]:
     """Build documented OpenClaw tools policy for subscriber tier."""
     tools = generate_tool_config(tier, version=version)
+    from apps.orchestrator.tool_policy import attention_hold_tool_allow_overlay
+
+    tools["allow"].extend(attention_hold_tool_allow_overlay(tenant))
+    if _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS"):
+        # The 9.4 unified sessions tool can delete/reset the parent and orphan
+        # unrelated helpers. Job cancellation is owned by the durable server.
+        tools.setdefault("deny", []).append("sessions")
+
     if subagents_on is None:
         subagents_on = subagents_enabled(tenant)
     if subagents_on:
@@ -3098,7 +3108,7 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
                 },
                 "memorySearch": _build_memory_search_config(tenant),
                 "heartbeat": _build_heartbeat_defaults(tenant),
-                "maxConcurrent": 2,
+                "maxConcurrent": 4 if _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS") else 2,
                 "subagents": (
                     {
                         "maxConcurrent": 2,
@@ -3350,6 +3360,13 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
         if journal_tools_id in plugin_config["entries"] and chat_panels_tool_enabled(tenant):
             plugin_config["entries"][journal_tools_id]["config"] = {"panelsEnabled": True}
 
+        # ATTENTION_HOLD_TENANT_IDS also attests the running journal-tools
+        # manifest, just like the panels rollout above. Never enable on an old image.
+        from apps.tenants.attention import attention_holds_enabled
+
+        if journal_tools_id in plugin_config["entries"] and attention_holds_enabled(tenant):
+            plugin_config["entries"][journal_tools_id].setdefault("config", {})["attentionHoldsEnabled"] = True
+
         # Older settings-tools manifests hard-reject unknown plugin config at
         # LOAD (additionalProperties:false), so this block stays absent until
         # that tenant's image manifest has been verified. personas.py uses this
@@ -3513,6 +3530,10 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
 
     if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
         config.setdefault("env", {})["NBHD_TAINT_CARRY_BARE_CONFIRM"] = "1"
+    if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+        config.setdefault("env", {})["NBHD_ONE_QUESTION"] = "1"
+    if _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS"):
+        config.setdefault("env", {})["NBHD_KEEP_CHATTING"] = "1"
 
     # OpenClaw >= 2026.4.15 auto-generates models.json with the wrong
     # OpenRouter base URL (/v1 instead of /api/v1). Inject the override.

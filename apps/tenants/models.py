@@ -1287,6 +1287,30 @@ class PlaceholderMigrationCursor(models.Model):
         return f"{self.tenant_id}:{self.store_label}:{self.mode}:{self.status}"
 
 
+class AttentionHold(models.Model):
+    """A topic the assistant must not initiate, stored exactly in placeholder space.
+
+    Writers use tenants.attention to serialize deduplication and the active cap.
+    Like UserSituation, Django scopes access; the migration relocks the public
+    schema against the anon Data API (boot uses the existing RLS posture).
+    """
+
+    class ReleaseReason(models.TextChoices):
+        USER = "user", "User"
+        EXPIRED = "expired", "Expired"
+
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="attention_holds")
+    topic = models.CharField(max_length=200)
+    resume_on = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    release_reason = models.CharField(max_length=7, choices=ReleaseReason.choices, blank=True, default="")
+
+    class Meta:
+        db_table = "attention_holds"
+        indexes = [models.Index(fields=["tenant", "released_at"], name="attention_hold_active")]
+
+
 class UserSituation(models.Model):
     """Structured, short-lived observations about a tenant's current situation.
 

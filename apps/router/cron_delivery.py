@@ -644,6 +644,34 @@ class CronDeliveryView(APIView):
         if panels and not placeholder_message_text.strip() and channel != "eval":
             channel = "app"
 
+        from apps.tenants.attention import attention_holds_enabled
+
+        if attention_holds_enabled(tenant):
+            from apps.router.attention_holds import blocked_hold
+
+            hold_id = blocked_hold(
+                tenant,
+                message=placeholder_message_text,
+                job_name=request.headers.get("X-NBHD-Job-Name", ""),
+                gateway_job_id=request.headers.get("X-NBHD-Cron-Job-Id", "").strip()[:64],
+                panels=panels,
+                journal_link=journal_link,
+                quick_replies=quick_replies,
+            )
+            if hold_id is not None:
+                # Before rehydration, insight writes, ProactiveOutbound and the
+                # DeliveryAttempt claim. A rewritten send keeps its about key.
+                return Response(
+                    {
+                        "delivered": False,
+                        "skipped": "on_hold",
+                        "detail": (
+                            f"This draft raises held topic {hold_id}. Drop that part and send again "
+                            "without raising it, or send nothing. Keep the hold in place."
+                        ),
+                    }
+                )
+
         # Final owner-facing integrity guard.
         entity_map = tenant.pii_entity_map
         from apps.router.reply_text import finalize_outbound_text
@@ -806,6 +834,9 @@ class CronDeliveryView(APIView):
                 _resolve_delivery_attempt(delivery_attempt, state="failed", response=response)
                 return response
             _record_send(tid)
+            from apps.router.reply_shape import log_reply_shape
+
+            log_reply_shape(tenant, message_text, quick_replies)
             response = Response({"status": "sent", "channel": "app", "delivered_to": ["app_feed"]})
             _resolve_delivery_attempt(delivery_attempt, state="sent", response=response)
             return response

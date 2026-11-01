@@ -66,3 +66,29 @@ test("postPartial is a no-op (never throws) when runtime env is unset", async ()
     if (prev.key !== undefined) process.env.NBHD_INTERNAL_API_KEY = prev.key;
   }
 });
+
+test("interleaved real runner outputs retain separate accumulators and session attribution", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { default: register } = await import("./index.js");
+  const { outputCalls } = JSON.parse(readFileSync(new URL("../nbhd-doc-taint-guard/fixtures/keep-chatting-hooks.json", import.meta.url)));
+  const hooks = new Map();
+  const posts = [];
+  const previous = { fetch: globalThis.fetch, env: { ...process.env } };
+  process.env.NBHD_API_BASE_URL = "http://offline.invalid";
+  process.env.NBHD_TENANT_ID = "fixture";
+  process.env.NBHD_INTERNAL_API_KEY = "offline";
+  globalThis.fetch = async (_url, options) => { posts.push(JSON.parse(options.body)); return { ok: true }; };
+  try {
+    register({ on: (name, fn) => hooks.set(name, fn), logger: { warn() {}, debug() {} } });
+    for (const { event, ctx } of outputCalls) hooks.get("llm_output")(event, ctx);
+    assert.equal(posts.length, 3);
+    assert.deepEqual(posts.map((p) => p.text), ["main first", "side", "main firstmain second"]);
+    assert.equal(posts[0].session_key, posts[2].session_key);
+    assert.notEqual(posts[0].session_key, posts[1].session_key);
+  } finally {
+    globalThis.fetch = previous.fetch;
+    for (const key of ["NBHD_API_BASE_URL", "NBHD_TENANT_ID", "NBHD_INTERNAL_API_KEY"]) {
+      if (previous.env[key] === undefined) delete process.env[key]; else process.env[key] = previous.env[key];
+    }
+  }
+});

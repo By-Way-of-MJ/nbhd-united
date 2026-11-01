@@ -3146,6 +3146,24 @@ class ReplyArtifactPersistenceTest(TestCase):
             )
         return batch
 
+    @override_settings(ONE_QUESTION_TENANT_IDS="*")
+    @patch("apps.router.pending_queue._dispatch_push")
+    def test_one_shape_observation_per_coalesced_reply_with_four_buttons(self, _push):
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        batch = self._batch("shape-sibling", "shape-representative")
+        reply = "Pick?\n```\ncode?\n```\n[[quick-replies: A | B | C | D]]"
+        with self.assertLogs("apps.router.reply_shape") as logs:
+            _store_ios_turn_reply(self.tenant, batch, reply)
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(
+            logs.records[0].getMessage(), f"reply_shape tenant={str(self.tenant.id)[:8]} questions=1 buttons=1"
+        )
+        row = AppChatMessage.objects.get(client_msg_id="shape-representative")
+        self.assertEqual(row.quick_replies, ["A", "B", "C", "D"])
+        self.assertNotIn("quick-replies", row.reply_text)
+        self.assertEqual(AppChatMessage.objects.get(client_msg_id="shape-sibling").reply_text, "")
+
     @patch("apps.router.pending_queue._dispatch_push")
     def test_move_precedes_clamp_and_generated_chip_lands_on_representative_row(self, _push):
         from apps.journal.models import Document

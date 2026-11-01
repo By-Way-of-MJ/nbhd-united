@@ -9,6 +9,7 @@
  */
 
 const http = require("http");
+const { createHash } = require("node:crypto");
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "8080", 10);
 const GATEWAY_PORT = 18789;
@@ -72,6 +73,87 @@ function proxyRequest(req, res, targetPort, stripForwarded = false) {
   req.pipe(upstream);
 }
 
+// A Django drain can die or lose its response while the gateway continues.
+// Stable batch IDs let its replacement attach to that same call/result. Only
+// flagged app drains send this header. No files or transcripts are persisted.
+const CHAT_REPLAY_TTL_MS = 15 * 60 * 1000;
+// Covers the unchanged 300 sends/hour limit plus their internal recap turns.
+const CHAT_REPLAY_MAX_ENTRIES = 512;
+const CHAT_REPLAY_MAX_BYTES = 1024 * 1024;
+function proxyChatOnce(req, res, targetPort, calls) {
+  const requestId = req.headers["x-nbhd-chat-request-id"];
+  const identity = createHash("sha256").update(String(req.headers.authorization || "") + ":" + requestId).digest("hex");
+  for (const [key, value] of calls) {
+    if (value.done && Date.now() - value.done > CHAT_REPLAY_TTL_MS) calls.delete(key);
+  }
+  let entry = calls.get(identity);
+  if (entry) {
+    req.resume(); // only the first request body reaches the gateway
+    entry.promise.then((reply) => sendReplay(res, reply));
+    return;
+  }
+  if (calls.size >= CHAT_REPLAY_MAX_ENTRIES) {
+    // Do not evict a still-retriable result: that could re-run a mutation.
+    req.resume();
+    sendReplay(res, { status: 503, headers: {}, body: Buffer.from('{"error":"chat_replay_capacity"}') });
+    return;
+  }
+  let finish;
+  entry = { done: null, promise: new Promise((resolve) => { finish = resolve; }) };
+  calls.set(identity, entry);
+  entry.promise.then((reply) => sendReplay(res, reply));
+  let settled = false;
+  function complete(reply) {
+    if (settled) return;
+    settled = true;
+    entry.done = Date.now();
+    // Keep only in-flight work and finished successes. Every failure must be
+    // retryable just as it is without the stable request header.
+    if ((reply.status < 200 || reply.status >= 300) && calls.get(identity) === entry) calls.delete(identity);
+    finish(reply);
+  }
+  const headers = stripForwardedHeaders(req.headers);
+  const upstream = http.request({ hostname: "127.0.0.1", port: targetPort, path: req.url, method: req.method, headers }, (response) => {
+    const chunks = [];
+    let size = 0;
+    response.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= CHAT_REPLAY_MAX_BYTES) chunks.push(chunk);
+    });
+    response.on("end", () => {
+      if (size > CHAT_REPLAY_MAX_BYTES) {
+        complete({ status: 502, headers: {}, body: Buffer.from('{"error":"chat_reply_too_large"}') });
+      } else {
+        const reply = { status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) };
+        complete(reply);
+      }
+    });
+    response.on("error", fail);
+  });
+  function fail(error) {
+    const refused = error?.code === "ECONNREFUSED";
+    const incomplete = error?.code === "CHAT_BODY_INCOMPLETE";
+    // An incomplete body or a refused connection cannot have started a turn.
+    // Keep the existing bad_gateway shape for the router's boot-grace retry.
+    const body = refused
+      ? { error: "bad_gateway", detail: `upstream ${targetPort} unreachable` }
+      : { error: incomplete ? "chat_request_interrupted" : "chat_gateway_connection_lost" };
+    complete({ status: 502, headers: {}, body: Buffer.from(JSON.stringify(body)) });
+  }
+  upstream.on("error", fail);
+  const abortIncomplete = () => {
+    if (!req.complete) upstream.destroy(Object.assign(new Error("incomplete chat body"), { code: "CHAT_BODY_INCOMPLETE" }));
+  };
+  req.on("aborted", abortIncomplete);
+  req.on("error", abortIncomplete);
+  req.pipe(upstream);
+}
+function sendReplay(res, reply) {
+  if (res.destroyed) return;
+  res.writeHead(reply.status, reply.headers);
+  res.end(reply.body);
+}
+
 function proxyHealth(res, gatewayPort, timeoutMs) {
   let settled = false;
   const respond = (statusCode, payload) => {
@@ -118,9 +200,16 @@ function createProxyServer({
   webhookPort = WEBHOOK_PORT,
   healthTimeoutMs = GATEWAY_HEALTH_TIMEOUT_MS,
 } = {}) {
+  const chatCalls = new Map();
   return http.createServer((req, res) => {
     if (req.url === "/proxy-health") {
       proxyHealth(res, gatewayPort, healthTimeoutMs);
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/v1/chat/completions" &&
+        /^[0-9a-f-]{36}$/.test(String(req.headers["x-nbhd-chat-request-id"] || ""))) {
+      proxyChatOnce(req, res, gatewayPort, chatCalls);
       return;
     }
 

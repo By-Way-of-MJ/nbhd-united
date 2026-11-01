@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.orchestrator.config_generator import _build_cron_message, build_cron_seed_jobs
 from apps.orchestrator.services import update_system_cron_prompts
@@ -171,6 +171,17 @@ class UpdateSystemCronPromptsNoChurnTests(TestCase):
         self.tenant.container_id = "oc-no-churn"
         self.tenant.container_fqdn = "oc-no-churn.internal.example.io"
         self.tenant.save()
+
+    @override_settings(SEND_TEST_TENANT_IDS="*")
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_flagged_edited_default_is_not_recreated(self, gateway):
+        existing = self._existing_jobs_from_seed(normalize=True)
+        morning = next(j for j in existing if j["name"] == "Morning Briefing")
+        morning["payload"]["message"] += "\n\nKeep this personal edit."
+        gateway.return_value = _list_response(existing)
+        update_system_cron_prompts(self.tenant)
+        removed = {c.args[2]["jobId"] for c in gateway.call_args_list if c.args[1] == "cron.remove"}
+        self.assertNotIn(morning["id"], removed)
 
     def _existing_jobs_from_seed(self, *, normalize: bool = True) -> list[dict]:
         """Build an ``existing_jobs`` fixture from build_cron_seed_jobs.

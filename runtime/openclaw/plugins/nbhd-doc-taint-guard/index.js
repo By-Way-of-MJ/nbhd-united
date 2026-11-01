@@ -51,6 +51,13 @@ import {
  * before_tool_call discipline.
  */
 
+// Real gateway shape: http-utils-DhJ41GBs.mjs::resolveSessionKey and
+// agent-tools.before-tool-call-WtmCO7BO.mjs::buildToolContext (2026.9.4).
+export function isSideSession(ctx) {
+  return /^agent:[^:]+:openai-user:thread:[0-9a-f-]{36}:side:[0-9a-f]{12}$/.test(ctx?.sessionKey || "");
+}
+const SIDE_BLOCK_REASON = "A side conversation cannot publish, send data outward, or spawn helpers. Continue chatting here; job changes will be picked up when the running job finishes.";
+
 // ── Taint detection ──────────────────────────────────────────────────────
 
 const DOCUMENT_MARKERS = ["[Document attached:", "[Photo attached:"];
@@ -96,8 +103,8 @@ const BARE_CONFIRMATION_EDGES = /^[\s.!?,。！？、~ー]+|[\s.!?,。！？、~
 const BATCHED_MESSAGE_PREFIX = /^\[\d+\](?:\s*\(\d{2}:\d{2}:\d{2}\))?\s*/;
 
 /** Pure: is the last non-empty line of this prompt just a bare yes? */
-export function isBareConfirmation(prompt) {
-  if (typeof prompt !== "string" || prompt.length === 0) return false;
+function normalizedConfirmation(prompt) {
+  if (typeof prompt !== "string" || prompt.length === 0) return "";
   const lines = prompt.split(/\r?\n/);
   let lastLine = "";
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -107,8 +114,58 @@ export function isBareConfirmation(prompt) {
     }
   }
   lastLine = lastLine.replace(BATCHED_MESSAGE_PREFIX, "");
-  const normalized = lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
-  return BARE_CONFIRMATIONS.has(normalized);
+  return lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
+}
+
+export function isBareConfirmation(prompt) {
+  return BARE_CONFIRMATIONS.has(normalizedConfirmation(prompt));
+}
+
+function confirmationLabelsMatch(left, right) {
+  if (left === right) return true;
+  const placeholder = /\[[a-z][a-z0-9_]*_\d+\]/;
+  if (!placeholder.test(left) && !placeholder.test(right)) return false;
+  const tokens = (text) => text.split(/(\[[a-z][a-z0-9_]*_\d+\])/)
+    .flatMap(part => placeholder.test(part) ? [null] : Array.from(part));
+  const a = tokens(left), b = tokens(right);
+  // Intersection of two literal/wildcard strings. Either side can have newly
+  // minted placeholders, including different positions on both sides. Empty
+  // matches are deliberately conservative: retaining taint is the safe choice.
+  let below = new Uint8Array(b.length + 1);
+  for (let i = a.length; i >= 0; i--) {
+    const current = new Uint8Array(b.length + 1);
+    for (let j = b.length; j >= 0; j--) {
+      if (i === a.length && j === b.length) current[j] = 1;
+      else if (i < a.length && a[i] === null) current[j] = below[j] || (j < b.length && current[j + 1]);
+      else if (j < b.length && b[j] === null) current[j] = current[j + 1] || (i < a.length && below[j]);
+      else if (i < a.length && j < b.length && a[i] === b[j]) current[j] = below[j + 1];
+    }
+    below = current;
+  }
+  return Boolean(below[0]);
+}
+
+// openclaw@2026.9.4: builtin-openclaw-B-H-7lKk.mjs:4422 sends the
+// messagesSnapshot as event.messages. session-accessor.sqlite-transcript-store-
+// BczH1lRJ.mjs:273 preserves assistant content blocks in that projection.
+// lifecycle-hook-helpers-Bnm4Rpmf.mjs:10,95 puts runId in ctx.
+export function finalQuickReplyLabels(event) {
+  const messages = event && event.messages;
+  if (!Array.isArray(messages)) return [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role === "user") return []; // never reuse a prior turn's marker
+    if (message?.role !== "assistant") continue;
+    const text = typeof message.content === "string" ? message.content :
+      Array.isArray(message.content) ? message.content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("\n") : "";
+    const match = /^\[\[quick-replies:\s*(.+)\]\]$/i.exec(text.trim().split(/\r?\n/).at(-1)?.trim() || "");
+    if (!match) return [];
+    const labels = match[1].split("|").map(label => label.trim());
+    // Match Python's MAX_LABEL_LEN in Unicode code points, not UTF-16 units.
+    if (labels.length > 4 || labels.some(label => !label || Array.from(label).length > 24)) return [];
+    return labels.map(normalizedConfirmation).filter(Boolean);
+  }
+  return [];
 }
 
 /** Is the opt-in bare-yes carry enabled for this process? Read at call time. */
@@ -353,7 +410,7 @@ export default function register(api) {
   // before_tool_call (which sees params.id) to tool_result_persist (which
   // doesn't).
   const toolCallResolvedId = new Map();
-  // sessionKey -> expiry ms for a flagged turn whose limits should survive one
+  // sessionKey -> {expiry, labels} for a flagged turn whose limits survive one
   // bare "ok"; runId -> sessionKey so agent_end can re-arm the chain.
   const carriedSessions = new Map();
   const runSessions = new Map();
@@ -373,13 +430,21 @@ export default function register(api) {
       }
       if (carryEnabled() && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
         const sessionKey = ctx.sessionKey;
+        const carry = carriedSessions.get(sessionKey);
+        // A server recap is not the next real user turn. Preserve its exact
+        // one-shot entry, and keep this turn tainted too (spoofing fails safe).
+        if (String(event?.prompt || "").includes("[earlier-from-you:")) {
+          if (carry && carry.expiry > Date.now()) {
+            setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
+          }
+          return undefined;
+        }
         setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
-        const expiry = carriedSessions.get(sessionKey);
         carriedSessions.delete(sessionKey);
         if (
-          expiry !== undefined &&
-          expiry > Date.now() &&
-          isBareConfirmation(event && event.prompt) &&
+          carry !== undefined &&
+          carry.expiry > Date.now() &&
+          (isBareConfirmation(event && event.prompt) || carry.labels.some(label => confirmationLabelsMatch(label, normalizedConfirmation(event && event.prompt)))) &&
           !taintedRuns.get(runId)
         ) {
           setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
@@ -400,6 +465,9 @@ export default function register(api) {
   api.on("before_tool_call", (event, ctx) => {
     try {
       const realId = resolveRealToolId(event);
+      if (isSideSession(ctx) && (realId === "sessions_spawn" || EXFIL_TOOL_IDS.has(realId))) {
+        return { block: true, blockReason: SIDE_BLOCK_REASON };
+      }
       const toolCallId = event && event.toolCallId;
 
       // (i) Track pdf/image calls so tool_result_persist can correlate,
@@ -493,7 +561,10 @@ export default function register(api) {
         const sessionKey = runSessions.get(runId);
         runSessions.delete(runId);
         if (carryEnabled() && flagged && typeof sessionKey === "string" && sessionKey.length > 0) {
-          setWithCap(carriedSessions, sessionKey, Date.now() + CARRY_TTL_MS, MAX_TAINTED_RUNS);
+          setWithCap(carriedSessions, sessionKey, {
+            expiry: Date.now() + CARRY_TTL_MS,
+            labels: finalQuickReplyLabels(event),
+          }, MAX_TAINTED_RUNS);
         }
         taintedRuns.delete(runId);
       }

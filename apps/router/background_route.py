@@ -21,7 +21,7 @@ BACKGROUND_MIN = 0.7
 BACKGROUND_ROUTE_BUDGET_SECONDS = 1.2
 BACKGROUND_ROUTING_NOTE = (
     "[NBHD routing: run the latest request as a background helper — call sessions_spawn first "
-    "with a bounded task, reply with the short acknowledgement, and end your turn.]"
+    "with a bounded task, then reply in one short line naming the actual job and saying the person can keep chatting; never use a generic acknowledgement. End your turn.]"
 )
 
 

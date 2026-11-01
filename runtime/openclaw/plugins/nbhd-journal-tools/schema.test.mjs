@@ -680,3 +680,67 @@ test("sessions_recent sends bounded GET queries and renders processed sessions",
   assert.deepEqual(Object.fromEntries(requests[1].url.searchParams), { days: "3", project: "YardTalk / app", limit: "2" });
   assert.deepEqual(Object.fromEntries(requests[2].url.searchParams), { days: "90", limit: "25" });
 });
+
+test("hold tools are absent by default and optional behind the manifest gate", () => {
+  for (const config of [{}, { attentionHoldsEnabled: false }]) {
+    const tools = collectTools({}, config);
+    assert.equal(tools.nbhd_hold_topic, undefined);
+    assert.equal(tools.nbhd_release_hold, undefined);
+  }
+  const registrations = {};
+  const tools = collectTools({}, { attentionHoldsEnabled: true }, registrations);
+  assert.deepEqual(registrations.nbhd_hold_topic, { optional: true });
+  assert.deepEqual(registrations.nbhd_release_hold, { optional: true });
+  assert.ok(tools.nbhd_hold_topic.description.startsWith("Save a topic the person does not want raised until a date or until they lift it."));
+  assert.ok(tools.nbhd_release_hold.description.startsWith("Lift a saved hold when the person says the topic may come up again."));
+  assert.deepEqual(tools.nbhd_hold_topic.parameters.required, ["topic"]);
+  assert.deepEqual(tools.nbhd_release_hold.parameters.required, ["hold_id"]);
+  const manifest = JSON.parse(readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"));
+  for (const name of ["nbhd_hold_topic", "nbhd_release_hold"]) assert.ok(manifest.contracts.tools.includes(name));
+  assert.equal(manifest.configSchema.properties.attentionHoldsEnabled.default, false);
+});
+
+test("hold tools preserve authored placeholders and send internal tenant auth", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    requests.push({ url: new URL(url), options });
+    return { ok: true, status: 200, async text() { return '{"ok":true,"hold_id":7}'; } };
+  });
+  const tools = collectTools({}, { attentionHoldsEnabled: true });
+  await tools.nbhd_hold_topic.execute("hold", { topic: "  [PERSON_1]'s tax bill  ", resume_on: "2026-11-06" });
+  await tools.nbhd_hold_topic.execute("indefinite", { topic: "gym" });
+  await tools.nbhd_release_hold.execute("release", { hold_id: 7 });
+  assert.equal(requests[0].url.pathname, "/api/v1/integrations/runtime/tenant-test/attention/hold/");
+  assert.deepEqual(JSON.parse(requests[0].options.body), { topic: "  [PERSON_1]'s tax bill  ", resume_on: "2026-11-06" });
+  assert.deepEqual(JSON.parse(requests[1].options.body), { topic: "gym" });
+  assert.equal(requests[2].url.pathname, "/api/v1/integrations/runtime/tenant-test/attention/release/");
+  assert.deepEqual(JSON.parse(requests[2].options.body), { hold_id: 7 });
+  assert.equal(requests[0].options.headers["X-NBHD-Internal-Key"], "test-key");
+  assert.equal(requests[0].options.headers["X-NBHD-Tenant-Id"], "tenant-test");
+});
+
+test("send tool surfaces on_hold rewrite instruction verbatim", async (t) => {
+  const saved = { ...process.env };
+  t.after(() => { process.env = saved; });
+  process.env.NBHD_API_BASE_URL = "https://nbhd.test";
+  process.env.NBHD_TENANT_ID = "tenant-test";
+  process.env.NBHD_INTERNAL_API_KEY = "test-key";
+  const payload = { delivered: false, skipped: "on_hold", detail: "Drop that part and send again without it, or send nothing. Keep the hold in place." };
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    requests.push(options);
+    return { ok: true, status: 200, async text() { return JSON.stringify(payload); } };
+  });
+  // OpenClawPluginToolContext.sessionKey is defined in the pinned image's
+  // dist/plugin-entry-Cc00OvUf.d.ts:22881; this is tool context, not a hook event.
+  const tool = collectTools({ sessionKey: "agent:main:cron:real-job-id:run:run-id" }).nbhd_send_to_user;
+  const result = await tool.execute("send", { message: "How is the gym?" });
+  assert.deepEqual(result.details.json, payload);
+  assert.deepEqual(JSON.parse(result.content[0].text), payload);
+  assert.equal(requests[0].headers["X-NBHD-Cron-Job-Id"], "real-job-id");
+});

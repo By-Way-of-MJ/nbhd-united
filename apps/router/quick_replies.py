@@ -5,6 +5,8 @@ tappable choices instead of making the user type a short answer:
 
     [[quick-replies: Label A | Label B | Label C]]
 
+ONE_QUESTION_TENANT_IDS opts tenants into up to 4 labels; the default stays 3.
+
 This is deliberately distinct from LINE's ``[[button:label|data]]`` marker
 (``apps.router.line_flex.extract_quick_reply_buttons``): that one carries a
 callback payload and can appear anywhere in the text; this one carries plain
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,10 @@ def extract_quick_replies(
 
     remainder = "\n".join(lines[:-1]).rstrip()
     labels = [part.strip() for part in match.group(1).split("|")]
-    valid = 1 <= len(labels) <= MAX_QUICK_REPLIES and all(0 < len(label) <= MAX_LABEL_LEN for label in labels)
+    from apps.router.chat_gates import _tenant_allowed
+
+    maximum = 4 if _tenant_allowed(SimpleNamespace(id=tenant_id), "ONE_QUESTION_TENANT_IDS") else MAX_QUICK_REPLIES
+    valid = 1 <= len(labels) <= maximum and all(0 < len(label) <= MAX_LABEL_LEN for label in labels)
     if not valid:
         _log_malformed(
             tenant_id=tenant_id, channel=channel, label_count=len(labels), sample=last_line, reason="parse_validation"

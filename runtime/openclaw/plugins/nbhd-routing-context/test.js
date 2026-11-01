@@ -15,7 +15,18 @@ import register, {
   decideSubagentToolBlock,
   REMOVED_BUILTIN_TOOL_IDS,
   SUBAGENT_READ_ONLY_NBHD_TOOL_IDS,
+  stripNativeQuickReplies,
 } from "./index.js";
+
+describe("native channel quick replies", () => {
+  it("strips the final-line marker including invalid label counts", () => {
+    for (const labels of ["A | B", "A | B | C | D", "A | B | C | D | E"]) {
+      assert.equal(stripNativeQuickReplies(`Pick?\n[[quick-replies: ${labels}]]`), "Pick?");
+    }
+    assert.equal(stripNativeQuickReplies("[[quick-replies: A | B]]"), "");
+    assert.equal(stripNativeQuickReplies("Plain reply?"), "Plain reply?");
+  });
+});
 
 // Mirror of the heuristic from index.js. Kept in sync by hand; the
 // canonical copy is index.js. If you change one, change both.

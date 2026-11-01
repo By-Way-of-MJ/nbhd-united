@@ -2,7 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -63,6 +63,88 @@ class HelperClosureTests(TestCase):
         self.assertEqual(HelperRun.objects.get(pk=row.pk).deadline, row.deadline)
         self.assertEqual(HelperRun.objects.count(), 2)
 
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_cancelled_helper_closes_with_ack_and_never_delivers_raw_result(self):
+        self.thread.side_jobs = {
+            "job": {"main_ids": [], "side_ids": [], "kind": "cancel", "finished": True, "helpers": [self.key]}
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        self.assertEqual(self.send("RAW CANCELLED PLAN").data["status"], "sent")
+        self.assertEqual(self.send("RAW CANCELLED PLAN").data["status"], "duplicate")
+        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
+        row = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(row.message_text, "Cancelled — I won't send that result.")
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_announce_context_uses_only_its_captured_child_session(self):
+        from apps.pii.redactor import RedactionOutcome
+        from apps.router.models import AppChatMessage
+
+        other = "helper:" + "b" * 48
+        first_session = "agent:main:subagent:00000000-0000-4000-8000-000000000001"
+        second_session = "agent:main:subagent:00000000-0000-4000-8000-000000000002"
+        HelperRun.objects.create(
+            tenant=self.tenant, thread=self.thread, occurrence_key=other, deadline=self.row.deadline
+        )
+        for cid, text in (("old-side", "cancel the old desk job"), ("new-side", "what time is my dentist visit?")):
+            AppChatMessage.objects.create(
+                tenant=self.tenant,
+                user=self.tenant.user,
+                thread=self.thread,
+                client_msg_id=cid,
+                user_text=text,
+                reply_text="Noted.",
+                status="ready",
+            )
+        self.thread.side_jobs = {
+            "old": {
+                "main_ids": [],
+                "side_ids": ["old-side"],
+                "kind": "cancel",
+                "finished": True,
+                "helpers": [self.key],
+                "helper_sessions": {self.key: first_session},
+            },
+            "new": {
+                "main_ids": [],
+                "side_ids": ["new-side"],
+                "kind": "none",
+                "finished": True,
+                "helpers": [other],
+                "helper_sessions": {other: second_session},
+            },
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        with patch(
+            "apps.pii.redactor.redact_user_message_checked",
+            side_effect=lambda text, *a, **kw: RedactionOutcome(text, True, "ok"),
+        ):
+            response = self.client.post(
+                self.base + "helpers/context/",
+                {"thread_id": str(self.thread.pk), "source_session_key": second_session},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("dentist", response.data["context"])
+        self.assertNotIn("cancel", response.data["context"].split("]\n", 1)[1])
+
+    def test_active_job_selection_uses_admission_time_not_jsonb_key_order(self):
+        from apps.router.job_changes import active_helper_job
+
+        other = "helper:" + "b" * 48
+        newer = HelperRun.objects.create(
+            tenant=self.tenant, thread=self.thread, occurrence_key=other, deadline=self.row.deadline
+        )
+        self.thread.side_jobs = {
+            "00000000-0000-4000-8000-000000000001": {"helpers": [other]},
+            "ffffffff-ffff-4fff-8fff-ffffffffffff": {"helpers": [self.key]},
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        self.thread.refresh_from_db()
+        self.assertEqual(active_helper_job(self.tenant, self.thread)[1]["helpers"], [newer.occurrence_key])
+
     def test_admission_refuses_closed_and_expired_keys(self):
         self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
         self.row.closed_at = timezone.now()
@@ -76,6 +158,24 @@ class HelperClosureTests(TestCase):
         self.assertEqual(self.admit(occurrence_key="bad").status_code, 400)
         self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="wrong", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
         self.assertEqual(self.admit().status_code, 401)
+
+    def test_rejected_spawn_release_is_scoped_idempotent_and_never_undoes_delivery(self):
+        payload = {"occurrence_key": self.key, "thread_id": str(self.thread.id)}
+        url = self.base + "helpers/release/"
+        wrong = {**payload, "thread_id": "00000000-0000-4000-8000-000000000001"}
+        self.assertEqual(self.client.post(url, wrong, format="json").status_code, 400)
+        self.assertTrue(HelperRun.objects.filter(pk=self.row.pk).exists())
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(self.client.post(url, payload, format="json").data["status"], "released")
+        self.assertTrue(HelperRun.objects.filter(pk=self.row.pk, closed_by=HelperRun.ClosedBy.RESULT).exists())
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.admit()
+        payload["occurrence_key"] = "helper:" + "b" * 48
+        for _ in range(2):
+            self.assertEqual(self.client.post(url, payload, format="json").data["status"], "released")
+        self.assertEqual(HelperRun.objects.count(), 1)
+        self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="wrong", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
+        self.assertEqual(self.client.post(url, payload, format="json").status_code, 401)
 
     def test_restart_without_any_runtime_completion_delivers_failure_once(self):
         # Only Postgres state exists: no hook, parent announce, process timer,
@@ -94,22 +194,13 @@ class HelperClosureTests(TestCase):
         self.assertEqual(self.send("Repeated parent completion.").data["status"], "duplicate")
         self.assertEqual(ProactiveOutbound.objects.get().message_text, "A useful result.")
 
-    def test_late_result_after_watchdog_failure_is_delivered(self):
+    def test_late_result_after_watchdog_failure_is_duplicate(self):
         self.assertEqual(close_expired_helpers(), {"sent": 1})
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
+        self.assertEqual(self.send().data["status"], "duplicate")
+        self.assertEqual(self.send("Sorry, I couldn't finish that.").data["status"], "duplicate")
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
         self.row.refresh_from_db()
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
-
-    def test_second_late_result_is_duplicate(self):
-        close_expired_helpers()
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertEqual(self.send("Repeated late completion.").data["status"], "duplicate")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
 
     def test_failure_after_result_sends_nothing(self):
         self.assertEqual(self.send().data["status"], "sent")
@@ -119,26 +210,19 @@ class HelperClosureTests(TestCase):
         self.row.refresh_from_db()
         self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
 
-    def test_late_result_after_ended_hook_failure_is_delivered_once(self):
+    def test_late_result_after_ended_hook_failure_is_duplicate(self):
         self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "sent")
-        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
-        self.assertEqual(close_expired_helpers(), {"sent": 0})
-        self.assertEqual(self.send().data["status"], "sent")
         self.assertEqual(self.send().data["status"], "duplicate")
-        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
-
-    def test_failed_late_result_write_preserves_failure_closure_for_retry(self):
-        close_expired_helpers()
-        with patch.object(HelperRun, "save", side_effect=RuntimeError("worker crash")), self.assertRaises(RuntimeError):
-            self.send()
-        self.row.refresh_from_db()
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
+        self.assertEqual(self.send("Sorry, I couldn't finish.").data["status"], "duplicate")
         self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertEqual(ProactiveOutbound.objects.count(), 2)
+
+    def test_late_post_after_failure_does_not_attempt_a_closure_write(self):
+        close_expired_helpers()
+        with patch.object(HelperRun, "save", side_effect=RuntimeError("must not write")) as save:
+            self.assertEqual(self.send("Sorry, I could not finish.").data["status"], "duplicate")
+            self.assertEqual(self.send("A late result.").data["status"], "duplicate")
+        save.assert_not_called()
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
 
     def test_live_helpers_are_not_closed_early(self):
         self.row.deadline = timezone.now() + timedelta(minutes=8)
@@ -233,6 +317,53 @@ class HelperRaceTests(TransactionTestCase):
     def setUp(self):
         seed(self)
 
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_result_waits_for_in_progress_cancel_without_holding_a_transaction(self):
+        from apps.router import helper_runs
+
+        self.thread.side_jobs = {
+            "job": {
+                "main_ids": [],
+                "side_ids": [],
+                "kind": "none",
+                "finished": True,
+                "helpers": [self.key],
+                "checking_until": timezone.now().timestamp() + 10,
+            }
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        waiting = Event()
+        original = helper_runs._deliver_helper_once
+
+        def observed(**kwargs):
+            try:
+                return original(**kwargs)
+            except helper_runs._JobChangePending:
+                waiting.set()
+                raise
+
+        def deliver():
+            close_old_connections()
+            try:
+                tenant = Tenant.objects.select_related("user").get(pk=self.tenant.pk)
+                return deliver_helper(tenant=tenant, occurrence_key=self.key, message_text="RAW CANCELLED PLAN")
+            finally:
+                close_old_connections()
+
+        with (
+            patch("apps.router.helper_runs._deliver_helper_once", side_effect=observed),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            future = pool.submit(deliver)
+            self.assertTrue(waiting.wait(5))
+            with transaction.atomic():
+                thread = ChatThread.objects.select_for_update().get(pk=self.thread.pk)
+                thread.side_jobs["job"].pop("checking_until")
+                thread.side_jobs["job"]["kind"] = "cancel"
+                thread.save(update_fields=["side_jobs"])
+            self.assertEqual(future.result(timeout=5).data["status"], "sent")
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, "Cancelled — I won't send that result.")
+
     def send_concurrently(self, messages):
         barrier = Barrier(2)
 
@@ -248,23 +379,19 @@ class HelperRaceTests(TransactionTestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             return list(pool.map(send, messages))
 
-    def test_simultaneous_result_and_failure_always_deliver_result(self):
-        result_status, failure_status = self.send_concurrently(["Result", FAILURE_MESSAGE])
-        self.assertEqual(result_status, "sent")
-        self.assertIn(failure_status, ["sent", "duplicate"])
-        expected = ["Result", FAILURE_MESSAGE] if failure_status == "sent" else ["Result"]
-        self.assertCountEqual(ProactiveOutbound.objects.values_list("message_text", flat=True), expected)
-        self.row.refresh_from_db()
-        self.assertIsNotNone(self.row.closed_at)
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
-
-    def test_simultaneous_late_results_deliver_once(self):
-        self.assertEqual(close_expired_helpers(), {"sent": 1})
-        statuses = self.send_concurrently(["Result", "Result"])
+    def test_simultaneous_result_and_failure_publish_first_closure_only(self):
+        statuses = self.send_concurrently(["Result", FAILURE_MESSAGE])
         self.assertCountEqual(statuses, ["sent", "duplicate"])
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "Result"]
-        )
+        self.assertEqual(ProactiveOutbound.objects.count(), 1)
         self.row.refresh_from_db()
         self.assertIsNotNone(self.row.closed_at)
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+        self.assertEqual(
+            self.row.closed_by, HelperRun.ClosedBy.RESULT if statuses[0] == "sent" else HelperRun.ClosedBy.FAILURE
+        )
+
+    def test_simultaneous_late_results_after_failure_are_duplicates(self):
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(self.send_concurrently(["Result", "Result"]), ["duplicate", "duplicate"])
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)

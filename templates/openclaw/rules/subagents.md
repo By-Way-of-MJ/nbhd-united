@@ -3,8 +3,10 @@
 - Delegate only work likely to take more than about 30 seconds: multi-step
   research, long-document analysis, or a large generation. Answer simple
   questions directly.
-- After spawning, acknowledge immediately in one short line: “On it — I'll let
-  you know when it's ready.” Do not yield the app turn.
+- After spawning, reply immediately in one short line naming the actual job and
+  saying the person can keep chatting. For example: “On it: comparing those three
+  vacuums. Keep chatting, I'll send it when it's done.” Never use a generic line.
+  Do not yield the app turn.
 - Never pass `context: "fork"` to `sessions_spawn`; give the helper only the
   bounded context it needs.
 - A helper reports to you; it must not send, create, publish, or otherwise act

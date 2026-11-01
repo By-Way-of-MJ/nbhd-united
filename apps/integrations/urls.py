@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from apps.platform_logs.views import PlatformIssueReportView as _PlatformIssueReportView
 from apps.router.cron_delivery import CronDeliveryView as _CronDeliveryView
-from apps.router.helper_runs import HelperAdmissionView
+from apps.router.helper_runs import HelperAdmissionView, HelperContextView, HelperReleaseView
 
 from .link_views import SautaiLinkView
 from .runtime_views import (
@@ -12,6 +12,8 @@ from .runtime_views import (
     RedditDisconnectView,
     RedditStatusView,
     RedditToolView,
+    RuntimeAttentionHoldView,
+    RuntimeAttentionReleaseView,
     RuntimeBYOErrorReportView,
     RuntimeCalendarEventsView,
     RuntimeCalendarFreeBusyView,
@@ -346,6 +348,12 @@ urlpatterns = [
         name="runtime-profile-update",
     ),
     # Agent-stated transient current location
+    path("runtime/<uuid:tenant_id>/attention/hold/", RuntimeAttentionHoldView.as_view(), name="runtime-attention-hold"),
+    path(
+        "runtime/<uuid:tenant_id>/attention/release/",
+        RuntimeAttentionReleaseView.as_view(),
+        name="runtime-attention-release",
+    ),
     path(
         "runtime/<uuid:tenant_id>/situation/",
         RuntimeSituationUpdateView.as_view(),
@@ -373,6 +381,12 @@ urlpatterns = [
         name="runtime-workspace-detail",
     ),
     # Cron delivery — tenant agents send messages to users via Django
+    path("runtime/<uuid:tenant_id>/helpers/context/", HelperContextView.as_view(), name="runtime-helper-context"),
+    path(
+        "runtime/<uuid:tenant_id>/helpers/release/",
+        HelperReleaseView.as_view(),
+        name="runtime-helper-release",
+    ),
     path(
         "runtime/<uuid:tenant_id>/helpers/admit/",
         HelperAdmissionView.as_view(),

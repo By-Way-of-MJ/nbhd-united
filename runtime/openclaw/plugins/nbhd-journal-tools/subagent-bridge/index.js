@@ -8,6 +8,7 @@ const SPAWN_TOOL_ID = "sessions_spawn";
 const SEND_TOOL_ID = "nbhd_send_to_user";
 const APP_THREAD_MARKER = "-user:thread:";
 const ANNOUNCE_MARKER = "[Internal task completion event]";
+const PLAIN_ANNOUNCE_HEADER = "A background task completed. Use this result to reply to the user in your normal assistant voice.\n\n";
 const INTERNAL_CONTEXT_BEGIN = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
 const SESSION_SPAWN_BLOCK_REASON =
   "Sub-agent spawning is unavailable for this turn because its safety guard could not verify a safe requester context.";
@@ -168,6 +169,9 @@ function extractThreadId(sessionKey) {
 
 function normalizePrompt(prompt) {
   const text = asTrimmedString(prompt).replace(/\r\n?/g, "\n");
+  // 2026.9.4 resolveAcpPromptBody uses formatTaskCompletionEvent("plain").
+  // Match its complete producer header, never an arbitrary embedded marker.
+  if (text.startsWith(PLAIN_ANNOUNCE_HEADER)) return `${ANNOUNCE_MARKER}\n${text.slice(PLAIN_ANNOUNCE_HEADER.length)}`;
   if (!text.startsWith(INTERNAL_CONTEXT_BEGIN)) return text;
   const markerIndex = text.indexOf(ANNOUNCE_MARKER);
   return markerIndex >= 0 ? text.slice(markerIndex) : text;
@@ -228,12 +232,18 @@ function textFromContent(content) {
     .join("\n");
 }
 
-export function lastAssistantText(messages) {
+export function lastAssistantText(messages, priorAssistantTexts = []) {
   if (!Array.isArray(messages)) return "";
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    const text = asTrimmedString(textFromContent(message.content));
+    const text = asTrimmedString(textFromContent(message?.content));
+    // The snapshot includes prior turns. Never cross the current announce's
+    // user/custom carrier, or reuse an assistant already present at run start.
+    if (message?.role !== "assistant") {
+      if (text.includes("[Internal task completion event]") || text.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>")) break;
+      continue;
+    }
+    if (priorAssistantTexts.includes(text)) break;
     if (text) return text;
   }
   return "";
@@ -297,7 +307,7 @@ async function postRuntime(runtime, path, body, occurrenceKey = "") {
       });
       if (response.ok) {
         const data = await response.json();
-        if (["sent", "duplicate", "pending"].includes(data?.status)) return;
+        if (["sent", "duplicate", "pending", "released"].includes(data?.status)) return data;
       }
       lastError = new Error(`runtime ${path} returned ${response.status} without acceptance`);
     } catch (error) {
@@ -430,21 +440,77 @@ export default function register(api) {
     try {
       const runId = asTrimmedString(ctx?.runId || event?.runId);
       const parsed = parseAnnounceTurn(event?.prompt, ctx?.sessionKey);
-      if (!runId || !parsed) return undefined;
-      markedRuns.set(runId, parsed);
-      return {
-        appendContext:
+      const provenance = ctx?.inputProvenance;
+      const runtimeAnnounce = provenance?.kind === "inter_session"
+        && provenance?.sourceChannel === "internal"
+        && provenance?.sourceTool === "subagent_announce";
+      const threadId = parsed?.threadId || (runtimeAnnounce && extractThreadId(asTrimmedString(ctx?.sessionKey)));
+      if (!runId || !threadId) return undefined;
+      if (parsed) markedRuns.set(runId, {
+        ...parsed,
+        priorAssistantTexts: (event.messages || []).filter(m => m.role === "assistant")
+          .map(m => asTrimmedString(textFromContent(m.content))),
+      });
+      const build = (side = {}) => ({
+        // Do not turn a runtime-only event into a synthetic persisted user
+        // message. 9.4 supplies an empty prompt here plus trusted provenance.
+        [parsed ? "appendContext" : "appendSystemContext"]:
           `This is an app-session sub-agent completion. Never reply with NO_REPLY. ` +
-          `Send exactly one final user update with nbhd_send_to_user and thread_id=${parsed.threadId}.`,
-      };
+          `Write one final update in your normal voice. The bridge delivers your final reply to app thread ${threadId}; do not call a send tool.` +
+          (typeof side?.context === "string" && side.context ? `\n${side.context}` : ""),
+      });
+      return runtimeAnnounce && process.env.NBHD_KEEP_CHATTING === "1"
+        ? postRuntime(runtime, "helpers/context/", {
+          thread_id: threadId, source_session_key: provenance.sourceSessionKey,
+        }).then(build).catch(() => build())
+        : build();
     } catch (error) {
       safeLog(api, "warn", `nbhd-subagent-bridge: announce marker detection failed: ${safeErrorText(error)}`);
       return undefined;
     }
   });
 
-  api.on("after_tool_call", (event, ctx) => {
+  api.on("before_agent_run", (event, ctx) => {
+    // Unlike before_prompt_build, this boundary has the current completion
+    // body (resolveAcpPromptBody), including its durable admission label.
+    const provenance = ctx?.inputProvenance;
+    if (provenance?.kind !== "inter_session" || provenance?.sourceChannel !== "internal"
+        || provenance?.sourceTool !== "subagent_announce") return;
+    const runId = asTrimmedString(ctx?.runId);
+    const info = parseAnnounceTurn(event?.prompt, ctx?.sessionKey);
+    if (runId && info) markedRuns.set(runId, {
+      ...info,
+      priorAssistantTexts: (event.messages || []).filter(m => m.role === "assistant")
+        .map(m => asTrimmedString(textFromContent(m.content))),
+    });
+  });
+
+  api.on("after_tool_call", async (event, ctx) => {
     try {
+      // Captured 2026.9.4 inner-tool hook: overridden params.label and
+      // result.details.status="error" identify a definitely rejected spawn.
+      // Ambiguous exceptions retain the watchdog obligation.
+      if (asTrimmedString(event?.toolName) === SPAWN_TOOL_ID
+          && event?.result?.details?.status === "error") {
+        const occurrenceKey = asTrimmedString(event?.params?.label).match(HELPER_LABEL)?.[1];
+        const threadId = extractThreadId(asTrimmedString(ctx?.sessionKey));
+        if (occurrenceKey && threadId) await postRuntime(runtime, "helpers/release/", {
+          occurrence_key: occurrenceKey, thread_id: threadId,
+        });
+        return;
+      }
+      if (process.env.NBHD_KEEP_CHATTING === "1" && asTrimmedString(event?.toolName) === SPAWN_TOOL_ID
+          && event?.result?.details?.status === "accepted") {
+        // Captured inner-tool result supplies childSessionKey. Tie it to the
+        // admission label before a later announce uses sourceSessionKey.
+        const occurrenceKey = asTrimmedString(event?.params?.label).match(HELPER_LABEL)?.[1];
+        const threadId = extractThreadId(asTrimmedString(ctx?.sessionKey));
+        const childSessionKey = asTrimmedString(event.result.details.childSessionKey);
+        if (occurrenceKey && threadId && childSessionKey) await postRuntime(runtime, "helpers/context/", {
+          occurrence_key: occurrenceKey, thread_id: threadId, child_session_key: childSessionKey,
+        });
+        return;
+      }
       const runId = asTrimmedString(ctx?.runId || event?.runId);
       if (!runId || !markedRuns.has(runId)) return;
       if (resolveRealToolId(event) !== SEND_TOOL_ID || asTrimmedString(event?.error)) return;
@@ -465,8 +531,8 @@ export default function register(api) {
         deliveredBy = "model";
         return;
       }
-      const assistantText = lastAssistantText(event?.messages);
-      const useChildResult = isSilentToken(assistantText);
+      const assistantText = lastAssistantText(event?.messages, info.priorAssistantTexts);
+      const useChildResult = event?.success === false || isSilentToken(assistantText);
       const message = useChildResult ? fallbackText(info) : assistantText;
       await postCompletion(runtime, info, runId, message);
       deliveredBy = useChildResult ? "backstop_child_result" : "backstop";
