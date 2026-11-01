@@ -249,11 +249,11 @@ class PlaceTimezoneResolveTests(TestCase):
 
         self.assertEqual(result, PlaceTz(kind="unknown"))
 
-    def test_small_state_name_matches_are_unknown(self):
+    def test_small_same_name_city_matches_are_unknown(self):
         client = self._geocode_client(
             [
                 {
-                    "name": "California",
+                    "name": "Zzyzxville",
                     "feature_code": "PPLA2",
                     "timezone": "America/Chicago",
                     "country_code": "US",
@@ -261,7 +261,7 @@ class PlaceTimezoneResolveTests(TestCase):
                     "population": 4396,
                 },
                 {
-                    "name": "California",
+                    "name": "Zzyzxville",
                     "feature_code": "PPL",
                     "timezone": "America/New_York",
                     "country_code": "US",
@@ -271,7 +271,7 @@ class PlaceTimezoneResolveTests(TestCase):
             ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
-            result = resolve_place_timezone("California")
+            result = resolve_place_timezone("Zzyzxville")
 
         self.assertEqual(result, PlaceTz(kind="unknown"))
 
