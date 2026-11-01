@@ -68,6 +68,37 @@ class HelperAdmissionView(APIView):
         return Response({"status": "pending"})
 
 
+class HelperReleaseView(APIView):
+    """Release an admission when OpenClaw explicitly rejects the spawn."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, tenant_id):
+        try:
+            validate_internal_runtime_request(
+                provided_key=request.headers.get("X-NBHD-Internal-Key", ""),
+                provided_tenant_id=request.headers.get("X-NBHD-Tenant-Id", ""),
+                expected_tenant_id=str(tenant_id),
+            )
+        except InternalAuthError:
+            return Response({"error": "internal_auth_failed"}, status=401)
+        serializer = HelperAdmissionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        with transaction.atomic():
+            row = (
+                HelperRun.objects.select_for_update()
+                .filter(tenant_id=tenant_id, occurrence_key=data["occurrence_key"])
+                .first()
+            )
+            if row and row.thread_id != data["thread_id"]:
+                return Response({"error": "helper_thread_mismatch"}, status=400)
+            if row and row.closed_at is None:
+                row.delete()
+        return Response({"status": "released"})
+
+
 def deliver_helper(*, tenant, occurrence_key, message_text, thread_id=None, expired_only=False, **content):
     """Commit the app-feed row and closure together; rollback is safe to retry.
 

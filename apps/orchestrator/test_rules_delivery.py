@@ -90,9 +90,9 @@ class RulesDeliveryTest(TestCase):
                     "On it: comparing those three vacuums. Keep chatting, I'll send it when it's done.",
                     'Never pass `context: "fork"`',
                     "helper is read-only, reports back",
-                    "exactly one `nbhd_send_to_user`",
-                    "requester's `thread_id`",
-                    "bridge backstops delivery",
+                    "write one final reply",
+                    "requesting app thread",
+                    "bridge delivers that reply",
                     "timeout/failure",
                 ):
                     with self.subTest(persona=persona_key, marker=marker):

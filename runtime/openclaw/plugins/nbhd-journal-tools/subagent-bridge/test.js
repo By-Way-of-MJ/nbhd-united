@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import registerCron from "../../nbhd-cron-enforcement/index.js";
@@ -13,6 +14,68 @@ import registerBridge, {
 
 const THREAD_ID = "7c410ca8-33e7-42ed-b65c-95c42142e621";
 const SESSION_KEY = `agent:main:openai-user:thread:${THREAD_ID}`;
+const captured = JSON.parse(readFileSync(new URL("./fixtures/completion-2026.9.4.json", import.meta.url)));
+
+describe("captured 2026.9.4 app completion", () => {
+  it("recognises the empty build prompt, delivers the real parent reply once, and uses the admission key", async () => {
+    const api = fakeApi();
+    registerBridge(api);
+    const calls = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      calls.push({url: String(url), options});
+      return {ok: true, json: async () => ({status: "sent"})};
+    };
+    try {
+      const build = captured.before_prompt_build;
+      assert.equal(build.event.prompt, "");
+      assert.match(api._handlers.before_prompt_build(build.event, build.ctx).appendSystemContext, /do not call a send tool/);
+      const start = captured.before_agent_run;
+      api._handlers.before_agent_run(start.event, start.ctx);
+      const end = captured.agent_end;
+      await api._handlers.agent_end(end.event, end.ctx);
+      await api._handlers.agent_end(end.event, end.ctx);
+      assert.equal(calls.length, 1);
+      assert.equal(JSON.parse(calls[0].options.body).message, lastAssistantText(end.event.messages));
+      assert.equal(JSON.parse(calls[0].options.body).thread_id, start.ctx.sessionKey.split(":thread:")[1]);
+      assert.equal(calls[0].options.headers["X-NBHD-Occurrence-Key"], captured.accepted_spawn.event.params.label.match(/\[nbhd-(helper:[a-f0-9]{48})\]/)[1]);
+      assert.ok(api._logs.some(l => l.message.includes("delivered_by=backstop")));
+    } finally { globalThis.fetch = previous; }
+  });
+
+  it("backstops a silent parent with the captured child result", async () => {
+    const api = fakeApi(); registerBridge(api);
+    const previous = globalThis.fetch; let body;
+    globalThis.fetch = async (_url, options) => { body = JSON.parse(options.body); return {ok: true, json: async () => ({status: "sent"})}; };
+    try {
+      const start = captured.before_agent_run;
+      api._handlers.before_agent_run(start.event, start.ctx);
+      const end = structuredClone(captured.agent_end);
+      end.event.messages.at(-1).content = "NO_REPLY";
+      await api._handlers.agent_end(end.event, end.ctx);
+      assert.match(body.message, /^Here's what I found:/);
+      assert.match(body.message, /FEZIBO/);
+      assert.doesNotMatch(body.message, /Stats: runtime|session_key:/);
+    } finally { globalThis.fetch = previous; }
+  });
+
+  it("releases a captured rejected spawn but retains accepted or ambiguous work", async () => {
+    const api = fakeApi(); registerBridge(api);
+    const previous = globalThis.fetch; const calls = [];
+    globalThis.fetch = async (url, options) => { calls.push({url: String(url), body: JSON.parse(options.body)}); return {ok: true, json: async () => ({status: "released"})}; };
+    try {
+      for (const name of ["rejected_spawn", "accepted_spawn"]) {
+        const row = captured[name]; await api._handlers.after_tool_call(row.event, row.ctx);
+      }
+      const ambiguous = structuredClone(captured.rejected_spawn);
+      delete ambiguous.event.result;
+      await api._handlers.after_tool_call(ambiguous.event, ambiguous.ctx);
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /helpers\/release\/$/);
+      assert.equal(calls[0].body.occurrence_key, captured.rejected_spawn.event.params.label.match(/\[nbhd-(helper:[a-f0-9]{48})\]/)[1]);
+    } finally { globalThis.fetch = previous; }
+  });
+});
 
 function markerPrompt(status = "completed; ready for parent review", result = "Three grounded findings.") {
   return [

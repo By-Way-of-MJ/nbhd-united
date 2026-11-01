@@ -556,9 +556,9 @@ _SUBAGENT_CHAT_INSTRUCTIONS = (
     'Never pass `context: "fork"`; '
     "give only bounded context. The helper is read-only, reports back to you, and must not "
     "send, create, publish, or act outward. On an `[Internal task completion event]`, "
-    "send exactly one `nbhd_send_to_user` update to the requester's `thread_id`, in your "
-    "normal voice, without raw run/session/delivery metadata. The bridge backstops delivery; "
-    "do not duplicate its sends. Never use `NO_REPLY`, `no_reply`, or `ANNOUNCE_SKIP` for "
+    "write one final reply in your normal voice, without raw run/session/delivery metadata. "
+    "The bridge delivers that reply to the requesting app thread; do not call a send tool "
+    "or duplicate its delivery. Never use `NO_REPLY`, `no_reply`, or `ANNOUNCE_SKIP` for "
     "completion. On timeout/failure, send a brief honest reason and offer to retry."
 )
 

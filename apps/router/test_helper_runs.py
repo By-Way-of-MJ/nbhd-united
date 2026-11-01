@@ -77,6 +77,24 @@ class HelperClosureTests(TestCase):
         self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="wrong", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
         self.assertEqual(self.admit().status_code, 401)
 
+    def test_rejected_spawn_release_is_scoped_idempotent_and_never_undoes_delivery(self):
+        payload = {"occurrence_key": self.key, "thread_id": str(self.thread.id)}
+        url = self.base + "helpers/release/"
+        wrong = {**payload, "thread_id": "00000000-0000-4000-8000-000000000001"}
+        self.assertEqual(self.client.post(url, wrong, format="json").status_code, 400)
+        self.assertTrue(HelperRun.objects.filter(pk=self.row.pk).exists())
+        self.assertEqual(self.send().data["status"], "sent")
+        self.assertEqual(self.client.post(url, payload, format="json").data["status"], "released")
+        self.assertTrue(HelperRun.objects.filter(pk=self.row.pk, closed_by=HelperRun.ClosedBy.RESULT).exists())
+        self.assertEqual(close_expired_helpers(), {"sent": 0})
+        self.admit()
+        payload["occurrence_key"] = "helper:" + "b" * 48
+        for _ in range(2):
+            self.assertEqual(self.client.post(url, payload, format="json").data["status"], "released")
+        self.assertEqual(HelperRun.objects.count(), 1)
+        self.client.credentials(HTTP_X_NBHD_INTERNAL_KEY="wrong", HTTP_X_NBHD_TENANT_ID=str(self.tenant.id))
+        self.assertEqual(self.client.post(url, payload, format="json").status_code, 401)
+
     def test_restart_without_any_runtime_completion_delivers_failure_once(self):
         # Only Postgres state exists: no hook, parent announce, process timer,
         # runtime container, or in-memory child mapping is required.
