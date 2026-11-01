@@ -1329,8 +1329,9 @@ def _terminalize_failed_queue_rows(
 
         committed_at = timezone.now()
         if channel == "ios" and keep_chatting_enabled(locked_tenant):
-            from apps.router.job_changes import finish_main, mark_suppressed_main
+            from apps.router.job_changes import finish_main, mark_suppressed_main, release_context
 
+            release_context(locked_tenant, terminalized_rows)
             for row in terminalized_rows:
                 if row.lane == PendingMessage.Lane.MAIN and not row.payload.get("side_handoff"):
                     if finish_main(locked_tenant, [row]):
@@ -3291,8 +3292,9 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
 
                 lock_owned_batch(tenant, batch)
                 if getattr(batch[0], "lane", "main") == "main":
-                    from apps.router.job_changes import finish_main, mark_suppressed_main
+                    from apps.router.job_changes import finish_main, mark_suppressed_main, release_context
 
+                    release_context(tenant, batch)
                     if finish_main(tenant, batch):
                         mark_suppressed_main(tenant, batch)
                         return (time.monotonic() - write_started) * 1000

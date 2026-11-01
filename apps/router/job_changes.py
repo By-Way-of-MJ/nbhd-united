@@ -253,6 +253,16 @@ def complete_context(tenant, batch):
     thread.save(update_fields=["side_jobs"])
 
 
+def release_context(tenant, batch):
+    """A terminally failed ordinary turn did not consume its passive context."""
+    thread = ChatThread.objects.get(tenant=tenant, pk=batch[0].channel_user_id)
+    keys = {str(row.batch_id or row.id) for row in batch}
+    for entry in thread.side_jobs.values():
+        if entry.get("recap_for") in keys and not entry.get("consumed"):
+            entry.pop("recap_for", None)
+    thread.save(update_fields=["side_jobs"])
+
+
 def bind_helper(tenant, thread_id, occurrence_key):
     from apps.router.chat_gates import keep_chatting_enabled
 

@@ -132,3 +132,16 @@ class JobPublicationTests(TestCase):
         self.drain()
         self.change_check.assert_called_once()
         self.assertNotIn("earlier-from-you", json.dumps(row.payload))
+
+    def test_empty_ordinary_reply_leaves_passive_context_for_next_turn(self):
+        main = self.main()
+        self.row("is the plan done yet?")
+        self.drain()
+        self.finish(main, "plan")
+        self.row("what did I ask?")
+        self.post.return_value = _ok_chat_response("")
+        self.drain()
+        self.row("try again, what did I ask?")
+        self.post.return_value = _ok_chat_response("You asked whether the plan was done.")
+        self.drain()
+        self.assertIn("is the plan done yet?", self.post.call_args.kwargs["json"]["messages"][0]["content"])
