@@ -125,13 +125,7 @@ def claim_chat_batch(tenant, thread_id, timeout):
                 lane="main",
                 prioritize_handoffs=True,
             )
-            if batch:
-                token = uuid.uuid4()
-                for row in batch:
-                    row.lease_token = token
-                    row.batch_id = row.batch_id or batch[0].id
-                    row.turn_started_at = timezone.now()
-                    row.save(update_fields=["lease_token", "batch_id", "turn_started_at"])
+            batch = _fence_chat_batch(tenant, batch, timezone.now())
             return batch, info
         now = timezone.now()
         rows = list(_key_rows(tenant, thread_id).order_by("created_at", "id"))
@@ -221,33 +215,38 @@ def claim_chat_batch(tenant, thread_id, timeout):
         batch, info = _claim_pending_batch_for_key(
             tenant, "ios", thread_id, timeout, lane=lane, prioritize_handoffs=lane == "main"
         )
-        if batch:
-            # Handoffs are server turns and must not coalesce with user rows;
-            # a side batch cannot span jobs. Release any unwanted tail leases.
-            boundary = next(
-                (
-                    i
-                    for i, r in enumerate(batch[1:], 1)
-                    if r.side_main_id != batch[0].side_main_id
-                    or r.batch_id != batch[0].batch_id
-                    or bool(r.payload.get("side_handoff")) != bool(batch[0].payload.get("side_handoff"))
-                ),
-                len(batch),
-            )
-            for row in batch[boundary:]:
-                PendingMessage.objects.filter(pk=row.pk).update(delivery_in_flight_until=None)
-            batch = batch[:boundary]
-            token = uuid.uuid4()
-            batch_id = batch[0].batch_id or batch[0].id
-            for row in batch:
-                row.batch_id = batch_id
-                row.turn_started_at = now
-                row.lease_token = token
-                row.save(update_fields=["turn_started_at", "lease_token", "batch_id"])
-            from apps.router.job_changes import reserve_before_framing
-
-            reserve_before_framing(tenant, batch)
+        batch = _fence_chat_batch(tenant, batch, now)
         return batch, info
+
+
+def _fence_chat_batch(tenant, batch, now):
+    if batch:
+        # Handoffs are server turns and must not coalesce with user rows;
+        # a side batch cannot span jobs. Release any unwanted tail leases.
+        boundary = next(
+            (
+                i
+                for i, r in enumerate(batch[1:], 1)
+                if r.side_main_id != batch[0].side_main_id
+                or r.batch_id != batch[0].batch_id
+                or bool(r.payload.get("side_handoff")) != bool(batch[0].payload.get("side_handoff"))
+            ),
+            len(batch),
+        )
+        for row in batch[boundary:]:
+            PendingMessage.objects.filter(pk=row.pk).update(delivery_in_flight_until=None)
+        batch = batch[:boundary]
+        token = uuid.uuid4()
+        batch_id = batch[0].batch_id or batch[0].id
+        for row in batch:
+            row.batch_id = batch_id
+            row.turn_started_at = now
+            row.lease_token = token
+            row.save(update_fields=["turn_started_at", "lease_token", "batch_id"])
+        from apps.router.job_changes import reserve_before_framing
+
+        reserve_before_framing(tenant, batch)
+    return batch
 
 
 def _excerpt(tenant, text, limit=_EXCERPT_CHARS, *, required=False):

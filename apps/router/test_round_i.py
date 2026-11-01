@@ -84,6 +84,19 @@ class RoundITests(TestCase):
         self.assertEqual(info["broken_lease_count"], 1)
         self.assertNotEqual(batch[0].lease_token, old_token)
 
+    def test_dead_lease_recovery_preserves_replay_batch_boundary(self):
+        row = self.main()
+        row.batch_id = uuid.uuid4()
+        row.save(update_fields=["batch_id"])
+        tail = self.row("a later request")
+        self.health.return_value = False
+        batch, _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+        self.assertEqual([r.id for r in batch], [row.id])
+        self.assertEqual(batch[0].batch_id, row.batch_id)
+        tail.refresh_from_db()
+        self.assertIsNone(tail.delivery_in_flight_until)
+        self.assertIsNone(tail.lease_token)
+
     def test_replacement_main_lease_survives_health_probe(self):
         row = self.main()
         replacement = timezone.now() + timedelta(seconds=400)
