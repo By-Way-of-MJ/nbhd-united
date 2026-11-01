@@ -128,7 +128,9 @@ def reserve_before_framing(tenant, batch):
         entry = _entry(thread.side_jobs, batch[0].side_main_id, batch[0].payload.get("side_main_client_msg_ids", []))
     else:
         active = active_helper_job(tenant, thread)
-        entry = active[1] if active else None
+        # Framing skips classification of this batch's own helper job. Do not
+        # invent or extend a fence there; an existing side check keeps its TTL.
+        entry = active[1] if active and str(batch[0].id) != active[0] else None
     if entry is not None:
         entry["checking_until"] = timezone.now().timestamp() + 30
         save_side_jobs(thread)
