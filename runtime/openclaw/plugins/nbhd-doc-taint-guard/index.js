@@ -130,7 +130,8 @@ export function finalQuickReplyLabels(event) {
     const match = /^\[\[quick-replies:\s*(.+)\]\]$/i.exec(text.trim().split(/\r?\n/).at(-1)?.trim() || "");
     if (!match) return [];
     const labels = match[1].split("|").map(label => label.trim());
-    if (labels.length > 4 || labels.some(label => !label || label.length > 24)) return [];
+    // Match Python's MAX_LABEL_LEN in Unicode code points, not UTF-16 units.
+    if (labels.length > 4 || labels.some(label => !label || Array.from(label).length > 24)) return [];
     return labels.map(normalizedConfirmation).filter(Boolean);
   }
   return [];
