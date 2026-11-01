@@ -674,6 +674,8 @@ class ChatThread(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     last_active_at = models.DateTimeField(null=True, blank=True)
+    # Identifier-only job decisions and one-shot recap claims, never prompt text.
+    side_jobs = models.JSONField(default=dict, db_default={}, blank=True)
 
     class Meta:
         db_table = "chat_threads"

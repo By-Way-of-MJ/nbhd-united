@@ -26,12 +26,14 @@ _FRAME = (
     "Answer the current message normally. Do not redo that job, claim its results, or say it is done. "
     "If the person changes or cancels the job, you may answer the smaller request now. "
     "Do not promise the original result. Say the job will be adjusted once the running turn ends. "
+    "Do not guess how the job is running; never mention a helper. "
     "Do not act outward on a bare yes. Do not spawn helpers.]"
 )
 _HANDOFF = (
     "[earlier-from-you: the following side conversation happened while your longer job ran. "
-    "The main turn has ended; rely on its own completion or failure evidence. Do not repeat either reply. "
-    "Act now on any changes or cancellation the user requested, without asking them to repeat it. "
+    "The finished job's output is already in this session and was withheld from the person. "
+    "Do only what the person now wants. Never re-send a cancelled plan. Do not repeat what the side reply already gave. "
+    "Take no outward or saving action they did not ask for. "
     "A bare yes in the recap does not authorize outward action. "
     "If there is no change needing action and no new user message, reply only [[side-recap-no-action]].]"
 )
@@ -276,45 +278,62 @@ def frame_chat_content(tenant, batch, content, user_param):
             f"{_FRAME}\nRunning request (data): {_excerpt(tenant, request)}\n"
             f"{_exchanges(tenant, history)}\nCurrent message:\n{content}"
         )
+        from apps.router.job_changes import check_batch
+
+        check_batch(tenant, batch, first.side_main_id, first.payload.get("side_main_client_msg_ids", []), request)
         return content, f"{user_param}:side:{first.side_main_id.hex[:12]}"
     if first.payload.get("side_handoff"):
-        ids = [cid for row in batch for cid in row.payload.get("side_client_msg_ids", [])]
+        job_id = first.payload.get("side_job_id")
+        thread = ChatThread.objects.get(tenant=tenant, pk=first.channel_user_id)
+        entry = thread.side_jobs.get(job_id, {})
+        ids = entry.get("side_ids") or [cid for row in batch for cid in row.payload.get("side_client_msg_ids", [])]
         history = AppChatMessage.objects.filter(
             tenant=tenant, thread_id=first.channel_user_id, client_msg_id__in=ids
         ).order_by("created_at")
         content += f"\n{_HANDOFF}\n{_exchanges(tenant, history, handoff=True)}"
+    elif getattr(first, "lease_token", None):
+        from apps.router.job_changes import check_batch, passive_context
+        from apps.router.models import HelperRun
+
+        thread = ChatThread.objects.get(tenant=tenant, pk=first.channel_user_id)
+        open_keys = set(
+            HelperRun.objects.filter(tenant=tenant, thread=thread, closed_at=None).values_list(
+                "occurrence_key", flat=True
+            )
+        )
+        for job_id, entry in reversed(list(thread.side_jobs.items())):
+            if open_keys.intersection(entry["helpers"]) and str(first.id) != job_id:
+                request = "\n".join(
+                    AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=entry["main_ids"])
+                    .order_by("created_at")
+                    .values_list("user_text", flat=True)
+                )
+                check_batch(tenant, batch, job_id, entry["main_ids"], request)
+                break
+        content = passive_context(tenant, batch) + content
     return content, user_param
 
 
 def queue_handoff(tenant, batch):
-    """Commit a durable main-lane wake alongside the side reply, exactly once."""
-    from apps.router.pending_queue import _reschedule_drain
+    """Wake only a changed, finished job; unchanged exchanges remain passive."""
+    from apps.router.job_changes import queue_changed_job
 
-    head = batch[0]
-    # A batch has one token across attempts, but row IDs are the stable replay key.
-    handoff_id = uuid.uuid5(head.id, "side-handoff")
-    PendingMessage.objects.get_or_create(
-        pk=handoff_id,
-        defaults={
-            "tenant": tenant,
-            "channel": "ios",
-            "channel_user_id": head.channel_user_id,
-            "side_main_id": head.side_main_id,
-            "payload": {
-                "side_handoff": True,
-                "side_client_msg_ids": [r.payload["client_msg_id"] for r in batch],
-                "user_param": head.payload.get("user_param", f"thread:{head.channel_user_id}"),
-                "user_timezone": head.payload.get("user_timezone", "UTC"),
-            },
-        },
-    )
-    transaction.on_commit(lambda: _reschedule_drain(tenant, "ios", head.channel_user_id))
+    thread = ChatThread.objects.get(tenant=tenant, pk=batch[0].channel_user_id)
+    if str(batch[0].side_main_id) in thread.side_jobs:
+        queue_changed_job(tenant, thread, batch[0].side_main_id)
 
 
-def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENCRYPTION):
+def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENCRYPTION, terminal_notice=False):
     """Store a requested main-lane followup as an assistant-only feed message."""
     from apps.router.pending_queue import _clean_assistant_text_for_app
 
+    job_id = batch[0].payload.get("side_job_id")
+    thread = ChatThread.objects.filter(tenant=tenant, pk=batch[0].channel_user_id).first() if job_id else None
+    cancelled = bool(thread and thread.side_jobs.get(job_id, {}).get("kind") == "cancel")
+    # The side answer already acknowledges cancellation. A mistaken adjustment
+    # reply cannot publish the cancelled plan under a new assistant-only id.
+    if cancelled and not terminal_notice:
+        ai_text = "[[side-recap-no-action]]"
     if not (ai_text or "").strip():
         raise RuntimeError("side_handoff_empty_response")
     client_id = f"side-resume-{batch[0].id.hex}"
@@ -333,6 +352,11 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
         for row in batch:
             row.payload = {**row.payload, "handoff_completed": True}
             row.save(update_fields=["payload"])
+        job_id = batch[0].payload.get("side_job_id")
+        if job_id:
+            thread = ChatThread.objects.get(tenant=tenant, pk=batch[0].channel_user_id)
+            thread.side_jobs[job_id]["handoff_done"] = True
+            thread.save(update_fields=["side_jobs"])
         if silent or not text:
             return None
         _, created = AppChatMessage.objects.get_or_create(
@@ -392,6 +416,16 @@ def log_side_turn(tenant, batch, started, response):
 def progress_rows(base, tenant_id, session_key, client_msg_id):
     import re
 
+    # Never refill a cancelled plan's partial preview after the decision lands.
+    blocked_ids = [
+        cid
+        for jobs in ChatThread.objects.filter(tenant_id=tenant_id).values_list("side_jobs", flat=True)
+        for entry in jobs.values()
+        if entry["kind"] != "none" and not entry["helpers"]
+        for cid in entry["main_ids"]
+    ]
+    if blocked_ids:
+        base = base.exclude(client_msg_id__in=blocked_ids)
     if client_msg_id:
         return base.filter(client_msg_id=client_msg_id)
     match = re.fullmatch(

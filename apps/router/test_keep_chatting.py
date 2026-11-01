@@ -27,6 +27,19 @@ from apps.router.test_pending_queue import _make_tenant, _make_user, _ok_chat_re
 @override_settings(KEEP_CHATTING_TENANT_IDS="*", NBHD_INTERNAL_API_KEY="test-key")
 class KeepChattingTests(TestCase):
     def setUp(self):
+        from apps.router.job_changes import JobChange
+
+        self.change_check = self.enterContext(
+            patch(
+                "apps.router.job_changes.classify_job_change",
+                side_effect=lambda tenant, request, messages: JobChange(
+                    changes_job=any(word in " ".join(messages) for word in ("cancel", "change", "redo", "actually")),
+                    kind="change"
+                    if any(word in " ".join(messages) for word in ("cancel", "change", "redo", "actually"))
+                    else "none",
+                ),
+            )
+        )
         self.user = _make_user()
         self.tenant = _make_tenant(self.user)
         self.thread = ChatThread.objects.create(tenant=self.tenant, user=self.user, is_main=True)
@@ -78,6 +91,12 @@ class KeepChattingTests(TestCase):
         )
         row.refresh_from_db()
         return row
+
+    def finish(self, row):
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        _store_ios_turn_reply(self.tenant, [row], "original job result")
+        row.delete()
 
     def drain(self):
         return drain_pending_messages_for_tenant_task(str(self.tenant.id), "ios", str(self.thread.id))
@@ -237,7 +256,7 @@ class KeepChattingTests(TestCase):
         self.drain()
         self.post.assert_not_called()
         self.assertEqual(self.app(second).reply_text, "answer")
-        self.assertEqual(PendingMessage.objects.filter(payload__side_handoff=True).count(), 1)
+        self.assertEqual(PendingMessage.objects.filter(payload__side_handoff=True).count(), 0)
 
     def test_transport_failure_retries_only_side_and_preserves_main(self):
         main = self.main()
@@ -276,7 +295,7 @@ class KeepChattingTests(TestCase):
         payload = self.post.call_args.kwargs["json"]
         self.assertEqual(payload["user"], f"thread:{self.thread.id}")
         self.assertIn("cancel that job and compare only two", payload["messages"][0]["content"])
-        self.assertEqual(self.app(main).reply_text, "original job result")
+        self.assertEqual(self.app(main).reply_text, "")
         followup = AppChatMessage.objects.get(client_msg_id__startswith="side-resume-")
         self.assertEqual(followup.user_text, "")
         self.assertEqual(followup.reply_text, "I have applied that change")
@@ -288,7 +307,14 @@ class KeepChattingTests(TestCase):
         main = self.main()
         self.row("actually just give me three things")
         self.drain()
-        handoff = PendingMessage.objects.get(payload__side_handoff=True)
+        # A queued handoff from the previous runtime must also wait for a retrying main.
+        handoff = PendingMessage.objects.create(
+            tenant=self.tenant,
+            channel="ios",
+            channel_user_id=str(self.thread.pk),
+            side_main_id=main.id,
+            payload={"side_handoff": True, "side_client_msg_ids": [], "user_param": f"thread:{self.thread.pk}"},
+        )
         self.assertEqual(handoff.side_main_id, main.id)
         PendingMessage.objects.filter(pk=main.pk).update(delivery_in_flight_until=None)
         self.post.side_effect = httpx.HTTPStatusError(
@@ -363,7 +389,7 @@ class KeepChattingTests(TestCase):
         main = self.main()
         self.row("cancel that job")
         self.drain()
-        main.delete()
+        self.finish(main)
         self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, False, "failed")
         for _ in range(3):
             with self.assertRaises(RuntimeError):
@@ -553,7 +579,7 @@ class KeepChattingTests(TestCase):
         self.row("cancel that job")
         self.drain()
         self.assertEqual(self.app(attachment).status, "pending")
-        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.finish(main)
         self.post.return_value = _ok_chat_response("[[side-recap-no-action]]")
         self.drain()
         self.assertIn("earlier-from-you", self.post.call_args.kwargs["json"]["messages"][0]["content"])
@@ -584,7 +610,7 @@ class KeepChattingTests(TestCase):
         self.post.return_value = _ok_chat_response("")
         self.drain()
         self.assertEqual(self.app(side).error, "empty_response")
-        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.finish(main)
         self.post.return_value = _ok_chat_response("I picked up the cancellation")
         self.drain()
         self.assertIn("cancel the job", self.post.call_args.kwargs["json"]["messages"][0]["content"])
@@ -626,7 +652,7 @@ class KeepChattingTests(TestCase):
         text = "context " * 300 + "cancel that job and change the destination"
         self.row(text)
         self.drain()
-        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.finish(main)
         self.drain()
         content = self.post.call_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn(text, content)
@@ -635,7 +661,7 @@ class KeepChattingTests(TestCase):
         main = self.main()
         self.row("cancel that job")
         self.drain()
-        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.finish(main)
         calls = self.post.call_count
         self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, False, "failed")
         with self.assertRaises(RuntimeError):

@@ -1328,6 +1328,13 @@ def _terminalize_failed_queue_rows(
             return locked_tenant, [], False
 
         committed_at = timezone.now()
+        if channel == "ios" and keep_chatting_enabled(locked_tenant):
+            from apps.router.job_changes import finish_main, mark_suppressed_main
+
+            for row in terminalized_rows:
+                if row.lane == PendingMessage.Lane.MAIN and not row.payload.get("side_handoff"):
+                    if finish_main(locked_tenant, [row]):
+                        mark_suppressed_main(locked_tenant, [row])
         client_msg_ids = _ios_client_msg_ids(terminalized_rows)
         if client_msg_ids:
             _terminalize_pending_app_turns(
@@ -1360,6 +1367,7 @@ def _terminalize_failed_queue_rows(
                     [row],
                     "I couldn't act on a note you sent while the job was running. Please send it again.",
                     user_text_enc=handoff_user_text_enc,
+                    terminal_notice=True,
                 )
 
         side_groups = {}
@@ -3183,6 +3191,14 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 from apps.router.side_lane import lock_owned_batch
 
                 lock_owned_batch(tenant, batch)
+                if getattr(batch[0], "lane", "main") == "main":
+                    from apps.router.job_changes import complete_context, finish_main, mark_suppressed_main
+
+                    suppressed = finish_main(tenant, batch)
+                    complete_context(tenant, batch)
+                    if suppressed:
+                        mark_suppressed_main(tenant, batch)
+                        return (time.monotonic() - write_started) * 1000
             text, push_text, reply_redactions, quick_replies, journal_link = _clean_assistant_text_for_app(
                 tenant,
                 ai_text,
@@ -3274,6 +3290,12 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 from apps.router.side_lane import lock_owned_batch
 
                 lock_owned_batch(tenant, batch)
+                if getattr(batch[0], "lane", "main") == "main":
+                    from apps.router.job_changes import finish_main, mark_suppressed_main
+
+                    if finish_main(tenant, batch):
+                        mark_suppressed_main(tenant, batch)
+                        return (time.monotonic() - write_started) * 1000
             AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=client_ids).update(
                 status=AppChatMessage.Status.ERROR,
                 error="empty_response",
