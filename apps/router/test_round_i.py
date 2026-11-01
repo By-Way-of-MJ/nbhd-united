@@ -132,6 +132,17 @@ class RoundITests(TestCase):
         save_side_jobs(self.thread)
         self.thread.refresh_from_db()
         self.assertEqual(set(self.thread.side_jobs), set(newest + [open_id, context_id]))
+        checking_id = str(uuid.uuid4())
+        self.thread.side_jobs[checking_id] = {
+            "finished": True,
+            "helpers": [],
+            "consumed": True,
+            "created": -3,
+            "closed": -3,
+            "checking_until": timezone.now().timestamp() + 20,
+        }
+        save_side_jobs(self.thread)
+        self.assertIn(checking_id, self.thread.side_jobs)
 
     def test_replayed_handoff_does_not_push_twice(self):
         row = self.row()

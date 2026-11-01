@@ -32,6 +32,7 @@ def save_side_jobs(thread):
         entry.setdefault("created", now)
         is_closed = (
             bool(entry.get("finished"))
+            and entry.get("checking_until", 0) <= now
             and not open_helpers.intersection(entry.get("helpers", []))
             and (bool(entry.get("helpers")) or bool(entry.get("consumed")) or bool(entry.get("handoff_done")))
         )
