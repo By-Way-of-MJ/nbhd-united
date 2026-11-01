@@ -64,6 +64,11 @@ def send_test_enabled(job_name: str, tenant) -> bool:
     return job_name in SEND_TEST_JOBS and _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS")
 
 
+def requires_send_test_comparison(tenant, message: str) -> bool:
+    """Protect opted-in prompts and exact owned blocks during flag removal."""
+    return _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS") or without_send_test(message) != message
+
+
 def apply_send_test(prompt: str, job_name: str, tenant) -> str:
     """Add the rule only while composing an identified platform seed job."""
     if not send_test_enabled(job_name, tenant):

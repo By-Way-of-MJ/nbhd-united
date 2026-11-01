@@ -45,13 +45,46 @@ class SendTestRefreshTests(TestCase):
                 else:
                     self.assertEqual(job_drift(before[row.name], row.data), [])
         result = refresh_system_cron_rows_from_seed(self.tenant)
-        self.assertEqual(result["updated"], len(SEND_TEST_JOBS))
+        # Personal Question has no managed block: with the flag off it resumes
+        # the original clock refresh behavior as well as prefix comparison.
+        self.assertEqual(result["updated"], len(SEND_TEST_JOBS) + 1)
         for name, row in self.rows().items():
             self.assertEqual(job_drift(before[name], row.data), [])
         self.clock.now.return_value += timedelta(hours=2)
         reverted = {name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}
         refresh_system_cron_rows_from_seed(self.tenant)
-        self.assertEqual({name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}, reverted)
+        for name, row in self.rows().items():
+            if name in SEND_TEST_JOBS:
+                self.assertEqual(job_drift(reverted[name], row.data), [])
+
+    def test_unflagged_evening_tomorrow_prep_rolls_forward_in_canonical_rows(self):
+        from apps.orchestrator.config_generator import _EVENING_TOMORROW_PREP_STEP
+
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=""):
+            refresh_system_cron_rows_from_seed(self.tenant)
+        self.assertNotIn(_EVENING_TOMORROW_PREP_STEP, self.rows()["Evening Check-in"].data["payload"]["message"])
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=str(self.tenant.id)):
+            refresh_system_cron_rows_from_seed(self.tenant)
+        self.assertIn(_EVENING_TOMORROW_PREP_STEP, self.rows()["Evening Check-in"].data["payload"]["message"])
+
+    def test_unflagged_evening_tomorrow_prep_rolls_forward_in_runtime(self):
+        from apps.orchestrator.config_generator import _EVENING_TOMORROW_PREP_STEP
+
+        with override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=""):
+            jobs = copy.deepcopy(build_cron_seed_jobs(self.tenant))
+        for i, job in enumerate(jobs):
+            job["id"] = f"local-{i}"
+            if "model" in job:
+                job["payload"]["model"] = job.pop("model")
+        with (
+            override_settings(EVENING_TOMORROW_PREP_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.orchestrator.services.invoke_gateway_tool") as gateway,
+        ):
+            gateway.return_value = {"jobs": jobs}
+            update_system_cron_prompts(self.tenant)
+        added = [c.args[2]["job"] for c in gateway.call_args_list if c.args[1] == "cron.add"]
+        evening = next(j for j in added if j["name"] == "Evening Check-in")
+        self.assertIn(_EVENING_TOMORROW_PREP_STEP, evening["payload"]["message"])
 
     def test_user_source_name_collision_and_edited_default_are_preserved(self):
         user_job = self.rows()["Morning Briefing"]

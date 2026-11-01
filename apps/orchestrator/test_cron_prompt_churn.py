@@ -172,6 +172,17 @@ class UpdateSystemCronPromptsNoChurnTests(TestCase):
         self.tenant.container_fqdn = "oc-no-churn.internal.example.io"
         self.tenant.save()
 
+    @override_settings(SEND_TEST_TENANT_IDS="*")
+    @patch("apps.orchestrator.services.invoke_gateway_tool")
+    def test_flagged_edited_default_is_not_recreated(self, gateway):
+        existing = self._existing_jobs_from_seed(normalize=True)
+        morning = next(j for j in existing if j["name"] == "Morning Briefing")
+        morning["payload"]["message"] += "\n\nKeep this personal edit."
+        gateway.return_value = _list_response(existing)
+        update_system_cron_prompts(self.tenant)
+        removed = {c.args[2]["jobId"] for c in gateway.call_args_list if c.args[1] == "cron.remove"}
+        self.assertNotIn(morning["id"], removed)
+
     def _existing_jobs_from_seed(self, *, normalize: bool = True) -> list[dict]:
         """Build an ``existing_jobs`` fixture from build_cron_seed_jobs.
 
@@ -230,15 +241,16 @@ class UpdateSystemCronPromptsNoChurnTests(TestCase):
         instead of just the spurious ones.
         """
         existing = self._existing_jobs_from_seed(normalize=True)
-        # Use a known managed variant. Arbitrarily edited text, even after a
-        # default preamble, now belongs to the user and must be preserved.
-        from apps.orchestrator.send_test import apply_send_test
-
+        # Mutate one cron's message to simulate a genuine prompt drift
+        # (e.g., template was updated server-side after this cron was created).
         morning_idx = next(i for i, e in enumerate(existing) if e["name"] == "Morning Briefing")
-        with override_settings(SEND_TEST_TENANT_IDS="*"):
-            existing[morning_idx]["payload"]["message"] = apply_send_test(
-                existing[morning_idx]["payload"]["message"], "Morning Briefing", self.tenant
-            )
+        existing[morning_idx]["payload"]["message"] = (
+            "Current date and time: Friday, May 8, 2026 at 07:00 (UTC)\n"
+            "When mentioning future events, ... days from now. "
+            "Never say 'tomorrow' unless the math confirms exactly 1 day away.\n\n"
+            "Good morning! Create today's morning briefing"
+            "  ← old prompt body, missing the new mandatory preamble"
+        )
         mock_invoke.return_value = _list_response(existing)
 
         update_system_cron_prompts(self.tenant)
