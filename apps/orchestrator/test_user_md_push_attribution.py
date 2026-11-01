@@ -778,7 +778,7 @@ class PropagationTests(SimpleTestCase):
             "apps/datebook/services.py": ["DATEBOOK"],
             "apps/router/conversation_capture.py": ["CONVERSATION"],
             "apps/router/chat_views.py": ["PLACE_OBSERVATION"],
-            "apps/integrations/runtime_views.py": ["PLACE_OBSERVATION"],
+            "apps/integrations/runtime_views.py": ["ATTENTION_HOLD", "PLACE_OBSERVATION"],
             "apps/orchestrator/services.py": ["PROVISION", "CONFIG_UPDATE", "CRON_PROMPTS"],
             "apps/orchestrator/tasks.py": ["FLEET_SWEEP"],
             "apps/orchestrator/management/commands/refresh_user_md.py": ["MANUAL"],
