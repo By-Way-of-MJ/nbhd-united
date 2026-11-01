@@ -18,6 +18,7 @@ from apps.tenants.models import Tenant, User
     CHAT_PANELS_TOOL_TENANT_IDS="",
     CHAT_SHAPE_TENANT_IDS="",
     HEARTBEAT_NUDGE_DEDUP_TENANT_IDS="",
+    ONE_QUESTION_TENANT_IDS="",
     OPENCLAW_JOURNAL_PLUGIN_ID="nbhd-journal-tools",
     OPENCLAW_JOURNAL_PLUGIN_PATH="/opt/nbhd/plugins/nbhd-journal-tools",
     TELEGRAM_WEBHOOK_SECRET="",
@@ -74,3 +75,22 @@ class AttentionConfigTests(SimpleTestCase):
             config["plugins"]["entries"]["nbhd-journal-tools"]["config"],
             {"panelsEnabled": True, "attentionHoldsEnabled": True},
         )
+
+    def test_one_question_is_standalone_and_fits_bootstrap_budget(self):
+        from apps.orchestrator.config_generator import BOOTSTRAP_MAX_CHARS
+
+        config, agents = self.rendered()
+        with override_settings(ONE_QUESTION_TENANT_IDS=str(self.tenant.id)):
+            changed_config, changed_agents = self.rendered()
+        changed_config = json.loads(changed_config)
+        self.assertEqual(changed_config["env"]["vars"].pop("NBHD_ONE_QUESTION"), "1")
+        if changed_config["env"] == {"vars": {}}:
+            changed_config.pop("env")
+        self.assertEqual(changed_config, json.loads(config))
+        rule = changed_agents.split("## One question\n\n")[1].split("\n\n")[0]
+        self.assertLess(len(rule.split()), 70)
+        self.assertIn("[[quick-replies: A | B]]", rule)
+        self.assertIn("open question gets no buttons", rule)
+        self.assertIn("chat replies and messages you start", rule)
+        self.assertEqual(changed_agents.replace("\n\n## One question\n\n" + rule, ""), agents)
+        self.assertLess(len(changed_agents), BOOTSTRAP_MAX_CHARS - 1000)

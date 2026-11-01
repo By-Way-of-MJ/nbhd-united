@@ -3210,6 +3210,10 @@ def _clean_assistant_text_for_app(
     stored_text = clamp_reply_text(stored_text.strip())
     push_text = clamp_reply_text(push_text.strip())
 
+    from apps.router.reply_shape import log_reply_shape
+
+    log_reply_shape(tenant, push_text, quick_replies)
+
     return stored_text, push_text, reply_redactions, quick_replies, journal_link
 
 

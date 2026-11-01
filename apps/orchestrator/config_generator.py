@@ -3523,6 +3523,8 @@ def generate_openclaw_config(tenant: Tenant) -> dict[str, Any]:
 
     if _tenant_allowed(tenant, "TAINT_CARRY_TENANT_IDS"):
         config.setdefault("env", {})["NBHD_TAINT_CARRY_BARE_CONFIRM"] = "1"
+    if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+        config.setdefault("env", {})["NBHD_ONE_QUESTION"] = "1"
 
     # OpenClaw >= 2026.4.15 auto-generates models.json with the wrong
     # OpenRouter base URL (/v1 instead of /api/v1). Inject the override.

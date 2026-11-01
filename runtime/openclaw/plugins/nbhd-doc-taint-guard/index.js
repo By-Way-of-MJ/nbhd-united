@@ -96,8 +96,8 @@ const BARE_CONFIRMATION_EDGES = /^[\s.!?,。！？、~ー]+|[\s.!?,。！？、~
 const BATCHED_MESSAGE_PREFIX = /^\[\d+\](?:\s*\(\d{2}:\d{2}:\d{2}\))?\s*/;
 
 /** Pure: is the last non-empty line of this prompt just a bare yes? */
-export function isBareConfirmation(prompt) {
-  if (typeof prompt !== "string" || prompt.length === 0) return false;
+function normalizedConfirmation(prompt) {
+  if (typeof prompt !== "string" || prompt.length === 0) return "";
   const lines = prompt.split(/\r?\n/);
   let lastLine = "";
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -107,8 +107,33 @@ export function isBareConfirmation(prompt) {
     }
   }
   lastLine = lastLine.replace(BATCHED_MESSAGE_PREFIX, "");
-  const normalized = lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
-  return BARE_CONFIRMATIONS.has(normalized);
+  return lastLine.trim().toLowerCase().replace(BARE_CONFIRMATION_EDGES, "");
+}
+
+export function isBareConfirmation(prompt) {
+  return BARE_CONFIRMATIONS.has(normalizedConfirmation(prompt));
+}
+
+// openclaw@2026.9.4: builtin-openclaw-B-H-7lKk.mjs:4422 sends the
+// messagesSnapshot as event.messages. session-accessor.sqlite-transcript-store-
+// BczH1lRJ.mjs:273 preserves assistant content blocks in that projection.
+// lifecycle-hook-helpers-Bnm4Rpmf.mjs:10,95 puts runId in ctx.
+export function finalQuickReplyLabels(event) {
+  const messages = event && event.messages;
+  if (!Array.isArray(messages)) return [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role === "user") return []; // never reuse a prior turn's marker
+    if (message?.role !== "assistant") continue;
+    const text = typeof message.content === "string" ? message.content :
+      Array.isArray(message.content) ? message.content.filter(b => b?.type === "text" && typeof b.text === "string").map(b => b.text).join("\n") : "";
+    const match = /^\[\[quick-replies:\s*(.+)\]\]$/i.exec(text.trim().split(/\r?\n/).at(-1)?.trim() || "");
+    if (!match) return [];
+    const labels = match[1].split("|").map(label => label.trim());
+    if (labels.length > 4 || labels.some(label => !label || label.length > 24)) return [];
+    return labels.map(normalizedConfirmation).filter(Boolean);
+  }
+  return [];
 }
 
 /** Is the opt-in bare-yes carry enabled for this process? Read at call time. */
@@ -353,7 +378,7 @@ export default function register(api) {
   // before_tool_call (which sees params.id) to tool_result_persist (which
   // doesn't).
   const toolCallResolvedId = new Map();
-  // sessionKey -> expiry ms for a flagged turn whose limits should survive one
+  // sessionKey -> {expiry, labels} for a flagged turn whose limits survive one
   // bare "ok"; runId -> sessionKey so agent_end can re-arm the chain.
   const carriedSessions = new Map();
   const runSessions = new Map();
@@ -374,12 +399,12 @@ export default function register(api) {
       if (carryEnabled() && ctx && typeof ctx.sessionKey === "string" && ctx.sessionKey.length > 0) {
         const sessionKey = ctx.sessionKey;
         setWithCap(runSessions, runId, sessionKey, MAX_TAINTED_RUNS);
-        const expiry = carriedSessions.get(sessionKey);
+        const carry = carriedSessions.get(sessionKey);
         carriedSessions.delete(sessionKey);
         if (
-          expiry !== undefined &&
-          expiry > Date.now() &&
-          isBareConfirmation(event && event.prompt) &&
+          carry !== undefined &&
+          carry.expiry > Date.now() &&
+          (isBareConfirmation(event && event.prompt) || carry.labels.includes(normalizedConfirmation(event && event.prompt))) &&
           !taintedRuns.get(runId)
         ) {
           setWithCap(taintedRuns, runId, "carried", MAX_TAINTED_RUNS);
@@ -493,7 +518,10 @@ export default function register(api) {
         const sessionKey = runSessions.get(runId);
         runSessions.delete(runId);
         if (carryEnabled() && flagged && typeof sessionKey === "string" && sessionKey.length > 0) {
-          setWithCap(carriedSessions, sessionKey, Date.now() + CARRY_TTL_MS, MAX_TAINTED_RUNS);
+          setWithCap(carriedSessions, sessionKey, {
+            expiry: Date.now() + CARRY_TTL_MS,
+            labels: finalQuickReplyLabels(event),
+          }, MAX_TAINTED_RUNS);
         }
         taintedRuns.delete(runId);
       }

@@ -239,9 +239,14 @@ export default function register(api) {
   });
 
   api.on("message_sending", (event) => {
-    const content = asTrimmedString(event && event.content);
+    const original = asTrimmedString(event && event.content);
+    // Native channel sends (notably Telegram webhook) bypass Django's reply
+    // parser. Never display the final-line choice marker on those transports.
+    const content = process.env.NBHD_ONE_QUESTION === "1"
+      ? original.replace(/(?:^|\n)[ \t]*\[\[quick-replies:[^\n]*\]\][ \t]*$/i, "").trimEnd()
+      : original;
     const failureKind = isDegenerateOutput(content);
-    if (!failureKind) return undefined;
+    if (!failureKind) return content !== original ? { content, ...(!content ? { cancel: true } : {}) } : undefined;
     api.logger.warn(
       `nbhd-routing-context: cancelling outbound delivery — degenerate ` +
       `kind=${failureKind} to=${asTrimmedString(event && event.to) || "?"} ` +

@@ -777,7 +777,17 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
         )
         result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"] + "\n\n" + site_editor_gate
 
+    from apps.router.chat_gates import _tenant_allowed
     from apps.tenants.attention import attention_holds_enabled
+
+    if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+        result["NBHD_AGENTS_MD"] += (
+            "\n\n## One question\n\n"
+            "In chat replies and messages you start, ask at most one question per message. "
+            "When the answer is a small pick, offer 2–4 short labels (each at most 24 characters) "
+            "using `[[quick-replies: A | B]]` on its own last line, without backticks. "
+            "An open question gets no buttons."
+        )
 
     if attention_holds_enabled(tenant):
         result["NBHD_AGENTS_MD"] += (

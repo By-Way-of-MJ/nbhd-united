@@ -834,6 +834,9 @@ class CronDeliveryView(APIView):
                 _resolve_delivery_attempt(delivery_attempt, state="failed", response=response)
                 return response
             _record_send(tid)
+            from apps.router.reply_shape import log_reply_shape
+
+            log_reply_shape(tenant, message_text, quick_replies)
             response = Response({"status": "sent", "channel": "app", "delivered_to": ["app_feed"]})
             _resolve_delivery_attempt(delivery_attempt, state="sent", response=response)
             return response
