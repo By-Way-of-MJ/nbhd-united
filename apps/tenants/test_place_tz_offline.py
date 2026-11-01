@@ -135,6 +135,25 @@ class OfflinePlaceTimezoneTests(SimpleTestCase):
         ):
             self.assertIsNone(offline_place_timezone("Chicago"))
 
+    def test_same_name_cities_with_other_zones_are_unknown(self):
+        for name in ("Birmingham", "London", "Athens", "Kingston", "Portland"):
+            with self.subTest(name=name):
+                self.assertEqual(self._offline_without_network(name), PlaceTz(kind="unknown"))
+
+        self.assertEqual(self._offline_without_network("Chicago"), self._zone("America/Chicago"))
+        self.assertEqual(self._offline_without_network("Tokyo"), self._zone("Asia/Tokyo"))
+        self.assertEqual(self._offline_without_network("Paris"), self._zone("Europe/Paris"))
+
+    def test_clashing_names_only_ask_when_zones_really_differ(self):
+        self.assertEqual(self._offline_without_network("Luxembourg"), self._zone("Europe/Luxembourg"))
+        # Real data has a same-named Mali city in Africa/Bamako outside Japan's
+        # administrative candidates, so Nara stays ambiguous.
+        self.assertEqual(self._offline_without_network("Nara"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("Georgia"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("Washington"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("Texas"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("New York"), self._zone("America/New_York"))
+
 
 class BuildPlaceTzTableTests(SimpleTestCase):
     @staticmethod

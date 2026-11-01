@@ -10,6 +10,7 @@ from pathlib import Path
 
 from apps.tenants.situation import (
     PlaceTz,
+    _clear_winner_zone,
     _normalize_place_text,
     is_assignable_profile_timezone,
 )
@@ -91,21 +92,24 @@ def offline_place_timezone(label: str) -> PlaceTz | None:
             rows = filtered
 
         kept = [(int(row[2]), str(row[3])) for row in rows if is_assignable_profile_timezone(str(row[3]))]
-        city_tz = None
-        if kept:
-            top_population, top_tz = max(kept, key=lambda place: place[0])
-            clear_winner = top_population >= 100_000 and all(
-                tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
-            )
-            if clear_winner:
-                city_tz = top_tz
+        city_tz = _clear_winner_zone(kept)
 
         if admin_found:
             candidates = {tz for tz in admin_tzs if is_assignable_profile_timezone(tz)}
             if city_tz:
                 candidates.add(city_tz)
             if rows and not city_tz:
-                return PlaceTz(kind="region")
+                # Same-name places disagree, but a city row is only a real
+                # clash when its zone is outside the administrative match.
+                kept_zones = {tz_name for _, tz_name in kept}
+                if kept_zones and not kept_zones.issubset(candidates):
+                    top_population, top_tz = max(kept, key=lambda place: place[0])
+                    # A populated city matching the admin candidates still has
+                    # a same-name rival in another zone, so item 3's ambiguity
+                    # wins over the administrative fallback.
+                    if top_population >= 100_000 and top_tz in candidates:
+                        return PlaceTz(kind="unknown")
+                    return PlaceTz(kind="region")
             if len(candidates) == 1:
                 return PlaceTz(kind="zone", tz=next(iter(candidates)))
             return PlaceTz(kind="region") if candidates else PlaceTz(kind="unknown")

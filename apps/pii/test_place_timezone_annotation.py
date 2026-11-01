@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.core.cache import cache
 from django.test import SimpleTestCase, override_settings
 
-from apps.pii.redactor import annotate_model_context
+from apps.pii.redactor import annotate_model_context, redact_tool_response
 from apps.tenants.envelope import _PRIVACY_PLACEHOLDERS_BODY
 from apps.tenants.situation import (
     PlaceTz,
@@ -213,3 +214,86 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
     def test_envelope_rule_mentions_place_zone(self):
         self.assertIn("tz America/Chicago", _PRIVACY_PLACEHOLDERS_BODY)
         self.assertIn("region with several time zones", _PRIVACY_PLACEHOLDERS_BODY)
+
+    def test_place_stopwords_never_look_up(self):
+        names = ["West", "North", "Downtown", "Metro"]
+        entity_map = {f"[LOCATION_{index}]": {"name": name} for index, name in enumerate(names, start=1)}
+        text = " ".join(entity_map)
+
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone") as offline,
+            patch("apps.tenants.situation._lookup_place_timezone") as lookup,
+        ):
+            result = annotate_model_context(text, entity_map)
+
+        offline.assert_not_called()
+        lookup.assert_not_called()
+        self.assertEqual(
+            result,
+            "[LOCATION_1|unresolved] [LOCATION_2|unresolved] [LOCATION_3|unresolved] [LOCATION_4|unresolved]",
+        )
+
+    def test_street_names_never_look_up(self):
+        names = ["Maple Avenue", "Rue de Rivoli", "Main St"]
+        entity_map = {f"[LOCATION_{index}]": {"name": name} for index, name in enumerate(names, start=1)}
+        text = " ".join(entity_map)
+
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone") as offline,
+            patch("apps.tenants.situation._lookup_place_timezone") as lookup,
+        ):
+            result = annotate_model_context(text, entity_map)
+
+        offline.assert_not_called()
+        lookup.assert_not_called()
+        self.assertEqual(
+            result,
+            "[LOCATION_1|unresolved] [LOCATION_2|unresolved] [LOCATION_3|unresolved]",
+        )
+
+    def test_tool_response_annotation_never_uses_network(self):
+        names = ["Zzyzxville", "Qqqville", "Vvville", "Xxville", "Yyville"]
+        entity_map = {f"[LOCATION_{index}]": {"name": name} for index, name in enumerate(names, start=1)}
+        entity_map["[LOCATION_6]"] = {"name": "Chicago"}
+        data = {"places": [f"[LOCATION_{index}]" for index in range(1, 7)]}
+        tenant = SimpleNamespace(model_tier="starter", pii_entity_map=entity_map)
+
+        with (
+            patch("apps.pii.redactor._redact_tool_value", side_effect=lambda value, *args, **kwargs: value),
+            patch("apps.tenants.situation._lookup_place_timezone") as lookup,
+            patch("apps.tenants.situation.httpx.Client", side_effect=AssertionError("network used")) as client,
+        ):
+            result = redact_tool_response(data, tenant)
+
+        lookup.assert_not_called()
+        client.assert_not_called()
+        self.assertEqual(
+            result["places"],
+            [
+                "[LOCATION_1|unresolved]",
+                "[LOCATION_2|unresolved]",
+                "[LOCATION_3|unresolved]",
+                "[LOCATION_4|unresolved]",
+                "[LOCATION_5|unresolved]",
+                "[LOCATION_6|tz America/Chicago]",
+            ],
+        )
+
+    def test_long_relationship_keeps_whole_zone_within_cap(self):
+        relationship = "r" * 100
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch(
+                "apps.tenants.situation._lookup_place_timezone",
+                return_value=self._zone(),
+            ),
+        ):
+            result = annotate_model_context(
+                "[LOCATION_1]",
+                {"[LOCATION_1]": {"name": "Chicago", "relationship": relationship}},
+            )
+
+        descriptor = result.removeprefix("[LOCATION_1|").removesuffix("]")
+        self.assertLessEqual(len(descriptor), 80)
+        self.assertTrue(descriptor.endswith("tz America/Chicago"))
+        self.assertIn("; tz America/Chicago", descriptor)
