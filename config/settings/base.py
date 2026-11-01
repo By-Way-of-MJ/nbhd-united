@@ -1150,3 +1150,4 @@ if SENTRY_DSN and not _SENTRY_RUNNING_TESTS:
 TEST_RUNNER = "config.test_runner.QuietCronSignalRunner"
 
 PROJECTS_V2_TENANT_IDS = env("PROJECTS_V2_TENANT_IDS", default="")
+STEP_PREP_TENANT_IDS = env("STEP_PREP_TENANT_IDS", default="")

@@ -938,3 +938,34 @@ class PendingProjectAction(models.Model):
     class Meta:
         db_table = "friends_pending_project_actions"
         indexes = [models.Index(fields=["tenant", "status"])]
+
+
+class StepPrep(models.Model):
+    """A holder's private preparation, never part of the shared project plan."""
+
+    class Status(models.TextChoices):
+        WORKING = "working", "Working"
+        READY = "ready", "Ready"
+        STUCK = "stuck", "Stuck"
+        NEEDS_CHOICE = "needs_choice", "Needs your choice"
+        STOPPED = "stopped", "Stopped"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="step_preps")
+    membership = models.ForeignKey(SharedGoalMembership, on_delete=models.CASCADE, related_name="+")
+    step = models.ForeignKey(SharedGoalStep, on_delete=models.CASCADE, related_name="+")
+    brief = models.JSONField(default=dict, db_default={})
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.WORKING, db_default="working")
+    question = models.CharField(max_length=300, blank=True, default="", db_default="")
+    choices = models.JSONField(default=list, db_default=[])
+    answer = models.CharField(max_length=120, blank=True, default="", db_default="")
+    doc_slug = models.CharField(max_length=200, blank=True, default="", db_default="")
+    last_seen_note_at = models.DateTimeField(null=True, blank=True)
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "friends_step_preps"
+        indexes = [models.Index(fields=["tenant", "status"])]
+        constraints = [models.UniqueConstraint(fields=["membership", "step"], name="unique_membership_step_prep")]

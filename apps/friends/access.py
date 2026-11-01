@@ -1883,3 +1883,56 @@ def can_view_photo(viewer, profile) -> bool:
     return SharedGoalMembership.objects.filter(
         tenant_id=owner_id, status__in=["active", "invited"], shared_goal_id__in=my_projects
     ).exists()
+
+
+# Private StepPrep access: even fellow project members cannot read these rows.
+def my_step_preps(tenant):
+    from .models import StepPrep
+
+    return StepPrep.objects.filter(
+        tenant_id=_tenant_id(tenant),
+        membership__tenant_id=_tenant_id(tenant),
+        membership__shared_goal_id=F("step__shared_goal_id"),
+    )
+
+
+def create_step_prep(tenant, membership, step, brief):
+    from rest_framework.exceptions import NotFound
+
+    from .models import StepPrep
+
+    if membership.tenant_id != _tenant_id(tenant) or membership.shared_goal_id != step.shared_goal_id:
+        raise NotFound("No such project item.")
+    return StepPrep.objects.create(tenant_id=_tenant_id(tenant), membership=membership, step=step, brief=brief)
+
+
+def update_step_prep(tenant, prep, **fields):
+    from rest_framework.exceptions import NotFound
+
+    fields["updated_at"] = timezone.now()
+    if not my_step_preps(tenant).filter(id=prep.id).update(**fields):
+        raise NotFound("No such preparation.")
+    for key, value in fields.items():
+        setattr(prep, key, value)
+    return prep
+
+
+def stop_ineligible_step_preps(tenant):
+    """One bulk update, including assignment checks, regardless of row count."""
+    from .models import SharedGoalStepAssignment
+
+    accepted = SharedGoalStepAssignment.objects.filter(
+        membership_id=OuterRef("membership_id"), step_id=OuterRef("step_id"), status="accepted"
+    )
+    return (
+        my_step_preps(tenant)
+        .exclude(status="stopped")
+        .annotate(_held=Exists(accepted))
+        .exclude(
+            membership__status="active",
+            step__status__in=["open", "in_progress"],
+            step__shared_goal__status="active",
+            _held=True,
+        )
+        .update(status="stopped", updated_at=timezone.now())
+    )
