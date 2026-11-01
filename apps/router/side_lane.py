@@ -14,6 +14,7 @@ import uuid
 from django.db import transaction
 from django.utils import timezone
 
+from apps.router.job_changes import save_side_jobs
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage
 
 logger = logging.getLogger(__name__)
@@ -102,15 +103,36 @@ def claim_chat_batch(tenant, thread_id, timeout):
     """
     from apps.router.pending_queue import _claim_pending_batch_for_key, _is_tenant_container_live
 
-    snapshot = (
-        _key_rows(tenant, thread_id).filter(lane="side").exists()
-        or _key_rows(tenant, thread_id).filter(delivery_in_flight_until__gt=timezone.now()).exists()
+    snapshot = list(
+        _key_rows(tenant, thread_id)
+        .filter(delivery_in_flight_until__gt=timezone.now())
+        .values_list("id", "delivery_in_flight_until")
     )
     live = _is_tenant_container_live(tenant) if snapshot else True
     with transaction.atomic():
         if not ChatThread.objects.select_for_update().filter(pk=thread_id, tenant=tenant).exists():
             retire_thread_queue(tenant, thread_id)
             return [], {}
+        if snapshot and not live:
+            # Reuse the unflagged compare-and-set recovery: a replacement lease
+            # acquired during the health probe is never broken.
+            batch, info = _claim_pending_batch_for_key(
+                tenant,
+                "ios",
+                thread_id,
+                timeout,
+                break_live_lease_snapshot=snapshot,
+                lane="main",
+                prioritize_handoffs=True,
+            )
+            if batch:
+                token = uuid.uuid4()
+                for row in batch:
+                    row.lease_token = token
+                    row.batch_id = row.batch_id or batch[0].id
+                    row.turn_started_at = timezone.now()
+                    row.save(update_fields=["lease_token", "batch_id", "turn_started_at"])
+            return batch, info
         now = timezone.now()
         rows = list(_key_rows(tenant, thread_id).order_by("created_at", "id"))
         # The reply and its handoff commit before the queue is retired. Recover
@@ -183,11 +205,19 @@ def claim_chat_batch(tenant, thread_id, timeout):
                 row.save(update_fields=["lane", "side_main_id", "payload"])
             lane = "side"
         elif side:
-            # Main finished during a side POST: finish/drain the side lane before
-            # claiming its recap, including side rows awaiting a retry.
-            lane = "side"
-            if tenant.hibernated_at is not None or not live:
-                return [], {}
+            # Only never-claimed side rows return to the ordinary lane. An
+            # in-flight/retrying side POST retains its session and request id.
+            for row in rows:
+                if row.lane == "side" and row.lease_token is None:
+                    row.lane = "main"
+                    row.side_main_id = None
+                    row.payload = {k: v for k, v in row.payload.items() if not k.startswith("side_main_")}
+                    row.save(update_fields=["lane", "side_main_id", "payload"])
+            side = next((r for r in rows if r.lane == "side"), None)
+            if side:
+                lane = "side"
+                if tenant.hibernated_at is not None or not live:
+                    return [], {}
         batch, info = _claim_pending_batch_for_key(
             tenant, "ios", thread_id, timeout, lane=lane, prioritize_handoffs=lane == "main"
         )
@@ -361,7 +391,7 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
         if job_id:
             thread = ChatThread.objects.get(tenant=tenant, pk=batch[0].channel_user_id)
             thread.side_jobs[job_id]["handoff_done"] = True
-            thread.save(update_fields=["side_jobs"])
+            save_side_jobs(thread)
         if silent or not text:
             return None
         _, created = AppChatMessage.objects.get_or_create(
@@ -387,7 +417,7 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
         from apps.router.reply_shape import log_reply_shape
 
         log_reply_shape(tenant, push_text, quick)
-    transaction.on_commit(lambda: _dispatch_push(notify_app_reply_ready, tenant, [client_id], push_text))
+        transaction.on_commit(lambda: _dispatch_push(notify_app_reply_ready, tenant, [client_id], push_text))
     return None
 
 

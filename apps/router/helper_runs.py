@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.integrations.internal_auth import InternalAuthError, validate_internal_runtime_request
+from apps.router.job_changes import save_side_jobs
 from apps.router.models import ChatThread, HelperRun
 from apps.tenants.models import Tenant
 
@@ -146,7 +147,7 @@ class HelperContextView(APIView):
                 entry = helper_entry(thread, data.get("occurrence_key"))
                 if entry:
                     entry.setdefault("helper_sessions", {})[data["occurrence_key"]] = data["child_session_key"]
-                    thread.save(update_fields=["side_jobs"])
+                    save_side_jobs(thread)
             return Response({"status": "pending", "context": ""})
         open_keys = set(
             HelperRun.objects.filter(tenant=tenant, thread=thread)

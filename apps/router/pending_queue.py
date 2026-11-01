@@ -1824,6 +1824,9 @@ def drain_pending_messages_for_tenant_task(
             batch_size,
         )
 
+    from apps.router.job_changes import JobChangePending
+    from apps.router.side_lane import lock_owned_batch, skipped_lease_result
+
     delivered = 0
     failed = 0
     gateway_responded = False
@@ -1951,6 +1954,19 @@ def drain_pending_messages_for_tenant_task(
                 "batch_size": batch_size,
             }
 
+    except JobChangePending:
+        # The proxy retains the finished 2xx response under batch_id. Release
+        # only our lease; retry publication without counting a failed attempt.
+        with transaction.atomic():
+            try:
+                lock_owned_batch(tenant, batch)
+            except LeaseLost:
+                return skipped_lease_result(tenant, batch)
+            PendingMessage.objects.filter(pk__in=[r.pk for r in batch], lease_token=batch[0].lease_token).update(
+                delivery_in_flight_until=None
+            )
+        _reschedule_drain(tenant, channel, channel_user_id or "", delay_seconds=3)
+        return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": len(batch)}
     except LeaseLost:
         from apps.router.side_lane import skipped_lease_result
 
@@ -3252,7 +3268,8 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
         # body uses the REHYDRATED copy (``push_text``) — ``reply_text`` is stored
         # placeholder-space, so pushing ``text`` would leak a raw ``[PERSON_1]``.
         reply_write_ms = (time.monotonic() - write_started) * 1000
-        _dispatch_push(notify_app_reply_ready, tenant, [rep_id], push_text)
+        if text or panels or quick_replies or journal_link:
+            _dispatch_push(notify_app_reply_ready, tenant, [rep_id], push_text)
         # Only feeds the retry_succeeded log line, so it runs AFTER the reply is
         # committed (the client can already read it) instead of in front of the
         # write. The rows are READY by now, hence no status filter. Fail-open: a
@@ -3377,6 +3394,7 @@ def _clean_assistant_text_for_app(
     # Re-establish placeholder-space before any persistence-derived metadata or
     # marker extraction. This catches a model echo of a value it learned from a
     # contaminated local tool result without minting a new entity.
+    ai_text = ai_text.replace("[[side-recap-no-action]]", "").strip()
     ai_text = redact_known_values(tenant, ai_text, seam="ios_reply_storage")
     entity_map = getattr(tenant, "pii_entity_map", None)
     reply_redactions = placeholder_redactions(ai_text, entity_map)

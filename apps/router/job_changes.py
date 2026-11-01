@@ -17,6 +17,32 @@ from apps.router.models import AppChatMessage, ChatThread, PendingMessage
 logger = logging.getLogger(__name__)
 
 
+class JobChangePending(RuntimeError):
+    """Publication waits for a concurrent side classification, without failure."""
+
+
+def save_side_jobs(thread):
+    """Retain pending context and helpers; bound completed history on every write."""
+    from apps.router.models import HelperRun
+
+    open_helpers = set(HelperRun.objects.filter(thread=thread, closed_at=None).values_list("occurrence_key", flat=True))
+    closed = []
+    now = timezone.now().timestamp()
+    for key, entry in thread.side_jobs.items():
+        entry.setdefault("created", now)
+        is_closed = (
+            bool(entry.get("finished"))
+            and not open_helpers.intersection(entry.get("helpers", []))
+            and (bool(entry.get("helpers")) or bool(entry.get("consumed")) or bool(entry.get("handoff_done")))
+        )
+        if is_closed:
+            entry.setdefault("closed", now)
+            closed.append((entry["closed"], entry["created"], key))
+    for _, _, key in sorted(closed, reverse=True)[20:]:
+        del thread.side_jobs[key]
+    thread.save(update_fields=["side_jobs"])
+
+
 class JobChange(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     changes_job: bool
@@ -80,7 +106,15 @@ def classify_job_change(tenant, request, messages):
 
 def _entry(jobs, job_id, main_ids=()):
     return jobs.setdefault(
-        str(job_id), {"main_ids": list(main_ids), "side_ids": [], "kind": "none", "finished": False, "helpers": []}
+        str(job_id),
+        {
+            "main_ids": list(main_ids),
+            "side_ids": [],
+            "kind": "none",
+            "finished": False,
+            "helpers": [],
+            "created": timezone.now().timestamp(),
+        },
     )
 
 
@@ -96,7 +130,7 @@ def reserve_before_framing(tenant, batch):
         entry = active[1] if active else None
     if entry is not None:
         entry["checking_until"] = timezone.now().timestamp() + 30
-        thread.save(update_fields=["side_jobs"])
+        save_side_jobs(thread)
 
 
 def active_helper_job(tenant, thread):
@@ -133,7 +167,7 @@ def check_batch(tenant, batch, job_id, main_ids, request):
         # call. A main publication must wait for both, including a batched turn.
         entry["checking_until"] = timezone.now().timestamp() + max(30, 11 + 5 * (len(batch) + 1))
         thread.side_jobs = jobs
-        thread.save(update_fields=["side_jobs"])
+        save_side_jobs(thread)
         for row in batch:
             row.payload = {**row.payload, "job_change": {"changes_job": False, "kind": "none"}}
             row.save(update_fields=["payload"])
@@ -170,7 +204,7 @@ def check_batch(tenant, batch, job_id, main_ids, request):
             AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=entry["main_ids"], status="pending").update(
                 partial_text=""
             )
-        thread.save(update_fields=["side_jobs"])
+        save_side_jobs(thread)
         for row in batch:
             row.payload = {**row.payload, "job_change": decision.model_dump()}
             PendingMessage.objects.filter(pk=row.pk).update(payload=row.payload)
@@ -210,7 +244,7 @@ def finish_main(tenant, batch):
     if not entry:
         return False
     if entry.get("checking_until", 0) > timezone.now().timestamp():
-        raise RuntimeError("side_job_change_pending")
+        raise JobChangePending("side_job_change_pending")
     from apps.router.models import HelperRun
 
     # A definite native spawn rejection releases its admission. It must not
@@ -222,7 +256,7 @@ def finish_main(tenant, batch):
     )
     entry["finished"] = True
     entry["suppressed"] = entry["kind"] != "none" and not entry["helpers"]
-    thread.save(update_fields=["side_jobs"])
+    save_side_jobs(thread)
     queue_changed_job(tenant, thread, batch[0].id)
     return entry["suppressed"]
 
@@ -262,7 +296,7 @@ def passive_context(tenant, batch):
             ):
                 entry["recap_for"] = key
                 ids.extend(entry["side_ids"])
-        thread.save(update_fields=["side_jobs"])
+        save_side_jobs(thread)
     if not ids:
         return ""
     rows = AppChatMessage.objects.filter(
@@ -281,7 +315,7 @@ def complete_context(tenant, batch):
     for entry in thread.side_jobs.values():
         if entry.get("recap_for") == key:
             entry["consumed"] = True
-    thread.save(update_fields=["side_jobs"])
+    save_side_jobs(thread)
 
 
 def release_context(tenant, batch):
@@ -291,7 +325,7 @@ def release_context(tenant, batch):
     for entry in thread.side_jobs.values():
         if entry.get("recap_for") in keys and not entry.get("consumed"):
             entry.pop("recap_for", None)
-    thread.save(update_fields=["side_jobs"])
+    save_side_jobs(thread)
 
 
 def bind_helper(tenant, thread_id, occurrence_key):
@@ -322,7 +356,7 @@ def bind_helper(tenant, thread_id, occurrence_key):
             ]
             entry = _entry(thread.side_jobs, main.id, ids)
             entry["helpers"] = list(dict.fromkeys(entry["helpers"] + [occurrence_key]))
-            thread.save(update_fields=["side_jobs"])
+            save_side_jobs(thread)
 
 
 def helper_entry(thread, occurrence_key):

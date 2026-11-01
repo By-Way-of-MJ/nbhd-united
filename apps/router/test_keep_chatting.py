@@ -151,7 +151,7 @@ class KeepChattingTests(TestCase):
         self.drain()
         self.assertEqual(self.app(second).status, "ready")
 
-    def test_attachments_hibernation_waking_and_failed_health_wait(self):
+    def test_attachments_hibernation_and_waking_wait(self):
         main = self.main()
         for flag in ("is_image", "is_document", "is_voice", "attachment_paths"):
             with self.subTest(attachment=flag):
@@ -159,7 +159,7 @@ class KeepChattingTests(TestCase):
                 self.assertEqual(self.drain()["delivered"], 0)
                 row.delete()
         second = self.row()
-        for state in ("hibernated", "waking", "down"):
+        for state in ("hibernated", "waking"):
             with self.subTest(state=state):
                 self.tenant.hibernated_at = timezone.now() if state == "hibernated" else None
                 self.tenant.save(update_fields=["hibernated_at"])
