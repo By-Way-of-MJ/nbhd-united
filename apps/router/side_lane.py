@@ -436,6 +436,29 @@ def completed_batch_outcome(tenant, batch):
 def log_side_turn(tenant, batch, started, response):
     from datetime import datetime
 
+    timings = getattr(batch[0], "_side_timings", {})
+    first = batch[0]
+    saved = (
+        AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=[r.payload.get("client_msg_id") for r in batch])
+        .order_by("created_at")
+        .values_list("created_at", flat=True)
+        .first()
+        or first.created_at
+    )
+    elapsed = time.monotonic() - timings.get("task_started", started)
+    saved_to_drain = (timezone.now() - saved).total_seconds() - elapsed
+    logger.info(
+        "side_turn_timing tenant=%s saved_to_drain_ms=%d arrival_to_claim_ms=%d "
+        "redaction_ms=%d classifier_ms=%d framing_ms=%d pre_post_ms=%d post_ms=%d",
+        str(tenant.id)[:8],
+        max(0, int(saved_to_drain * 1000)),
+        max(0, int(((first.turn_started_at or first.created_at) - saved).total_seconds() * 1000)),
+        timings.get("redaction_ms", 0),
+        timings.get("classifier_ms", 0),
+        timings.get("framing_ms", 0),
+        int((started - timings.get("task_started", started)) * 1000),
+        int((time.monotonic() - started) * 1000),
+    )
     main_started = datetime.fromisoformat(batch[0].payload["side_main_started_at"])
     logger.info(
         "side_lane tenant=%s main_age_s=%d batch=%d post_ms=%d status=%d",

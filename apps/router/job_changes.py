@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 import uuid
 from typing import Literal
 
@@ -175,13 +176,19 @@ def check_batch(tenant, batch, job_id, main_ids, request):
             row.payload = {**row.payload, "job_change": {"changes_job": False, "kind": "none"}}
             row.save(update_fields=["payload"])
     # Both inputs are checked in full before truncation. No raw text is stored.
+    timings = getattr(first, "_side_timings", {})
+    started = time.monotonic()
     try:
-        decision = classify_job_change(
-            tenant,
-            _excerpt(tenant, request, required=True),
-            [_excerpt(tenant, row.user_text, None, required=True) for row in batch],
-        )
+        checked_request = _excerpt(tenant, request, required=True)
+        checked_messages = [_excerpt(tenant, row.user_text, None, required=True) for row in batch]
+        timings["redaction_ms"] = int((time.monotonic() - started) * 1000)
+        started = time.monotonic()
+        try:
+            decision = classify_job_change(tenant, checked_request, checked_messages)
+        finally:
+            timings["classifier_ms"] = int((time.monotonic() - started) * 1000)
     except Exception:
+        timings.setdefault("redaction_ms", int((time.monotonic() - started) * 1000))
         logger.warning("job_change_check_failed tenant=%s reason=redaction_unconfirmed", str(tenant.id)[:8])
         decision = JobChange(changes_job=False, kind="none")
         logger.info("job_change tenant=%s kind=none", str(tenant.id)[:8])

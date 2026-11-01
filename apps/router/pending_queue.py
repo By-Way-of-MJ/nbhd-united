@@ -3015,7 +3015,12 @@ def _drain_ios_batch(
 
     from apps.router.side_lane import frame_chat_content
 
+    frame_started = time.monotonic()
+    if getattr(batch[0], "lane", "main") == "side":
+        batch[0]._side_timings = {"task_started": task_started}
     content, user_param = frame_chat_content(tenant, batch, content, user_param)
+    if hasattr(batch[0], "_side_timings"):
+        batch[0]._side_timings["framing_ms"] = int((time.monotonic() - frame_started) * 1000)
 
     # Server instructions enter after every PII pass, including side context.
     # Prepending preserves the taint guard's last-line confirmation/label check.
