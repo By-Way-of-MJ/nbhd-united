@@ -1233,7 +1233,15 @@ class ChatLocalTurnView(APIView):
         user_text = str(request.data.get("text") or "").strip()[:_MAX_CHARS]
         if not user_text:
             return Response({"error": "empty_message"}, status=status.HTTP_400_BAD_REQUEST)
-        reply_text = clamp_reply_text(str(request.data.get("reply_text") or "").strip())
+        reply_text = str(request.data.get("reply_text") or "").strip()
+        quick_replies = None
+        from apps.router.chat_gates import _tenant_allowed
+
+        if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
+            from apps.router.quick_replies import extract_quick_replies
+
+            reply_text, quick_replies = extract_quick_replies(reply_text, tenant_id=tenant.id, channel="on_device")
+        reply_text = clamp_reply_text(reply_text)
 
         client_msg_id = str(request.data.get("client_msg_id") or "").strip() or uuid.uuid4().hex
         if len(client_msg_id) > _CLIENT_MSG_ID_MAX:
@@ -1268,6 +1276,7 @@ class ChatLocalTurnView(APIView):
                     status=AppChatMessage.Status.READY,
                     source=AppChatMessage.Source.ON_DEVICE,
                     replied_at=occurred_at or now,
+                    quick_replies=quick_replies or None,
                 )
         except IntegrityError:
             # Safe only because ATOMIC_REQUESTS is off: the inner atomic rolled
@@ -1287,6 +1296,10 @@ class ChatLocalTurnView(APIView):
             user_text=user_text,
             reply_text=reply_text,
         )
+        if reply_text or quick_replies:
+            from apps.router.reply_shape import log_reply_shape
+
+            log_reply_shape(tenant, reply_text, quick_replies)
         ChatThread.objects.filter(id=thread.id).update(last_active_at=now)
 
         # Same debounced USER.md push a captured Telegram/LINE turn triggers,

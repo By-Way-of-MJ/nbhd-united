@@ -1490,6 +1490,41 @@ class IOSOnDeviceTurnRecordTest(TestCase):
             1,
         )
 
+    @override_settings(ONE_QUESTION_TENANT_IDS="*")
+    @patch("apps.router.conversation_capture.schedule_user_md_refresh")
+    def test_flagged_local_reply_strips_marker_and_logs_once_across_retry(self, _refresh):
+        payload = {
+            "text": "Pick one",
+            "reply_text": "Pick?\n[[quick-replies: A | B | C | D]]",
+            "client_msg_id": "local-buttons",
+        }
+        with self.assertLogs("apps.router.reply_shape") as logs:
+            reply = self.client.post("/api/v1/chat/turns/", payload, format="json")
+        self.assertEqual(reply.status_code, 201)
+        self.assertEqual(reply.data["reply_text"], "Pick?")
+        self.assertEqual(reply.data["quick_replies"], ["A", "B", "C", "D"])
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(
+            logs.records[0].getMessage(), f"reply_shape tenant={str(self.tenant.id)[:8]} questions=1 buttons=1"
+        )
+        with self.assertNoLogs("apps.router.reply_shape"):
+            retry = self.client.post("/api/v1/chat/turns/", payload, format="json")
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.data, reply.data)
+
+    @override_settings(ONE_QUESTION_TENANT_IDS="")
+    @patch("apps.router.conversation_capture.schedule_user_md_refresh")
+    def test_unflagged_local_reply_keeps_its_existing_bytes(self, _refresh):
+        text = "Pick?\n[[quick-replies: A | B]]"
+        with self.assertNoLogs("apps.router.reply_shape"):
+            reply = self.client.post(
+                "/api/v1/chat/turns/",
+                {"text": "Pick one", "reply_text": text, "client_msg_id": "old-local"},
+                format="json",
+            )
+        self.assertEqual(reply.data["reply_text"], text)
+        self.assertIsNone(reply.data["quick_replies"])
+
     def test_turn_lands_in_thread_history_and_digest(self):
         self.client.post(
             "/api/v1/chat/turns/",
