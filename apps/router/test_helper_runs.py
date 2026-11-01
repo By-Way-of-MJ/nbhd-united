@@ -216,6 +216,14 @@ class HelperClosureTests(TestCase):
         self.assertEqual(self.send("Sorry, I couldn't finish.").data["status"], "duplicate")
         self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
 
+    def test_late_post_after_failure_does_not_attempt_a_closure_write(self):
+        close_expired_helpers()
+        with patch.object(HelperRun, "save", side_effect=RuntimeError("must not write")) as save:
+            self.assertEqual(self.send("Sorry, I could not finish.").data["status"], "duplicate")
+            self.assertEqual(self.send("A late result.").data["status"], "duplicate")
+        save.assert_not_called()
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
+
     def test_live_helpers_are_not_closed_early(self):
         self.row.deadline = timezone.now() + timedelta(minutes=8)
         self.row.save()
@@ -377,6 +385,9 @@ class HelperRaceTests(TransactionTestCase):
         self.assertEqual(ProactiveOutbound.objects.count(), 1)
         self.row.refresh_from_db()
         self.assertIsNotNone(self.row.closed_at)
+        self.assertEqual(
+            self.row.closed_by, HelperRun.ClosedBy.RESULT if statuses[0] == "sent" else HelperRun.ClosedBy.FAILURE
+        )
 
     def test_simultaneous_late_results_after_failure_are_duplicates(self):
         self.assertEqual(close_expired_helpers(), {"sent": 1})
