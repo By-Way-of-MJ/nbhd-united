@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from django.core.cache import cache
 from django.test import SimpleTestCase, override_settings
 
-from apps.pii.redactor import annotate_model_context, redact_tool_response
+from apps.pii.redactor import _place_zone_label, annotate_model_context, redact_tool_response
 from apps.tenants.envelope import _PRIVACY_PLACEHOLDERS_BODY
 from apps.tenants.situation import (
     PlaceTz,
@@ -250,6 +250,45 @@ class PlaceTimezoneAnnotationTests(SimpleTestCase):
             result,
             "[LOCATION_1|unresolved] [LOCATION_2|unresolved] [LOCATION_3|unresolved]",
         )
+
+    def test_street_suffix_abbreviations_reject_only_the_last_word(self):
+        names = ["Main St", "Elm Rd.", "Maple Avenue", "Rue de Rivoli", "Abbey Road"]
+        entity_map = {f"[LOCATION_{index}]": {"name": name} for index, name in enumerate(names, start=1)}
+        text = " ".join(entity_map)
+
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone") as offline,
+            patch("apps.tenants.situation._lookup_place_timezone") as lookup,
+        ):
+            result = annotate_model_context(text, entity_map)
+
+        offline.assert_not_called()
+        lookup.assert_not_called()
+        self.assertEqual(
+            result,
+            " ".join(f"[LOCATION_{index}|unresolved]" for index in range(1, len(names) + 1)),
+        )
+
+    def test_leading_st_is_lookup_eligible_in_city_names(self):
+        for name in ("St Louis", "St. Petersburg", "St Paul"):
+            with self.subTest(name=name):
+                self.assertEqual(_place_zone_label(name), name)
+
+    def test_st_louis_offline_table_has_no_unpunctuated_row(self):
+        with (
+            patch("apps.tenants.situation._lookup_place_timezone") as lookup,
+            patch("apps.tenants.situation.httpx.Client", side_effect=AssertionError("network used")),
+        ):
+            result = annotate_model_context(
+                "[LOCATION_1]",
+                {"[LOCATION_1]": {"name": "St Louis"}},
+                allow_network=False,
+            )
+
+        lookup.assert_not_called()
+        # The committed table keys this city as "st. louis", so the offline
+        # table has no "st louis" row; see DSH_REPORT.md for the full finding.
+        self.assertEqual(result, "[LOCATION_1|unresolved]")
 
     def test_tool_response_annotation_never_uses_network(self):
         names = ["Zzyzxville", "Qqqville", "Vvville", "Xxville", "Yyville"]

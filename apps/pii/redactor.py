@@ -233,31 +233,38 @@ _PLACE_ZONE_STOPWORDS = frozenset(
 _STREET_WORDS = frozenset(
     {
         "street",
-        "st",
         "avenue",
-        "ave",
         "road",
-        "rd",
         "boulevard",
-        "blvd",
         "lane",
-        "ln",
         "drive",
-        "dr",
-        "way",
         "court",
-        "ct",
-        "place",
-        "pl",
         "terrace",
         "highway",
-        "hwy",
         "rue",
         "strasse",
         "straße",
         "dori",
         "chome",
         "calle",
+    }
+)
+
+# Suffix abbreviations are only street markers in the final word: "Main St"
+# is an address, while "St Louis" and "St. Petersburg" are cities.
+_STREET_SUFFIX_ABBREVIATIONS = frozenset(
+    {
+        "st",
+        "ave",
+        "rd",
+        "blvd",
+        "ln",
+        "dr",
+        "ct",
+        "pl",
+        "hwy",
+        "way",
+        "place",
         "via",
     }
 )
@@ -1350,6 +1357,8 @@ def _place_zone_label(name: object) -> str:
             return ""
         words = re.split(r"[\s-]+", folded)
         if any(word in _STREET_WORDS for word in words):
+            return ""
+        if words and words[-1].rstrip(".") in _STREET_SUFFIX_ABBREVIATIONS:
             return ""
         if any(ch.isdigit() for ch in label) or len(label.split()) > 4:
             return ""
