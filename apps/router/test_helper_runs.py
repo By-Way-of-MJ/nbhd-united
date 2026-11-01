@@ -77,6 +77,59 @@ class HelperClosureTests(TestCase):
         self.row.refresh_from_db()
         self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
 
+    @override_settings(KEEP_CHATTING_TENANT_IDS="*")
+    def test_announce_context_uses_only_its_captured_child_session(self):
+        from apps.pii.redactor import RedactionOutcome
+        from apps.router.models import AppChatMessage
+
+        other = "helper:" + "b" * 48
+        first_session = "agent:main:subagent:00000000-0000-4000-8000-000000000001"
+        second_session = "agent:main:subagent:00000000-0000-4000-8000-000000000002"
+        HelperRun.objects.create(
+            tenant=self.tenant, thread=self.thread, occurrence_key=other, deadline=self.row.deadline
+        )
+        for cid, text in (("old-side", "cancel the old desk job"), ("new-side", "what time is my dentist visit?")):
+            AppChatMessage.objects.create(
+                tenant=self.tenant,
+                user=self.tenant.user,
+                thread=self.thread,
+                client_msg_id=cid,
+                user_text=text,
+                reply_text="Noted.",
+                status="ready",
+            )
+        self.thread.side_jobs = {
+            "old": {
+                "main_ids": [],
+                "side_ids": ["old-side"],
+                "kind": "cancel",
+                "finished": True,
+                "helpers": [self.key],
+                "helper_sessions": {self.key: first_session},
+            },
+            "new": {
+                "main_ids": [],
+                "side_ids": ["new-side"],
+                "kind": "none",
+                "finished": True,
+                "helpers": [other],
+                "helper_sessions": {other: second_session},
+            },
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        with patch(
+            "apps.pii.redactor.redact_user_message_checked",
+            side_effect=lambda text, *a, **kw: RedactionOutcome(text, True, "ok"),
+        ):
+            response = self.client.post(
+                self.base + "helpers/context/",
+                {"thread_id": str(self.thread.pk), "source_session_key": second_session},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("dentist", response.data["context"])
+        self.assertNotIn("cancel", response.data["context"].split("]\n", 1)[1])
+
     def test_admission_refuses_closed_and_expired_keys(self):
         self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
         self.row.closed_at = timezone.now()

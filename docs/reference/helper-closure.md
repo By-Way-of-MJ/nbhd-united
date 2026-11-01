@@ -33,7 +33,10 @@ visible; side exchanges do not start a recap turn. At the real announce build
 hook, the bridge fetches checked side context and appends it as system context
 when config env `NBHD_KEEP_CHATTING=1`. This uses the captured empty-prompt /
 `inputProvenance.sourceTool=subagent_announce` envelope cited below, without a
-new plugin configuration key. The delivery transaction also checks cancellation
+new plugin configuration key. Captured accepted `after_tool_call` results bind
+`details.childSessionKey` to the admission; announce provenance's
+`sourceSessionKey` selects only that job's exchanges, including across restart.
+The delivery transaction also checks cancellation
 under the thread lock: a cancelled helper result becomes a plain cancellation
 acknowledgement, closes as a result, and never publishes the raw result or a
 later watchdog failure. Apply the additive router migration and Django before

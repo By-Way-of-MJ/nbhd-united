@@ -450,7 +450,9 @@ export default function register(api) {
           (typeof side?.context === "string" && side.context ? `\n${side.context}` : ""),
       });
       return runtimeAnnounce && process.env.NBHD_KEEP_CHATTING === "1"
-        ? postRuntime(runtime, "helpers/context/", { thread_id: threadId }).then(build).catch(() => build())
+        ? postRuntime(runtime, "helpers/context/", {
+          thread_id: threadId, source_session_key: provenance.sourceSessionKey,
+        }).then(build).catch(() => build())
         : build();
     } catch (error) {
       safeLog(api, "warn", `nbhd-subagent-bridge: announce marker detection failed: ${safeErrorText(error)}`);
@@ -480,6 +482,18 @@ export default function register(api) {
         const threadId = extractThreadId(asTrimmedString(ctx?.sessionKey));
         if (occurrenceKey && threadId) await postRuntime(runtime, "helpers/release/", {
           occurrence_key: occurrenceKey, thread_id: threadId,
+        });
+        return;
+      }
+      if (process.env.NBHD_KEEP_CHATTING === "1" && asTrimmedString(event?.toolName) === SPAWN_TOOL_ID
+          && event?.result?.details?.status === "accepted") {
+        // Captured inner-tool result supplies childSessionKey. Tie it to the
+        // admission label before a later announce uses sourceSessionKey.
+        const occurrenceKey = asTrimmedString(event?.params?.label).match(HELPER_LABEL)?.[1];
+        const threadId = extractThreadId(asTrimmedString(ctx?.sessionKey));
+        const childSessionKey = asTrimmedString(event.result.details.childSessionKey);
+        if (occurrenceKey && threadId && childSessionKey) await postRuntime(runtime, "helpers/context/", {
+          occurrence_key: occurrenceKey, thread_id: threadId, child_session_key: childSessionKey,
         });
         return;
       }

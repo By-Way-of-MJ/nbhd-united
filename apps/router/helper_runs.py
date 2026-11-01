@@ -26,6 +26,13 @@ class HelperAdmissionSerializer(serializers.Serializer):
     thread_id = serializers.UUIDField()
 
 
+class HelperContextSerializer(serializers.Serializer):
+    thread_id = serializers.UUIDField()
+    occurrence_key = serializers.RegexField(r"^helper:[0-9a-f]{48}$", required=False)
+    child_session_key = serializers.RegexField(r"^agent:[^:]+:subagent:[0-9a-f-]{36}$", required=False)
+    source_session_key = serializers.CharField(max_length=256, required=False)
+
+
 class HelperAdmissionView(APIView):
     authentication_classes = []
     permission_classes = []
@@ -118,6 +125,9 @@ class HelperContextView(APIView):
             )
         except InternalAuthError:
             return Response({"error": "internal_auth_failed"}, status=401)
+        serializer = HelperContextSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
         tenant = Tenant.objects.filter(pk=tenant_id).first()
         from apps.router.chat_gates import keep_chatting_enabled
         from apps.router.models import AppChatMessage
@@ -125,15 +135,36 @@ class HelperContextView(APIView):
 
         if tenant is None or not keep_chatting_enabled(tenant):
             return Response({"status": "pending", "context": ""})
-        thread = ChatThread.objects.filter(tenant=tenant, pk=request.data.get("thread_id")).first()
+        thread = ChatThread.objects.filter(tenant=tenant, pk=data["thread_id"]).first()
         if thread is None:
             return Response({"error": "thread_not_found"}, status=404)
+        if data.get("child_session_key"):
+            from apps.router.job_changes import helper_entry
+
+            with transaction.atomic():
+                thread = ChatThread.objects.select_for_update().get(pk=thread.pk)
+                entry = helper_entry(thread, data.get("occurrence_key"))
+                if entry:
+                    entry.setdefault("helper_sessions", {})[data["occurrence_key"]] = data["child_session_key"]
+                    thread.save(update_fields=["side_jobs"])
+            return Response({"status": "pending", "context": ""})
         open_keys = set(
             HelperRun.objects.filter(tenant=tenant, thread=thread)
             .exclude(closed_by=HelperRun.ClosedBy.RESULT)
             .values_list("occurrence_key", flat=True)
         )
-        entries = [e for e in thread.side_jobs.values() if open_keys.intersection(e["helpers"])]
+        active_entries = [e for e in thread.side_jobs.values() if open_keys.intersection(e["helpers"])]
+        source = data.get("source_session_key")
+        entries = [
+            e
+            for e in active_entries
+            if source
+            and any(e.get("helper_sessions", {}).get(key) == source for key in open_keys.intersection(e["helpers"]))
+        ]
+        # Old in-flight admissions may lack the mapping. Only an unambiguous,
+        # entirely unmapped job can use that backwards-compatible fallback.
+        if not entries and len(active_entries) == 1 and not active_entries[0].get("helper_sessions"):
+            entries = active_entries
         ids = [cid for e in entries for cid in e["side_ids"]]
         if not ids:
             return Response({"status": "pending", "context": ""})

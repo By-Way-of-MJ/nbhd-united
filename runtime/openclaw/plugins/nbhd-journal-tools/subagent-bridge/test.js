@@ -59,7 +59,26 @@ describe("captured 2026.9.4 app completion", () => {
       assert.match(result.appendSystemContext, /never mind, forget the plan/);
       assert.equal(calls.length, 1);
       assert.match(calls[0].url, /helpers\/context\/$/);
-      assert.deepEqual(calls[0].body, {thread_id: build.ctx.sessionKey.split(":thread:")[1]});
+      assert.deepEqual(calls[0].body, {thread_id: build.ctx.sessionKey.split(":thread:")[1], source_session_key: build.ctx.inputProvenance.sourceSessionKey});
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousFlag === undefined) delete process.env.NBHD_KEEP_CHATTING;
+      else process.env.NBHD_KEEP_CHATTING = previousFlag;
+    }
+  });
+
+  it("binds the captured accepted child session to its durable admission", async () => {
+    const api = fakeApi(); registerBridge(api);
+    const previousFetch = globalThis.fetch, previousFlag = process.env.NBHD_KEEP_CHATTING;
+    process.env.NBHD_KEEP_CHATTING = "1";
+    const calls = [];
+    globalThis.fetch = async (url, options) => {calls.push({url: String(url), body: JSON.parse(options.body)});return {ok: true, json: async () => ({status: "pending"})};};
+    try {
+      const accepted = captured.accepted_spawn;
+      await api._handlers.after_tool_call(accepted.event, accepted.ctx);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].body.child_session_key, accepted.event.result.details.childSessionKey);
+      assert.equal(calls[0].body.occurrence_key, accepted.event.params.label.match(/\[nbhd-(helper:[a-f0-9]{48})\]/)[1]);
     } finally {
       globalThis.fetch = previousFetch;
       if (previousFlag === undefined) delete process.env.NBHD_KEEP_CHATTING;
