@@ -9,7 +9,7 @@ from django.utils import timezone
 
 from apps.router import test_keep_chatting as keep
 from apps.router.job_changes import save_side_jobs
-from apps.router.models import AppChatMessage, PendingMessage
+from apps.router.models import AppChatMessage, HelperRun, PendingMessage
 from apps.router.side_lane import claim_chat_batch, store_handoff_reply
 
 
@@ -74,6 +74,123 @@ class RoundITests(TestCase):
         self.assertEqual(first_id, self.post.call_args.kwargs["headers"]["X-NBHD-Chat-Request-Id"])
         self.assertEqual(self.app(row).status, "ready")
         self.assertEqual(AppChatMessage.objects.count(), 1)
+
+    def _open_helper(self):
+        from apps.router.job_changes import bind_helper
+
+        helper = HelperRun.objects.create(
+            tenant=self.tenant,
+            thread=self.thread,
+            occurrence_key="helper:" + uuid.uuid4().hex + uuid.uuid4().hex[:16],
+            deadline=timezone.now() + timedelta(minutes=8),
+        )
+        bind_helper(self.tenant, self.thread.id, helper.occurrence_key)
+        return helper
+
+    def _assert_own_helper_retry_preserves_side_fence(self, *, expire):
+        from apps.router.job_changes import JobChangePending, finish_main
+        from apps.router.pending_queue import _store_ios_turn_reply
+        from apps.router.side_lane import frame_chat_content
+
+        main = self.row("research the desks in the background")
+        state = {}
+        raised = []
+
+        def reply_with_side_classification_open(*args, **kwargs):
+            state["helper"] = self._open_helper()
+            PendingMessage.objects.filter(pk=main.pk).update(turn_started_at=timezone.now() - timedelta(seconds=12))
+            state["side"] = self.row("is the plan done yet?")
+            state["side_batch"], _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+            self.assertEqual(state["side_batch"][0].id, state["side"].id)
+            self.thread.refresh_from_db()
+            state["fence"] = self.thread.side_jobs[str(main.id)]["checking_until"]
+            self.assertGreater(state["fence"], timezone.now().timestamp())
+            return keep._ok_chat_response("On it: desk research.")
+
+        def tracked_finish(*args, **kwargs):
+            try:
+                return finish_main(*args, **kwargs)
+            except JobChangePending:
+                raised.append(True)
+                raise
+
+        self.post.side_effect = reply_with_side_classification_open
+        with patch("apps.router.job_changes.finish_main", side_effect=tracked_finish):
+            first = self.drain()
+            self.assertEqual(first["skipped_in_flight"], 1)
+            self.assertEqual(raised, [True])
+            main.refresh_from_db()
+            self.assertEqual(main.delivery_attempts, 0)
+            self.assertIsNone(main.delivery_in_flight_until)
+            self.assertEqual(self.app(main).status, "pending")
+            self.thread.refresh_from_db()
+            self.assertEqual(self.thread.side_jobs[str(main.id)]["checking_until"], state["fence"])
+            request_id = self.post.call_args.kwargs["headers"]["X-NBHD-Chat-Request-Id"]
+
+            if expire:
+                fence = timezone.now().timestamp() - 1
+                self.thread.side_jobs[str(main.id)]["checking_until"] = fence
+                save_side_jobs(self.thread)
+            else:
+                # The real classifier completes and clears its own reservation.
+                frame_chat_content(self.tenant, state["side_batch"], "status?", f"thread:{self.thread.id}")
+                self.thread.refresh_from_db()
+                self.assertNotIn("checking_until", self.thread.side_jobs[str(main.id)])
+            _store_ios_turn_reply(self.tenant, state["side_batch"], "Still working.")
+            PendingMessage.objects.filter(pk=state["side"].pk).delete()
+            self.post.side_effect = None
+            self.post.return_value = keep._ok_chat_response("On it: desk research.")
+            with patch("apps.router.pending_queue._dispatch_push") as push:
+                self.assertEqual(self.drain()["delivered"], 1)
+                self.assertEqual(self.drain()["delivered"], 0)
+            self.assertEqual(push.call_count, 1)
+
+        self.assertEqual(raised, [True])
+        self.assertEqual(self.post.call_count, 2)
+        self.assertEqual(self.post.call_args.kwargs["headers"]["X-NBHD-Chat-Request-Id"], request_id)
+        self.assertEqual(self.app(main).reply_text, "On it: desk research.")
+        self.assertEqual(self.app(main).status, "ready")
+        self.assertEqual(AppChatMessage.objects.filter(client_msg_id=main.payload["client_msg_id"]).count(), 1)
+        self.thread.refresh_from_db()
+        entry = self.thread.side_jobs[str(main.id)]
+        if expire:
+            self.assertEqual(entry["checking_until"], fence)
+        else:
+            self.assertNotIn("checking_until", entry)
+        state["helper"].refresh_from_db()
+        self.assertIsNone(state["helper"].closed_at)
+
+    def test_own_helper_retry_does_not_rearm_a_cleared_side_fence(self):
+        self._assert_own_helper_retry_preserves_side_fence(expire=False)
+
+    def test_own_helper_retry_does_not_rearm_an_expired_side_fence(self):
+        self._assert_own_helper_retry_preserves_side_fence(expire=True)
+
+    def test_dead_lease_recovery_does_not_fence_its_own_open_helper(self):
+        main = self.main()
+        main.batch_id = uuid.uuid4()
+        main.save(update_fields=["batch_id"])
+        helper = self._open_helper()
+        old_token = main.lease_token
+        self.health.return_value = False
+        observed = []
+
+        def recovered_reply(*args, **kwargs):
+            recovered = PendingMessage.objects.get(pk=main.pk)
+            self.assertNotEqual(recovered.lease_token, old_token)
+            self.assertEqual(recovered.batch_id, main.batch_id)
+            self.thread.refresh_from_db()
+            observed.append(self.thread.side_jobs[str(main.id)].get("checking_until"))
+            return keep._ok_chat_response("On it: desk research.")
+
+        self.post.side_effect = recovered_reply
+        self.assertEqual(self.drain()["delivered"], 1)
+        self.assertEqual(observed, [None])
+        self.assertEqual(self.app(main).status, "ready")
+        self.assertEqual(self.app(main).reply_text, "On it: desk research.")
+        self.change_check.assert_not_called()
+        helper.refresh_from_db()
+        self.assertIsNone(helper.closed_at)
 
     def test_dead_main_lease_uses_exact_snapshot_and_new_ownership(self):
         row = self.main()
