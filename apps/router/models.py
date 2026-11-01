@@ -153,7 +153,7 @@ class PendingMessage(models.Model):
             "other."
         ),
     )
-    lane = models.CharField(max_length=8, choices=Lane.choices, default=Lane.MAIN)
+    lane = models.CharField(max_length=8, choices=Lane.choices, default=Lane.MAIN, db_default=Lane.MAIN)
     turn_started_at = models.DateTimeField(null=True, blank=True)
     lease_token = models.UUIDField(null=True, blank=True)
     batch_id = models.UUIDField(null=True, blank=True)

@@ -442,3 +442,20 @@ class KeepChattingTests(TestCase):
         self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, True, "ok")
         self.drain()
         self.assertIn("cancel that job", self.post.call_args.kwargs["json"]["messages"][0]["content"])
+
+    def test_old_server_insert_uses_database_main_lane_default(self):
+        from django.db import connection
+
+        row_id = uuid.uuid4()
+        with connection.cursor() as cursor:
+            # Simulate the pre-migration ORM: no new lane or lease metadata in
+            # the INSERT. A Python-only default would break this during rollout.
+            cursor.execute(
+                "INSERT INTO pending_messages "
+                "(id, tenant_id, channel, channel_user_id, payload, user_text, created_at, "
+                "delivery_status, delivery_attempts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                [row_id, self.tenant.id, "ios", str(self.thread.id), "{}", "old writer", timezone.now(), "pending", 0],
+            )
+        row = PendingMessage.objects.get(pk=row_id)
+        self.assertEqual(row.lane, PendingMessage.Lane.MAIN)
+        self.assertIsNone(row.lease_token)
