@@ -194,22 +194,13 @@ class HelperClosureTests(TestCase):
         self.assertEqual(self.send("Repeated parent completion.").data["status"], "duplicate")
         self.assertEqual(ProactiveOutbound.objects.get().message_text, "A useful result.")
 
-    def test_late_result_after_watchdog_failure_is_delivered(self):
+    def test_late_result_after_watchdog_failure_is_duplicate(self):
         self.assertEqual(close_expired_helpers(), {"sent": 1})
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
+        self.assertEqual(self.send().data["status"], "duplicate")
+        self.assertEqual(self.send("Sorry, I couldn't finish that.").data["status"], "duplicate")
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
         self.row.refresh_from_db()
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
-
-    def test_second_late_result_is_duplicate(self):
-        close_expired_helpers()
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertEqual(self.send("Repeated late completion.").data["status"], "duplicate")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
 
     def test_failure_after_result_sends_nothing(self):
         self.assertEqual(self.send().data["status"], "sent")
@@ -219,26 +210,11 @@ class HelperClosureTests(TestCase):
         self.row.refresh_from_db()
         self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
 
-    def test_late_result_after_ended_hook_failure_is_delivered_once(self):
+    def test_late_result_after_ended_hook_failure_is_duplicate(self):
         self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "sent")
-        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
-        self.assertEqual(close_expired_helpers(), {"sent": 0})
-        self.assertEqual(self.send().data["status"], "sent")
         self.assertEqual(self.send().data["status"], "duplicate")
-        self.assertEqual(self.send(FAILURE_MESSAGE).data["status"], "duplicate")
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "A useful result."]
-        )
-
-    def test_failed_late_result_write_preserves_failure_closure_for_retry(self):
-        close_expired_helpers()
-        with patch.object(HelperRun, "save", side_effect=RuntimeError("worker crash")), self.assertRaises(RuntimeError):
-            self.send()
-        self.row.refresh_from_db()
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)
+        self.assertEqual(self.send("Sorry, I couldn't finish.").data["status"], "duplicate")
         self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
-        self.assertEqual(self.send().data["status"], "sent")
-        self.assertEqual(ProactiveOutbound.objects.count(), 2)
 
     def test_live_helpers_are_not_closed_early(self):
         self.row.deadline = timezone.now() + timedelta(minutes=8)
@@ -395,23 +371,16 @@ class HelperRaceTests(TransactionTestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             return list(pool.map(send, messages))
 
-    def test_simultaneous_result_and_failure_always_deliver_result(self):
-        result_status, failure_status = self.send_concurrently(["Result", FAILURE_MESSAGE])
-        self.assertEqual(result_status, "sent")
-        self.assertIn(failure_status, ["sent", "duplicate"])
-        expected = ["Result", FAILURE_MESSAGE] if failure_status == "sent" else ["Result"]
-        self.assertCountEqual(ProactiveOutbound.objects.values_list("message_text", flat=True), expected)
-        self.row.refresh_from_db()
-        self.assertIsNotNone(self.row.closed_at)
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
-
-    def test_simultaneous_late_results_deliver_once(self):
-        self.assertEqual(close_expired_helpers(), {"sent": 1})
-        statuses = self.send_concurrently(["Result", "Result"])
+    def test_simultaneous_result_and_failure_publish_first_closure_only(self):
+        statuses = self.send_concurrently(["Result", FAILURE_MESSAGE])
         self.assertCountEqual(statuses, ["sent", "duplicate"])
-        self.assertCountEqual(
-            ProactiveOutbound.objects.values_list("message_text", flat=True), [FAILURE_MESSAGE, "Result"]
-        )
+        self.assertEqual(ProactiveOutbound.objects.count(), 1)
         self.row.refresh_from_db()
         self.assertIsNotNone(self.row.closed_at)
-        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.RESULT)
+
+    def test_simultaneous_late_results_after_failure_are_duplicates(self):
+        self.assertEqual(close_expired_helpers(), {"sent": 1})
+        self.assertEqual(self.send_concurrently(["Result", "Result"]), ["duplicate", "duplicate"])
+        self.assertEqual(ProactiveOutbound.objects.get().message_text, FAILURE_MESSAGE)
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.closed_by, HelperRun.ClosedBy.FAILURE)

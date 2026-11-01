@@ -102,6 +102,25 @@ describe("captured 2026.9.4 app completion", () => {
     } finally { globalThis.fetch = previous; }
   });
 
+  it("does not reuse a prior On it when the captured announce emits no new text", async () => {
+    const api = fakeApi(); registerBridge(api);
+    const previous = globalThis.fetch; let body;
+    globalThis.fetch = async (_url, options) => { body = JSON.parse(options.body); return {ok: true, json: async () => ({status: "sent"})}; };
+    try {
+      const start = structuredClone(captured.before_agent_run);
+      const old = structuredClone(captured.agent_end.event.messages[0]);
+      old.content = [{type: "text", text: "On it — I'll send the comparison."}];
+      start.event.messages.unshift(old);
+      api._handlers.before_agent_run(start.event, start.ctx);
+      const end = structuredClone(captured.agent_end);
+      end.event.messages = [old, ...start.event.messages.slice(1)];
+      await api._handlers.agent_end(end.event, end.ctx);
+      assert.match(body.message, /^Here's what I found:/);
+      assert.doesNotMatch(body.message, /On it/);
+      assert.ok(api._logs.some(l => l.message.includes("delivered_by=backstop_child_result")));
+    } finally { globalThis.fetch = previous; }
+  });
+
   it("releases a captured rejected spawn but retains accepted or ambiguous work", async () => {
     const api = fakeApi(); registerBridge(api);
     const previous = globalThis.fetch; const calls = [];

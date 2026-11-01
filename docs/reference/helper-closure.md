@@ -91,12 +91,10 @@ second, misleading watchdog notice. Deploy Django before the bridge image.
 Result delivery, hook failure, and watchdog failure all lock the same
 `HelperRun` row. The existing proactive app-feed writer and `closed_at`/`closed_by` updates
 commit in one transaction. A crash rolls back both; a lost HTTP response after
-commit is a duplicate on retry. A failure notice closes the row as `failure`;
-one later result is still delivered, without a prefix, and changes closure to
-`result`. Once a result is delivered, all further deliveries are duplicates.
-Failure notices after either kind of closure create no message. Concurrent
-sends follow the same rules under the row lock: if failure wins, the answer
-can follow it; if the result wins, the failure is suppressed.
+commit is a duplicate on retry. Either a result or a failure closes the row
+permanently. Every later post is a duplicate, regardless of its text. Concurrent
+sends publish only the first closure under the row lock, preventing a timeout
+notice followed by the parent's apology.
 APNs dispatch is deferred until commit;
 the app-feed row is the durable user-visible delivery, independent of push
 permission or linked Telegram/LINE accounts. This avoids relying on the

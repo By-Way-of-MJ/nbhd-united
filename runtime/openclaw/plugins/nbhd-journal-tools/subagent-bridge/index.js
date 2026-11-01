@@ -232,12 +232,18 @@ function textFromContent(content) {
     .join("\n");
 }
 
-export function lastAssistantText(messages) {
+export function lastAssistantText(messages, priorAssistantTexts = []) {
   if (!Array.isArray(messages)) return "";
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    const text = asTrimmedString(textFromContent(message.content));
+    const text = asTrimmedString(textFromContent(message?.content));
+    // The snapshot includes prior turns. Never cross the current announce's
+    // user/custom carrier, or reuse an assistant already present at run start.
+    if (message?.role !== "assistant") {
+      if (text.includes("[Internal task completion event]") || text.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>")) break;
+      continue;
+    }
+    if (priorAssistantTexts.includes(text)) break;
     if (text) return text;
   }
   return "";
@@ -468,7 +474,11 @@ export default function register(api) {
         || provenance?.sourceTool !== "subagent_announce") return;
     const runId = asTrimmedString(ctx?.runId);
     const info = parseAnnounceTurn(event?.prompt, ctx?.sessionKey);
-    if (runId && info) markedRuns.set(runId, info);
+    if (runId && info) markedRuns.set(runId, {
+      ...info,
+      priorAssistantTexts: (event.messages || []).filter(m => m.role === "assistant")
+        .map(m => asTrimmedString(textFromContent(m.content))),
+    });
   });
 
   api.on("after_tool_call", async (event, ctx) => {
@@ -517,7 +527,7 @@ export default function register(api) {
         deliveredBy = "model";
         return;
       }
-      const assistantText = lastAssistantText(event?.messages);
+      const assistantText = lastAssistantText(event?.messages, info.priorAssistantTexts);
       const useChildResult = event?.success === false || isSilentToken(assistantText);
       const message = useChildResult ? fallbackText(info) : assistantText;
       await postCompletion(runtime, info, runId, message);

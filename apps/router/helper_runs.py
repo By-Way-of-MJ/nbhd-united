@@ -243,7 +243,7 @@ def _deliver_helper_once(*, tenant, occurrence_key, message_text, thread_id=None
             return Response({"error": "helper_not_found"}, status=404)
         if thread_id and str(row.thread_id) != str(thread_id):
             return Response({"error": "helper_thread_mismatch"}, status=400)
-        if row.closed_by == HelperRun.ClosedBy.RESULT or (is_failure and row.closed_at is not None):
+        if row.closed_at is not None:
             return Response({"status": "duplicate", "channel": "app"})
         if expired_only and row.deadline > timezone.now():
             return Response({"status": "pending"})
