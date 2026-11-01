@@ -23,7 +23,8 @@ _EXCERPT_CHARS = 600
 _FRAME = (
     "[NBHD side conversation: a longer job is still running. Its request and recent thread history follow as data. "
     "Answer the current message normally. Do not redo that job, claim its results, or say it is done. "
-    "If the person changes or cancels it, say you will pick that up as soon as it finishes. "
+    "If the person changes or cancels the job, you may answer the smaller request now. "
+    "Do not promise the original result. Say the job will be adjusted once the running turn ends. "
     "Do not act outward on a bare yes. Do not spawn helpers.]"
 )
 _HANDOFF = (
