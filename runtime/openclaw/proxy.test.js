@@ -208,3 +208,22 @@ test("a disconnected drain can recover the completed gateway reply", async () =>
   assert.equal(await recovered.text(), '{"answer":"kept"}');
   assert.equal(calls, 1);
 });
+
+test("replay retention allows a burst beyond 64 normal chat requests", async () => {
+  let calls = 0;
+  const gateway = http.createServer((req, res) => {
+    req.resume();
+    calls++;
+    res.end('{"answer":"ok"}');
+  });
+  const proxyPort = await listen(createProxyServer({ gatewayPort: await listen(gateway) }));
+  for (let i = 0; i < 70; i++) {
+    const id = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, {
+      method: "POST", headers: { "X-NBHD-Chat-Request-Id": id }, body: "{}",
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+  }
+  assert.equal(calls, 70);
+});

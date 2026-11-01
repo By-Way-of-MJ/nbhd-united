@@ -77,7 +77,8 @@ function proxyRequest(req, res, targetPort, stripForwarded = false) {
 // Stable batch IDs let its replacement attach to that same call/result. Only
 // flagged app drains send this header. No files or transcripts are persisted.
 const CHAT_REPLAY_TTL_MS = 15 * 60 * 1000;
-const CHAT_REPLAY_MAX_ENTRIES = 64;
+// Covers the unchanged 300 sends/hour limit plus their internal recap turns.
+const CHAT_REPLAY_MAX_ENTRIES = 512;
 const CHAT_REPLAY_MAX_BYTES = 1024 * 1024;
 function proxyChatOnce(req, res, targetPort, calls) {
   const requestId = req.headers["x-nbhd-chat-request-id"];
