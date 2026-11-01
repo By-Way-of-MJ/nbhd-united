@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.orchestrator.config_generator import _build_cron_message, build_cron_seed_jobs
 from apps.orchestrator.services import update_system_cron_prompts
@@ -230,16 +230,15 @@ class UpdateSystemCronPromptsNoChurnTests(TestCase):
         instead of just the spurious ones.
         """
         existing = self._existing_jobs_from_seed(normalize=True)
-        # Mutate one cron's message to simulate a genuine prompt drift
-        # (e.g., template was updated server-side after this cron was created).
+        # Use a known managed variant. Arbitrarily edited text, even after a
+        # default preamble, now belongs to the user and must be preserved.
+        from apps.orchestrator.send_test import apply_send_test
+
         morning_idx = next(i for i, e in enumerate(existing) if e["name"] == "Morning Briefing")
-        existing[morning_idx]["payload"]["message"] = (
-            "Current date and time: Friday, May 8, 2026 at 07:00 (UTC)\n"
-            "When mentioning future events, ... days from now. "
-            "Never say 'tomorrow' unless the math confirms exactly 1 day away.\n\n"
-            "Good morning! Create today's morning briefing"
-            "  ← old prompt body, missing the new mandatory preamble"
-        )
+        with override_settings(SEND_TEST_TENANT_IDS="*"):
+            existing[morning_idx]["payload"]["message"] = apply_send_test(
+                existing[morning_idx]["payload"]["message"], "Morning Briefing", self.tenant
+            )
         mock_invoke.return_value = _list_response(existing)
 
         update_system_cron_prompts(self.tenant)

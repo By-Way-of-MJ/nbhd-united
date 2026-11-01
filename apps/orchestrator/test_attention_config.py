@@ -95,7 +95,8 @@ class AttentionConfigTests(SimpleTestCase):
         self.assertLess(len(rule.split()), 70)
         self.assertIn("[[quick-replies: A | B]]", rule)
         self.assertIn("open question gets no buttons", rule)
-        self.assertIn("chat replies and messages you start", rule)
+        self.assertIn("Chat replies and messages you start", rule)
+        self.assertLess(changed_agents.index("## One question"), changed_agents.index("## Reply Markers"))
         self.assertEqual(changed_agents.replace("\n\n## One question\n\n" + rule, ""), agents)
         self.assertLess(len(changed_agents), BOOTSTRAP_MAX_CHARS - 1000)
 

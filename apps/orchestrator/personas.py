@@ -781,13 +781,16 @@ def render_workspace_files(persona_key: str, tenant=None, *, metadata_only=False
     from apps.tenants.attention import attention_holds_enabled
 
     if _tenant_allowed(tenant, "ONE_QUESTION_TENANT_IDS"):
-        result["NBHD_AGENTS_MD"] += (
+        one_question = (
             "\n\n## One question\n\n"
-            "In chat replies and messages you start, ask at most one question per message. "
-            "When the answer is a small pick, offer 2–4 short labels (each at most 24 characters) "
-            "using `[[quick-replies: A | B]]` on its own last line, without backticks. "
-            "An open question gets no buttons."
+            "Chat replies and messages you start must ask at most ONE question. "
+            "Never stack follow-ups or question-shaped examples. For a small pick, put "
+            "`[[quick-replies: A | B]]` alone on the last line, without backticks, using "
+            "2–4 short labels (at most 24 characters each). An open question gets no buttons. "
+            "Before sending, remove every question after the first."
         )
+        boundary = "\n\n## Reply Markers — Mandatory"
+        result["NBHD_AGENTS_MD"] = result["NBHD_AGENTS_MD"].replace(boundary, one_question + boundary, 1)
 
     if attention_holds_enabled(tenant):
         result["NBHD_AGENTS_MD"] += (

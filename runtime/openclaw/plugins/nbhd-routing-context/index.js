@@ -208,6 +208,10 @@ function isDegenerateOutput(text) {
   return null;
 }
 
+export function stripNativeQuickReplies(content) {
+  return content.replace(/(?:^|\n)[ \t]*\[\[quick-replies:[^\n]*\]\][ \t]*$/i, "").trimEnd();
+}
+
 export default function register(api) {
   if (!api || typeof api.on !== "function") {
     return;
@@ -243,7 +247,7 @@ export default function register(api) {
     // Native channel sends (notably Telegram webhook) bypass Django's reply
     // parser. Never display the final-line choice marker on those transports.
     const content = process.env.NBHD_ONE_QUESTION === "1"
-      ? original.replace(/(?:^|\n)[ \t]*\[\[quick-replies:[^\n]*\]\][ \t]*$/i, "").trimEnd()
+      ? stripNativeQuickReplies(original)
       : original;
     const failureKind = isDegenerateOutput(content);
     if (!failureKind) return content !== original ? { content, ...(!content ? { cancel: true } : {}) } : undefined;

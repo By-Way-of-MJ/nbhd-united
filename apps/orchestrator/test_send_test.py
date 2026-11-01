@@ -20,7 +20,8 @@ class SendTestRefreshTests(TestCase):
     def setUp(self):
         self.tenant = create_tenant(display_name="Send test", telegram_chat_id=87654321)
         self.tenant.container_id = "local-test"
-        self.tenant.save(update_fields=["container_id"])
+        self.tenant.status = "active"
+        self.tenant.save(update_fields=["container_id", "status"])
         self.enterContext(suppress_cronjob_reconcile())
         self.clock = self.enterContext(patch("apps.orchestrator.config_generator.datetime"))
         self.clock.now.return_value = datetime(2026, 11, 1, 8, tzinfo=UTC)
@@ -34,9 +35,10 @@ class SendTestRefreshTests(TestCase):
         with override_settings(SEND_TEST_TENANT_IDS="*"):
             result = refresh_system_cron_rows_from_seed(self.tenant)
             self.assertEqual(result["updated"], 6)
+            applied = {name: copy.deepcopy(row.data) for name, row in self.rows().items() if name in SEND_TEST_JOBS}
             self.clock.now.return_value += timedelta(hours=2)
-            again = refresh_system_cron_rows_from_seed(self.tenant)
-            self.assertEqual(again["updated"], 0)
+            refresh_system_cron_rows_from_seed(self.tenant)
+            self.assertEqual({name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}, applied)
             for row in self.rows().values():
                 if row.name in SEND_TEST_JOBS:
                     self.assertEqual(row.data["payload"]["message"].count(SEND_TEST_BLOCK), 1)
@@ -47,7 +49,9 @@ class SendTestRefreshTests(TestCase):
         for name, row in self.rows().items():
             self.assertEqual(job_drift(before[name], row.data), [])
         self.clock.now.return_value += timedelta(hours=2)
-        self.assertEqual(refresh_system_cron_rows_from_seed(self.tenant)["updated"], 0)
+        reverted = {name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}
+        refresh_system_cron_rows_from_seed(self.tenant)
+        self.assertEqual({name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}, reverted)
 
     def test_user_source_name_collision_and_edited_default_are_preserved(self):
         user_job = self.rows()["Morning Briefing"]
@@ -89,6 +93,8 @@ class SendTestRefreshTests(TestCase):
         jobs = copy.deepcopy(build_cron_seed_jobs(self.tenant))
         for i, job in enumerate(jobs):
             job["id"] = f"local-{i}"
+            if "model" in job:
+                job["payload"]["model"] = job.pop("model")
         row = self.rows()["Morning Briefing"]
         row.source = CronJobSource.USER
         row.save(update_fields=["source"])
@@ -97,11 +103,12 @@ class SendTestRefreshTests(TestCase):
         with (
             override_settings(SEND_TEST_TENANT_IDS="*"),
             patch("apps.orchestrator.services.invoke_gateway_tool") as gateway,
+            self.assertLogs("apps.orchestrator.services", level="INFO") as logs,
         ):
             gateway.return_value = {"jobs": jobs}
             update_system_cron_prompts(self.tenant)
         removed = {c.args[2]["jobId"] for c in gateway.call_args_list if c.args[1] == "cron.remove"}
         self.assertNotIn(jobs[0]["id"], removed)
-        self.assertNotIn(evening["id"], removed)
+        self.assertNotIn(evening["id"], removed, logs.output)
         added = [c.args[2]["job"] for c in gateway.call_args_list if c.args[1] == "cron.add"]
         self.assertEqual({j["name"] for j in added}, SEND_TEST_JOBS - {"Morning Briefing", "Evening Check-in"})
