@@ -1135,20 +1135,25 @@ class RuntimeGoalDetailView(APIView):
             return tenant_failure
         record_runtime_write_activity(tenant)
 
-        goal = Goal.objects.filter(tenant=tenant, id=goal_id).first()
-        if goal is None:
+        if not Goal.objects.filter(tenant=tenant, id=goal_id).exists():
             return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
 
-        authored_data, receipts = _author_runtime_lifecycle_input(
+        # Author only the supplied fields before opening a transaction. Merge
+        # their receipts into the locked current row, exactly like task PATCH.
+        authored_data, authored_receipts = _author_runtime_lifecycle_input(
             tenant,
             request.data,
             seam="journal.runtime.goal.patch",
             model_label="journal.Goal",
-            receipts=goal.pii_receipts,
         )
-        serializer = GoalSerializer(goal, data=authored_data, partial=True, context={"tenant": tenant})
-        serializer.is_valid(raise_exception=True)
-        serializer.save(pii_receipts=receipts)
+        with transaction.atomic():
+            goal = Goal.objects.select_for_update().filter(tenant=tenant, id=goal_id).first()
+            if goal is None:
+                return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
+            receipts = {**(goal.pii_receipts or {}), **authored_receipts}
+            serializer = GoalSerializer(goal, data=authored_data, partial=True, context={"tenant": tenant})
+            serializer.is_valid(raise_exception=True)
+            serializer.save(pii_receipts=receipts)
         record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
@@ -1175,12 +1180,16 @@ class RuntimeGoalAchieveView(APIView):
             return tenant_failure
         record_runtime_write_activity(tenant)
 
-        goal = Goal.objects.filter(tenant=tenant, id=goal_id).first()
-        if goal is None:
-            return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        # Runtime authoring here is detector-deferred (DB/local masking only).
+        # Lock through the receipt merge and status change, so a simultaneous
+        # PATCH or deletion cannot be overwritten or resurrected.
+        with transaction.atomic():
+            goal = Goal.objects.select_for_update().filter(tenant=tenant, id=goal_id).first()
+            if goal is None:
+                return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
 
-        _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.achieve")
-        goal.mark_achieved()
+            _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.achieve")
+            goal.mark_achieved()
         record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
@@ -1207,12 +1216,16 @@ class RuntimeGoalAbandonView(APIView):
             return tenant_failure
         record_runtime_write_activity(tenant)
 
-        goal = Goal.objects.filter(tenant=tenant, id=goal_id).first()
-        if goal is None:
-            return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        # Runtime authoring here is detector-deferred (DB/local masking only).
+        # Lock through the receipt merge and status change, so a simultaneous
+        # PATCH or deletion cannot be overwritten or resurrected.
+        with transaction.atomic():
+            goal = Goal.objects.select_for_update().filter(tenant=tenant, id=goal_id).first()
+            if goal is None:
+                return Response({"error": "goal_not_found"}, status=status.HTTP_404_NOT_FOUND)
 
-        _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.abandon")
-        goal.abandon()
+            _reauthor_runtime_lifecycle_instance(goal, seam="journal.runtime.goal.abandon")
+            goal.abandon()
         record_runtime_write_event(tenant, kind="horizons_goal", ref={"goal_id": goal.id})
         return Response(
             {"tenant_id": str(tenant.id), "goal": GoalSerializer(goal).data},
@@ -1728,15 +1741,19 @@ class _RuntimeTaskTransitionView(APIView):
             return tenant_failure
         record_runtime_write_activity(tenant)
 
-        task = Task.objects.filter(tenant=tenant, id=task_id).first()
-        if task is None:
-            return Response({"error": "task_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        # Runtime authoring here is detector-deferred (DB/local masking only).
+        # Lock through the receipt merge and status change, so a simultaneous
+        # PATCH or deletion cannot be overwritten or resurrected.
+        with transaction.atomic():
+            task = Task.objects.select_for_update().filter(tenant=tenant, id=task_id).first()
+            if task is None:
+                return Response({"error": "task_not_found"}, status=status.HTTP_404_NOT_FOUND)
 
-        _reauthor_runtime_lifecycle_instance(
-            task,
-            seam=f"journal.runtime.task.{self.transition_method}",
-        )
-        getattr(task, self.transition_method)()
+            _reauthor_runtime_lifecycle_instance(
+                task,
+                seam=f"journal.runtime.task.{self.transition_method}",
+            )
+            getattr(task, self.transition_method)()
         return Response(
             {"tenant_id": str(tenant.id), "task": TaskSerializer(task).data},
             status=status.HTTP_200_OK,
@@ -3961,16 +3978,23 @@ class RuntimeProfileUpdateView(APIView):
 
                 new_tz = user.timezone
                 updated_rows = 0
-                for row in CronJob.objects.filter(tenant=tenant, managed=True):
-                    data = dict(row.data or {})
-                    sched = dict(data.get("schedule") or {})
-                    if sched.get("tz") == new_tz:
-                        continue
-                    sched["tz"] = new_tz
-                    data["schedule"] = sched
-                    row.data = data
-                    row.save(update_fields=["data", "updated_at"])
-                    updated_rows += 1
+                from apps.cron.signals import _enqueue_regen, suppress_cronjob_reconcile
+
+                # Each JSON merge reads the locked current row. Suppress the
+                # save signal while locked: QStash/network work follows commit.
+                with transaction.atomic(), suppress_cronjob_reconcile():
+                    for row in CronJob.objects.select_for_update().filter(tenant=tenant, managed=True).order_by("pk"):
+                        data = dict(row.data or {})
+                        sched = dict(data.get("schedule") or {})
+                        if sched.get("tz") == new_tz:
+                            continue
+                        sched["tz"] = new_tz
+                        data["schedule"] = sched
+                        row.data = data
+                        row.save(update_fields=["data", "updated_at"])
+                        updated_rows += 1
+                    if updated_rows and tenant.postgres_cron_canonical:
+                        transaction.on_commit(lambda: _enqueue_regen(str(tenant.id)))
                 logger.info(
                     "Timezone change for tenant %s (tz=%s): updated %d cron rows; "
                     "reconciler will push schedule.tz drift to gateway",
@@ -4125,8 +4149,13 @@ class RuntimeSituationTzOfferDismissView(APIView):
         if not device_tz or device_tz == profile_tz:
             return Response({"ok": True, "dismissed_for": ""})
 
-        situation.tz_offer_dismissed_for = device_tz
-        situation.save(update_fields=["tz_offer_dismissed_for", "updated_at"])
+        # The phone may report a new zone between the read and dismissal. Do
+        # not mark that new situation as dismissed using the old observation.
+        changed = UserSituation.objects.filter(pk=situation.pk, device_tz=device_tz).update(
+            tz_offer_dismissed_for=device_tz, updated_at=tz.now()
+        )
+        if not changed:
+            return Response({"ok": True, "dismissed_for": ""})
         logger.info("situation_tz_offer_dismissed tenant=%s", tenant.id)
         return Response({"ok": True, "dismissed_for": device_tz})
 
