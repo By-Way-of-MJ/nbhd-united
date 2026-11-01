@@ -2935,7 +2935,8 @@ def _drain_ios_batch(
     # the container operates in placeholder space, so we do NOT rehydrate here.
     from apps.router.proactive_context import surface_proactive_context
 
-    proactive_block = surface_proactive_context(tenant=tenant) if batch[0].lane != PendingMessage.Lane.SIDE else ""
+    main_context = getattr(batch[0], "lane", PendingMessage.Lane.MAIN) != PendingMessage.Lane.SIDE
+    proactive_block = surface_proactive_context(tenant=tenant) if main_context else ""
     if proactive_block:
         content = proactive_block + content
 
@@ -2954,7 +2955,7 @@ def _drain_ios_batch(
 
     recap_block = (
         build_thread_recap_block(tenant, thread_id, exclude_client_msg_ids=_ios_client_msg_ids(batch))
-        if batch[0].lane != PendingMessage.Lane.SIDE
+        if main_context
         else ""
     )
     if recap_block:
