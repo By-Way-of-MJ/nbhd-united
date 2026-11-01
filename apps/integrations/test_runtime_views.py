@@ -565,7 +565,7 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
 
     def test_lookup_failure_falls_back_to_the_existing_guidance(self):
         with patch("apps.tenants.situation.httpx.Client", side_effect=RuntimeError("boom")):
-            response = self._post("New York")
+            response = self._post("Zzyzxville")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["ok"], True)
@@ -577,7 +577,7 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
         client = self._geocode_client(
             [
                 {
-                    "name": "New York",
+                    "name": "Zzyzxville",
                     "feature_code": "PPL",
                     "timezone": "America/New_York",
                     "country_code": "US",
@@ -586,13 +586,22 @@ class RuntimeSituationPlaceTimezoneTest(TestCase):
             ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
-            first = self._post("New York")
+            first = self._post("Zzyzxville")
             UserSituation.objects.filter(tenant=self.tenant).delete()
-            second = self._post("New York")
+            second = self._post("Zzyzxville")
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(client.get.call_count, 1)
+
+    def test_offline_city_skips_the_network(self):
+        with patch("apps.tenants.situation.httpx.Client", side_effect=RuntimeError("boom")) as mock_client:
+            response = self._post("New York")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["ok"], True)
+        mock_client.assert_not_called()
+        self.assertNotIn("ask which city", response.json()["guidance"])
 
     def test_home_city_does_not_look_up_a_timezone(self):
         client = self._geocode_client(
