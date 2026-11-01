@@ -123,10 +123,9 @@ class AttentionConfigTests(SimpleTestCase):
         with override_settings(ONE_QUESTION_TENANT_IDS="*"):
             self.assertEqual(build_cron_seed_jobs(self.tenant), jobs)
 
-    def test_send_test_changes_only_six_prompts_and_no_agents_or_config(self):
+    def test_send_test_changes_only_five_prompts_and_no_agents_or_config(self):
         from apps.orchestrator.config_generator import build_cron_seed_jobs
         from apps.orchestrator.send_test import (
-            PERSONAL_QUESTION_SEND_TEST_BLOCK,
             SEND_TEST_BLOCK,
             SEND_TEST_JOBS,
             without_send_test,
@@ -143,7 +142,7 @@ class AttentionConfigTests(SimpleTestCase):
             with self.subTest(name=name):
                 if name in SEND_TEST_JOBS:
                     message = job["payload"]["message"]
-                    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if name == "Personal Question" else SEND_TEST_BLOCK
+                    block = SEND_TEST_BLOCK
                     self.assertLess(len(block.split()), 60)
                     self.assertEqual(message.count(block), 1)
                     self.assertTrue(message.endswith(block))

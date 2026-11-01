@@ -1,9 +1,10 @@
-"""Opt-in delivery instructions for the six platform default check-ins."""
+"""Opt-in delivery instructions for selected platform default check-ins."""
 
 from apps.orchestrator.cron_drift import strip_date_line
 from apps.router.chat_gates import _tenant_allowed
 
-SEND_TEST_JOBS = frozenset(
+# Retain retired names for identity protection and exact managed-block cleanup.
+SEND_TEST_MANAGED_JOBS = frozenset(
     {
         "Morning Briefing",
         "Evening Check-in",
@@ -13,6 +14,7 @@ SEND_TEST_JOBS = frozenset(
         "Project Check-in",
     }
 )
+SEND_TEST_JOBS = SEND_TEST_MANAGED_JOBS - {"Personal Question"}
 SEND_TEST_BLOCK = (
     "\n\n## Send test\n\n"
     "Finish all notes, saves and journal reports above first. Before sending, ask what "
@@ -20,6 +22,7 @@ SEND_TEST_BLOCK = (
     "concrete next step. Never ask questions to fill memory gaps. Otherwise never call "
     "`nbhd_send_to_user` or announce nothing to report. A quiet run is a good run."
 )
+# Retired after a real cleared-fixture run still sent; recognized only to remove it.
 PERSONAL_QUESTION_SEND_TEST_BLOCK = (
     "\n\n## Send test\n\n"
     "Finish all notes and saves above first. Ask only if the answer would change "
@@ -57,12 +60,15 @@ _NEW_STEP3 = (
 )
 
 
+def send_test_enabled(job_name: str, tenant) -> bool:
+    return job_name in SEND_TEST_JOBS and _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS")
+
+
 def apply_send_test(prompt: str, job_name: str, tenant) -> str:
     """Add the rule only while composing an identified platform seed job."""
-    if job_name not in SEND_TEST_JOBS or not _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS"):
+    if not send_test_enabled(job_name, tenant):
         return prompt
-    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if job_name == "Personal Question" else SEND_TEST_BLOCK
-    return prompt.replace(_OLD_STEP3, _NEW_STEP3).replace(_OLD_QUIET, _NEW_QUIET).rstrip() + block
+    return prompt.replace(_OLD_STEP3, _NEW_STEP3).replace(_OLD_QUIET, _NEW_QUIET).rstrip() + SEND_TEST_BLOCK
 
 
 def without_send_test(prompt: str) -> str:

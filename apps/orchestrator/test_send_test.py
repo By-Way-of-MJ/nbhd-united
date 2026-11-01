@@ -34,19 +34,18 @@ class SendTestRefreshTests(TestCase):
         before = {name: copy.deepcopy(row.data) for name, row in self.rows().items()}
         with override_settings(SEND_TEST_TENANT_IDS="*"):
             result = refresh_system_cron_rows_from_seed(self.tenant)
-            self.assertEqual(result["updated"], 6)
+            self.assertEqual(result["updated"], len(SEND_TEST_JOBS))
             applied = {name: copy.deepcopy(row.data) for name, row in self.rows().items() if name in SEND_TEST_JOBS}
             self.clock.now.return_value += timedelta(hours=2)
             refresh_system_cron_rows_from_seed(self.tenant)
             self.assertEqual({name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}, applied)
             for row in self.rows().values():
                 if row.name in SEND_TEST_JOBS:
-                    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if row.name == "Personal Question" else SEND_TEST_BLOCK
-                    self.assertEqual(row.data["payload"]["message"].count(block), 1)
+                    self.assertEqual(row.data["payload"]["message"].count(SEND_TEST_BLOCK), 1)
                 else:
                     self.assertEqual(job_drift(before[row.name], row.data), [])
         result = refresh_system_cron_rows_from_seed(self.tenant)
-        self.assertEqual(result["updated"], 6)
+        self.assertEqual(result["updated"], len(SEND_TEST_JOBS))
         for name, row in self.rows().items():
             self.assertEqual(job_drift(before[name], row.data), [])
         self.clock.now.return_value += timedelta(hours=2)
@@ -95,6 +94,24 @@ class SendTestRefreshTests(TestCase):
             self.assertEqual(refresh_system_cron_rows_from_seed(self.tenant)["updated"], 0)
         row.refresh_from_db()
         self.assertEqual(row.data["payload"]["message"].count(SEND_TEST_BLOCK), 1)
+
+    def test_retired_personal_trial_reverts_once_and_preserves_edits(self):
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                row = self.rows()["Personal Question"]
+                original = row.data["payload"]["message"]
+                row.data["payload"]["message"] += PERSONAL_QUESTION_SEND_TEST_BLOCK
+                if edited:
+                    row.data["payload"]["message"] += "\n\nKeep my personal edit."
+                row.save(update_fields=["data"])
+                with override_settings(SEND_TEST_TENANT_IDS="*"):
+                    refresh_system_cron_rows_from_seed(self.tenant)
+                    self.assertEqual(refresh_system_cron_rows_from_seed(self.tenant)["updated"], 0)
+                row.refresh_from_db()
+                self.assertEqual(
+                    row.data["payload"]["message"], original + ("\n\nKeep my personal edit." if edited else "")
+                )
+                self.assertNotIn("Personal Question", SEND_TEST_JOBS)
 
     def test_management_command_scopes_one_tenant(self):
         with patch(
