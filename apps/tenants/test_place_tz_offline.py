@@ -51,6 +51,34 @@ class OfflinePlaceTimezoneTests(SimpleTestCase):
         )
         self.assertEqual(self._offline_without_network("Chicago, US"), self._zone("America/Chicago"))
 
+    def test_states_and_country_qualifiers_disambiguate(self):
+        self.assertEqual(self._offline_without_network("Georgia"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("Georgia, US"), self._zone("America/New_York"))
+        self.assertEqual(self._offline_without_network("Georgia, Georgia"), self._zone("Asia/Tbilisi"))
+
+    def test_states_resolve_or_ask(self):
+        self.assertEqual(self._offline_without_network("Washington"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("New York"), self._zone("America/New_York"))
+        self.assertEqual(self._offline_without_network("California"), self._zone("America/Los_Angeles"))
+        self.assertEqual(self._offline_without_network("Texas"), PlaceTz(kind="region"))
+
+    def test_unchanged_city_and_country_cases(self):
+        self.assertEqual(self._offline_without_network("Chicago"), self._zone("America/Chicago"))
+        self.assertEqual(
+            self._offline_without_network("Chicago, Illinois"),
+            self._zone("America/Chicago"),
+        )
+        self.assertEqual(self._offline_without_network("Chicago, US"), self._zone("America/Chicago"))
+        self.assertEqual(self._offline_without_network("Tokyo"), self._zone("Asia/Tokyo"))
+        self.assertEqual(self._offline_without_network("Japan"), self._zone("Asia/Tokyo"))
+        self.assertEqual(self._offline_without_network("United States"), PlaceTz(kind="region"))
+        self.assertEqual(self._offline_without_network("Sao Paulo"), self._zone("America/Sao_Paulo"))
+        self.assertEqual(self._offline_without_network("São Paulo"), self._zone("America/Sao_Paulo"))
+        self.assertEqual(self._offline_without_network("Paris"), self._zone("Europe/Paris"))
+        self.assertEqual(self._offline_without_network("Springfield"), PlaceTz(kind="unknown"))
+        self.assertIsNone(self._offline_without_network("Chicago, Japan"))
+        self.assertIsNone(self._offline_without_network("Zzyzxville"))
+
     def test_countries_resolve_to_zone_or_region(self):
         self.assertEqual(self._offline_without_network("Japan"), self._zone("Asia/Tokyo"))
         self.assertEqual(self._offline_without_network("United States"), PlaceTz(kind="region"))
@@ -112,7 +140,9 @@ class BuildPlaceTzTableTests(SimpleTestCase):
     @staticmethod
     def _write_geonames(src: Path) -> None:
         (src / "admin1CodesASCII.txt").write_text(
-            "ZZ.01\tNorth Region\tNorth Region\t10\nYY.02\tSouth Region\tSouth Region\t20\n",
+            "ZZ.01\tNorth Region\tNorth Region\t10\n"
+            "YY.02\tSouth Region\tSouth Region\t20\n"
+            "QQ.03\tTwin Region\tTwin Region\t30\n",
             encoding="utf-8",
         )
         (src / "countryInfo.txt").write_text(
@@ -134,7 +164,9 @@ class BuildPlaceTzTableTests(SimpleTestCase):
             "2\tAlpha\tAlpha\t\t1\t2\tP\tPPL\tZZ\t\t01\t\t\t\t50000\t\t\tEurope/Paris\t2026-01-01\n"
             "3\tBeta\tBeta\t\t1\t2\tP\tPPLX\tYY\t\t02\t\t\t\t100000\t\t\tAmerica/New_York\t2026-01-01\n"
             "4\tGamma\tGamma\t\t1\t2\tA\tADM1\tZZ\t\t01\t\t\t\t9\t\t\tEurope/Paris\t2026-01-01\n"
-            "5\tKöln\tCologne\t\t1\t2\tP\tPPL\tZZ\t\t01\t\t\t\t1000\t\t\tEurope/Paris\t2026-01-01\n",
+            "5\tKöln\tCologne\t\t1\t2\tP\tPPL\tZZ\t\t01\t\t\t\t1000\t\t\tEurope/Paris\t2026-01-01\n"
+            "6\tDelta\tDelta\t\t1\t2\tP\tPPL\tQQ\t\t03\t\t\t\t100000\t\t\tEurope/Paris\t2026-01-01\n"
+            "7\tEpsilon\tEpsilon\t\t1\t2\tP\tPPL\tQQ\t\t03\t\t\t\t100000\t\t\tEurope/London\t2026-01-01\n",
             encoding="utf-8",
         )
 
@@ -157,6 +189,11 @@ class BuildPlaceTzTableTests(SimpleTestCase):
         self.assertEqual(
             table,
             {
+                "admins": {
+                    "north region": [["ZZ", ["Europe/Paris"]]],
+                    "south region": [["YY", ["America/New_York"]]],
+                    "twin region": [["QQ", ["Europe/London", "Europe/Paris"]]],
+                },
                 "cities": {
                     "alpha": [
                         ["ZZ", "North Region", 200000, "Europe/Paris"],
@@ -164,6 +201,8 @@ class BuildPlaceTzTableTests(SimpleTestCase):
                     ],
                     "beta": [["YY", "South Region", 100000, "America/New_York"]],
                     "cologne": [["ZZ", "North Region", 1000, "Europe/Paris"]],
+                    "delta": [["QQ", "Twin Region", 100000, "Europe/Paris"]],
+                    "epsilon": [["QQ", "Twin Region", 100000, "Europe/London"]],
                     "koln": [["ZZ", "North Region", 1000, "Europe/Paris"]],
                 },
                 "countries": {

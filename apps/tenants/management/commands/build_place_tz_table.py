@@ -62,6 +62,32 @@ def _countries(src: Path) -> tuple[dict[str, list], dict[str, str]]:
     return countries, country_names
 
 
+def _admins(src: Path) -> dict[str, list[list]]:
+    admin1 = _admin1_names(src)
+    timezones: dict[str, set[str]] = {}
+    for line in _read_lines(src / "cities15000.txt"):
+        columns = line.split("\t")
+        if len(columns) < 18:
+            continue
+        if not columns[7].startswith("PPL"):
+            continue
+        admin_key = f"{columns[8]}.{columns[10]}"
+        if admin_key not in admin1:
+            continue
+        timezones.setdefault(admin_key, set()).add(columns[17])
+
+    admins: dict[str, list[list]] = {}
+    for admin_key, admin_timezones in timezones.items():
+        normalized_name = _normalize_place_text(admin1[admin_key])
+        if not normalized_name:
+            continue
+        country_code = admin_key.split(".", 1)[0]
+        admins.setdefault(normalized_name, []).append([country_code, sorted(admin_timezones)])
+    for entries in admins.values():
+        entries.sort(key=lambda entry: (entry[0], entry[1]))
+    return admins
+
+
 def _cities(src: Path) -> dict[str, list[list]]:
     admin1 = _admin1_names(src)
     cities: dict[str, list[list]] = {}
@@ -112,6 +138,7 @@ class Command(BaseCommand):
 
         countries, country_names = _countries(src)
         table = {
+            "admins": _admins(src),
             "cities": _cities(src),
             "countries": countries,
             "country_names": country_names,

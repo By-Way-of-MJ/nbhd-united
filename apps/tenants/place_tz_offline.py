@@ -36,10 +36,12 @@ def _load_place_tz_table() -> dict | None:
 def offline_place_timezone(label: str) -> PlaceTz | None:
     """Resolve a place label from the offline table, or None when it is absent.
 
-    A known but ambiguous city is ``PlaceTz(kind="unknown")`` so callers do not
-    fall back to the network.  A country that spans several zones is
-    ``PlaceTz(kind="region")``.  Labels absent from the table (including a city
-    name whose qualifier filters out every row) return None.
+    Countries and first-level administrative regions (states/provinces) are
+    administrative matches, just like the network lookup's ADM1 handling.  A
+    known but ambiguous city is ``PlaceTz(kind="unknown")`` so callers do not
+    fall back to the network; a name shared by several administrative regions
+    or zones is ``PlaceTz(kind="region")``.  Labels absent from the table
+    (including a city name whose qualifier filters out every row) return None.
     """
     try:
         if not isinstance(label, str):
@@ -55,39 +57,61 @@ def offline_place_timezone(label: str) -> PlaceTz | None:
             return None
 
         countries = table.get("countries") or {}
+        countries_by_name = table.get("country_names") or {}
+        admins = table.get("admins") or {}
+        cities = table.get("cities") or {}
+
+        admin_tzs: set[str] = set()
+        admin_found = False
+
         country = countries.get(name)
         if country is not None:
-            timezones = country[1] if len(country) > 1 else []
-            if len(timezones) == 1 and is_assignable_profile_timezone(timezones[0]):
-                return PlaceTz(kind="zone", tz=timezones[0])
-            return PlaceTz(kind="region")
+            country_code = str(country[0]) if country else ""
+            country_name = _normalize_place_text(countries_by_name.get(country_code, ""))
+            if not qualifier or qualifier in {country_name, country_code.casefold()}:
+                admin_found = True
+                admin_tzs |= {str(tz) for tz in (country[1] if len(country) > 1 else [])}
 
-        cities = table.get("cities") or {}
-        rows = cities.get(name)
-        if not rows:
-            return None
+        for entry in admins.get(name, []):
+            country_code = str(entry[0])
+            country_name = _normalize_place_text(countries_by_name.get(country_code, ""))
+            if not qualifier or qualifier in {country_name, country_code.casefold()}:
+                admin_found = True
+                admin_tzs |= {str(tz) for tz in (entry[1] if len(entry) > 1 else [])}
 
+        rows = cities.get(name) or []
         if qualifier:
-            country_names = table.get("country_names") or {}
             filtered = []
             for row in rows:
                 country_code = str(row[0]).casefold()
                 admin1_name = _normalize_place_text(row[1])
-                country_name = _normalize_place_text(country_names.get(row[0], ""))
+                country_name = _normalize_place_text(countries_by_name.get(row[0], ""))
                 if qualifier in {admin1_name, country_name, country_code}:
                     filtered.append(row)
             rows = filtered
-            if not rows:
-                return None
 
         kept = [(int(row[2]), str(row[3])) for row in rows if is_assignable_profile_timezone(str(row[3]))]
-        if not kept:
-            return PlaceTz(kind="unknown")
+        city_tz = None
+        if kept:
+            top_population, top_tz = max(kept, key=lambda place: place[0])
+            clear_winner = top_population >= 100_000 and all(
+                tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
+            )
+            if clear_winner:
+                city_tz = top_tz
 
-        top_population, top_tz = max(kept, key=lambda place: place[0])
-        clear_winner = top_population >= 100_000 and all(
-            tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
-        )
-        return PlaceTz(kind="zone", tz=top_tz) if clear_winner else PlaceTz(kind="unknown")
+        if admin_found:
+            candidates = {tz for tz in admin_tzs if is_assignable_profile_timezone(tz)}
+            if city_tz:
+                candidates.add(city_tz)
+            if rows and not city_tz:
+                return PlaceTz(kind="region")
+            if len(candidates) == 1:
+                return PlaceTz(kind="zone", tz=next(iter(candidates)))
+            return PlaceTz(kind="region") if candidates else PlaceTz(kind="unknown")
+
+        if not rows:
+            return None
+        return PlaceTz(kind="zone", tz=city_tz) if city_tz else PlaceTz(kind="unknown")
     except Exception:
         return None
