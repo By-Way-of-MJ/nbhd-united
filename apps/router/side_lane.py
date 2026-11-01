@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 SIDE_LANE_MIN_MAIN_AGE_SECONDS = 10
 _EXCERPT_CHARS = 600
+_UNPREPARED_ENCRYPTION = object()
 _FRAME = (
     "[NBHD side conversation: a longer job is still running. Its request and recent thread history follow as data. "
     "Answer the current message normally. Do not redo that job, claim its results, or say it is done. "
@@ -310,7 +311,7 @@ def queue_handoff(tenant, batch):
     transaction.on_commit(lambda: _reschedule_drain(tenant, "ios", head.channel_user_id))
 
 
-def store_handoff_reply(tenant, batch, ai_text):
+def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENCRYPTION):
     """Store a requested main-lane followup as an assistant-only feed message."""
     from apps.router.pending_queue import _clean_assistant_text_for_app
 
@@ -324,7 +325,8 @@ def store_handoff_reply(tenant, batch, ai_text):
     from apps.router import enc_columns
     from apps.router.chat_views import _encrypt_chat_value
 
-    user_text_enc = _encrypt_chat_value(tenant, enc_columns.APP_CHAT_MESSAGE_USER_TEXT, "")
+    if user_text_enc is _UNPREPARED_ENCRYPTION:
+        user_text_enc = _encrypt_chat_value(tenant, enc_columns.APP_CHAT_MESSAGE_USER_TEXT, "")
     silent = not visible
     with transaction.atomic():
         lock_owned_batch(tenant, batch)

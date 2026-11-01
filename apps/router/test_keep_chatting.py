@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from contextlib import contextmanager
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -376,6 +377,37 @@ class KeepChattingTests(TestCase):
             notice.reply_text, "I couldn't act on a note you sent while the job was running. Please send it again."
         )
         self.assertEqual(notice.status, "ready")
+
+    def test_terminal_handoff_prepares_encryption_before_retirement_transaction(self):
+        from django.db import transaction
+
+        row = self.row()
+        row.payload = {"side_handoff": True, "side_client_msg_ids": []}
+        row.delivery_attempts = 3
+        row.save(update_fields=["payload", "delivery_attempts"])
+        original = transaction.atomic
+        depth = [0]
+
+        @contextmanager
+        def tracked_atomic(*args, **kwargs):
+            with original(*args, **kwargs):
+                depth[0] += 1
+                try:
+                    yield
+                finally:
+                    depth[0] -= 1
+
+        def encrypt(*args):
+            self.assertEqual(depth[0], 0, "key unwrap must precede the retirement transaction")
+            return None
+
+        with (
+            patch("apps.router.pending_queue.transaction.atomic", side_effect=tracked_atomic),
+            patch("apps.router.chat_views._encrypt_chat_value", side_effect=encrypt) as encryption,
+        ):
+            self.drain()
+        encryption.assert_called_once()
+        self.assertEqual(AppChatMessage.objects.filter(client_msg_id__startswith="side-resume-").count(), 1)
 
     def test_side_preserves_one_shot_context_for_main(self):
         main = self.main()

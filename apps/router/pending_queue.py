@@ -1282,6 +1282,16 @@ def _terminalize_failed_queue_rows(
     terminalized_rows: list[PendingMessage] = []
     fqdn_appeared = False
     committed_at = None
+    from apps.router.chat_gates import keep_chatting_enabled
+
+    # A terminal handoff notice is committed alongside queue retirement. Key
+    # unwrap on an encryption cache miss must happen before that transaction.
+    handoff_user_text_enc = None
+    if tenant is not None and channel == PendingMessage.Channel.IOS and keep_chatting_enabled(tenant):
+        from apps.router import enc_columns
+        from apps.router.chat_views import _encrypt_chat_value
+
+        handoff_user_text_enc = _encrypt_chat_value(tenant, enc_columns.APP_CHAT_MESSAGE_USER_TEXT, "")
 
     with transaction.atomic():
         if require_missing_fqdn:
@@ -1295,8 +1305,6 @@ def _terminalize_failed_queue_rows(
 
         if locked_tenant is None:
             return None, [], False
-
-        from apps.router.chat_gates import keep_chatting_enabled
 
         if channel == "ios" and keep_chatting_enabled(locked_tenant):
             if not ChatThread.objects.select_for_update().filter(pk=channel_user_id, tenant=locked_tenant).exists():
@@ -1351,6 +1359,7 @@ def _terminalize_failed_queue_rows(
                     locked_tenant,
                     [row],
                     "I couldn't act on a note you sent while the job was running. Please send it again.",
+                    user_text_enc=handoff_user_text_enc,
                 )
 
         side_groups = {}
