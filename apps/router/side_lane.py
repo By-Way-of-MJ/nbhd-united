@@ -214,6 +214,9 @@ def claim_chat_batch(tenant, thread_id, timeout):
                 row.turn_started_at = now
                 row.lease_token = token
                 row.save(update_fields=["turn_started_at", "lease_token", "batch_id"])
+            from apps.router.job_changes import reserve_before_framing
+
+            reserve_before_framing(tenant, batch)
         return batch, info
 
 

@@ -84,6 +84,27 @@ def _entry(jobs, job_id, main_ids=()):
     )
 
 
+def reserve_before_framing(tenant, batch):
+    """Fence publication at the claim, before checked framing can block on PII."""
+    if "job_change" in batch[0].payload or batch[0].payload.get("side_handoff"):
+        return
+    thread = ChatThread.objects.get(tenant=tenant, pk=batch[0].channel_user_id)
+    if batch[0].lane == "side":
+        entry = _entry(thread.side_jobs, batch[0].side_main_id, batch[0].payload.get("side_main_client_msg_ids", []))
+    else:
+        from apps.router.models import HelperRun
+
+        active = set(
+            HelperRun.objects.filter(tenant=tenant, thread=thread, closed_at=None).values_list(
+                "occurrence_key", flat=True
+            )
+        )
+        entry = next((e for e in reversed(list(thread.side_jobs.values())) if active.intersection(e["helpers"])), None)
+    if entry is not None:
+        entry["checking_until"] = timezone.now().timestamp() + 30
+        thread.save(update_fields=["side_jobs"])
+
+
 def check_batch(tenant, batch, job_id, main_ids, request):
     """Reserve the check before network I/O; a replay never makes a second call."""
     from apps.router.side_lane import _excerpt

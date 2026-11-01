@@ -171,3 +171,25 @@ class JobPublicationTests(TestCase):
             store_handoff_reply(self.tenant, handoff, "THE CANCELLED TWO WEEK PLAN")
         push.assert_not_called()
         self.assertFalse(AppChatMessage.objects.filter(client_msg_id=f"side-resume-{handoff[0].id.hex}").exists())
+
+    def test_publication_is_fenced_before_the_first_side_pii_pass(self):
+        from apps.router import side_lane
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        main = self.main()
+        self.row("actually skip the plan")
+        original = side_lane._excerpt
+        seen = []
+
+        def excerpt(*args, **kwargs):
+            if not seen:
+                seen.append(True)
+                with self.assertRaisesRegex(RuntimeError, "side_job_change_pending"):
+                    _store_ios_turn_reply(self.tenant, [main], "OLD PLAN")
+            return original(*args, **kwargs)
+
+        with patch("apps.router.side_lane._excerpt", side_effect=excerpt):
+            self.drain()
+        self.assertTrue(seen)
+        self.finish(main)
+        self.assertEqual(self.app(main).reply_text, "")
