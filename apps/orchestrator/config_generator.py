@@ -2427,6 +2427,11 @@ def _build_tools_section(
     from apps.orchestrator.tool_policy import attention_hold_tool_allow_overlay
 
     tools["allow"].extend(attention_hold_tool_allow_overlay(tenant))
+    if _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS"):
+        # The 9.4 unified sessions tool can delete/reset the parent and orphan
+        # unrelated helpers. Job cancellation is owned by the durable server.
+        tools.setdefault("deny", []).append("sessions")
+
     if subagents_on is None:
         subagents_on = subagents_enabled(tenant)
     if subagents_on:

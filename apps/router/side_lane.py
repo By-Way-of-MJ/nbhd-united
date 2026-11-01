@@ -296,24 +296,18 @@ def frame_chat_content(tenant, batch, content, user_param):
         ).order_by("created_at")
         content += f"\n{_HANDOFF}\n{_exchanges(tenant, history, handoff=True)}"
     elif getattr(first, "lease_token", None):
-        from apps.router.job_changes import check_batch, passive_context
-        from apps.router.models import HelperRun
+        from apps.router.job_changes import active_helper_job, check_batch, passive_context
 
         thread = ChatThread.objects.get(tenant=tenant, pk=first.channel_user_id)
-        open_keys = set(
-            HelperRun.objects.filter(tenant=tenant, thread=thread, closed_at=None).values_list(
-                "occurrence_key", flat=True
+        active = active_helper_job(tenant, thread)
+        if active and str(first.id) != active[0]:
+            job_id, entry = active
+            request = "\n".join(
+                AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=entry["main_ids"])
+                .order_by("created_at")
+                .values_list("user_text", flat=True)
             )
-        )
-        for job_id, entry in reversed(list(thread.side_jobs.items())):
-            if open_keys.intersection(entry["helpers"]) and str(first.id) != job_id:
-                request = "\n".join(
-                    AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=entry["main_ids"])
-                    .order_by("created_at")
-                    .values_list("user_text", flat=True)
-                )
-                check_batch(tenant, batch, job_id, entry["main_ids"], request)
-                break
+            check_batch(tenant, batch, job_id, entry["main_ids"], request)
         content = passive_context(tenant, batch) + content
     return content, user_param
 

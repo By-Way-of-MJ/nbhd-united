@@ -92,17 +92,22 @@ def reserve_before_framing(tenant, batch):
     if batch[0].lane == "side":
         entry = _entry(thread.side_jobs, batch[0].side_main_id, batch[0].payload.get("side_main_client_msg_ids", []))
     else:
-        from apps.router.models import HelperRun
-
-        active = set(
-            HelperRun.objects.filter(tenant=tenant, thread=thread, closed_at=None).values_list(
-                "occurrence_key", flat=True
-            )
-        )
-        entry = next((e for e in reversed(list(thread.side_jobs.values())) if active.intersection(e["helpers"])), None)
+        active = active_helper_job(tenant, thread)
+        entry = active[1] if active else None
     if entry is not None:
         entry["checking_until"] = timezone.now().timestamp() + 30
         thread.save(update_fields=["side_jobs"])
+
+
+def active_helper_job(tenant, thread):
+    """JSONB key order is not chronology; use the admission's creation order."""
+    from apps.router.models import HelperRun
+
+    for run in HelperRun.objects.filter(tenant=tenant, thread=thread, closed_at=None).order_by("-created_at", "-id"):
+        for job_id, entry in thread.side_jobs.items():
+            if run.occurrence_key in entry["helpers"]:
+                return job_id, entry
+    return None
 
 
 def check_batch(tenant, batch, job_id, main_ids, request):

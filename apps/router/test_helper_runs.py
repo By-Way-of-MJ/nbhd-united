@@ -130,6 +130,21 @@ class HelperClosureTests(TestCase):
         self.assertIn("dentist", response.data["context"])
         self.assertNotIn("cancel", response.data["context"].split("]\n", 1)[1])
 
+    def test_active_job_selection_uses_admission_time_not_jsonb_key_order(self):
+        from apps.router.job_changes import active_helper_job
+
+        other = "helper:" + "b" * 48
+        newer = HelperRun.objects.create(
+            tenant=self.tenant, thread=self.thread, occurrence_key=other, deadline=self.row.deadline
+        )
+        self.thread.side_jobs = {
+            "00000000-0000-4000-8000-000000000001": {"helpers": [other]},
+            "ffffffff-ffff-4fff-8fff-ffffffffffff": {"helpers": [self.key]},
+        }
+        self.thread.save(update_fields=["side_jobs"])
+        self.thread.refresh_from_db()
+        self.assertEqual(active_helper_job(self.tenant, self.thread)[1]["helpers"], [newer.occurrence_key])
+
     def test_admission_refuses_closed_and_expired_keys(self):
         self.assertEqual(self.admit(occurrence_key=self.key).status_code, 409)
         self.row.closed_at = timezone.now()

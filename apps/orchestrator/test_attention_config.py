@@ -52,6 +52,8 @@ class AttentionConfigTests(SimpleTestCase):
         self.assertEqual(flagged["agents"]["defaults"]["maxConcurrent"], 4)
         self.assertEqual(flagged["agents"]["defaults"]["subagents"]["maxConcurrent"], 2)
         flagged["agents"]["defaults"]["maxConcurrent"] = 2
+        self.assertIn("sessions", flagged["tools"]["deny"])
+        flagged["tools"]["deny"].remove("sessions")
         self.assertEqual(flagged["env"]["vars"].pop("NBHD_KEEP_CHATTING"), "1")
         if flagged["env"] == {"vars": {}}:
             flagged.pop("env")
