@@ -94,9 +94,14 @@ def without_send_test(prompt: str) -> str:
 
 def is_send_test_default(existing_message: str, desired_message: str) -> bool:
     """Compare full template bodies across either flag state, ignoring the clock."""
-    from apps.orchestrator.config_generator import _MORNING_BRIEFING_PROACTIVE_DEFER_LINE, _PROACTIVE_SUGGESTIONS_BLOCK
+    from apps.orchestrator.config_generator import (
+        _MORNING_BRIEFING_PROACTIVE_DEFER_LINE,
+        _PROACTIVE_SUGGESTIONS_BLOCK,
+        upgrade_retired_final_step_prose,
+    )
 
     def body(message):
+        message = upgrade_retired_final_step_prose(message)
         # This existing platform-owned optional suffix can independently flip.
         # Remove exact managed text only; any user addition still differs.
         return (

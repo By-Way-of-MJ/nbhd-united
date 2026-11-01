@@ -278,6 +278,38 @@ def _cron_rule_index(tenant: Tenant) -> str:
 # text used this exact substring, so the stripper keys off it.
 PHASE2_SYNC_MARKER = "FINAL STEP — conditional sync to the main session"
 
+# Seed prompts used to point at the retired Phase 2 block. Stored default rows
+# keep the old prose until the seed refreshes them, so recognise each retired
+# sentence as an older version of the same default.
+_RETIRED_FINAL_STEP_PROSE: tuple[tuple[str, str], ...] = (
+    (
+        "After that message is sent, proceed to the FINAL STEP described below.**\n",
+        "After that message is sent, you are done.**\n",
+    ),
+    (
+        "After your message is sent (or skipped), proceed to the FINAL STEP described below.**\n",
+        "After your message is sent (or skipped), you are done.**\n",
+    ),
+    (
+        "reply `HEARTBEAT_OK` and STOP. Do NOT proceed to the FINAL STEP — silent runs skip the sync.\n\n",
+        "reply `HEARTBEAT_OK` and STOP.\n\n",
+    ),
+    (
+        "This prevents the next heartbeat from repeating the same nudge.\n"
+        "c. Then proceed to the FINAL STEP described below.\n\n",
+        "This prevents the next heartbeat from repeating the same nudge.\n\n",
+    ),
+)
+
+
+def upgrade_retired_final_step_prose(message: str) -> str:
+    """Rewrite retired final-step prose to the current wording."""
+    if not isinstance(message, str):
+        return message
+    for old, new in _RETIRED_FINAL_STEP_PROSE:
+        message = message.replace(old, new)
+    return message
+
 
 def _build_cron_message(
     prompt: str,
@@ -696,7 +728,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "Note: These are default sections. The user may customize or remove them — "
     "only fill in sections that exist in their template.\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -928,7 +960,7 @@ _EVENING_CHECKIN_PROMPT = (
     "parser strips it first, then parses the now-final journal-link line. Do not "
     "reverse these two marker lines.\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -1048,7 +1080,7 @@ _PERSONAL_QUESTION_PROMPT = (
     "**IMPORTANT: Send at most ONE user-facing message via "
     "`nbhd_send_to_user`. If step 5 short-circuits, send NO message and "
     "reply `PERSONAL_QUESTION_SKIPPED`. After your message is sent (or "
-    "skipped), proceed to the FINAL STEP described below.**\n"
+    "skipped), you are done.**\n"
 )
 
 _WEEK_AHEAD_REVIEW_TRAVEL_LINE = (
@@ -1100,7 +1132,7 @@ _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE = (
     "   - Any cron adjustments needed (or 'all good, no changes')\n"
     "   - If nothing conflicts, keep it short: 'All good for this week.'\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -1162,14 +1194,12 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "- Was it already addressed in a message, with no new verified status? → skip it\n"
     "- Is it genuinely new information the user hasn't seen today? → keep it\n\n"
     "**Step 3 — Act.**\n"
-    "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP. "
-    "Do NOT proceed to the FINAL STEP — silent runs skip the sync.\n\n"
+    "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP.\n\n"
     "If something genuinely new needs attention:\n"
     "a. Send the user exactly ONE brief message via `nbhd_send_to_user`.\n"
     "b. Then append a one-line summary to the daily note under heading 'Heartbeat Log' "
     "via `nbhd_daily_note_append` (format: `- HH:MM — <what you nudged about>`). "
-    "This prevents the next heartbeat from repeating the same nudge.\n"
-    "c. Then proceed to the FINAL STEP described below.\n\n"
+    "This prevents the next heartbeat from repeating the same nudge.\n\n"
     "**IMPORTANT: Do NOT message unless you have something genuinely NEW to say. "
     "Do NOT send multiple messages. Quality over quantity.**\n"
 )
@@ -1223,8 +1253,7 @@ _WEEKLY_REFLECTION_PROMPT = (
     "If the user doesn't respond, that's OK — the Monday morning review will "
     "auto-generate a summary from available data.\n\n"
     "**Send exactly ONE user-facing message via `nbhd_send_to_user`. Keep it casual "
-    "and inviting, not a data dump. After that message is sent, proceed to the "
-    "FINAL STEP described below.**\n"
+    "and inviting, not a data dump. After that message is sent, you are done.**\n"
 )
 
 _PROJECT_CHECKIN_PROMPT = (
@@ -1384,7 +1413,7 @@ _GRAVITY_WEEKLY_PROMPT = (
     "track with [strategy from query (3)]. Anything to adjust?' Don't pad "
     "with stale content.\n\n"
     "**Send exactly ONE user-facing message via `nbhd_send_to_user`. After "
-    "that message is sent, proceed to the FINAL STEP described below.**\n"
+    "that message is sent, you are done.**\n"
 )
 
 
