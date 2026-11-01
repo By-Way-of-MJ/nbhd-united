@@ -125,7 +125,12 @@ class AttentionConfigTests(SimpleTestCase):
 
     def test_send_test_changes_only_six_prompts_and_no_agents_or_config(self):
         from apps.orchestrator.config_generator import build_cron_seed_jobs
-        from apps.orchestrator.send_test import SEND_TEST_BLOCK, SEND_TEST_JOBS, without_send_test
+        from apps.orchestrator.send_test import (
+            PERSONAL_QUESTION_SEND_TEST_BLOCK,
+            SEND_TEST_BLOCK,
+            SEND_TEST_JOBS,
+            without_send_test,
+        )
 
         original = {j["name"]: j for j in build_cron_seed_jobs(self.tenant)}
         config, agents = self.rendered()
@@ -138,11 +143,13 @@ class AttentionConfigTests(SimpleTestCase):
             with self.subTest(name=name):
                 if name in SEND_TEST_JOBS:
                     message = job["payload"]["message"]
-                    self.assertEqual(message.count(SEND_TEST_BLOCK), 1)
-                    self.assertTrue(message.endswith(SEND_TEST_BLOCK))
+                    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if name == "Personal Question" else SEND_TEST_BLOCK
+                    self.assertLess(len(block.split()), 60)
+                    self.assertEqual(message.count(block), 1)
+                    self.assertTrue(message.endswith(block))
                     self.assertNotIn("say so briefly", message)
                     self.assertIn("Every send below is conditional on passing the final Send test", message)
-                    self.assertIn("Finish all notes, saves and journal reports above first", message)
+                    self.assertIn("Finish all notes", message)
                     self.assertEqual(without_send_test(message), original[name]["payload"]["message"])
                 else:
                     self.assertEqual(job, original[name])

@@ -20,6 +20,12 @@ SEND_TEST_BLOCK = (
     "concrete next step. Never ask questions to fill memory gaps. Otherwise never call "
     "`nbhd_send_to_user` or announce nothing to report. A quiet run is a good run."
 )
+PERSONAL_QUESTION_SEND_TEST_BLOCK = (
+    "\n\n## Send test\n\n"
+    "Finish all notes and saves above first. Ask only if the answer would change "
+    "how you help this person this week. Otherwise never call `nbhd_send_to_user` "
+    "or announce nothing to report. A quiet run is a good run."
+)
 _CONCRETE_SEND_TEST_BLOCK = (
     "\n\n## Send test\n\n"
     "Finish every note, save and journal report above first. Override sends above: "
@@ -55,12 +61,19 @@ def apply_send_test(prompt: str, job_name: str, tenant) -> str:
     """Add the rule only while composing an identified platform seed job."""
     if job_name not in SEND_TEST_JOBS or not _tenant_allowed(tenant, "SEND_TEST_TENANT_IDS"):
         return prompt
-    return prompt.replace(_OLD_STEP3, _NEW_STEP3).replace(_OLD_QUIET, _NEW_QUIET).rstrip() + SEND_TEST_BLOCK
+    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if job_name == "Personal Question" else SEND_TEST_BLOCK
+    return prompt.replace(_OLD_STEP3, _NEW_STEP3).replace(_OLD_QUIET, _NEW_QUIET).rstrip() + block
 
 
 def without_send_test(prompt: str) -> str:
     """Remove only our exact managed block, preserving surrounding user edits."""
-    blocks = (SEND_TEST_BLOCK, _CONCRETE_SEND_TEST_BLOCK, _BACKGROUND_SEND_TEST_BLOCK, _PREVIOUS_SEND_TEST_BLOCK)
+    blocks = (
+        SEND_TEST_BLOCK,
+        PERSONAL_QUESTION_SEND_TEST_BLOCK,
+        _CONCRETE_SEND_TEST_BLOCK,
+        _BACKGROUND_SEND_TEST_BLOCK,
+        _PREVIOUS_SEND_TEST_BLOCK,
+    )
     if not any(block in prompt for block in blocks):
         return prompt
     for block in blocks:

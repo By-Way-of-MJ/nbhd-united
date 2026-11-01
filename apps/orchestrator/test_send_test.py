@@ -10,7 +10,7 @@ from apps.cron.models import CronJob, CronJobSource
 from apps.cron.signals import suppress_cronjob_reconcile
 from apps.orchestrator.config_generator import build_cron_seed_jobs
 from apps.orchestrator.cron_drift import job_drift
-from apps.orchestrator.send_test import SEND_TEST_BLOCK, SEND_TEST_JOBS
+from apps.orchestrator.send_test import PERSONAL_QUESTION_SEND_TEST_BLOCK, SEND_TEST_BLOCK, SEND_TEST_JOBS
 from apps.orchestrator.services import refresh_system_cron_rows_from_seed, update_system_cron_prompts
 from apps.tenants.services import create_tenant
 
@@ -41,7 +41,8 @@ class SendTestRefreshTests(TestCase):
             self.assertEqual({name: row.data for name, row in self.rows().items() if name in SEND_TEST_JOBS}, applied)
             for row in self.rows().values():
                 if row.name in SEND_TEST_JOBS:
-                    self.assertEqual(row.data["payload"]["message"].count(SEND_TEST_BLOCK), 1)
+                    block = PERSONAL_QUESTION_SEND_TEST_BLOCK if row.name == "Personal Question" else SEND_TEST_BLOCK
+                    self.assertEqual(row.data["payload"]["message"].count(block), 1)
                 else:
                     self.assertEqual(job_drift(before[row.name], row.data), [])
         result = refresh_system_cron_rows_from_seed(self.tenant)
@@ -85,7 +86,7 @@ class SendTestRefreshTests(TestCase):
 
         with override_settings(SEND_TEST_TENANT_IDS="*"):
             refresh_system_cron_rows_from_seed(self.tenant)
-            row = self.rows()["Personal Question"]
+            row = self.rows()["Morning Briefing"]
             row.data["payload"]["message"] = row.data["payload"]["message"].replace(
                 SEND_TEST_BLOCK, _PREVIOUS_SEND_TEST_BLOCK
             )
