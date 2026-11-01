@@ -446,7 +446,11 @@ export default function register(api) {
         && provenance?.sourceTool === "subagent_announce";
       const threadId = parsed?.threadId || (runtimeAnnounce && extractThreadId(asTrimmedString(ctx?.sessionKey)));
       if (!runId || !threadId) return undefined;
-      if (parsed) markedRuns.set(runId, parsed);
+      if (parsed) markedRuns.set(runId, {
+        ...parsed,
+        priorAssistantTexts: (event.messages || []).filter(m => m.role === "assistant")
+          .map(m => asTrimmedString(textFromContent(m.content))),
+      });
       const build = (side = {}) => ({
         // Do not turn a runtime-only event into a synthetic persisted user
         // message. 9.4 supplies an empty prompt here plus trusted provenance.

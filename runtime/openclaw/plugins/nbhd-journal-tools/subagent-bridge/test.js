@@ -113,7 +113,10 @@ describe("captured 2026.9.4 app completion", () => {
       start.event.messages.unshift(old);
       api._handlers.before_agent_run(start.event, start.ctx);
       const end = structuredClone(captured.agent_end);
-      end.event.messages = [old, ...start.event.messages.slice(1)];
+      // 9.4 may remove the carrier from the end snapshot. Both forms
+      // must stop before the old acknowledgement.
+      assert.equal(lastAssistantText([old, ...start.event.messages.slice(1)]), "");
+      end.event.messages = [old];
       await api._handlers.agent_end(end.event, end.ctx);
       assert.match(body.message, /^Here's what I found:/);
       assert.doesNotMatch(body.message, /On it/);

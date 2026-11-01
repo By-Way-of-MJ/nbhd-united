@@ -57,7 +57,9 @@ It contains the actual build/run/end hooks and rejected/accepted spawn results;
 historical messages and reasoning blocks are omitted. `runId` is in `ctx`.
 The bridge adds a system reminder using producer provenance, then parses the
 current plain completion at `before_agent_run`, and delivers the parent's final
-text at `agent_end`. Silent or unsuccessful parent runs use the child result.
+text at `agent_end`. The backstop stops at the announce carrier and excludes
+assistant text already present in the pre-run snapshot. If there is no new
+assistant text, or the parent is silent or unsuccessful, it uses the child result.
 This does not require model tool discovery or a phase-2 summary tool.
 
 The `Unknown tool id: nbhd_send_to_user` failures have a second, independent
