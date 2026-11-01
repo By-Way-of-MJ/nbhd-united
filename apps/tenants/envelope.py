@@ -344,6 +344,9 @@ _PRIVACY_PLACEHOLDERS_BODY = (
     "- If a token says `|unresolved`, say plainly that the name is redacted on your "
     "side with no relationship on file and ask who they are. Never claim familiarity, "
     "deny knowledge, or base a decision on an unresolved token.\n"
+    "- A place token may carry its time zone, e.g. `[LOCATION_1|tz America/Chicago]`. That zone is reliable: use it as\n"
+    '  the place\'s time zone (for example `nbhd_update_profile` with `timezone="America/Chicago"` once the user agrees),\n'
+    "  still writing the place itself only as the token. `region with several time zones` means ask which city.\n"
     "\n"
     'Example — DO: "You got an email from [PERSON_1] about the demo." '
     'DON\'T: "You got an email from Ryota about the demo."'

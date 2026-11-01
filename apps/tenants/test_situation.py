@@ -249,11 +249,11 @@ class PlaceTimezoneResolveTests(TestCase):
 
         self.assertEqual(result, PlaceTz(kind="unknown"))
 
-    def test_small_state_name_matches_are_unknown(self):
+    def test_small_same_name_city_matches_are_unknown(self):
         client = self._geocode_client(
             [
                 {
-                    "name": "California",
+                    "name": "Zzyzxville",
                     "feature_code": "PPLA2",
                     "timezone": "America/Chicago",
                     "country_code": "US",
@@ -261,7 +261,7 @@ class PlaceTimezoneResolveTests(TestCase):
                     "population": 4396,
                 },
                 {
-                    "name": "California",
+                    "name": "Zzyzxville",
                     "feature_code": "PPL",
                     "timezone": "America/New_York",
                     "country_code": "US",
@@ -271,7 +271,7 @@ class PlaceTimezoneResolveTests(TestCase):
             ]
         )
         with patch("apps.tenants.situation.httpx.Client", return_value=client):
-            result = resolve_place_timezone("California")
+            result = resolve_place_timezone("Zzyzxville")
 
         self.assertEqual(result, PlaceTz(kind="unknown"))
 
@@ -307,14 +307,14 @@ class PlaceTimezoneResolveTests(TestCase):
                     "feature_code": "PPL",
                     "timezone": "America/Los_Angeles",
                     "country_code": "US",
-                    "population": 652503,
+                    "population": 400000,
                 },
                 {
                     "name": "Portland",
                     "feature_code": "PPL",
                     "timezone": "America/New_York",
                     "country_code": "US",
-                    "population": 66881,
+                    "population": 40000,
                 },
                 {
                     "name": "Portland",
@@ -325,7 +325,10 @@ class PlaceTimezoneResolveTests(TestCase):
                 },
             ]
         )
-        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch("apps.tenants.situation.httpx.Client", return_value=client),
+        ):
             result = resolve_place_timezone("Portland")
 
         self.assertEqual(result, PlaceTz(kind="zone", tz="America/Los_Angeles"))
@@ -434,3 +437,80 @@ class PlaceTimezoneResolveTests(TestCase):
             result = resolve_place_timezone("New York")
 
         self.assertEqual(result, PlaceTz(kind="zone", tz="America/New_York"))
+
+    def test_large_same_name_city_in_another_zone_asks(self):
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Zzyzxville",
+                    "feature_code": "PPL",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "population": 400000,
+                },
+                {
+                    "name": "Zzyzxville",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 60000,
+                },
+            ]
+        )
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch("apps.tenants.situation.httpx.Client", return_value=client),
+        ):
+            result = resolve_place_timezone("Zzyzxville")
+
+        self.assertEqual(result, PlaceTz(kind="unknown"))
+
+        cache.clear()
+        client = self._geocode_client(
+            [
+                {
+                    "name": "Zzyzxville",
+                    "feature_code": "PPL",
+                    "timezone": "America/Chicago",
+                    "country_code": "US",
+                    "population": 400000,
+                },
+                {
+                    "name": "Zzyzxville",
+                    "feature_code": "PPL",
+                    "timezone": "America/New_York",
+                    "country_code": "US",
+                    "population": 40000,
+                },
+            ]
+        )
+        with (
+            patch("apps.tenants.place_tz_offline.offline_place_timezone", return_value=None),
+            patch("apps.tenants.situation.httpx.Client", return_value=client),
+        ):
+            result = resolve_place_timezone("Zzyzxville")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="America/Chicago"))
+
+    def test_network_failure_is_remembered_briefly(self):
+        with patch("apps.tenants.situation.httpx.Client", side_effect=RuntimeError("geocoder down")):
+            first = resolve_place_timezone("Zzyzxville")
+
+        self.assertEqual(first, PlaceTz(kind="unknown"))
+
+        client = MagicMock()
+        with patch("apps.tenants.situation.httpx.Client", return_value=client):
+            second = resolve_place_timezone("Zzyzxville")
+
+        self.assertEqual(second, PlaceTz(kind="unknown"))
+        client.assert_not_called()
+
+    def test_offline_hit_survives_cache_write_failure(self):
+        with (
+            patch("apps.tenants.situation.cache.set", side_effect=RuntimeError("cache down")),
+            patch("apps.tenants.situation.httpx.Client", side_effect=AssertionError("network used")) as client,
+        ):
+            result = resolve_place_timezone("Chicago")
+
+        self.assertEqual(result, PlaceTz(kind="zone", tz="America/Chicago"))
+        client.assert_not_called()

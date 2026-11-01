@@ -20,6 +20,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from django.conf import settings
+
 from apps.fuel import catalog as fuel_catalog
 from apps.pii.config import ADDRESS_CONTEXT_LABELS, DEBERTA_LABEL_MAP, LABEL_SCORE_OVERRIDES, TIER_POLICIES
 from apps.pii.entity_registry import (
@@ -190,6 +192,82 @@ _REHYDRATE_PLACEHOLDER_RE = re.compile(r"\\?\[([A-Z_]+)_(\d+)(?:\|[^\]]*)?\\?\]"
 
 _RELATIONSHIP_ENTITY_TYPES = frozenset({"PERSON", "ORG", "PLACE", "LOCATION"})
 _MAX_PLACEHOLDER_ANNOTATION_CHARS = 80
+
+# Directional/administrative words and generic place nouns are not places. A
+# model token like "West" or "Downtown" must never spend a geocoder lookup or
+# borrow a same-named city's zone.
+_PLACE_ZONE_STOPWORDS = frozenset(
+    {
+        "north",
+        "south",
+        "east",
+        "west",
+        "northeast",
+        "northwest",
+        "southeast",
+        "southwest",
+        "northern",
+        "southern",
+        "eastern",
+        "western",
+        "central",
+        "downtown",
+        "uptown",
+        "midtown",
+        "metro",
+        "city",
+        "centre",
+        "center",
+        "home",
+        "here",
+        "there",
+        "abroad",
+        "overseas",
+        "upstate",
+        "downstate",
+    }
+)
+
+# Address fragments: any of these words means the label is a street, not a
+# city, so it is never lookup-eligible.
+_STREET_WORDS = frozenset(
+    {
+        "street",
+        "avenue",
+        "road",
+        "boulevard",
+        "lane",
+        "drive",
+        "court",
+        "terrace",
+        "highway",
+        "rue",
+        "strasse",
+        "straße",
+        "dori",
+        "chome",
+        "calle",
+    }
+)
+
+# Suffix abbreviations are only street markers in the final word: "Main St"
+# is an address, while "St Louis" and "St. Petersburg" are cities.
+_STREET_SUFFIX_ABBREVIATIONS = frozenset(
+    {
+        "st",
+        "ave",
+        "rd",
+        "blvd",
+        "ln",
+        "dr",
+        "ct",
+        "pl",
+        "hwy",
+        "way",
+        "place",
+        "via",
+    }
+)
 
 # A bare lift number, rep/set count, or number+unit token. Fitness logs are
 # the dominant false-positive source for the contextual (PERSON/LOCATION)
@@ -1264,11 +1342,77 @@ def metadata_in_placeholder_space(metadata: str, entity_map: dict[str, Any]) -> 
     return descriptor
 
 
-def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
+def _place_zone_label(name: object) -> str:
+    """Return a lookup-eligible place label, or "" for addresses/junk."""
+    try:
+        from apps.tenants.situation import clean_place_label
+
+        if not isinstance(name, str):
+            return ""
+        label = clean_place_label(name)
+        if not label:
+            return ""
+        folded = label.casefold()
+        if folded in _PLACE_ZONE_STOPWORDS:
+            return ""
+        words = re.split(r"[\s-]+", folded)
+        if any(word in _STREET_WORDS for word in words):
+            return ""
+        if words and words[-1].rstrip(".") in _STREET_SUFFIX_ABBREVIATIONS:
+            return ""
+        if any(ch.isdigit() for ch in label) or len(label.split()) > 4:
+            return ""
+        return label
+    except Exception:
+        return ""
+
+
+def _place_zone_descriptor(name: str, *, allow_network: bool) -> str:
+    """Describe a place token's time zone without exposing the place name."""
+    try:
+        if not getattr(settings, "PII_PLACE_TZ_ANNOTATION_ENABLED", True):
+            return ""
+        label = _place_zone_label(name)
+        if not label:
+            return ""
+
+        from apps.tenants.place_tz_offline import offline_place_timezone
+        from apps.tenants.situation import cached_place_timezone, resolve_place_timezone
+
+        place = offline_place_timezone(label)
+        if place is None:
+            place = cached_place_timezone(label)
+        if place is None and allow_network:
+            place = resolve_place_timezone(label)
+        if place is None:
+            return ""
+        if place.kind == "zone":
+            descriptor = f"tz {place.tz}"
+        elif place.kind == "region":
+            descriptor = "region with several time zones"
+        else:
+            return ""
+        if any(delimiter in descriptor for delimiter in "|[]"):
+            return ""
+        return descriptor
+    except Exception:
+        return ""
+
+
+def annotate_model_context(
+    text: str,
+    entity_map: dict[str, Any] | None,
+    *,
+    allow_network: bool = True,
+) -> str:
     """Annotate identity placeholders for model-bound context without PII.
 
     PERSON/ORG/PLACE tokens with a curated relationship carry that relationship
-    in placeholder space.  Tokens without one are explicitly ``unresolved``.
+    in placeholder space.  PLACE/LOCATION tokens also carry the place's time
+    zone when it is already cached (or when the per-call network budget allows
+    one lookup).  ``allow_network=False`` restricts place zones to the offline
+    table and cache, so tool results never reach the geocoder.  Tokens without
+    either are explicitly ``unresolved``.
     Existing annotations are refreshed idempotently from the current registry.
     Other PII classes keep their historical bare form because a relationship is
     not meaningful for an email address, card number, and so on.
@@ -1277,6 +1421,32 @@ def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
         return text
 
     registry = entity_map or {}
+    network_budget = 2
+    network_names: set[str] = set()
+
+    def _allow_network(name: object) -> bool:
+        nonlocal network_budget
+        try:
+            label = _place_zone_label(name)
+            if not label:
+                return False
+            key = label.casefold()
+            if key in network_names:
+                return False
+            network_names.add(key)
+            from apps.tenants.place_tz_offline import offline_place_timezone
+            from apps.tenants.situation import cached_place_timezone
+
+            if offline_place_timezone(label) is not None:
+                return False
+            if cached_place_timezone(label) is not None:
+                return False
+            if network_budget <= 0:
+                return False
+            network_budget -= 1
+            return True
+        except Exception:
+            return False
 
     def _annotate(match: re.Match) -> str:
         entity_type, number = match.group(1), match.group(2)
@@ -1286,6 +1456,28 @@ def annotate_model_context(text: str, entity_map: dict[str, Any] | None) -> str:
         entry = registry.get(placeholder)
         relationship = entry.get("relationship") if isinstance(entry, dict) else ""
         descriptor = metadata_in_placeholder_space(relationship, registry) if isinstance(relationship, str) else ""
+        if entity_type in {"PLACE", "LOCATION"}:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+            elif isinstance(entry, str):
+                name = entry
+            else:
+                name = None
+            zone_descriptor = _place_zone_descriptor(
+                name,
+                allow_network=allow_network and _allow_network(name),
+            )
+            if descriptor and zone_descriptor:
+                separator = "; "
+                room = _MAX_PLACEHOLDER_ANNOTATION_CHARS - len(zone_descriptor) - len(separator)
+                if room > 0:
+                    descriptor = f"{descriptor[:room].rstrip()}{separator}{zone_descriptor}"
+                elif len(zone_descriptor) <= _MAX_PLACEHOLDER_ANNOTATION_CHARS:
+                    descriptor = zone_descriptor
+                # A zone longer than the cap is dropped; keep the relationship
+                # descriptor (already capped) rather than cutting the zone.
+            elif zone_descriptor and len(zone_descriptor) <= _MAX_PLACEHOLDER_ANNOTATION_CHARS:
+                descriptor = zone_descriptor
         return f"[{entity_type}_{number}|{descriptor or 'unresolved'}]"
 
     return _PLACEHOLDER_RE.sub(_annotate, text)
@@ -1968,7 +2160,12 @@ def redact_tool_response(data: Any, tenant: Tenant) -> Any:
 
     try:
         redacted = _redact_tool_value(data, tenant, policy, _TOOL_SKIP_KEYS)
-        return _annotate_model_value(redacted, getattr(tenant, "pii_entity_map", None) or {}, _TOOL_SKIP_KEYS)
+        return _annotate_model_value(
+            redacted,
+            getattr(tenant, "pii_entity_map", None) or {},
+            _TOOL_SKIP_KEYS,
+            allow_network=False,
+        )
     except Exception:
         logger.exception("Tool response PII redaction failed — returning original")
         return data
@@ -2028,21 +2225,37 @@ def _redact_tool_value(
         return value
 
 
-def _annotate_model_value(value: Any, entity_map: dict[str, Any], skip_keys: frozenset, path: tuple = ()) -> Any:
+def _annotate_model_value(
+    value: Any,
+    entity_map: dict[str, Any],
+    skip_keys: frozenset,
+    path: tuple = (),
+    *,
+    allow_network: bool = True,
+) -> Any:
     """Recursively annotate already-redacted tool data at its model boundary."""
     from apps.pii.store_registry import is_cardio_machine_path
 
     if is_cardio_machine_path(path, value):
         return value
     if isinstance(value, str):
-        return annotate_model_context(value, entity_map)
+        if allow_network:
+            return annotate_model_context(value, entity_map)
+        return annotate_model_context(value, entity_map, allow_network=False)
     if isinstance(value, dict):
         return {
-            key: (item if key in skip_keys else _annotate_model_value(item, entity_map, skip_keys, (*path, key)))
+            key: (
+                item
+                if key in skip_keys
+                else _annotate_model_value(item, entity_map, skip_keys, (*path, key), allow_network=allow_network)
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_annotate_model_value(item, entity_map, skip_keys, (*path, index)) for index, item in enumerate(value)]
+        return [
+            _annotate_model_value(item, entity_map, skip_keys, (*path, index), allow_network=allow_network)
+            for index, item in enumerate(value)
+        ]
     return value
 
 

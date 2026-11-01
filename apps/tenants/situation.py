@@ -68,19 +68,72 @@ def is_assignable_profile_timezone(tz_name: str) -> bool:
     return True
 
 
+_FAILED_PLACE_TZ_CACHE_SECONDS = 300
+
+
+def _clear_winner_zone(kept: list[tuple[int, str]]) -> str | None:
+    """Return the winning zone for same-name places, or None when ambiguous.
+
+    A clear winner needs a top population of at least 100k and every row in a
+    different zone to be small (under 50k and at most a fifth of the top).
+    """
+    if not kept:
+        return None
+    top_population, top_tz = max(kept, key=lambda place: place[0])
+    if top_population < 100_000:
+        return None
+    for population, tz_name in kept:
+        if tz_name == top_tz:
+            continue
+        if population >= 50_000 or population > top_population / 5:
+            return None
+    return top_tz
+
+
 def resolve_place_timezone(label: str) -> PlaceTz:
     """Resolve a stated place label to a zone, a multi-zone region, or unknown.
 
     One Open-Meteo geocoding lookup, cached by label. Never raises: any lookup,
     cache, or shape failure is ``kind="unknown"`` so the caller can fall back
-    to the model's own judgement.
+    to the model's own judgement. A failed network lookup is remembered briefly
+    so a broken geocoder is not retried on every call.
     """
     if not isinstance(label, str) or not label.strip():
         return PlaceTz(kind="unknown")
     try:
-        return _lookup_place_timezone(label)
+        from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS
+        from apps.tenants.place_tz_offline import offline_place_timezone
+
+        offline = offline_place_timezone(label)
+        if offline is not None:
+            try:
+                cache.set(_place_tz_cache_key(label), offline, GEOCODE_CACHE_SECONDS)
+            except Exception:
+                logger.warning("place timezone cache write failed; using offline result", exc_info=True)
+            return offline
     except Exception:
         return PlaceTz(kind="unknown")
+
+    try:
+        return _lookup_place_timezone(label)
+    except Exception:
+        try:
+            cache.set(_place_tz_cache_key(label), PlaceTz(kind="unknown"), _FAILED_PLACE_TZ_CACHE_SECONDS)
+        except Exception:
+            logger.warning("place timezone failure cache write failed", exc_info=True)
+        return PlaceTz(kind="unknown")
+
+
+def cached_place_timezone(label: str) -> PlaceTz | None:
+    """Cache-only read of resolve_place_timezone's result; None when not cached.
+
+    Never raises and never hits the network.
+    """
+    try:
+        cached = cache.get(_place_tz_cache_key(label))
+    except Exception:
+        return None
+    return cached if isinstance(cached, PlaceTz) else None
 
 
 def _normalize_place_text(value: object) -> str:
@@ -89,10 +142,14 @@ def _normalize_place_text(value: object) -> str:
     return "".join(ch for ch in text if not unicodedata.combining(ch))
 
 
+def _place_tz_cache_key(label: str) -> str:
+    return f"situation_place_tz:v3:{label.casefold()}"
+
+
 def _lookup_place_timezone(label: str) -> PlaceTz:
     from apps.orchestrator.briefing_weather import GEOCODE_CACHE_SECONDS, GEOCODE_URL
 
-    key = f"situation_place_tz:v3:{label.casefold()}"
+    key = _place_tz_cache_key(label)
     cached = cache.get(key)
     if isinstance(cached, PlaceTz):
         return cached
@@ -156,14 +213,8 @@ def _lookup_place_timezone(label: str) -> PlaceTz:
                 continue
             kept.append((population, tz_name))
 
-        if not kept:
-            result = PlaceTz(kind="unknown")
-        else:
-            top_population, top_tz = max(kept, key=lambda place: place[0])
-            clear_winner = top_population >= 100_000 and all(
-                tz_name == top_tz or population <= top_population / 5 for population, tz_name in kept
-            )
-            result = PlaceTz(kind="zone", tz=top_tz) if clear_winner else PlaceTz(kind="unknown")
+        clear_tz = _clear_winner_zone(kept)
+        result = PlaceTz(kind="zone", tz=clear_tz) if clear_tz else PlaceTz(kind="unknown")
 
     cache.set(key, result, GEOCODE_CACHE_SECONDS)
     return result
