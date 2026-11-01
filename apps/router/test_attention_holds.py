@@ -13,7 +13,7 @@ from apps.cron.models import CronJob, CronJobSource
 from apps.cron.signals import suppress_cronjob_reconcile
 from apps.orchestrator.envelope_registry import suppress_refresh
 from apps.router.cron_delivery import _rate_counts
-from apps.router.models import DeliveryAttempt, DeviceToken, ProactiveOutbound
+from apps.router.models import ChatThread, DeliveryAttempt, DeviceToken, ProactiveOutbound
 from apps.tenants.attention import hold_topic, release_hold
 from apps.tenants.models import Tenant, User
 from apps.tenants.test_utils import seed_internal_key
@@ -134,6 +134,27 @@ class AttentionDeliveryTests(TestCase):
 
     def test_subagent_result_is_a_requested_answer_and_skips(self):
         self.assertEqual(self.post(job="_subagent_result").data["status"], "sent")
+        self.check.assert_not_called()
+
+    def test_system_cron_id_cannot_spoof_a_requested_helper_result(self):
+        self.cron(CronJobSource.SYSTEM, "Morning Briefing", "system-1")
+        self.check.return_value = answer(self.hold.id)
+        response = self.post(job="_subagent_result", HTTP_X_NBHD_CRON_JOB_ID="system-1")
+        self.assertEqual(response.data["skipped"], "on_hold")
+        self.check.assert_called_once()
+        self.assertFalse(ProactiveOutbound.objects.filter(tenant=self.tenant).exists())
+
+    def test_thread_completion_answer_without_cron_id_is_exempt(self):
+        thread = ChatThread.objects.create(tenant=self.tenant, user=self.user)
+        response = self.client.post(
+            self.url,
+            {"message": "Here is the tax comparison you asked me to research.", "thread_id": str(thread.id)},
+            format="json",
+            HTTP_X_NBHD_JOB_NAME="_subagent_result",
+            **self.headers,
+        )
+        self.assertEqual(response.data["status"], "sent")
+        self.assertEqual(ProactiveOutbound.objects.get(tenant=self.tenant).thread_id, thread.id)
         self.check.assert_not_called()
 
     def test_user_made_reminder_skips_by_runtime_id_even_with_system_job_name(self):

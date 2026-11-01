@@ -30,10 +30,14 @@ class HoldCheck(BaseModel):
 def _assistant_initiated(tenant, job_name, gateway_job_id):
     from apps.cron.models import CronJob, CronJobSource
 
-    if job_name == "_subagent_result":
-        return False
     jobs = CronJob.objects.filter(tenant=tenant)
     job = jobs.filter(gateway_job_id=gateway_job_id).first() if gateway_job_id else None
+    if job is not None:
+        return job.source != CronJobSource.USER
+    # A requested helper answer comes back in the thread session, without a
+    # runtime cron id. A cron cannot acquire that exemption by naming itself.
+    if not gateway_job_id and job_name == "_subagent_result":
+        return False
     if job is None and job_name:
         job = jobs.filter(name=job_name).order_by("-enabled", "-created_at").first()
     # source=user includes reminders requested in conversation (typed cron gate)
