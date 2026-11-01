@@ -152,3 +152,59 @@ test("webhook hop leaves forwarded headers intact", async () => {
 
   assert.equal(seen["x-forwarded-for"], "1.2.3.4");
 });
+
+test("chat retries and replacement drains share the same in-flight call and reply", async () => {
+  let calls = 0;
+  let release;
+  const started = new Promise((resolve) => { release = resolve; });
+  const gateway = http.createServer((req, res) => {
+    calls++;
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      assert.equal(body, '{"user":"thread:fixture"}');
+      await started;
+      res.setHeader("Content-Type", "application/json");
+      res.end('{"choices":[{"message":{"content":"once"}}]}');
+    });
+  });
+  const proxyPort = await listen(createProxyServer({ gatewayPort: await listen(gateway) }));
+  const options = { method: "POST", headers: { "X-NBHD-Chat-Request-Id": "11111111-2222-4333-8444-555555555555", Authorization: "Bearer offline" }, body: '{"user":"thread:fixture"}' };
+  const first = fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, options);
+  const retry = fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, options);
+  release();
+  const replies = await Promise.all([first, retry]);
+  assert.deepEqual(await replies[0].json(), await replies[1].json());
+  const replay = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, options);
+  assert.equal(replay.status, 200);
+  assert.equal(calls, 1);
+  // Another batch and another authenticated caller cannot consume this reply.
+  await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, { ...options, headers: { ...options.headers, Authorization: "Bearer another-offline" } });
+  assert.equal(calls, 2);
+});
+
+test("a disconnected drain can recover the completed gateway reply", async () => {
+  let calls = 0;
+  let send;
+  const reached = new Promise((resolve) => {
+    send = resolve;
+  });
+  let reply;
+  const gateway = http.createServer((req, res) => {
+    calls++;
+    req.resume();
+    reply = () => res.end('{"answer":"kept"}');
+    send();
+  });
+  const proxyPort = await listen(createProxyServer({ gatewayPort: await listen(gateway) }));
+  const headers = { "X-NBHD-Chat-Request-Id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" };
+  const abort = new AbortController();
+  const first = fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, { method: "POST", headers, body: "{}", signal: abort.signal }).catch(() => null);
+  await reached;
+  abort.abort();
+  await first;
+  reply();
+  const recovered = await fetch(`http://127.0.0.1:${proxyPort}/v1/chat/completions`, { method: "POST", headers, body: "{}" });
+  assert.equal(await recovered.text(), '{"answer":"kept"}');
+  assert.equal(calls, 1);
+});

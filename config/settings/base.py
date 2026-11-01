@@ -340,6 +340,7 @@ TALK_ROUTE_TENANT_IDS = env("TALK_ROUTE_TENANT_IDS", default="")
 # empty/unset means nobody, keeping the existing prompt byte-for-byte identical.
 EVENING_TOMORROW_PREP_TENANT_IDS = env("EVENING_TOMORROW_PREP_TENANT_IDS", default="")
 HEARTBEAT_NUDGE_DEDUP_TENANT_IDS = env("HEARTBEAT_NUDGE_DEDUP_TENANT_IDS", default="")
+KEEP_CHATTING_TENANT_IDS = env("KEEP_CHATTING_TENANT_IDS", default="")
 
 # Hourly Jev "worth a message?" SHADOW check: comma-separated tenant UUIDs or
 # "*"; empty/unset means nobody. Logs Jev's decision only — never sends.

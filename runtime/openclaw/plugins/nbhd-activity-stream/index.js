@@ -80,7 +80,7 @@ function getRuntimeConfig() {
 }
 
 // Fire-and-forget POST. Returns a promise so callers can `void` it; never rejects.
-export async function postProgress(phase, detail, api) {
+export async function postProgress(phase, detail, api, sessionKey) {
   const cfg = getRuntimeConfig();
   if (!cfg) return;
   const controller = new AbortController();
@@ -97,7 +97,7 @@ export async function postProgress(phase, detail, api) {
         "X-NBHD-Internal-Key": cfg.internalKey,
         "X-NBHD-Tenant-Id": cfg.tenantId,
       },
-      body: JSON.stringify({ phase, detail: detail || "" }),
+      body: JSON.stringify({ phase, detail: detail || "", ...(sessionKey ? { session_key: sessionKey } : {}) }),
       signal: controller.signal,
     });
   } catch (err) {
@@ -122,10 +122,10 @@ export default function register(api) {
 
   // Narrate each tool the agent reaches for. FAIL-CLOSED hook → fire-and-forget,
   // never throw, always return undefined (never block a real tool call).
-  api.on("before_tool_call", (event) => {
+  api.on("before_tool_call", (event, ctx) => {
     try {
       const p = phaseForEvent(event);
-      if (p) void postProgress(p.phase, p.detail, api);
+      if (p) void postProgress(p.phase, p.detail, api, ctx?.sessionKey);
     } catch (_ignored) {
       // never let narration break a tool call
     }
@@ -134,9 +134,9 @@ export default function register(api) {
 
   // The agent is wrapping up → "composing". Return undefined so we never interfere
   // with the output-guard plugin's revise/finalize decision.
-  api.on("before_agent_finalize", () => {
+  api.on("before_agent_finalize", (_event, ctx) => {
     try {
-      void postProgress("composing", "", api);
+      void postProgress("composing", "", api, ctx?.sessionKey);
     } catch (_ignored) {
       // no-op
     }

@@ -9,6 +9,7 @@
  */
 
 const http = require("http");
+const { createHash } = require("node:crypto");
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "8080", 10);
 const GATEWAY_PORT = 18789;
@@ -72,6 +73,66 @@ function proxyRequest(req, res, targetPort, stripForwarded = false) {
   req.pipe(upstream);
 }
 
+// A Django drain can die or lose its response while the gateway continues.
+// Stable batch IDs let its replacement attach to that same call/result. Only
+// flagged app drains send this header. No files or transcripts are persisted.
+const CHAT_REPLAY_TTL_MS = 15 * 60 * 1000;
+const CHAT_REPLAY_MAX_ENTRIES = 64;
+const CHAT_REPLAY_MAX_BYTES = 1024 * 1024;
+function proxyChatOnce(req, res, targetPort, calls) {
+  const requestId = req.headers["x-nbhd-chat-request-id"];
+  const identity = createHash("sha256").update(String(req.headers.authorization || "") + ":" + requestId).digest("hex");
+  for (const [key, value] of calls) {
+    if (value.done && Date.now() - value.done > CHAT_REPLAY_TTL_MS) calls.delete(key);
+  }
+  let entry = calls.get(identity);
+  if (entry) {
+    req.resume(); // only the first request body reaches the gateway
+    entry.promise.then((reply) => sendReplay(res, reply));
+    return;
+  }
+  if (calls.size >= CHAT_REPLAY_MAX_ENTRIES) {
+    // Do not evict a still-retriable result: that could re-run a mutation.
+    req.resume();
+    sendReplay(res, { status: 503, headers: {}, body: Buffer.from('{"error":"chat_replay_capacity"}') });
+    return;
+  }
+  let finish;
+  entry = { done: null, promise: new Promise((resolve) => { finish = resolve; }) };
+  calls.set(identity, entry);
+  entry.promise.then((reply) => sendReplay(res, reply));
+  const headers = stripForwardedHeaders(req.headers);
+  const upstream = http.request({ hostname: "127.0.0.1", port: targetPort, path: req.url, method: req.method, headers }, (response) => {
+    const chunks = [];
+    let size = 0;
+    response.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= CHAT_REPLAY_MAX_BYTES) chunks.push(chunk);
+    });
+    response.on("end", () => {
+      entry.done = Date.now();
+      if (size > CHAT_REPLAY_MAX_BYTES) {
+        finish({ status: 502, headers: {}, body: Buffer.from('{"error":"chat_reply_too_large"}') });
+      } else {
+        finish({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks) });
+      }
+    });
+    response.on("error", fail);
+  });
+  function fail() {
+    entry.done = Date.now();
+    // Ambiguous transport failures remain cached too: a POST may have acted.
+    finish({ status: 502, headers: {}, body: Buffer.from('{"error":"chat_gateway_connection_lost"}') });
+  }
+  upstream.on("error", fail);
+  req.pipe(upstream);
+}
+function sendReplay(res, reply) {
+  if (res.destroyed) return;
+  res.writeHead(reply.status, reply.headers);
+  res.end(reply.body);
+}
+
 function proxyHealth(res, gatewayPort, timeoutMs) {
   let settled = false;
   const respond = (statusCode, payload) => {
@@ -118,9 +179,16 @@ function createProxyServer({
   webhookPort = WEBHOOK_PORT,
   healthTimeoutMs = GATEWAY_HEALTH_TIMEOUT_MS,
 } = {}) {
+  const chatCalls = new Map();
   return http.createServer((req, res) => {
     if (req.url === "/proxy-health") {
       proxyHealth(res, gatewayPort, healthTimeoutMs);
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/v1/chat/completions" &&
+        /^[0-9a-f-]{36}$/.test(String(req.headers["x-nbhd-chat-request-id"] || ""))) {
+      proxyChatOnce(req, res, gatewayPort, chatCalls);
       return;
     }
 

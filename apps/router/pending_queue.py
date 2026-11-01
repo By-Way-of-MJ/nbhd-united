@@ -63,6 +63,7 @@ from apps.orchestrator.gateway_url import gateway_base_url
 from apps.pii.authoring import placeholder_redactions
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage, RuntimeWriteActivity
 from apps.router.reply_text import clamp_reply_text
+from apps.router.side_lane import LeaseLost, save_owned_row
 from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, telegram_inbound_enabled
 from apps.tenants.models import Tenant
 
@@ -297,7 +298,7 @@ def _prepare_pending_transcript(
     include_assistant: bool,
 ) -> _PreparedPendingTranscript | None:
     """Confirm and encrypt a queue turn before its durable write transaction."""
-    if not getattr(tenant, "recall_capture_enabled", False) or not batch:
+    if not getattr(tenant, "recall_capture_enabled", False) or not batch or batch[0].payload.get("side_handoff"):
         return None
 
     from apps.transcripts.capture import derive_turn_id, encrypt_transcript_text
@@ -838,6 +839,8 @@ def _claim_pending_batch_for_key(
     timeout_seconds: float,
     *,
     break_live_lease_snapshot: list[tuple[Any, Any]] | None = None,
+    lane: str | None = None,
+    prioritize_handoffs: bool = False,
 ) -> tuple[list[PendingMessage], dict]:
     """Claim a deliverable head-of-queue batch for the given key.
 
@@ -898,6 +901,7 @@ def _claim_pending_batch_for_key(
         live_lease_qs = PendingMessage.objects.filter(
             tenant=tenant,
             channel=channel,
+            **({"lane": lane} if lane else {}),
             channel_user_id=channel_user_id or "",
             delivery_status=PendingMessage.Status.PENDING,
             delivery_in_flight_until__gt=now,
@@ -956,12 +960,17 @@ def _claim_pending_batch_for_key(
             .filter(
                 tenant=tenant,
                 channel=channel,
+                **({"lane": lane} if lane else {}),
                 channel_user_id=channel_user_id or "",
                 delivery_status=PendingMessage.Status.PENDING,
             )
             .filter(models.Q(delivery_in_flight_until__isnull=True) | models.Q(delivery_in_flight_until__lt=now))
             .order_by("created_at")
         )
+        if prioritize_handoffs:
+            qs = qs.order_by(
+                models.Case(models.When(payload__side_handoff=True, then=0), default=1), "created_at", "id"
+            )
         rows = list(qs)
         if not rows:
             return ([], claim_info)
@@ -1234,6 +1243,7 @@ def _terminalize_failed_queue_rows(
     # Intentionally None for stale-head, past-cap, and provisioning-timeout:
     # no completed turn exists, so P1 excludes those FAILED, repairable rows.
     transcript_capture: _PreparedPendingTranscript | None = None,
+    lease_token=None,
 ) -> tuple[Tenant | None, list[PendingMessage], bool]:
     """Atomically fail pending queue rows and correlated pending app turns.
 
@@ -1261,6 +1271,11 @@ def _terminalize_failed_queue_rows(
         if locked_tenant is None:
             return None, [], False
 
+        from apps.router.chat_gates import keep_chatting_enabled
+
+        if channel == "ios" and keep_chatting_enabled(locked_tenant):
+            ChatThread.objects.select_for_update().get(pk=channel_user_id, tenant=locked_tenant)
+
         queue_rows = PendingMessage.objects.select_for_update().filter(
             tenant_id=tenant_id,
             channel=channel,
@@ -1269,6 +1284,8 @@ def _terminalize_failed_queue_rows(
         )
         if row_ids is not None:
             queue_rows = queue_rows.filter(id__in=row_ids)
+        if lease_token is not None:
+            queue_rows = queue_rows.filter(lease_token=lease_token)
         terminalized_rows = list(queue_rows.order_by("created_at"))
         if not terminalized_rows:
             return locked_tenant, [], False
@@ -1604,7 +1621,15 @@ def drain_pending_messages_for_tenant_task(
         tenant = locked_tenant
 
     chat_timeout = _resolve_chat_timeout(tenant)
-    batch, info = _claim_pending_batch_for_key(tenant, channel, channel_user_id or "", chat_timeout)
+    from apps.router.chat_gates import keep_chatting_enabled
+
+    keep_chatting = channel == PendingMessage.Channel.IOS and keep_chatting_enabled(tenant)
+    if keep_chatting:
+        from apps.router.side_lane import claim_chat_batch
+
+        batch, info = claim_chat_batch(tenant, channel_user_id or "", chat_timeout)
+    else:
+        batch, info = _claim_pending_batch_for_key(tenant, channel, channel_user_id or "", chat_timeout)
 
     # A live per-key lease normally means another drain is mid-turn. Before
     # trusting it, probe the container OUTSIDE the claim transaction. A lease
@@ -1613,7 +1638,7 @@ def drain_pending_messages_for_tenant_task(
     # in a fresh transaction. A newer concurrent lease remains protected.
     live_lease_expiry = info.get("live_lease_expiry")
     live_lease_snapshot = info.get("live_lease_snapshot")
-    if live_lease_expiry is not None and not _is_tenant_container_live(tenant):
+    if not keep_chatting and live_lease_expiry is not None and not _is_tenant_container_live(tenant):
         batch, info = _claim_pending_batch_for_key(
             tenant,
             channel,
@@ -1693,6 +1718,8 @@ def drain_pending_messages_for_tenant_task(
         }
 
     if not batch:
+        if info.get("side_delay") is not None:
+            _reschedule_drain(tenant, channel, channel_user_id or "", delay_seconds=info["side_delay"])
         # Either the key's queue is drained or every remaining row has
         # a live in-flight lease held by a concurrent task. Either way
         # this run has nothing more to do — bail without erroring so we
@@ -1770,16 +1797,21 @@ def drain_pending_messages_for_tenant_task(
             )
             now = timezone.now()
             with transaction.atomic():
+                if keep_chatting:
+                    from apps.router.side_lane import lock_owned_batch
+
+                    lock_owned_batch(tenant, batch)
                 for row in batch:
                     row.delivery_status = PendingMessage.Status.DELIVERED
                     row.delivered_at = now
                     row.delivery_in_flight_until = None
-                    row.save(
+                    save_owned_row(
+                        row,
                         update_fields=[
                             "delivery_status",
                             "delivered_at",
                             "delivery_in_flight_until",
-                        ]
+                        ],
                     )
                 _persist_pending_transcript_fail_open(tenant, transcript_capture)
             delivered = batch_size
@@ -1817,11 +1849,12 @@ def drain_pending_messages_for_tenant_task(
             for row in batch:
                 row.delivery_attempts += 1
                 row.delivery_in_flight_until = None
-                row.save(
+                save_owned_row(
+                    row,
                     update_fields=[
                         "delivery_attempts",
                         "delivery_in_flight_until",
-                    ]
+                    ],
                 )
             failed = batch_size
         else:
@@ -1839,6 +1872,8 @@ def drain_pending_messages_for_tenant_task(
                 error=outcome.reason,
                 send_apology=outcome.reason == "telegram_unavailable",
                 transcript_capture=transcript_capture,
+                row_ids=[row.id for row in batch] if keep_chatting else None,
+                lease_token=batch[0].lease_token if keep_chatting else None,
             )
             return {
                 "delivered": 0,
@@ -1849,6 +1884,8 @@ def drain_pending_messages_for_tenant_task(
                 "batch_size": batch_size,
             }
 
+    except LeaseLost:
+        return {"delivered": 0, "failed": 0, "dropped": 0, "skipped_in_flight": batch_size}
     except Exception as exc:
         container_down = _delivery_failure_has_down_container(tenant, exc)
         proxy_gateway_down = _delivery_failure_is_proxy_gateway_down(exc)
@@ -1915,7 +1952,7 @@ def drain_pending_messages_for_tenant_task(
                 if woke:
                     for row in batch:
                         row.delivery_in_flight_until = None
-                        row.save(update_fields=["delivery_in_flight_until"])
+                        save_owned_row(row, update_fields=["delivery_in_flight_until"])
                     logger.info(
                         "drain_pending: tenant %s hibernated (container down) — woke and deferring drain %ds",
                         tenant_id[:8],
@@ -1953,7 +1990,7 @@ def drain_pending_messages_for_tenant_task(
         ):
             for row in batch:
                 row.delivery_in_flight_until = None
-                row.save(update_fields=["delivery_in_flight_until"])
+                save_owned_row(row, update_fields=["delivery_in_flight_until"])
             boot_state = "gateway still booting behind proxy" if proxy_gateway_down else "still booting after wake"
             logger.info(
                 "drain_pending: tenant %s %s — deferring drain %ds (no attempt burned)",
@@ -1994,11 +2031,12 @@ def drain_pending_messages_for_tenant_task(
         for row in batch:
             row.delivery_attempts += 1
             row.delivery_in_flight_until = None
-            row.save(
+            save_owned_row(
+                row,
                 update_fields=[
                     "delivery_attempts",
                     "delivery_in_flight_until",
-                ]
+                ],
             )
         failed = batch_size
 
@@ -2778,6 +2816,18 @@ def _drain_ios_batch(
             reason="empty_batch",
         )
 
+    from apps.router.side_lane import completed_batch_outcome
+
+    completed = completed_batch_outcome(tenant, batch)
+    if completed is not None:
+        return completed
+
+    if getattr(batch[0], "lane", "main") == "side" or batch[0].payload.get("side_handoff"):
+        from apps.billing.services import check_budget
+
+        if check_budget(tenant):
+            return DrainOutcome(Disposition.TERMINAL, DeliveryState.FAILED, reason="budget_exhausted")
+
     thread_id = batch[0].channel_user_id
     content, user_param, user_tz = _build_batch_chat_content(batch, thread_id, channel="ios", tenant=tenant)
 
@@ -2834,7 +2884,7 @@ def _drain_ios_batch(
     from apps.router.background_route import BACKGROUND_ROUTING_NOTE, route_background
 
     latest = batch[-1]
-    if (latest.payload or {}).get("client_msg_id"):
+    if getattr(latest, "lane", "main") != PendingMessage.Lane.SIDE and (latest.payload or {}).get("client_msg_id"):
         routing = route_background(
             latest.user_text or "",
             tenant,
@@ -2846,6 +2896,10 @@ def _drain_ios_batch(
             # Static server-owned framing goes AFTER all PII processing and is
             # never persisted to user_text, queue payloads, or the app feed.
             content += "\n" + BACKGROUND_ROUTING_NOTE
+
+    from apps.router.side_lane import frame_chat_content
+
+    content, user_param = frame_chat_content(tenant, batch, content, user_param)
 
     url = f"{gateway_base_url(tenant)}/v1/chat/completions"
     from apps.cron.gateway_client import get_gateway_token_for_tenant
@@ -2866,8 +2920,17 @@ def _drain_ios_batch(
         "X-OpenClaw-Message-Channel": "ios",
     }
 
+    if getattr(batch[0], "lease_token", None):
+        headers["X-NBHD-Chat-Request-Id"] = str(batch[0].batch_id)
+
     post_started = time.monotonic()
-    resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)
+    try:
+        resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)
+    finally:
+        if getattr(batch[0], "lane", "main") == PendingMessage.Lane.SIDE:
+            from apps.router.side_lane import log_side_turn
+
+            log_side_turn(tenant, batch, post_started, locals().get("resp"))
     post_ended = time.monotonic()
     if _looks_like_openrouter_credit_limit(resp):
         credit_result = _handle_openrouter_credit_limit(tenant, channel="ios", channel_user_id=thread_id)
@@ -2889,7 +2952,12 @@ def _drain_ios_batch(
     result = resp.json()
 
     ai_text = _extract_ai_response(result)
-    reply_write_ms = _store_ios_turn_reply(tenant, batch, ai_text)
+    from apps.router.side_lane import store_handoff_reply
+
+    if (batch[0].payload or {}).get("side_handoff"):
+        reply_write_ms = store_handoff_reply(tenant, batch, ai_text)
+    else:
+        reply_write_ms = _store_ios_turn_reply(tenant, batch, ai_text)
     # Latency attribution for the app chat path: everything the control plane
     # spends around the model turn. pre_post_ms = drain-task entry → gateway
     # POST (tenant load, claim, proactive/recap reads); post_ms = the model turn;
@@ -3011,6 +3079,10 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
         # is empty, so no duplicate is rendered.
         rep_id = client_ids[-1]
         with transaction.atomic():
+            if getattr(batch[0], "lease_token", None):
+                from apps.router.side_lane import lock_owned_batch
+
+                lock_owned_batch(tenant, batch)
             text, push_text, reply_redactions, quick_replies, journal_link = _clean_assistant_text_for_app(
                 tenant,
                 ai_text,
@@ -3036,6 +3108,10 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 # for the same reason. null when the reply carried no marker.
                 journal_link=journal_link or None,
             )
+            if getattr(batch[0], "lane", "main") == PendingMessage.Lane.SIDE:
+                from apps.router.side_lane import queue_handoff
+
+                queue_handoff(tenant, batch)
             other_ids = [cid for cid in client_ids if cid != rep_id]
             if other_ids:
                 AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=other_ids).update(
@@ -3112,6 +3188,10 @@ def _store_ios_turn_error(tenant: Tenant, batch: list[PendingMessage], reason: s
     if not client_ids:
         return
     with transaction.atomic():
+        if getattr(batch[0], "lease_token", None):
+            from apps.router.side_lane import lock_owned_batch
+
+            lock_owned_batch(tenant, batch)
         _terminalize_pending_app_turns(
             tenant,
             client_ids,

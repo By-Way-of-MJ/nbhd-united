@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import connection, transaction
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -39,7 +40,13 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         return Tenant.objects.none()
 
     @action(detail=False, methods=["get"])
-    @tenant_cache(ttl=60, tag="tenant", key_extra=lambda: f"multi_attachments_v1:{telegram_inbound_enabled()}")
+    @tenant_cache(
+        ttl=60,
+        tag="tenant",
+        key_extra=lambda: (
+            f"multi_attachments_v1:{telegram_inbound_enabled()}:keep_chatting:{settings.KEEP_CHATTING_TENANT_IDS}"
+        ),
+    )
     def me(self, request):
         """Get current user's tenant."""
         try:

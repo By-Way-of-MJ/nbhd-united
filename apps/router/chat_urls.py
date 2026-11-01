@@ -22,6 +22,7 @@ from apps.router.chat_views import (
 from apps.router.talk_route_views import TalkRouteView
 
 urlpatterns = [
+    path("", ChatMessageView.as_view(), name="chat-create"),
     path("talk-route/", TalkRouteView.as_view(), name="chat-talk-route"),
     path("shape/", ChatShapeView.as_view(), name="chat-shape"),
     path("prewarm/", ChatPrewarmView.as_view(), name="chat-prewarm"),

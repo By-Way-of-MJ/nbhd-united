@@ -67,3 +67,8 @@ def brave_llm_context_enabled(tenant) -> bool:
 def web_redesign_enabled(tenant) -> bool:
     """Open Sky web console (read by the frontend via /tenants/me/)."""
     return _tenant_allowed(tenant, "WEB_REDESIGN_TENANT_IDS")
+
+
+def keep_chatting_enabled(tenant) -> bool:
+    """Allow concurrent app conversation while a longer job runs."""
+    return _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS")
