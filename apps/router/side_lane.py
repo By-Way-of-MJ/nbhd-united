@@ -30,6 +30,7 @@ _HANDOFF = (
     "[earlier-from-you: the following side conversation happened while your longer job ran. "
     "The main turn has ended; rely on its own completion or failure evidence. Do not repeat either reply. "
     "Act now on any changes or cancellation the user requested, without asking them to repeat it. "
+    "A bare yes in the recap does not authorize outward action. "
     "If there is no change needing action and no new user message, reply only [[side-recap-no-action]].]"
 )
 
@@ -174,19 +175,28 @@ def claim_chat_batch(tenant, thread_id, timeout):
         return batch, info
 
 
-def _excerpt(tenant, text, limit=_EXCERPT_CHARS):
+def _excerpt(tenant, text, limit=_EXCERPT_CHARS, *, required=False):
     from apps.pii.redactor import MINT_REDACT_ONLY, redact_user_message_checked
     from apps.router.thread_recap import _truncate_on_word
 
     if not text:
         return ""
     outcome = redact_user_message_checked(text, tenant, allow_user_name=False, mint=MINT_REDACT_ONLY)
-    return _truncate_on_word(outcome.text, limit) if outcome.confirmed else "[context unavailable]"
+    if not outcome.confirmed:
+        if required:
+            raise RuntimeError("side_handoff_redaction_unconfirmed")
+        return "[context unavailable]"
+    return outcome.text if limit is None else _truncate_on_word(outcome.text, limit)
 
 
-def _exchanges(tenant, rows):
+def _exchanges(tenant, rows, *, handoff=False):
+    # The main handoff must retain the complete user request: a cancellation
+    # can occur at the end of a long message. Only history and assistant prose
+    # are excerpts. A privacy failure retries instead of consuming that request.
     return "\n".join(
-        f"user: {_excerpt(tenant, row.user_text, 400)}\nyou: {_excerpt(tenant, row.reply_text, 400)}" for row in rows
+        f"user: {_excerpt(tenant, row.user_text, None if handoff else 400, required=handoff)}\n"
+        f"you: {_excerpt(tenant, row.reply_text, 400)}"
+        for row in rows
     )
 
 
@@ -221,7 +231,7 @@ def frame_chat_content(tenant, batch, content, user_param):
         history = AppChatMessage.objects.filter(
             tenant=tenant, thread_id=first.channel_user_id, client_msg_id__in=ids
         ).order_by("created_at")
-        content += f"\n{_HANDOFF}\n{_exchanges(tenant, history)}"
+        content += f"\n{_HANDOFF}\n{_exchanges(tenant, history, handoff=True)}"
     return content, user_param
 
 
@@ -253,6 +263,8 @@ def store_handoff_reply(tenant, batch, ai_text):
     """Store a requested main-lane followup as an assistant-only feed message."""
     from apps.router.pending_queue import _clean_assistant_text_for_app
 
+    if not (ai_text or "").strip():
+        raise RuntimeError("side_handoff_empty_response")
     client_id = f"side-resume-{batch[0].id.hex}"
     text, push_text, redactions, quick, link = _clean_assistant_text_for_app(
         tenant, ai_text or "", artifact_dedup_key=client_id

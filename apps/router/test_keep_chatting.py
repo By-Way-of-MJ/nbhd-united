@@ -417,3 +417,28 @@ class KeepChattingTests(TestCase):
         self.post.side_effect = post
         self.drain()
         self.health.assert_called()
+
+    def test_long_side_change_is_not_truncated_out_of_main_handoff(self):
+        main = self.main()
+        text = "context " * 300 + "cancel that job and change the destination"
+        self.row(text)
+        self.drain()
+        PendingMessage.objects.filter(pk=main.pk).delete()
+        self.drain()
+        content = self.post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn(text, content)
+
+    def test_unconfirmed_handoff_redaction_retries_without_consuming_changes(self):
+        main = self.main()
+        self.row("cancel that job")
+        self.drain()
+        PendingMessage.objects.filter(pk=main.pk).delete()
+        calls = self.post.call_count
+        self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, False, "failed")
+        with self.assertRaises(RuntimeError):
+            self.drain()
+        self.assertEqual(self.post.call_count, calls)
+        self.assertTrue(PendingMessage.objects.filter(payload__side_handoff=True, delivery_status="pending").exists())
+        self.redact.side_effect = lambda text, *a, **kw: RedactionOutcome(text, True, "ok")
+        self.drain()
+        self.assertIn("cancel that job", self.post.call_args.kwargs["json"]["messages"][0]["content"])
