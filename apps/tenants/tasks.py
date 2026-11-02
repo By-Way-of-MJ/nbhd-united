@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 from django.utils.http import urlencode
 
@@ -34,9 +35,15 @@ def reset_monthly_counters_task():
 
 
 def cleanup_expired_telegram_tokens():
-    """Purge expired TelegramLinkTokens older than 1 hour."""
+    """Daily purge of expired link tokens and 30-day journal append receipts."""
+    from apps.journal.models import JournalAppendOp
+    from apps.tenants.middleware import set_rls_context
+
     cutoff = timezone.now() - timezone.timedelta(hours=1)
     deleted, _ = TelegramLinkToken.objects.filter(expires_at__lt=cutoff).delete()
+    with transaction.atomic():
+        set_rls_context(service_role=True)
+        JournalAppendOp.objects.filter(created_at__lt=timezone.now() - timezone.timedelta(days=30)).delete()
     return f"Deleted {deleted} expired tokens"
 
 

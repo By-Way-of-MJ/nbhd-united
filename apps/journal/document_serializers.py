@@ -95,6 +95,12 @@ class DocumentListSerializer(_RehydrateFieldMixin, serializers.ModelSerializer):
 class DocumentAppendSerializer(serializers.Serializer):
     content = serializers.CharField()
     time = serializers.RegexField(r"\A\d{2}:\d{2}\Z", required=False, trim_whitespace=False)
+    op_id = serializers.UUIDField(required=False)
+
+    def validate_op_id(self, value):
+        if not isinstance(self.initial_data["op_id"], str):
+            raise serializers.ValidationError("Must be a UUID string.")
+        return value
 
 
 class DocumentBlockReplaceSerializer(serializers.Serializer):

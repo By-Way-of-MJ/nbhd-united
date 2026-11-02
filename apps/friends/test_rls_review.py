@@ -52,6 +52,7 @@ class ReviewRegressionTests(TransactionTestCase):
                     "transcripts_transcriptevent",
                     "transcripts_transcriptcapturequarantine",
                     "transcripts_transcriptindexoutbox",
+                    "journal_append_ops",
                 }
                 for (table,) in cursor.fetchall():
                     if table not in protected:
