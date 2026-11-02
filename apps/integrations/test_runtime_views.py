@@ -3204,7 +3204,8 @@ class RuntimeProfileTimezoneAssignabilityTest(TestCase):
         )
 
     @patch("apps.orchestrator.services.update_tenant_config")
-    def test_endpoint_acceptance_matches_assignable_helper(self, _mock_update):
+    @patch("apps.cron.publish.publish_task")
+    def test_endpoint_acceptance_matches_assignable_helper(self, mock_publish, mock_update):
         for timezone_name in [
             "UTC",
             "Asia/Tokyo",
@@ -3215,9 +3216,16 @@ class RuntimeProfileTimezoneAssignabilityTest(TestCase):
             "Japan",
         ]:
             with self.subTest(timezone=timezone_name):
-                response = self._patch(timezone_name)
+                with self.captureOnCommitCallbacks(execute=True):
+                    response = self._patch(timezone_name)
                 self.assertEqual(
                     response.status_code == 200,
                     is_assignable_profile_timezone(timezone_name),
                     response.content,
                 )
+                mock_update.assert_not_called()
+                if response.status_code == 200:
+                    mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+                else:
+                    mock_publish.assert_not_called()
+                mock_publish.reset_mock()
