@@ -37,7 +37,7 @@ def render_memory_files(tenant) -> dict[str, str]:
     # lifecycle, Document(kind in [goal, tasks]) is owned by the typed tables
     # instead — skip them here so we don't write stale markdown mirrors of
     # rows that have been migrated/superseded.
-    documents = Document.objects.filter(tenant=tenant)
+    documents = Document.objects.filter(tenant=tenant).exclude(kind=Document.Kind.PREP)
     if getattr(tenant, "experimental_typed_journal_lifecycle", False):
         documents = documents.exclude(kind__in=[Document.Kind.GOAL, Document.Kind.TASKS])
     documents = documents.exclude(

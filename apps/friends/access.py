@@ -1941,14 +1941,36 @@ def update_step_prep(tenant, prep, **fields):
     return prep
 
 
+def publish_step_prep_page(tenant, prep, slug):
+    # Keep the signed run version valid for the report following this save.
+    my_step_preps(tenant).filter(pk=prep.pk).update(doc_slug=slug)
+
+
+def delete_step_prep_written_page(tenant, doc):
+    from apps.journal.models import Document
+
+    Document.objects.filter(
+        tenant_id=_tenant_id(tenant), pk=doc.pk, kind=Document.Kind.PREP, updated_at=doc.updated_at
+    ).delete()
+
+
+def delete_step_prep_pages(tenant, prep_ids):
+    from apps.journal.models import Document
+
+    Document.objects.filter(
+        tenant_id=_tenant_id(tenant), kind=Document.Kind.PREP, slug__in=[f"step-prep-{pk}" for pk in prep_ids]
+    ).delete()
+
+
+@transaction.atomic
 def stop_ineligible_step_preps(tenant):
-    """One bulk update, including assignment checks, regardless of row count."""
+    """Stop ineligible rows and remove their owner-only pages in bulk."""
     from .models import SharedGoalStepAssignment
 
     accepted = SharedGoalStepAssignment.objects.filter(
         membership_id=OuterRef("membership_id"), step_id=OuterRef("step_id"), status="accepted"
     )
-    return (
+    rows = (
         my_step_preps(tenant)
         .exclude(status="stopped")
         .annotate(_held=Exists(accepted))
@@ -1958,5 +1980,10 @@ def stop_ineligible_step_preps(tenant):
             step__shared_goal__status="active",
             _held=True,
         )
-        .update(status="stopped", updated_at=timezone.now())
+        .select_for_update(of=("self",))
     )
+    ids = list(rows.values_list("id", flat=True))
+    if not ids:
+        return 0
+    delete_step_prep_pages(tenant, ids)
+    return my_step_preps(tenant).filter(id__in=ids).update(status="stopped", doc_slug="", updated_at=timezone.now())

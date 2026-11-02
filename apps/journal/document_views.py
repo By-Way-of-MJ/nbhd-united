@@ -193,7 +193,7 @@ class DocumentListCreateView(APIView):
         tenant = _get_tenant(request.user)
         kind = request.query_params.get("kind")
 
-        queryset = Document.objects.filter(tenant=tenant)
+        queryset = Document.objects.filter(tenant=tenant).exclude(kind=Document.Kind.PREP)
         if kind:
             queryset = queryset.filter(kind=kind)
 
@@ -667,7 +667,11 @@ class SidebarTreeView(APIView):
         tenant = _get_tenant(request.user)
         entity_map = getattr(tenant, "pii_entity_map", None)
         today = str(today_in_tenant_tz(tenant))
-        documents = Document.objects.filter(tenant=tenant).values("kind", "slug", "title", "pii_receipts", "updated_at")
+        documents = (
+            Document.objects.filter(tenant=tenant)
+            .exclude(kind=Document.Kind.PREP)
+            .values("kind", "slug", "title", "pii_receipts", "updated_at")
+        )
 
         # Group by kind
         tree: dict[str, list] = defaultdict(list)

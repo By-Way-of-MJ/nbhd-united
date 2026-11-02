@@ -96,7 +96,7 @@ def probe_grounding(tenant, topic: str, expect_terms: list[str] | None = None) -
     # upward for a ``Document.objects`` chain, so building the Q() first would
     # hide this raw ``markdown`` predicate from the check that is supposed to
     # flag it when the column flips to ciphertext.
-    literal_matches = Document.objects.filter(tenant=tenant)
+    literal_matches = Document.objects.filter(tenant=tenant).exclude(kind=Document.Kind.PREP)
     literal_q = Q()
     for variant in search_query_variants(tenant, topic):
         literal_q |= Q(markdown__icontains=variant)

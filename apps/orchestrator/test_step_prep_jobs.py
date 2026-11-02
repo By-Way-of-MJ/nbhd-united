@@ -39,6 +39,7 @@ class StepPrepJobTests(TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        print(result.stdout, end="")
 
     def test_flagged_only_and_independent_of_scheduled_message_opt_in(self):
         self.assertEqual(self.jobs(), {})

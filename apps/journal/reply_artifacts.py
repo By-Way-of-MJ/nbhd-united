@@ -137,6 +137,9 @@ def document_contains_tables(doc: Document, tables) -> bool:
     table still misses and forks a duplicate. Bounded and self-healing — the
     binding exists from the next turn on.
     """
+    if doc.kind == Document.Kind.PREP:
+        return False
+
     from apps.pii.egress import redact_known_values
 
     markdown = doc.markdown or ""

@@ -26,3 +26,5 @@ for (const job of jobs) {
   assert.equal(isRuntimeToolAllowed("nbhd_step_prep_next", allow), job.name === "Step Prep");
   assert.equal(isRuntimeToolAllowed("nbhd_step_prep_update_next", allow), job.name === "Step Prep Update");
 }
+
+console.log("OpenClaw 2026.9.4 toolsAllow matcher: PASS — Step Prep and Step Prep Update allow their exact tools and deny document, send, task, memory, project-write, cron, session, exec, file, Gmail and calendar tools; web_search is research-only.");

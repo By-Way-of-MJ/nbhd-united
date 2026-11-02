@@ -332,6 +332,7 @@ def document_fts_search(base_queryset, variants: list[str], *, limit: int) -> li
     from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
     from django.db.models import Case, FloatField, Value, When
 
+    base_queryset = base_queryset.exclude(kind="prep")
     search_vector = SearchVector("title", weight="A") + SearchVector("markdown", weight="B")
     search_query = SearchQuery(as_fts_phrase(variants[0]), search_type="websearch")
     for variant in variants[1:]:
@@ -401,7 +402,7 @@ def document_semantic_search(tenant, base_queryset, query: str, *, limit: int) -
         from apps.journal.models import DocumentChunk
         from apps.lessons.services import generate_embedding
 
-        chunks = DocumentChunk.objects.filter(tenant=tenant, document__in=base_queryset)
+        chunks = DocumentChunk.objects.filter(tenant=tenant, document__in=base_queryset).exclude(document__kind="prep")
         # No embedded corpus means no semantic results; don't spend an embedding
         # call (or a network round trip in tests) on a query that cannot match.
         if not chunks.exists():

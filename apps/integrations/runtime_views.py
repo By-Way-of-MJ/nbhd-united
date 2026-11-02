@@ -3135,7 +3135,7 @@ def _put_runtime_document(tenant, *, kind, slug, markdown, title=""):
             doc.pii_receipts = {**(doc.pii_receipts or {}), **receipts}
             doc.save(update_fields=[*update_fields, "pii_receipts", "updated_at"])
 
-    if doc.kind != Document.Kind.MEMORY:
+    if doc.kind not in {Document.Kind.MEMORY, Document.Kind.PREP}:
         record_runtime_write_event(
             tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if created else "updated"
         )
@@ -3192,6 +3192,8 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
 
         # General path-component validation prevents reads from resolving
         # NTFS-hostile kind/slug values that cannot map to workspace paths.
+        if kind == Document.Kind.PREP:
+            return Response({"error": "invalid_kind", "detail": "Prep pages are owner-only."}, status=400)
         validation_error = validate_kind_slug(kind, slug)
         if validation_error is not None:
             error_code, detail = validation_error
@@ -3270,6 +3272,8 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
         if not slug:
             slug = kind
 
+        if kind == Document.Kind.PREP:
+            return Response({"error": "invalid_kind", "detail": "Prep pages are owner-only."}, status=400)
         validation_error = validate_kind_slug(kind, slug)
         if validation_error is not None:
             error_code, detail = validation_error
@@ -3338,7 +3342,7 @@ class RuntimeJournalSearchView(KnownValueResponseGuardMixin, APIView):
         # "<date>-debt-chart") must stay findable. Empty pre-guard stubs rank ~0
         # and are removed by migration 0020. Only the date-windowed CONTEXT
         # bundle filters daily slugs (see RuntimeJournalContextView).
-        qs = Document.objects.filter(tenant=tenant)
+        qs = Document.objects.filter(tenant=tenant).exclude(kind=Document.Kind.PREP)
         if kind:
             qs = qs.filter(kind=kind)
 
@@ -3750,6 +3754,8 @@ class RuntimeDocumentAppendView(KnownValueResponseGuardMixin, APIView):
             else:
                 slug = kind
 
+        if kind == Document.Kind.PREP:
+            return Response({"error": "invalid_kind", "detail": "Prep pages are owner-only."}, status=400)
         validation_error = validate_kind_slug(kind, slug)
         if validation_error is not None:
             error_code, detail = validation_error
@@ -3792,7 +3798,7 @@ class RuntimeDocumentAppendView(KnownValueResponseGuardMixin, APIView):
             )
             doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
 
-        if doc.kind != Document.Kind.MEMORY:
+        if doc.kind not in {Document.Kind.MEMORY, Document.Kind.PREP}:
             record_runtime_write_event(
                 tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if _created else "updated"
             )
@@ -6476,7 +6482,7 @@ class RuntimeStepPrepUpdateNextView(RuntimeStepPrepNextView):
     update = True
 
 
-class RuntimeStepPrepSaveView(RLSRequestTransactionMixin, APIView):
+class RuntimeStepPrepSaveView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
 

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 import register from "./index.js";
+import registerJournal from "../nbhd-journal-tools/index.js";
 
 function tools() {
   const out = {};
@@ -99,5 +100,15 @@ test("each prep tool forwards only to its authenticated endpoint without hook st
     const response = await toolsByName[name].execute("test-call", body);
     assert.deepEqual(response.details.json, { job: null });
     t.mock.restoreAll();
+  }
+});
+
+
+test("general journal tool schemas never expose the private prep kind", () => {
+  const journal = {};
+  registerJournal({ pluginConfig: {}, registerTool(tool) { if (typeof tool === "function") tool = tool({}); journal[tool.name] = tool; } });
+  for (const name of ["nbhd_document_get", "nbhd_document_put", "nbhd_document_append", "nbhd_journal_search"]) {
+    const kinds = journal[name].parameters.properties.kind.enum;
+    assert.ok(!kinds.includes("prep"), `${name} exposed prep`);
   }
 });

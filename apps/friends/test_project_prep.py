@@ -309,7 +309,8 @@ class StepPrepTests(TestCase):
             preps.append(project_prep.start(self.holder, self.holder.user, self.goal.id, step.id))
         StepPrep.objects.filter(id=preps[1].id).update(status="stopped")
         SharedGoalStepAssignment.objects.filter(step_id=preps[2].step_id).update(status="released")
-        with self.assertNumQueries(2):
+        # Lock/select, page cleanup and bulk stop stay constant with row count.
+        with self.assertNumQueries(6):
             rows = project_prep.list_mine(self.holder)
         self.assertEqual([r["id"] for r in rows], [str(preps[3].id), str(first.id)])
         self.assertTrue(all(r["project_title"] == "Garden" for r in rows))

@@ -118,7 +118,7 @@ def _resolve_journal_document(tenant, object_id):
     row = _uuid_row(Document, tenant, object_id)
     # Verbatim-keep routes to a dedicated non-daily Document (D5); a daily note
     # is shared same-day content and refuses deletion, so it is not recordable.
-    if row is not None and row.kind == Document.Kind.DAILY:
+    if row is not None and row.kind in {Document.Kind.DAILY, Document.Kind.PREP}:
         return None
     return row
 
@@ -129,7 +129,9 @@ def _remove_journal_document(tenant, object_id):
     try:
         # Never delete a daily note even if one were somehow recorded; its
         # DocumentChunk embeddings cascade on the dedicated-doc delete.
-        Document.objects.filter(tenant=tenant, id=object_id).exclude(kind=Document.Kind.DAILY).delete()
+        Document.objects.filter(tenant=tenant, id=object_id).exclude(
+            kind__in=[Document.Kind.DAILY, Document.Kind.PREP]
+        ).delete()
     except (ValueError, TypeError, DjangoValidationError):
         return  # malformed id → nothing to remove = success
 
@@ -328,6 +330,7 @@ def _completeness(tenant, marker_msg, recorded_count):
     ``window_count`` over-counts safely (unrelated writes in the window inflate it),
     so a gap is a monitored signal that triggers a look, never a bad delete (D2).
     """
+    from apps.journal.models import Document
     from apps.router.models import AppChatMessage
 
     since = marker_msg.created_at
@@ -339,7 +342,10 @@ def _completeness(tenant, marker_msg, recorded_count):
         if model in seen_models:
             continue
         seen_models.add(model)
-        window_count += model.objects.filter(tenant=tenant, created_at__gte=since).count()
+        rows = model.objects.filter(tenant=tenant, created_at__gte=since)
+        if model is Document:
+            rows = rows.exclude(kind=Document.Kind.PREP)
+        window_count += rows.count()
     return user_turns, window_count
 
 

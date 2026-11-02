@@ -76,7 +76,9 @@ def runtime_next(tenant, data, *, update=False):
             .filter(Q(last_run_at__isnull=True) | Q(updated_at__gt=F("last_run_at"), answer__gt=""))
         )
     else:
-        rows = access.step_preps_with_unseen_notes(tenant).filter(status__in=["ready", "stuck", "working"])
+        rows = access.step_preps_with_unseen_notes(tenant).filter(
+            status__in=["ready", "stuck"], last_run_at__isnull=False
+        )
     rows = rows.select_related("step__shared_goal").select_for_update(of=("self",))
     for prep in rows.order_by("created_at", "id"):
         notes = []
@@ -91,12 +93,9 @@ def runtime_next(tenant, data, *, update=False):
             if not notes:
                 continue
             cursor = max(n["created_at"] for n in notes)
-        if not prep.doc_slug:
-            access.update_step_prep(tenant, prep, doc_slug=f"step-prep-{prep.id}")
         from apps.billing.services import check_budget
 
         if check_budget(tenant):
-            access.update_step_prep(tenant, prep, status="stuck", question="", choices=[])
             return {"job": None}
         snapshot = {
             "tenant": str(tenant.id),
@@ -116,7 +115,7 @@ def runtime_next(tenant, data, *, update=False):
             from apps.journal.models import Document
 
             job["body"] = (
-                Document.objects.filter(tenant=tenant, kind="ideas", slug=prep.doc_slug)
+                Document.objects.filter(tenant=tenant, kind="prep", slug=prep.doc_slug)
                 .values_list("markdown", flat=True)
                 .first()
                 or ""
@@ -150,14 +149,30 @@ def _runtime_row(tenant, prep_id, run_token):
     return prep, snapshot
 
 
-@transaction.atomic
 def runtime_save(tenant, data):
     from apps.integrations.runtime_views import _put_runtime_document
 
     spec = _validate(PrepSave, data)
-    prep, _snapshot = _runtime_row(tenant, spec.id, spec.run_token)
-    # Neither the model nor the request can redirect this write to another page.
-    _put_runtime_document(tenant, kind="ideas", slug=f"step-prep-{prep.id}", markdown=spec.body)
+    with transaction.atomic():
+        prep, _snapshot = _runtime_row(tenant, spec.id, spec.run_token)
+        slug = f"step-prep-{prep.id}"
+        title = prep.brief["title"]
+    # Authoring may call out: release the row and request transaction first.
+    doc, _created = _put_runtime_document(tenant, kind="prep", slug=slug, title=title, markdown=spec.body)
+    failure = None
+    with transaction.atomic():
+        try:
+            prep, _snapshot = _runtime_row(tenant, spec.id, spec.run_token)
+        except (NotFound, ValidationError) as exc:
+            # Stop may have run before this write landed. Commit the cleanup
+            # before refusing; don't remove a newer concurrent replacement.
+            access.delete_step_prep_written_page(tenant, doc)
+            failure = exc
+        else:
+            # Publishing the coordinate must not invalidate the report token.
+            access.publish_step_prep_page(tenant, prep, slug)
+    if failure is not None:
+        raise failure
     return {"id": str(prep.id), "saved": True}
 
 
@@ -248,7 +263,8 @@ def _mine(tenant, mission_id, step_id):
 @transaction.atomic
 def stop(tenant, mission_id, step_id):
     prep = _mine(tenant, mission_id, step_id)
-    return access.update_step_prep(tenant, prep, status=StepPrep.Status.STOPPED)
+    access.delete_step_prep_pages(tenant, [prep.id])
+    return access.update_step_prep(tenant, prep, status=StepPrep.Status.STOPPED, doc_slug="")
 
 
 @transaction.atomic
