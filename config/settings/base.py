@@ -1151,3 +1151,4 @@ TEST_RUNNER = "config.test_runner.QuietCronSignalRunner"
 
 PROJECTS_V2_TENANT_IDS = env("PROJECTS_V2_TENANT_IDS", default="")
 STEP_PREP_TENANT_IDS = env("STEP_PREP_TENANT_IDS", default="")
+PROJECT_QUIET_PUSH_TENANT_IDS = env("PROJECT_QUIET_PUSH_TENANT_IDS", default="")
