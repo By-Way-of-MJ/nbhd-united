@@ -25,8 +25,9 @@ private "My sky" table (``friend_sky_memberships``, added by friends.0011 /
 BN-PR6): they carry real FORCE-RLS tenant policies (a deliberate DB backstop,
 kept enabled by disable_rls's RLS_KEEP_ENABLED). Those policies name
 ``app_user`` (never ``public``), so they never re-expose the anon API — plus
-the three tenant-scoped transcript ledger tables, which use the same named-role
-posture. The runtime guard below allows only these named policies.
+the tenant-scoped transcript ledger and journal append receipt tables, which
+use the same named-role posture. The runtime guard below allows only these
+named policies.
 """
 
 from __future__ import annotations
@@ -138,6 +139,7 @@ class PublicSchemaLockdownRuntimeGuard(TestCase):
             "transcripts_transcriptevent",
             "transcripts_transcriptcapturequarantine",
             "transcripts_transcriptindexoutbox",
+            "journal_append_ops",
         }
     )
 

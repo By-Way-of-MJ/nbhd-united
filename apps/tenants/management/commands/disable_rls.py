@@ -4,9 +4,9 @@ Supabase re-enables RLS on tables created by migrations.
 Run this after every `migrate` to ensure the application can
 read/write without per-row policies blocking access.
 
-EXCEPTION (friends DB backstop + transcript ledger): the ten friends tables
-and three ciphertext-only transcript tables carry deliberate FORCE-RLS tenant
-policies. Those MUST survive this boot-time sweep, or the backstop would be
+EXCEPTION (friends, transcript ledger, journal append receipts): these tables
+carry deliberate FORCE-RLS tenant policies. Those MUST survive this boot-time
+sweep, or the backstop would be
 wiped on every deploy. Everything else keeps the pre-existing fleet posture
 (RLS off; the anon Data API has zero grants on these tables, so isolation is
 the Django layer). Keep this list in sync with the policy migrations and
@@ -32,6 +32,7 @@ RLS_KEEP_ENABLED = frozenset(
         "transcripts_transcriptevent",
         "transcripts_transcriptcapturequarantine",
         "transcripts_transcriptindexoutbox",
+        "journal_append_ops",
     }
 )
 

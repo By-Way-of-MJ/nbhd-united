@@ -17,6 +17,7 @@ from apps.common.cache import tenant_cache
 from apps.common.llm_contracts import today_in_tenant_tz
 from apps.common.tenant_tz import tenant_tz
 from apps.pii.redactor import rehydrate_for_tenant
+from apps.tenants.middleware import set_rls_context
 from apps.tenants.models import Tenant
 
 from .blocks import split_markdown_blocks
@@ -29,7 +30,7 @@ from .document_serializers import (
     DocumentSerializer,
 )
 from .md_utils import format_author_suffix
-from .models import Document
+from .models import Document, JournalAppendOp
 from .services import (
     get_default_template as get_tenant_template,
 )
@@ -591,6 +592,9 @@ class DocumentAppendView(APIView):
     """POST /api/v1/journal/documents/<kind>/<slug>/append/
 
     Appends timestamped content to a document (used for quick log).
+    Daily notes accept an optional persisted UUID ``op_id``. For 30 days,
+    retries return the current original document and its saved entry heading
+    without appending again; both first use and replay return HTTP 201.
     """
 
     permission_classes = [IsAuthenticated]
@@ -598,9 +602,33 @@ class DocumentAppendView(APIView):
     def post(self, request, kind: str, slug: str):
         tenant = _get_tenant(request.user)
         serializer = DocumentAppendSerializer(data=request.data)
+        op_id = None
+        if isinstance(request.data, dict) and "op_id" in request.data:
+            # A replay is identified by its operation alone. Validate that ID
+            # first, so an edited/empty retry body cannot hide a committed op.
+            try:
+                op_id = serializer.validate_op_id(serializer.fields["op_id"].run_validation(request.data["op_id"]))
+            except serializers.ValidationError as exc:
+                raise serializers.ValidationError({"op_id": exc.detail}) from exc
+        if op_id is not None:
+            if kind != "daily":
+                raise serializers.ValidationError({"op_id": "Only daily notes support append operation IDs."})
+            _validate_slug(kind, slug)
+            # A committed retry needs neither default-document creation nor
+            # external authoring. Set context INSIDE this short transaction:
+            # session GUCs cannot be relied on over the transaction pooler.
+            with transaction.atomic():
+                set_rls_context(tenant_id=tenant.pk, as_tenant=True)
+                op = JournalAppendOp.objects.filter(tenant=tenant, op_id=op_id).first()
+                if op is not None:
+                    doc = Document.objects.get(tenant=tenant, kind="daily", slug=op.document_slug)
+            if op is not None:
+                response = DocumentSerializer(doc, context={"tenant": tenant}).data
+                response.update(entry_heading=op.entry_heading, replayed=True)
+                return Response(response, status=status.HTTP_201_CREATED)
+
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-
         doc = _get_or_create_document(tenant, kind, slug)
 
         # Re-author owner input before persisting so the appended real PII does
@@ -619,24 +647,44 @@ class DocumentAppendView(APIView):
         content = authored.text
 
         with transaction.atomic():
+            if op_id is not None:
+                set_rls_context(tenant_id=tenant.pk, as_tenant=True)
             # Re-read under a row lock to serialise concurrent appends and
             # prevent a lost-update when two writers hit the same document.
             doc = Document.objects.select_for_update().get(pk=doc.pk)
             time_str = data.get("time") or timezone.now().astimezone(tenant_tz(tenant)).strftime("%H:%M")
-            entry_block = f"\n\n### {time_str}{format_author_suffix(request.user.display_name)}\n{content}\n"
-            doc.markdown = (doc.markdown or "").rstrip() + entry_block
-            # Merge under the SAME lock as the text: the receipt is re-read from
-            # the locked row, so a concurrent append's receipt is folded in
-            # rather than clobbered by this request's stale copy.
-            doc.pii_receipts = merge_field_receipt(
-                doc.pii_receipts,
-                "markdown",
-                authored.receipt,
-                stored_text=doc.markdown,
-            )
-            doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
+            entry_heading = f"### {time_str}{format_author_suffix(request.user.display_name)}"
+            replayed = False
+            if op_id is not None:
+                # get_or_create uses a savepoint for a unique-constraint race
+                # (including requests targeting different dates). The receipt
+                # and document write commit or roll back together.
+                op, created = JournalAppendOp.objects.get_or_create(
+                    tenant=tenant,
+                    op_id=op_id,
+                    defaults={"document_slug": slug, "entry_heading": entry_heading},
+                )
+                replayed = not created
+                entry_heading = op.entry_heading
+            if replayed:
+                doc = Document.objects.get(tenant=tenant, kind="daily", slug=op.document_slug)
+            else:
+                entry_block = f"\n\n{entry_heading}\n{content}\n"
+                doc.markdown = (doc.markdown or "").rstrip() + entry_block
+                # Merge under the SAME lock as the text: the receipt is re-read
+                # from the locked row, preserving concurrent writers' receipts.
+                doc.pii_receipts = merge_field_receipt(
+                    doc.pii_receipts,
+                    "markdown",
+                    authored.receipt,
+                    stored_text=doc.markdown,
+                )
+                doc.save(update_fields=["markdown", "pii_receipts", "updated_at"])
 
-        return Response(DocumentSerializer(doc, context={"tenant": tenant}).data, status=status.HTTP_201_CREATED)
+        response = DocumentSerializer(doc, context={"tenant": tenant}).data
+        if op_id is not None:
+            response.update(entry_heading=entry_heading, replayed=replayed)
+        return Response(response, status=status.HTTP_201_CREATED)
 
 
 class TodayView(APIView):

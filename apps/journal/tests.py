@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from threading import Barrier
+from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from django.test import TestCase, override_settings
+from django.db import DatabaseError, IntegrityError, connection, connections, transaction
+from django.db.models.query import QuerySet
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
@@ -14,7 +20,7 @@ from apps.tenants.models import Tenant, User
 from apps.tenants.test_utils import seed_internal_key
 
 from .md_utils import append_entry_markdown, parse_daily_note, serialise_daily_note
-from .models import DailyNote, Document, NoteTemplate, UserMemory, WeeklyReview
+from .models import DailyNote, Document, JournalAppendOp, NoteTemplate, UserMemory, WeeklyReview
 from .services import (
     DEFAULT_TEMPLATE_SECTIONS,
     append_log_to_note,
@@ -1326,6 +1332,176 @@ class DocumentAPITest(TestCase):
         self.assertIn("### 10:15\nNeutral entry", resp.data["markdown"])
         self.assertNotIn("### 10:15 —", resp.data["markdown"])
 
+    def test_append_without_op_id_keeps_exact_body_and_response_keys(self):
+        doc = Document.objects.create(
+            tenant=self.tenant, kind="daily", slug="2026-02-16", title="Day", markdown="# Day\n"
+        )
+        response = self.client.post(
+            "/api/v1/journal/documents/daily/2026-02-16/append/",
+            {"content": "  Thought  ", "time": "09:45"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        doc.refresh_from_db()
+        self.assertEqual(doc.markdown, "# Day\n\n### 09:45 — Casey Park\nThought\n")
+        self.assertEqual(
+            set(response.data), {"id", "kind", "slug", "title", "markdown", "pii_receipts", "created_at", "updated_at"}
+        )
+        self.assertFalse(JournalAppendOp.objects.exists())
+
+    def test_append_op_first_use_and_changed_content_replay(self):
+        url = "/api/v1/journal/documents/daily/2026-02-16/append/"
+        op_id = str(uuid4())
+        first = self.client.post(url, {"op_id": op_id, "content": "First thought", "time": "23:48"}, format="json")
+        self.assertEqual(first.status_code, 201)
+        self.assertIs(first.data["replayed"], False)
+        self.assertEqual(first.data["entry_heading"], "### 23:48 — Casey Park")
+        self.assertIn(first.data["entry_heading"] + "\nFirst thought\n", first.data["markdown"])
+        op = JournalAppendOp.objects.get(tenant=self.tenant, op_id=op_id)
+        self.assertEqual(op.document_slug, "2026-02-16")
+        self.assertEqual(op.entry_heading, first.data["entry_heading"])
+        doc = Document.objects.get(pk=first.data["id"])
+        before = (doc.markdown, doc.pii_receipts, doc.updated_at)
+        with patch("apps.journal.document_views._author_owner_document") as author:
+            replay = self.client.post(url, {"op_id": op_id, "content": "Changed", "time": "01:00"}, format="json")
+        author.assert_not_called()
+        self.assertEqual(replay.status_code, 201)
+        self.assertEqual(replay.data, {**first.data, "replayed": True})
+        doc.refresh_from_db()
+        self.assertEqual((doc.markdown, doc.pii_receipts, doc.updated_at), before)
+        self.assertEqual(JournalAppendOp.objects.count(), 1)
+        for retry_body in ({"content": ""}, {"content": None}, {}):
+            with self.subTest(retry_body=retry_body):
+                replay = self.client.post(url, {"op_id": op_id, **retry_body}, format="json")
+                self.assertEqual(replay.status_code, 201)
+                self.assertEqual(replay.data, {**first.data, "replayed": True})
+
+    def test_append_op_replay_after_edit_returns_current_document_and_original_heading(self):
+        op_id = str(uuid4())
+        url = "/api/v1/journal/documents/daily/2026-02-16/append/"
+        first = self.client.post(url, {"op_id": op_id, "content": "Thought", "time": "23:48"}, format="json")
+        edited = self.client.patch(url.removesuffix("append/"), {"markdown": "Edited page"}, format="json")
+        self.assertEqual(edited.status_code, 200)
+        # Even a retry sent to another date resolves the persisted operation.
+        replay = self.client.post(
+            "/api/v1/journal/documents/daily/2026-02-17/append/",
+            {"op_id": op_id, "content": "Different thought"},
+            format="json",
+        )
+        self.assertEqual(replay.status_code, 201)
+        self.assertEqual(replay.data, {**edited.data, "entry_heading": first.data["entry_heading"], "replayed": True})
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, slug="2026-02-17").exists())
+
+    def test_append_op_is_tenant_scoped_and_cascades_on_tenant_deletion(self):
+        url = "/api/v1/journal/documents/daily/2026-02-16/append/"
+        op_id = str(uuid4())
+        first = self.client.post(url, {"op_id": op_id, "content": "Owner thought"}, format="json")
+        other_user = User.objects.create_user(username="append-other", password="pass")
+        other = Tenant.objects.create(user=other_user, status="active")
+        self.client.force_authenticate(other_user)
+        response = self.client.post(url, {"op_id": op_id, "content": "Other thought"}, format="json")
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(response.data["replayed"], False)
+        self.assertNotEqual(response.data["id"], first.data["id"])
+        self.assertNotIn("Owner thought", response.data["markdown"])
+        self.assertEqual(JournalAppendOp.objects.filter(op_id=op_id).count(), 2)
+        other.delete()
+        self.assertEqual(
+            list(JournalAppendOp.objects.filter(op_id=op_id).values_list("tenant_id", flat=True)), [self.tenant.id]
+        )
+
+    def test_append_op_rejects_bad_ids_without_writing(self):
+        for op_id in ("bad", "", None, 123, [], {}, True):
+            with self.subTest(op_id=op_id):
+                response = self.client.post(
+                    "/api/v1/journal/documents/daily/2026-02-16/append/",
+                    {"op_id": op_id, "content": "Thought"},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("op_id", response.data)
+        self.assertFalse(JournalAppendOp.objects.exists())
+        self.assertFalse(Document.objects.filter(tenant=self.tenant).exists())
+
+    def test_append_op_and_append_roll_back_together(self):
+        doc = Document.objects.create(
+            tenant=self.tenant, kind="daily", slug="2026-02-16", title="Day", markdown="Before"
+        )
+        with (
+            patch.object(Document, "save", side_effect=IntegrityError("write failed")),
+            self.assertRaises(IntegrityError),
+        ):
+            self.client.post(
+                "/api/v1/journal/documents/daily/2026-02-16/append/",
+                {"op_id": str(uuid4()), "content": "Thought"},
+                format="json",
+            )
+        doc.refresh_from_db()
+        self.assertEqual(doc.markdown, "Before")
+        self.assertFalse(JournalAppendOp.objects.exists())
+
+    def test_daily_cleanup_expires_only_append_ops_older_than_30_days(self):
+        from apps.tenants.tasks import cleanup_expired_telegram_tokens
+
+        now = timezone.now()
+        old, boundary, recent = [
+            JournalAppendOp.objects.create(
+                tenant=self.tenant, op_id=uuid4(), document_slug="2026-02-16", entry_heading="### 09:45"
+            )
+            for _ in range(3)
+        ]
+        JournalAppendOp.objects.filter(pk=old.pk).update(created_at=now - timedelta(days=30, seconds=1))
+        JournalAppendOp.objects.filter(pk=boundary.pk).update(created_at=now - timedelta(days=30))
+        with patch("apps.tenants.tasks.timezone.now", return_value=now):
+            self.assertEqual(cleanup_expired_telegram_tokens(), "Deleted 0 expired tokens")
+        self.assertEqual(set(JournalAppendOp.objects.values_list("pk", flat=True)), {boundary.pk, recent.pk})
+
+    def test_append_op_force_rls_and_boot_allowlists(self):
+        from apps.tenants.management.commands.disable_rls import RLS_KEEP_ENABLED
+        from apps.tenants.test_public_schema_lockdown import PublicSchemaLockdownRuntimeGuard
+
+        self.assertIn("journal_append_ops", RLS_KEEP_ENABLED)
+        self.assertIn("journal_append_ops", PublicSchemaLockdownRuntimeGuard.ALLOWED_POLICY_TABLES)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'journal_append_ops'"
+            )
+            self.assertEqual(cursor.fetchone(), (True, True))
+
+    def test_append_op_rls_fails_closed_for_other_tenant_and_checks_writes(self):
+        op = JournalAppendOp.objects.create(
+            tenant=self.tenant, op_id=uuid4(), document_slug="2026-02-16", entry_heading="### 09:45"
+        )
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            cursor.execute("SET LOCAL ROLE app_user")
+            try:
+                for tenant_id, service, expected in (
+                    ("", "", []),
+                    (str(uuid4()), "", []),
+                    (str(self.tenant.pk), "", [op.pk]),
+                    ("", "true", [op.pk]),
+                ):
+                    cursor.execute(
+                        "SELECT set_config('app.tenant_id', %s, true), set_config('app.service_role', %s, true)",
+                        [tenant_id, service],
+                    )
+                    cursor.execute("SELECT id FROM journal_append_ops")
+                    self.assertEqual([row[0] for row in cursor.fetchall()], expected)
+                cursor.execute(
+                    "SELECT set_config('app.tenant_id', %s, true), set_config('app.service_role', '', true)",
+                    [str(self.tenant.pk)],
+                )
+                JournalAppendOp.objects.create(
+                    tenant=self.tenant, op_id=uuid4(), document_slug="2026-02-16", entry_heading="### 10:00"
+                )
+                with self.assertRaises(DatabaseError), transaction.atomic():
+                    JournalAppendOp.objects.create(
+                        tenant_id=uuid4(), op_id=uuid4(), document_slug="2026-02-16", entry_heading="### 10:00"
+                    )
+            finally:
+                cursor.execute("RESET ROLE")
+
     def test_post_rejects_nan_daily_slug(self):
         """POST is the create path that historically skipped slug validation.
         A daily slug that isn't a real ISO date (the web UI's 'NaN-NaN-NaN'
@@ -2036,3 +2212,75 @@ class PathValidationDateValidityTest(TestCase):
 
         self.assertIsNone(validate_kind_slug("daily", "2026-02-28"))
         self.assertIsNone(validate_kind_slug("daily", "2024-02-29"))  # leap year
+
+
+class DocumentAppendConcurrencyTest(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username="append-concurrent", password="pass")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        for slug in ("2026-02-16", "2026-02-17"):
+            Document.objects.create(tenant=self.tenant, kind="daily", slug=slug, title=slug, markdown="Before")
+
+    def _race(self, slugs):
+        from .document_views import DocumentAppendView
+
+        barrier = Barrier(2)
+        insert_barrier = Barrier(2)
+        different_documents = len(set(slugs)) > 1
+        unique_conflicts = []
+        op_id = str(uuid4())
+        create = QuerySet.create
+
+        def synchronized_create(queryset, **kwargs):
+            if queryset.model is JournalAppendOp and different_documents:
+                # Both get_or_create lookups saw no receipt. Force real
+                # competing INSERTs so the unique-constraint recovery runs.
+                insert_barrier.wait(timeout=15)
+                try:
+                    return create(queryset, **kwargs)
+                except IntegrityError:
+                    unique_conflicts.append(True)
+                    raise
+            return create(queryset, **kwargs)
+
+        def author(*args, **kwargs):
+            # A real TransactionTestCase proves the external authoring seam
+            # never runs under a transaction, even on the first-send race.
+            self.assertFalse(connection.in_atomic_block)
+            barrier.wait(timeout=15)
+            return SimpleNamespace(text="Thought", receipt={"state": "bypass"})
+
+        def send(slug):
+            try:
+                user = User.objects.get(pk=self.user.pk)
+                request = APIRequestFactory().post(
+                    "/append/", {"op_id": op_id, "content": "Thought", "time": "23:48"}, format="json"
+                )
+                force_authenticate(request, user=user)
+                response = DocumentAppendView.as_view()(request, kind="daily", slug=slug)
+                return response.status_code, dict(response.data)
+            finally:
+                connections.close_all()
+
+        with (
+            patch("apps.journal.document_views._author_owner_document", side_effect=author),
+            patch.object(QuerySet, "create", new=synchronized_create),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            futures = [pool.submit(send, slug) for slug in slugs]
+            responses = [future.result(timeout=30) for future in futures]
+        self.assertEqual([code for code, _ in responses], [201, 201])
+        bodies = [body for _, body in responses]
+        self.assertEqual(sorted(body["replayed"] for body in bodies), [False, True])
+        self.assertEqual(bodies[0]["entry_heading"], bodies[1]["entry_heading"])
+        self.assertEqual(bodies[0]["id"], bodies[1]["id"])
+        self.assertEqual(JournalAppendOp.objects.filter(tenant=self.tenant, op_id=op_id).count(), 1)
+        docs = list(Document.objects.filter(tenant=self.tenant))
+        self.assertEqual(sum(doc.markdown.count("Thought") for doc in docs), 1)
+        self.assertEqual(len(unique_conflicts), int(different_documents))
+
+    def test_simultaneous_append_same_document_uses_row_lock(self):
+        self._race(("2026-02-16", "2026-02-16"))
+
+    def test_simultaneous_append_different_documents_uses_unique_constraint(self):
+        self._race(("2026-02-16", "2026-02-17"))

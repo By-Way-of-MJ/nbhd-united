@@ -235,6 +235,21 @@ class Document(models.Model):
         return f"{self.tenant_id}:{self.kind}:{self.slug}"
 
 
+class JournalAppendOp(models.Model):
+    """Persisted daily-append receipt, scoped to the owner's tenant."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name="journal_append_ops")
+    op_id = models.UUIDField()
+    document_slug = models.CharField(max_length=128)
+    entry_heading = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "journal_append_ops"
+        constraints = [models.UniqueConstraint(fields=["tenant", "op_id"], name="journal_append_op_tenant_op_unique")]
+
+
 class PendingExtraction(models.Model):
     """A goal, task, or lesson extracted from a daily note, awaiting user approval.
 
