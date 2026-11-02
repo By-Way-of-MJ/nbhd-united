@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from unittest.mock import call, patch
 
+from django.core.cache import cache
 from django.db import OperationalError
 from django.db.models import QuerySet
 from django.test import TestCase, override_settings
@@ -20,6 +21,8 @@ from apps.cron.gateway_client import GatewayError
 from apps.orchestrator.hibernation import (
     _capture_tenant_cron_schedules,
     _cron_active_or_imminent,
+    _wake_in_progress_key,
+    is_wake_in_progress,
     wake_hibernated_tenant,
 )
 from apps.orchestrator.tool_policy import OPENCLAW_CURRENT_VERSION, openclaw_version_for_image_tag
@@ -182,6 +185,39 @@ class WakeHibernatedTenantImageRefreshTest(TestCase):
 
         self.assertTrue(wake_hibernated_tenant(self.tenant, cron_wake=True))
         self.assertEqual(mock_wake.call_count, 2)
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_claimant_marks_wake_in_progress_before_azure(self, _mock_mount, mock_wake, _mock_publish):
+        key = _wake_in_progress_key(self.tenant.pk)
+        self.addCleanup(cache.delete, key)
+        cache.delete(key)
+        marked_during_azure = []
+
+        def record_mark(_container_id):
+            marked_during_azure.append(is_wake_in_progress(self.tenant.pk))
+
+        mock_wake.side_effect = record_mark
+
+        self.assertTrue(wake_hibernated_tenant(self.tenant))
+
+        self.assertEqual(marked_during_azure, [True])
+
+    @override_settings(OPENCLAW_IMAGE_TAG="latest")
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.wake_container_app")
+    @patch("apps.orchestrator.azure_client.ensure_plugin_runtime_deps_mount", return_value=False)
+    def test_failed_wake_clears_wake_in_progress(self, _mock_mount, mock_wake, _mock_publish):
+        key = _wake_in_progress_key(self.tenant.pk)
+        self.addCleanup(cache.delete, key)
+        cache.delete(key)
+        mock_wake.side_effect = RuntimeError("simulated Azure failure")
+
+        self.assertFalse(wake_hibernated_tenant(self.tenant))
+
+        self.assertFalse(is_wake_in_progress(self.tenant.pk))
 
     @override_settings(OPENCLAW_IMAGE_TAG="latest")
     @patch("apps.cron.publish.publish_task")

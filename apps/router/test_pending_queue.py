@@ -2084,15 +2084,16 @@ class WakeInProgressTest(TestCase):
     pre-warm started it) must show "waking" even though the drain's POST does
     not fail — it just blocks until the container boots."""
 
-    def setUp(self):
+    def _ios_batch(self):
         from django.core.cache import cache
 
-        cache.clear()
-        self.addCleanup(cache.clear)
+        from apps.orchestrator.hibernation import _wake_in_progress_key
 
-    def _ios_batch(self):
         user = _make_user()
         tenant = _make_tenant(user)
+        key = _wake_in_progress_key(tenant.id)
+        self.addCleanup(cache.delete, key)
+        cache.delete(key)
         thread = ChatThread.objects.create(tenant=tenant, user=user, title="", is_main=True)
         turn = AppChatMessage.objects.create(
             tenant=tenant,

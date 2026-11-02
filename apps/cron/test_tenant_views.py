@@ -1812,9 +1812,15 @@ class RuntimeContainerStartedTest(TestCase):
     def test_hook_clears_wake_in_progress_signal(self):
         from django.core.cache import cache
 
-        from apps.orchestrator.hibernation import is_wake_in_progress, mark_wake_in_progress
+        from apps.orchestrator.hibernation import (
+            _wake_in_progress_key,
+            is_wake_in_progress,
+            mark_wake_in_progress,
+        )
 
-        self.addCleanup(cache.clear)
+        key = _wake_in_progress_key(self.tenant.id)
+        self.addCleanup(cache.delete, key)
+        cache.delete(key)
         mark_wake_in_progress(self.tenant.id)
         self.assertTrue(is_wake_in_progress(self.tenant.id))
 
@@ -1822,6 +1828,57 @@ class RuntimeContainerStartedTest(TestCase):
 
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(is_wake_in_progress(self.tenant.id))
+
+    def test_hook_clears_waking_at_on_pending_turns_only(self):
+        from django.utils import timezone
+
+        from apps.router.models import AppChatMessage, ChatThread
+
+        thread = ChatThread.objects.create(tenant=self.tenant, user=self.user, title="", is_main=True)
+        pending = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=thread,
+            client_msg_id="wake-pending",
+            user_text="are you there?",
+        )
+        ready = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=thread,
+            client_msg_id="wake-ready",
+            user_text="already answered",
+            status=AppChatMessage.Status.READY,
+        )
+
+        other_user = User.objects.create_user(username="cronother", password="testpass123")
+        other_tenant = Tenant.objects.create(
+            user=other_user,
+            status=Tenant.Status.ACTIVE,
+            container_id="oc-other",
+            container_fqdn="oc-other.internal.azurecontainerapps.io",
+        )
+        other_thread = ChatThread.objects.create(tenant=other_tenant, user=other_user, title="", is_main=True)
+        other_pending = AppChatMessage.objects.create(
+            tenant=other_tenant,
+            user=other_user,
+            thread=other_thread,
+            client_msg_id="wake-other-pending",
+            user_text="other tenant",
+        )
+
+        stamp = timezone.now()
+        AppChatMessage.objects.filter(pk__in=[pending.pk, ready.pk, other_pending.pk]).update(waking_at=stamp)
+
+        resp = self._boot()
+
+        self.assertEqual(resp.status_code, 200)
+        pending.refresh_from_db()
+        ready.refresh_from_db()
+        other_pending.refresh_from_db()
+        self.assertIsNone(pending.waking_at)
+        self.assertEqual(ready.waking_at, stamp)
+        self.assertEqual(other_pending.waking_at, stamp)
 
     @patch("apps.orchestrator.cron_reconcile.regenerate_tenant_crons")
     def test_hook_skipped_when_flag_off(self, mock_regen):
