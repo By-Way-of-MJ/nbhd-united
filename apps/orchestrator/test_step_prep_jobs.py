@@ -5,12 +5,15 @@ import os
 import subprocess
 from pathlib import Path
 from unittest import skipUnless
+from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
 from apps.cron.models import CronCreationPath, CronJob, CronPattern
 from apps.cron.services import create_typed_cron
 from apps.cron.share_cron_sync import build_signed_crons_doc
+from apps.cron.system_dispatch import STEP_PREP_NOW_PREFIX
+from apps.friends.project_prep_scheduling import _schedule
 from apps.friends.test_pr6 import _tenant
 from apps.orchestrator.config_generator import HEARTBEAT_MODEL, build_cron_seed_jobs
 from apps.orchestrator.services import refresh_system_cron_rows_from_seed
@@ -111,13 +114,24 @@ class StepPrepJobTests(TestCase):
             name="Typed reminder control",
             schedule={"kind": "cron", "expr": "0 10 * * *", "tz": "UTC"},
         )
+        with (
+            patch("apps.friends.project_prep_scheduling.check_budget", return_value=""),
+            patch("apps.friends.project_prep_scheduling._push_at_cron_immediately"),
+        ):
+            _schedule(self.tenant.pk)
+        one_shot = CronJob.objects.get(tenant=self.tenant, name__startswith=STEP_PREP_NOW_PREFIX)
         self.tenant.internal_api_key = "test-signing-key"
         body, _ = build_signed_crons_doc(self.tenant)
         rendered = {job["name"]: job for job in json.loads(json.loads(body)["signed"])}
-        for name, seed in {**self.jobs(), "Typed reminder control": control.data}.items():
+        for name, seed in {**self.jobs(), "Typed reminder control": control.data, one_shot.name: one_shot.data}.items():
             row = CronJob.objects.get(tenant=self.tenant, name=name)
             self.assertEqual(
-                row.creation_path, CronCreationPath.TYPED if row.pk == control.pk else CronCreationPath.LEGACY
+                row.creation_path,
+                CronCreationPath.INTERNAL
+                if row.pk == one_shot.pk
+                else CronCreationPath.TYPED
+                if row.pk == control.pk
+                else CronCreationPath.LEGACY,
             )
             self.assertEqual(rendered[name]["payload"]["toolsAllow"], seed["payload"]["toolsAllow"])
         self.assertEqual(rendered["Step Prep"]["payload"]["model"], HEARTBEAT_MODEL)

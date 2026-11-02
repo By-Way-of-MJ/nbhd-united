@@ -18,6 +18,8 @@ import threading
 from django.conf import settings
 from django.db import transaction
 
+from apps.router.chat_gates import _tenant_allowed
+
 logger = logging.getLogger(__name__)
 
 TITLE_CAP = 60
@@ -30,6 +32,14 @@ _DIRECT_ROUTE_TYPES = {
     "step_due",
     "milestone_reached",
     "step_note",
+}
+_ATTENTION_PUSH_TYPES = {
+    "prep_result",
+    "project_invite",
+    "step_ask",
+    "step_unblocked",
+    "step_needs_look",
+    "step_question",
 }
 
 
@@ -45,7 +55,9 @@ def _name(tenant_id) -> str:
     return profile.display_name if profile and profile.display_name else "A neighbor"
 
 
-def _deliver(memberships, *, ptype: str, body: str, mission_id, step_id=None, actor_tenant_id=None) -> int:
+def _deliver(
+    memberships, *, ptype: str, body: str, mission_id, step_id=None, actor_tenant_id=None, answer=None, collapse_id=None
+) -> int:
     """Synchronous core (tests call it directly). Returns how many users were pushed."""
     from apps.common.apns import apns_configured
 
@@ -56,6 +68,9 @@ def _deliver(memberships, *, ptype: str, body: str, mission_id, step_id=None, ac
     from . import access
 
     blocked = access.blocked_counterpart_ids(actor_tenant_id) if actor_tenant_id else set()
+    needs_attention = ptype in _ATTENTION_PUSH_TYPES or (
+        ptype == "step_answer" and answer in {"dates", "smaller", "no", "other"}
+    )
     sent = 0
     # App builds route a tap by ``type`` and send an unknown one to Chat. Kinds added
     # outside the direct routing set ride a type every build already opens the
@@ -70,11 +85,13 @@ def _deliver(memberships, *, ptype: str, body: str, mission_id, step_id=None, ac
         if membership.muted or membership.tenant_id == actor_tenant_id or membership.tenant_id in blocked:
             continue
         try:
+            if not needs_attention and _tenant_allowed(membership.tenant, "PROJECT_QUIET_PUSH_TENANT_IDS"):
+                continue
             _push_to_user_devices(
                 membership.user,
                 body=body,
                 thread_id=None,
-                collapse_id=f"{ptype}-{step_id or mission_id}"[:64],
+                collapse_id=(collapse_id or f"{ptype}-{step_id or mission_id}")[:64],
                 content_available=True,
                 extra=extra,
             )
@@ -120,6 +137,30 @@ def _members(goal, *, ids=None, statuses=("active",)):
 
 
 # ── Events ───────────────────────────────────────────────────────────────────
+
+
+def notify_prep_result(prep) -> None:
+    """Only the requesting holder hears a research result; never private content."""
+    membership_id = prep.membership_id
+    step = prep.step
+    goal = step.shared_goal
+    body = {
+        "ready": "The prep for {step} is ready.",
+        "needs_choice": "Your assistant has a question about {step}.",
+        "stuck": "Your assistant is stuck on {step}.",
+    }[prep.status].format(step=_short(step.title))
+
+    def fn():
+        _deliver(
+            _members(goal, ids=[membership_id]),
+            ptype="prep_result",
+            body=body,
+            mission_id=goal.id,
+            step_id=step.id,
+            collapse_id=f"prep_result-{prep.id}",
+        )
+
+    _dispatch(fn)
 
 
 def notify_project_invite(goal, actor_tenant, *, membership_ids=None) -> None:
@@ -201,7 +242,8 @@ def notify_step_answer(goal, step, answer: str, responder_tenant, asker_tenant_i
         asker = (
             access.mission_memberships()
             .filter(shared_goal=goal, tenant_id=asker_tenant_id, status="active")
-            .select_related("user")
+            .select_related("user", "tenant")
+            .defer("tenant__cron_jobs_snapshot", "tenant__openclaw_migration")
         )
         body = f"{_name(responder_tenant.id)} " + _ANSWER_TEXT.get(answer, "answered about “{title}”").format(
             title=_short(title)
@@ -213,6 +255,7 @@ def notify_step_answer(goal, step, answer: str, responder_tenant, asker_tenant_i
             mission_id=goal.id,
             step_id=step.id,
             actor_tenant_id=responder_tenant.id,
+            answer=answer,
         )
 
     _dispatch(fn)

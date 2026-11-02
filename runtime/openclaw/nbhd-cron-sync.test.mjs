@@ -10,6 +10,7 @@ import { writeFile, mkdtemp, rm, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const KEY = "test-internal-key-abc123";
 const dir = await mkdtemp(path.join(tmpdir(), "nbhd-cron-sync-"));
@@ -348,6 +349,59 @@ test("reconcileOnce: future one-shot absent from current is added", async t => {
   assert.equal(calls[1][calls[1].indexOf("--at") + 1], at);
 });
 
+test("reconcileOnce: keep active or queued work, remove settled and unrelated stale jobs", async t => {
+  const now = Date.parse("2026-09-20T12:00:00Z");
+  t.mock.method(Date, "now", () => now);
+  const twoHours = 2 * 60 * 60 * 1000;
+  const cases = [
+    ["running one-shot", { runningAtMs: now - 1000 }, -1000, false],
+    ["running after earlier run", { runningAtMs: 0, lastRunAtMs: now - 5000 }, -twoHours - 1, false],
+    ["queued", {}, -1000, false],
+    ["queued just inside grace", { lastRunAtMs: null }, -twoHours + 1, false],
+    ["successful spent", { lastRunAtMs: now - 500, lastRunStatus: "ok" }, -1000, true],
+    ["failed spent", { lastRunAtMs: now - 500, lastRunStatus: "error" }, -1000, true],
+    ["spent with zero timestamp", { lastRunAtMs: 0 }, -1000, true],
+    ["never ran at two hours", {}, -twoHours, true],
+    ["never ran over two hours", {}, -twoHours - 1, true],
+    ["future unwanted", {}, 60000, true],
+    ["invalid fire", {}, null, true],
+  ];
+  for (const [name, state, offset, remove] of cases) {
+    const job = { ...typedJob(), id: "runtime-id", state,
+      schedule: { kind: "at", at: offset === null ? "invalid" : new Date(now + offset).toISOString() } };
+    // Cover both an unchanged stale signed file and a declaration already
+    // retired by Django. Neither may re-add a kept expired one-shot.
+    for (const desired of [[], offset !== null && offset <= 0 ? [job] : []]) {
+      await writeFile(CRONS_FILE, signDoc(desired));
+      const calls = [];
+      const run = async args => {
+        calls.push(args);
+        return JSON.stringify({ jobs: [job] });
+      };
+      for (let poll = 0; poll < 2; poll++) {
+        const result = await reconcileOnce({ run });
+        assert.equal(result.applied, 0, name);
+        assert.equal(result.removed, Number(remove), name);
+      }
+      assert.deepEqual(calls, Array.from({ length: 2 }, () => [
+        ["cron", "list", "--json"], ...(remove ? [["cron", "rm", job.id]] : []),
+      ]).flat(), name);
+    }
+  }
+  await writeFile(CRONS_FILE, signDoc([]));
+  const calls = [];
+  await reconcileOnce({ run: async args => {
+    calls.push(args);
+    return JSON.stringify({ jobs: [
+      { ...typedJob(), id: "running-recurring", state: { runningAtMs: now - twoHours - 1 } },
+      { ...typedJob(), id: "stale-recurring", state: { lastRunAtMs: now - 1000 } },
+      { id: "legacy-stale", declarationKey: "nbhd:legacy" },
+      { id: "operator", declarationKey: "operator:keep" },
+    ] });
+  } });
+  assert.deepEqual(calls, [["cron", "list", "--json"], ["cron", "rm", "stale-recurring"], ["cron", "rm", "legacy-stale"]]);
+});
+
 test("reconcileOnce: signature and kind controls hold; removals stay in nbhd namespace", async () => {
   const unsafe = typedJob();
   unsafe.payload.command = "evil";
@@ -405,6 +459,22 @@ test("pinned 9.4 source registers each emitted flag; negative light context is e
   assert.ok(source.includes('.option("--no-light-context", "Disable lightweight bootstrap context for agent jobs")'));
   assert.ok(source.includes("lightContext: opts.lightContext === true ? true : void 0"));
   assert.ok(source.includes("thinking: normalizeOptionalString(opts.thinking)"));
+
+  // cron list --json requests the full read view (not compact). Its public
+  // projection strips queuedAtMs but preserves the state/schedule we need.
+  const handler = await readFile(path.join(_pinnedRoot, "dist/cron-BVhE33Jg.mjs"), "utf8");
+  assert.ok(handler.includes("p.compact === true ? compactCronListJob(job) : cronJobReadView(job)"));
+  const readView = await readFile(path.join(_pinnedRoot, "dist/job-read-view-BGi7H4yU.mjs"), "utf8");
+  assert.ok(readView.includes("...toPublicCronJob(job)"));
+  const { t: toPublicCronJob } = await import(pathToFileURL(path.join(_pinnedRoot, "dist/public-job-BE-yz-XX.mjs")));
+  const row = { ...typedJob(), state: { runningAtMs: 123, lastRunAtMs: 100, queuedAtMs: 99 } };
+  const projected = toPublicCronJob(row);
+  assert.deepEqual(projected.schedule, row.schedule);
+  assert.deepEqual(projected.state, { runningAtMs: 123, lastRunAtMs: 100 });
+  assert.ok(source.includes('printCronJson(enrichCronJsonWithStatus(res))'));
+  assert.ok(source.includes('Object.assign({}, job, { status })'));
+  const pager = await readFile(path.join(_pinnedRoot, "dist/list-jobs-CAA__iJI.mjs"), "utf8");
+  assert.ok(pager.includes("jobs.push(...page.jobs)"));
 });
 
 test("stateRow: keeps timing metadata, drops the payload", () => {

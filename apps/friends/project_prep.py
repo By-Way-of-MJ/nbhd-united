@@ -15,6 +15,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from . import access
 from .models import StepPrep
 from .project_hygiene import UNTRUSTED_RULE, fence
+from .project_prep_scheduling import run_soon
 from .project_services import _row
 
 
@@ -105,6 +106,7 @@ def runtime_next(tenant, data, *, update=False):
             "id": str(prep.id),
             "version": _iso(prep.updated_at),
             "cursor": _iso(cursor),
+            "research": not update,
         }
         job = {
             "id": str(prep.id),
@@ -187,6 +189,7 @@ def runtime_report(tenant, data):
         raise ValidationError("The note cursor was not returned by next. Call next again.")
     if spec.status == "ready" and not prep.doc_slug:
         raise ValidationError("Save the page before reporting ready.")
+    notify = snapshot.get("research") is True and (prep.status != spec.status or prep.last_run_at is None)
     access.update_step_prep(
         tenant,
         prep,
@@ -196,6 +199,10 @@ def runtime_report(tenant, data):
         last_run_at=timezone.now(),
         last_seen_note_at=spec.last_seen_note_at,
     )
+    if notify:
+        from .project_notifications import notify_prep_result
+
+        notify_prep_result(prep)
     return {"id": str(prep.id), "status": prep.status, "doc_slug": prep.doc_slug}
 
 
@@ -236,9 +243,11 @@ def start(tenant, user, mission_id, step_id):
         "due_date": step.due_date.isoformat() if step.due_date else None,
     }
     if prep is None:
-        return access.create_step_prep(tenant, member, step, brief)
+        prep = access.create_step_prep(tenant, member, step, brief)
+        run_soon(tenant)
+        return prep
     prep.step = step
-    return access.update_step_prep(
+    prep = access.update_step_prep(
         tenant,
         prep,
         brief=brief,
@@ -250,6 +259,8 @@ def start(tenant, user, mission_id, step_id):
         last_seen_note_at=None,
         last_run_at=None,
     )
+    run_soon(tenant)
+    return prep
 
 
 def _mine(tenant, mission_id, step_id):
@@ -282,7 +293,7 @@ def choose(tenant, mission_id, step_id, choice):
     offered = [rehydrate_for_tenant(tenant, value) for value in prep.choices]
     if not isinstance(choice, str) or len(choice) > 120 or choice not in offered:
         raise ValidationError("Choose one of the offered choices.")
-    return access.update_step_prep(
+    prep = access.update_step_prep(
         tenant,
         prep,
         answer=prep.choices[offered.index(choice)],
@@ -291,6 +302,8 @@ def choose(tenant, mission_id, step_id, choice):
         status=StepPrep.Status.WORKING,
         last_seen_note_at=None,
     )
+    run_soon(tenant)
+    return prep
 
 
 def list_mine(tenant):

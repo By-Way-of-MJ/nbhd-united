@@ -102,6 +102,12 @@ On 2026-10-16, the boot fixture's writer source pin was refreshed for the option
 `payload.thinking` → `--thinking` mapping. Neither captured declaration sets
 `thinking`; both produce identical CLI arguments with the parent and updated
 writer. The recorded boot observations were retained, not re-captured.
+On 2026-11-03, the boot fixture's writer source pin was refreshed for the
+active/queued-job removal guard. Both captured declarations remain desired
+(the one-shot fires in 2027), so neither enters the changed removal branch;
+their CLI arguments and installation behavior are unchanged. The recorded
+boot observations were retained, not re-captured. The offline regression
+probe is `apps/orchestrator/at-cancel-repro.mjs`.
 The older `runtime-metadata.json` and `round_six/runtime-metadata.json` source
 and `writerHash` values describe their original image captures, not current-file
 parity pins, and remain unchanged.

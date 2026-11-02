@@ -2149,7 +2149,8 @@ _STEP_PREP_PROMPT = (
     "Search only public facts needed for that brief, never shared notes or private context. "
     "Do one bounded piece of homework. Say what you could not find; never guess. "
     "Mark every web fact with its source. Save the result with nbhd_step_prep_save: "
-    "job.id, job.run_token and body. This is the person's private prep page. "
+    "Set id to the exact UUID in the returned job.id (outside job.brief), never a step, mission or page id. "
+    "Set run_token to job.run_token unchanged, and body to your result. This is the person's private prep page. "
     "Report with nbhd_step_prep_report: job.id, ready or stuck, or needs_choice with at most "
     "one clear question (max 300 characters) and two or three short choices (max 40 each). "
     "If stuck, pass one short plain sentence in question saying what is missing (max 300 characters), with no choices. "
@@ -2171,6 +2172,24 @@ _STEP_PREP_UPDATE_PROMPT = (
     "Pass job.run_token and job.last_seen_note_at unchanged. Explain blockers on the page. "
     "Never send, book, change a project, create tasks, schedule anything or write memory."
 )
+
+
+def step_prep_job(*, update=False) -> dict:
+    """One tool wall and prompt for both daily and person-requested prep runs."""
+    name = "Step Prep Update" if update else "Step Prep"
+    return {
+        "name": name,
+        "sessionTarget": "isolated",
+        "model": HEARTBEAT_MODEL,
+        "payload": {
+            "kind": "agentTurn",
+            "message": _STEP_PREP_UPDATE_PROMPT if update else _STEP_PREP_PROMPT,
+            "toolsAllow": list(STEP_PREP_TOOLS[name]),
+            "lightContext": True,
+        },
+        "delivery": {"mode": "none"},
+        "enabled": True,
+    }
 
 
 def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
@@ -2323,26 +2342,10 @@ def build_cron_seed_jobs(tenant: Tenant) -> list[dict]:
     # tool wall. No shared preamble: it asks for unrelated journal/mission reads.
     if _tenant_allowed(tenant, "STEP_PREP_TENANT_IDS"):
         checkin_hour = (tenant.heartbeat_start_hour + tenant.heartbeat_window_hours // 2) % 24
-        for offset, name, prompt in (
-            (1, "Step Prep", _STEP_PREP_PROMPT),
-            (2, "Step Prep Update", _STEP_PREP_UPDATE_PROMPT),
-        ):
-            jobs.append(
-                {
-                    "name": name,
-                    "schedule": {"kind": "cron", "expr": f"0 {(checkin_hour + offset) % 24} * * *", "tz": user_tz},
-                    "sessionTarget": "isolated",
-                    "model": HEARTBEAT_MODEL,
-                    "payload": {
-                        "kind": "agentTurn",
-                        "message": prompt,
-                        "toolsAllow": list(STEP_PREP_TOOLS[name]),
-                        "lightContext": True,
-                    },
-                    "delivery": {"mode": "none"},
-                    "enabled": True,
-                }
-            )
+        for offset, update in ((1, False), (2, True)):
+            job = step_prep_job(update=update)
+            job["schedule"] = {"kind": "cron", "expr": f"0 {(checkin_hour + offset) % 24} * * *", "tz": user_tz}
+            jobs.append(job)
 
     # Opt-in tenants choose their own scheduled messages, so none of the
     # generic user-facing ones are seeded (and the reaper never re-creates

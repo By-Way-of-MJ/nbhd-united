@@ -277,6 +277,14 @@ export async function reconcileOnce({ run = oc } = {}) {
   let removed = 0;
   for (const row of current) {
     if (!desiredKeys.has(row.declarationKey)) {
+      // Operator removal aborts active runs in 9.4. A just-fired one-shot may
+      // also be queued before runningAtMs is set. Retain it until settlement,
+      // or for at most two hours if it never starts; never re-add a past fire.
+      if (Number.isFinite(row.state?.runningAtMs)) continue;
+      const fire = atFireMs(row.schedule);
+      const age = fire === null ? null : Date.now() - fire;
+      if (row.schedule?.kind === "at" && !Number.isFinite(row.state?.lastRunAtMs)
+          && age !== null && age >= 0 && age < 2 * 60 * 60 * 1000) continue;
       try { await run(["cron", "rm", row.id]); removed++; }
       catch (e) { warn("cron rm failed for", row.id, "-", e && e.message); }
     }

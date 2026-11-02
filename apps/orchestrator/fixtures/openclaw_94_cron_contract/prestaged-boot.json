@@ -5,7 +5,7 @@
   "imageId": "sha256:2f82b167ceaae431a2fee052168c92904584fc3dfcdf30ecbc969855ba1ae18e",
   "sources": {
     "runtime/openclaw/entrypoint.sh": "473589de68944e14f9b0e0f75ccbc66acfbae72e7d83f85b7ed8fba265c1504b",
-    "runtime/openclaw/nbhd-cron-sync.mjs": "b26fe0e1bb1a8ece613adae40e966583c2bd8b16766d6c5e8d8344c9eda09b30"
+    "runtime/openclaw/nbhd-cron-sync.mjs": "a68d79e1f2ae5bc3a3aadac6fe74d5b85350cd329d02b345bde0f1b360e19236"
   },
   "isolation": "network none; no ports/mounts; synthetic token; cron firing/plugins disabled",
   "entrypoint": [

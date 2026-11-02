@@ -20,6 +20,7 @@ from rest_framework import status
 
 from .models import CronJob, CronJobSource
 from .schedule_validation import ScheduleValidationError, validate_schedule
+from .system_dispatch import STEP_PREP_NOW_PREFIX, _is_system_dispatch
 
 if TYPE_CHECKING:
     from apps.tenants.models import Tenant
@@ -400,6 +401,8 @@ def upsert_from_gateway_jobs(
             managed = source != CronJobSource.AGENT
 
             row = existing.get(name)
+            if row is not None and _is_system_dispatch(row):
+                continue
             if row is None:
                 CronJob.objects.create(
                     tenant=tenant,
@@ -423,7 +426,13 @@ def upsert_from_gateway_jobs(
         stale_names = set(existing) - desired_names
         removed = 0
         if stale_names and delete_missing:
-            removed = CronJob.objects.filter(tenant=tenant, name__in=stale_names).count()
-            CronJob.objects.filter(tenant=tenant, name__in=stale_names).delete()
+            removed = (
+                CronJob.objects.filter(tenant=tenant, name__in=stale_names)
+                .exclude(source="system", creation_path="internal", name__startswith=STEP_PREP_NOW_PREFIX)
+                .count()
+            )
+            CronJob.objects.filter(tenant=tenant, name__in=stale_names).exclude(
+                source="system", creation_path="internal", name__startswith=STEP_PREP_NOW_PREFIX
+            ).delete()
 
     return {"upserted": upserted, "removed": removed}
