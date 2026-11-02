@@ -68,6 +68,77 @@ class StepPrepRuntimeTests(TestCase):
     def save(self, job, body="A private preparation", tenant=None, **extra):
         return self.runtime("save", {"id": job["id"], "run_token": job["run_token"], "body": body, **extra}, tenant)
 
+    @override_settings(PROJECT_QUIET_PUSH_TENANT_IDS="*")
+    def test_research_results_push_only_holder_once_with_step_route_and_private_body(self):
+        from apps.friends.project_notifications import _short
+
+        titles = {
+            "ready": "The prep for {step} is ready.",
+            "needs_choice": "Your assistant has a question about {step}.",
+            "stuck": "Your assistant is stuck on {step}.",
+        }
+        self.step.title = "A very long step title " * 5
+        self.step.save(update_fields=["title"])
+        for status, template in titles.items():
+            with self.subTest(status=status):
+                if status != "ready":
+                    project_prep.stop(self.holder, self.goal.id, self.step.id)
+                    project_prep.start(self.holder, self.holder.user, self.goal.id, self.step.id)
+                job = self.next().json()["job"]
+                self.assertEqual(self.save(job, "PRIVATE_PAGE_MARKER").status_code, 200)
+                extra = (
+                    {"question": "PRIVATE_QUESTION_MARKER", "choices": ["A", "B"]} if status == "needs_choice" else {}
+                )
+                with (
+                    patch("apps.common.apns.apns_configured", return_value=True),
+                    patch("apps.router.push_views._push_to_user_devices") as push,
+                ):
+                    with self.captureOnCommitCallbacks(execute=True):
+                        response = self.report(job, status=status, **extra)
+                        push.assert_not_called()
+                    self.assertEqual(response.status_code, 200, response.content)
+                    push.assert_called_once_with(
+                        self.holder.user,
+                        body=template.format(step=_short(self.step.title)),
+                        thread_id=None,
+                        collapse_id=f"prep_result-{job['id']}",
+                        content_available=True,
+                        extra={
+                            "type": "step_answer",
+                            "kind": "prep_result",
+                            "mission_id": str(self.goal.id),
+                            "step_id": str(self.step.id),
+                        },
+                    )
+                    with self.captureOnCommitCallbacks(execute=True):
+                        retry = self.report(job, status=status, **extra)
+                    self.assertEqual(retry.status_code, 400)  # stale run version, no duplicate
+                    push.assert_called_once()
+
+    def test_update_result_token_cannot_trigger_push_even_if_status_changes(self):
+        from django.core import signing
+
+        self.prepared()
+        self.note()
+        job = self.next("update").json()["job"]
+        self.assertIs(signing.loads(job["run_token"], salt="step-prep-run")["research"], False)
+        with patch("apps.friends.project_notifications._deliver") as deliver:
+            with self.captureOnCommitCallbacks(execute=True):
+                response = self.report(job, status="needs_choice", question="PRIVATE", choices=["A", "B"])
+            self.assertEqual(response.status_code, 200, response.content)
+        deliver.assert_not_called()
+
+    def test_failed_result_push_does_not_fail_report(self):
+        job = self.next().json()["job"]
+        self.assertEqual(self.save(job).status_code, 200)
+        with (
+            patch("apps.friends.project_notifications._deliver", side_effect=RuntimeError("APNs unavailable")),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            response = self.report(job)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.row().status, "ready")
+
     def test_ready_without_saved_page_is_refused(self):
         job = self.next().json()["job"]
         response = self.report(job)

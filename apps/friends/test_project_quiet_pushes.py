@@ -8,7 +8,7 @@ from django.test import SimpleTestCase, override_settings
 
 from . import project_notifications as pushes
 
-# All 14 ptypes emitted by project_notifications, including member_left's two
+# All emitted ptypes emitted by project_notifications, including member_left's two
 # branches and the two cron nudges. step_answer has an additional answer gate.
 ATTENTION_KINDS = (
     "project_invite",
@@ -16,6 +16,7 @@ ATTENTION_KINDS = (
     "step_unblocked",
     "step_needs_look",
     "step_question",
+    "prep_result",
 )
 QUIET_KINDS = (
     "step_note",

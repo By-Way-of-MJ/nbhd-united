@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from .gateway_client import GatewayError
 from .models import CronJob
+from .system_dispatch import STEP_PREP_NOW_PREFIX, _is_system_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ def upsert_jobs_to_cache(tenant, jobs: list[dict[str, Any]]) -> None:
         for name, job in by_name.items():
             gateway_job_id = str(job.get("id") or job.get("jobId") or "")[:64]
             row = existing.get(name)
+            if row is not None and _is_system_dispatch(row):
+                continue
             if row is None:
                 CronJob.objects.create(
                     tenant=tenant,
@@ -98,7 +101,9 @@ def upsert_jobs_to_cache(tenant, jobs: list[dict[str, Any]]) -> None:
 
         stale_names = set(existing) - desired_names
         if stale_names:
-            CronJob.objects.filter(tenant=tenant, name__in=stale_names).delete()
+            CronJob.objects.filter(tenant=tenant, name__in=stale_names).exclude(
+                source="system", creation_path="internal", name__startswith=STEP_PREP_NOW_PREFIX
+            ).delete()
 
 
 def read_jobs_from_cache(tenant) -> list[dict[str, Any]]:
