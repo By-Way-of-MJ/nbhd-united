@@ -263,6 +263,10 @@ TASK_MAP = {
     # Async LLM cluster-naming pass (enqueued by refresh_constellation after the
     # deterministic label pass; cached + capped, deterministic labels on failure)
     "name_clusters": "apps.lessons.tasks.name_clusters_task",
+    # Post-save embedding + recluster for assistant-captured lessons (enqueued on
+    # commit by RuntimeLessonCreateView so the tool reply doesn't block on the
+    # embedding HTTP call or pairwise clustering).
+    "process_lesson_after_save": "apps.lessons.tasks.process_lesson_after_save",
     "reseed_lessons": "apps.lessons.tasks.reseed_lessons_task",
     "reseed_lessons_single_tenant": "apps.lessons.tasks.reseed_lessons_single_tenant_task",
     # Neighborhood: fail-closed share scrub (async, never inline in a request)
