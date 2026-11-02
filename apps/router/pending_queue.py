@@ -1695,6 +1695,8 @@ def drain_pending_messages_for_tenant_task(
         from apps.router.side_lane import claim_chat_batch
 
         batch, info = claim_chat_batch(tenant, channel_user_id or "", chat_timeout)
+        if batch and batch[0].lane == PendingMessage.Lane.SIDE:
+            batch[0]._side_claimed_at = timezone.now()
     else:
         batch, info = _claim_pending_batch_for_key(tenant, channel, channel_user_id or "", chat_timeout)
 
@@ -3013,47 +3015,57 @@ def _drain_ios_batch(
             # never persisted to user_text, queue payloads, or the app feed.
             content += "\n" + BACKGROUND_ROUTING_NOTE
 
+    from apps.router.job_changes import concurrent_checks
     from apps.router.side_lane import frame_chat_content
 
-    content, user_param = frame_chat_content(tenant, batch, content, user_param)
-
-    # Server instructions enter after every PII pass, including side context.
-    # Prepending preserves the taint guard's last-line confirmation/label check.
-    from apps.router.reply_shape import frame_reply_shape
-
-    content = frame_reply_shape(tenant, content)
-
-    url = f"{gateway_base_url(tenant)}/v1/chat/completions"
-    from apps.cron.gateway_client import get_gateway_token_for_tenant
-
-    gateway_token = get_gateway_token_for_tenant(tenant)
-
-    chat_payload = {
-        # See ``_drain_line_batch`` for why this stays the ``openclaw``
-        # sentinel rather than a resolved tenant primary.
-        "model": "openclaw",
-        "messages": [{"role": "user", "content": content}],
-        "user": user_param,
-    }
-    headers = {
-        "Authorization": f"Bearer {gateway_token}",
-        "X-User-Timezone": user_tz,
-        "X-Channel": "ios",
-        "X-OpenClaw-Message-Channel": "ios",
-    }
-
-    if getattr(batch[0], "lease_token", None):
-        headers["X-NBHD-Chat-Request-Id"] = str(batch[0].batch_id)
-
-    post_started = time.monotonic()
+    post_started = None
     try:
-        resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)
+        with concurrent_checks() as check:
+            frame_started = time.monotonic()
+            if getattr(batch[0], "lane", "main") == "side":
+                batch[0]._side_timings = {"task_started": task_started}
+            content, user_param = frame_chat_content(tenant, batch, content, user_param, check=check)
+            if hasattr(batch[0], "_side_timings"):
+                batch[0]._side_timings["framing_ms"] = int((time.monotonic() - frame_started) * 1000)
+
+            # Server instructions enter after every PII pass, including side context.
+            # Prepending preserves the taint guard's last-line confirmation/label check.
+            from apps.router.reply_shape import frame_reply_shape
+
+            content = frame_reply_shape(tenant, content)
+
+            url = f"{gateway_base_url(tenant)}/v1/chat/completions"
+            from apps.cron.gateway_client import get_gateway_token_for_tenant
+
+            gateway_token = get_gateway_token_for_tenant(tenant)
+
+            chat_payload = {
+                # See ``_drain_line_batch`` for why this stays the ``openclaw``
+                # sentinel rather than a resolved tenant primary.
+                "model": "openclaw",
+                "messages": [{"role": "user", "content": content}],
+                "user": user_param,
+            }
+            headers = {
+                "Authorization": f"Bearer {gateway_token}",
+                "X-User-Timezone": user_tz,
+                "X-Channel": "ios",
+                "X-OpenClaw-Message-Channel": "ios",
+            }
+
+            if getattr(batch[0], "lease_token", None):
+                headers["X-NBHD-Chat-Request-Id"] = str(batch[0].batch_id)
+
+            post_started = time.monotonic()
+            try:
+                resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)
+            finally:
+                post_ended = time.monotonic()
     finally:
-        if getattr(batch[0], "lane", "main") == PendingMessage.Lane.SIDE:
+        if post_started is not None and getattr(batch[0], "lane", "main") == PendingMessage.Lane.SIDE:
             from apps.router.side_lane import log_side_turn
 
-            log_side_turn(tenant, batch, post_started, locals().get("resp"))
-    post_ended = time.monotonic()
+            log_side_turn(tenant, batch, post_started, locals().get("resp"), ended=post_ended)
     if _looks_like_openrouter_credit_limit(resp):
         credit_result = _handle_openrouter_credit_limit(tenant, channel="ios", channel_user_id=thread_id)
         if credit_result == "ceiling_raised":
