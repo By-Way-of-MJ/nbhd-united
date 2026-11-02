@@ -124,6 +124,15 @@ async function postJson(url, body, headers, timeoutMs) {
       throw new Error(`NBHD runtime error ${response.status}: ${code}${detailSuffix}`);
     }
     return payload;
+  } catch (error) {
+    // postJson is a write: an aborted request may still have committed on the
+    // server, so the model must verify before reporting failure.
+    if (error && error.name === "AbortError") {
+      throw new Error(
+        `NBHD runtime request timed out after ${timeoutMs}ms. The server may still have saved this change. Check the current state before telling the user it failed, and do not repeat it blindly.`,
+      );
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
