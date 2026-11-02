@@ -45,7 +45,11 @@ class JobChangeCheckTests(SimpleTestCase):
             JobChange(changes_job=False, kind="cancel")
 
 
-@override_settings(KEEP_CHATTING_TENANT_IDS="*", NBHD_INTERNAL_API_KEY="test-key")
+@override_settings(
+    KEEP_CHATTING_TENANT_IDS="*",
+    NBHD_INTERNAL_API_KEY="test-key",
+    NBHD_DISABLE_BACKGROUND_THREADS=True,
+)
 class JobPublicationTests(TestCase):
     setUp = keep_tests.KeepChattingTests.setUp
     row = keep_tests.KeepChattingTests.row

@@ -24,7 +24,11 @@ from apps.router.side_lane import (
 from apps.router.test_pending_queue import _make_tenant, _make_user, _ok_chat_response
 
 
-@override_settings(KEEP_CHATTING_TENANT_IDS="*", NBHD_INTERNAL_API_KEY="test-key")
+@override_settings(
+    KEEP_CHATTING_TENANT_IDS="*",
+    NBHD_INTERNAL_API_KEY="test-key",
+    NBHD_DISABLE_BACKGROUND_THREADS=True,
+)
 class KeepChattingTests(TestCase):
     def setUp(self):
         from apps.router.job_changes import JobChange
