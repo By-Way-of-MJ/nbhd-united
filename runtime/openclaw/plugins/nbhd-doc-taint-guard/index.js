@@ -217,6 +217,7 @@ export const EXFIL_TOOL_IDS = new Set([
 // taints the rest of the turn exactly like an upload does: the exfil tools above are
 // blocked unless the user asks again in their own words.
 export const TAINT_SOURCE_TOOL_IDS = new Set([
+  "nbhd_step_prep_update_next",
   "nbhd_project_context",
   "nbhd_mission_context",
   "nbhd_neighborhood_context",

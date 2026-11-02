@@ -48,6 +48,9 @@ def queue_memory_sync_on_document_save(sender, instance, **kwargs):
     """
     from datetime import datetime
 
+    if instance.kind == Document.Kind.PREP:
+        return
+
     tenant_id = str(instance.tenant_id)
 
     def _publish() -> None:

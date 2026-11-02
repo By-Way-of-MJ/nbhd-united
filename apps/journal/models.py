@@ -192,6 +192,7 @@ class Document(models.Model):
         TASKS = "tasks", "Tasks"
         IDEAS = "ideas", "Ideas"
         MEMORY = "memory", "Memory"
+        PREP = "prep", "Prep"
 
     class IntentStatus(models.TextChoices):
         ACTIVE = "active", "Active"

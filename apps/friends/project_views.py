@@ -7,9 +7,10 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.router.chat_gates import _tenant_allowed
 from apps.tenants.authentication import JWTAuthenticationWithRLS
 
-from . import access, project_notes
+from . import access, project_notes, project_prep
 from . import project_services as projects
 from .project_flags import projects_v2_enabled
 from .throttling import StepNoteDayThrottle
@@ -310,3 +311,35 @@ class StepNotePhotoView(ProjectView):
         response = HttpResponse(bytes(row.image), content_type="image/jpeg")
         response["Cache-Control"] = "private, max-age=86400"
         return response
+
+
+class StepPrepView(ProjectView):
+    def get_tenant(self, request):
+        tenant = getattr(request.user, "tenant", None)
+        if not _tenant_allowed(tenant, "STEP_PREP_TENANT_IDS"):
+            raise NotFound("No such endpoint.")
+        return super().get_tenant(request)
+
+    def post(self, request, mission_id, step_id):
+        prep = project_prep.start(self.get_tenant(request), request.user, mission_id, step_id)
+        return Response(project_prep.payload(prep))
+
+
+class StepPrepStopView(StepPrepView):
+    def post(self, request, mission_id, step_id):
+        prep = project_prep.stop(self.get_tenant(request), mission_id, step_id)
+        return Response(project_prep.payload(prep))
+
+
+class StepPrepChooseView(StepPrepView):
+    def post(self, request, mission_id, step_id):
+        tenant = self.get_tenant(request)
+        prep = project_prep.choose(tenant, mission_id, step_id, self.data(request).get("choice"))
+        return Response(project_prep.payload(prep))
+
+
+class StepPrepsView(StepPrepView):
+    http_method_names = ["get", "head", "options"]
+
+    def get(self, request):
+        return Response(project_prep.list_mine(self.get_tenant(request)))

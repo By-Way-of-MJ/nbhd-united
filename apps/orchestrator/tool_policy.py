@@ -19,6 +19,13 @@ from typing import Any
 # function defaults, tests) imports this value.
 OPENCLAW_CURRENT_VERSION = "2026.9.4"
 
+# Optional plugin tools use the same group:plugins grant as project proposals.
+# Per-job toolsAllow narrows this to the homework surface at fire time.
+STEP_PREP_TOOLS = {
+    "Step Prep": ("nbhd_step_prep_next", "nbhd_step_prep_save", "nbhd_step_prep_report", "web_search"),
+    "Step Prep Update": ("nbhd_step_prep_update_next", "nbhd_step_prep_save", "nbhd_step_prep_report"),
+}
+
 
 def _parse_version(v: str) -> tuple[int, ...]:
     """Parse 'YYYY.M.D' version string into a comparable tuple."""

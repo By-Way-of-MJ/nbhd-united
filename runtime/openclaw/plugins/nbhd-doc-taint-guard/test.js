@@ -445,8 +445,8 @@ describe("project text taints the turn like an upload", () => {
     assert.equal(before_tool_call({ toolName: "web_fetch", params: {} }, { runId: "p-1" }), undefined);
   });
 
-  it("the older neighborhood/mission context tools taint too", () => {
-    for (const tool of ["nbhd_mission_context", "nbhd_neighborhood_context"]) {
+  it("prep update and older neighborhood/mission context tools taint too", () => {
+    for (const tool of ["nbhd_step_prep_update_next", "nbhd_mission_context", "nbhd_neighborhood_context"]) {
       const api = makeFakeApi({ mode: "enforce" });
       register(api);
       api._handlers.before_tool_call({ toolName: tool, params: {} }, { runId: `r-${tool}` });

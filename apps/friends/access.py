@@ -29,7 +29,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import connection, transaction
-from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q, Window
+from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q, Subquery, Window
 from django.db.models.functions import RowNumber
 from django.utils import timezone
 
@@ -1465,7 +1465,7 @@ def note_profiles(notes):
     return {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={n.author.tenant_id for n in notes})}
 
 
-def newest_shared_notes(goal, *, viewer=None):
+def newest_shared_notes(goal, *, viewer=None, with_cursor=False):
     """Newest three per step in one metadata-only query, including the photo count."""
     return (
         project_notes(goal, viewer=viewer)
@@ -1479,7 +1479,13 @@ def newest_shared_notes(goal, *, viewer=None):
         )
         .filter(position__lte=3)
         .order_by("step_id", "-created_at", "-id")
-        .values("step_id", "text", "author_id", "photo_count")
+        .values(
+            "step_id",
+            "text",
+            "author_id",
+            "photo_count",
+            *(["created_at", "author__tenant__neighbor_profile__handle"] if with_cursor else []),
+        )
     )
 
 
@@ -1883,3 +1889,101 @@ def can_view_photo(viewer, profile) -> bool:
     return SharedGoalMembership.objects.filter(
         tenant_id=owner_id, status__in=["active", "invited"], shared_goal_id__in=my_projects
     ).exists()
+
+
+# Private StepPrep access: even fellow project members cannot read these rows.
+def my_step_preps(tenant):
+    from .models import StepPrep
+
+    return StepPrep.objects.filter(
+        tenant_id=_tenant_id(tenant),
+        membership__tenant_id=_tenant_id(tenant),
+        membership__shared_goal_id=F("step__shared_goal_id"),
+    )
+
+
+def create_step_prep(tenant, membership, step, brief):
+    from rest_framework.exceptions import NotFound
+
+    from .models import StepPrep
+
+    if membership.tenant_id != _tenant_id(tenant) or membership.shared_goal_id != step.shared_goal_id:
+        raise NotFound("No such project item.")
+    return StepPrep.objects.create(tenant_id=_tenant_id(tenant), membership=membership, step=step, brief=brief)
+
+
+def step_preps_with_unseen_notes(tenant):
+    """Select due rows in SQL, without reading every idle preparation's notes."""
+    newest = (
+        project_notes(OuterRef("step__shared_goal_id"), viewer=tenant)
+        .filter(step_id=OuterRef("step_id"))
+        .order_by("-created_at")
+        .values("created_at")[:1]
+    )
+    return (
+        my_step_preps(tenant)
+        .alias(_newest_note_at=Subquery(newest))
+        .filter(
+            Q(last_seen_note_at__isnull=True, _newest_note_at__isnull=False)
+            | Q(_newest_note_at__gt=F("last_seen_note_at"))
+        )
+    )
+
+
+def update_step_prep(tenant, prep, **fields):
+    from rest_framework.exceptions import NotFound
+
+    fields["updated_at"] = timezone.now()
+    if not my_step_preps(tenant).filter(id=prep.id).update(**fields):
+        raise NotFound("No such preparation.")
+    for key, value in fields.items():
+        setattr(prep, key, value)
+    return prep
+
+
+def publish_step_prep_page(tenant, prep, slug):
+    # Keep the signed run version valid for the report following this save.
+    my_step_preps(tenant).filter(pk=prep.pk).update(doc_slug=slug)
+
+
+def delete_step_prep_written_page(tenant, doc):
+    from apps.journal.models import Document
+
+    Document.objects.filter(
+        tenant_id=_tenant_id(tenant), pk=doc.pk, kind=Document.Kind.PREP, updated_at=doc.updated_at
+    ).delete()
+
+
+def delete_step_prep_pages(tenant, prep_ids):
+    from apps.journal.models import Document
+
+    Document.objects.filter(
+        tenant_id=_tenant_id(tenant), kind=Document.Kind.PREP, slug__in=[f"step-prep-{pk}" for pk in prep_ids]
+    ).delete()
+
+
+@transaction.atomic
+def stop_ineligible_step_preps(tenant):
+    """Stop ineligible rows and remove their owner-only pages in bulk."""
+    from .models import SharedGoalStepAssignment
+
+    accepted = SharedGoalStepAssignment.objects.filter(
+        membership_id=OuterRef("membership_id"), step_id=OuterRef("step_id"), status="accepted"
+    )
+    rows = (
+        my_step_preps(tenant)
+        .exclude(status="stopped")
+        .annotate(_held=Exists(accepted))
+        .exclude(
+            membership__status="active",
+            step__status__in=["open", "in_progress"],
+            step__shared_goal__status="active",
+            _held=True,
+        )
+        .select_for_update(of=("self",))
+    )
+    ids = list(rows.values_list("id", flat=True))
+    if not ids:
+        return 0
+    delete_step_prep_pages(tenant, ids)
+    return my_step_preps(tenant).filter(id__in=ids).update(status="stopped", doc_slug="", updated_at=timezone.now())
