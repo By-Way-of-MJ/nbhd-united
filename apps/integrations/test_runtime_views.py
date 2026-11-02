@@ -1343,21 +1343,23 @@ class RuntimeMemorySyncViewTest(TestCase):
         self.assertIn("memory/journal/memory/long-term.md", body["files"])
         self.assertIn("# Long-Term Memory", body["files"]["memory/journal/memory/long-term.md"])
 
+    @patch("apps.cron.publish.publish_task")
     @patch("apps.lessons.clustering.refresh_constellation")
     @patch("apps.lessons.services.process_approved_lesson")
-    def test_runtime_lessons_create_endpoint_auto_approves_lesson(self, mock_process, mock_refresh):
-        response = self.client.post(
-            f"/api/v1/integrations/runtime/{self.tenant.id}/lessons/",
-            data={
-                "text": "Keep Alice's exact phrasing",
-                "context": "evening check-in with Alice",
-                "source_type": "reflection",
-                "source_ref": "conversation:msg-1",
-                "tags": ["growth", "discipline"],
-            },
-            content_type="application/json",
-            **self._headers(),
-        )
+    def test_runtime_lessons_create_endpoint_auto_approves_lesson(self, mock_process, mock_refresh, mock_publish):
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/v1/integrations/runtime/{self.tenant.id}/lessons/",
+                data={
+                    "text": "Keep Alice's exact phrasing",
+                    "context": "evening check-in with Alice",
+                    "source_type": "reflection",
+                    "source_ref": "conversation:msg-1",
+                    "tags": ["growth", "discipline"],
+                },
+                content_type="application/json",
+                **self._headers(),
+            )
 
         self.assertEqual(response.status_code, 201)
         created = Lesson.objects.filter(tenant=self.tenant).get(text="Keep Alice's exact phrasing")
@@ -1375,17 +1377,23 @@ class RuntimeMemorySyncViewTest(TestCase):
             "Tell the user it was added to their constellation; do not say it awaits approval.",
         )
         self.assertNotIn("pii_receipts", response.json()["lesson"])
-        # Embedding + connections run on the auto-approval path.
-        mock_process.assert_called_once_with(created)
+        # The request only saves + queues; embedding/clustering run in the task.
+        mock_process.assert_not_called()
+        mock_refresh.assert_not_called()
+        mock_publish.assert_called_once_with("process_lesson_after_save", str(created.id))
 
+    @patch("apps.cron.publish.publish_task")
     @patch("apps.lessons.clustering.refresh_constellation")
     @patch("apps.lessons.services.process_approved_lesson")
-    def test_runtime_lessons_create_stores_and_returns_placeholder_space(self, mock_process, mock_refresh):
+    def test_runtime_lessons_create_stores_and_returns_placeholder_space(
+        self, mock_process, mock_refresh, mock_publish
+    ):
         self.tenant.layer1_placeholder_writes = True
         self.tenant.pii_entity_map = {"[PERSON_1]": {"name": "Alice"}}
         self.tenant.save(update_fields=["layer1_placeholder_writes", "pii_entity_map"])
 
         with (
+            self.captureOnCommitCallbacks(execute=True),
             patch("apps.pii.redactor._detect_pii", return_value=[]),
             patch("apps.pii.authoring._detect_pii", return_value=[]),
         ):
@@ -1416,7 +1424,63 @@ class RuntimeMemorySyncViewTest(TestCase):
         self.assertEqual(lesson_payload["text"], created.text)
         self.assertEqual(lesson_payload["context"], created.context)
         self.assertNotIn("pii_receipts", lesson_payload)
-        mock_process.assert_called_once_with(created)
+        mock_process.assert_not_called()
+        mock_refresh.assert_not_called()
+        mock_publish.assert_called_once_with("process_lesson_after_save", str(created.id))
+
+    def test_process_lesson_after_save_is_registered(self):
+        from apps.cron.views import TASK_MAP
+
+        self.assertEqual(
+            TASK_MAP["process_lesson_after_save"],
+            "apps.lessons.tasks.process_lesson_after_save",
+        )
+
+    @patch("apps.lessons.clustering.refresh_constellation")
+    @patch("apps.lessons.services.process_approved_lesson")
+    def test_process_lesson_after_save_runs_the_same_pipeline_as_the_view(self, mock_process, mock_refresh):
+        from apps.lessons.tasks import process_lesson_after_save
+
+        lessons = [
+            Lesson.objects.create(
+                tenant=self.tenant,
+                text=f"Queued lesson {index}",
+                context="runtime",
+                source_type="conversation",
+                source_ref=f"conversation:queued-{index}",
+                tags=["queued"],
+                status="approved",
+            )
+            for index in range(5)
+        ]
+        lesson = lessons[0]
+
+        result = process_lesson_after_save(str(lesson.id))
+
+        self.assertEqual(result, {"ok": True, "lesson_id": lesson.id})
+        mock_process.assert_called_once_with(lesson)
+        mock_refresh.assert_called_once_with(self.tenant)
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    def test_runtime_lessons_create_survives_queue_failure(self, mock_publish):
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(
+                f"/api/v1/integrations/runtime/{self.tenant.id}/lessons/",
+                data={
+                    "text": "Queue failures do not lose the lesson",
+                    "context": "queue down",
+                    "source_type": "reflection",
+                    "source_ref": "conversation:queue-down",
+                    "tags": ["resilience"],
+                },
+                content_type="application/json",
+                **self._headers(),
+            )
+
+        self.assertEqual(response.status_code, 201)
+        created = Lesson.objects.get(tenant=self.tenant, source_ref="conversation:queue-down")
+        self.assertEqual(created.status, "approved")
+        mock_publish.assert_called_once_with("process_lesson_after_save", str(created.id))
 
     @patch("apps.integrations.runtime_views.search_lessons")
     def test_runtime_lesson_search_endpoint_supports_query(self, mock_search):

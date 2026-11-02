@@ -2892,24 +2892,23 @@ class RuntimeLessonCreateView(KnownValueResponseGuardMixin, APIView):
             approved_at=tz.now(),
         )
 
-        # Generate embedding + connections, then re-cluster once enough lessons
-        # exist — same post-approval pipeline as the journal-extraction path
-        # (apps/router/extraction_callbacks.py). Best-effort: a failure here
-        # must not fail the capture.
+        # Embedding + connections and the constellation refresh are slow
+        # (OpenRouter HTTP call + pairwise clustering). The lesson row is
+        # already durable, so queue the post-save pipeline instead of blocking
+        # the assistant's 20s tool budget. A queue failure must never fail the
+        # capture.
+        def _queue_lesson_processing():
+            try:
+                from apps.cron.publish import publish_task
+
+                publish_task("process_lesson_after_save", str(lesson.id))
+            except Exception:
+                logger.exception("runtime: failed to queue lesson processing for lesson %s", lesson.id)
+
         try:
-            from apps.lessons.services import process_approved_lesson
-
-            process_approved_lesson(lesson)
+            transaction.on_commit(_queue_lesson_processing)
         except Exception:
-            logger.exception("runtime: embedding failed for lesson %s", lesson.id)
-
-        try:
-            from apps.lessons.clustering import refresh_constellation
-
-            if Lesson.objects.filter(tenant=tenant, status="approved").count() >= 5:
-                refresh_constellation(tenant)
-        except Exception:
-            logger.exception("runtime: clustering failed for tenant %s", str(tenant.id)[:8])
+            logger.exception("runtime: failed to schedule lesson processing for lesson %s", lesson.id)
 
         return Response(
             {
