@@ -2164,6 +2164,7 @@ _STEP_PREP_PROMPT = (
     "job.id, job.run_token and body. This is the person's private prep page. "
     "Report with nbhd_step_prep_report: job.id, ready or stuck, or needs_choice with at most "
     "one clear question (max 300 characters) and two or three short choices (max 40 each). "
+    "If stuck, pass one short plain sentence in question saying what is missing (max 300 characters), with no choices. "
     "Pass job.run_token unchanged and last_seen_note_at=null. If stuck, explain plainly on the page. "
     "Never send, book, change a project, create tasks, schedule anything or write memory."
 )
@@ -2178,6 +2179,7 @@ _STEP_PREP_UPDATE_PROMPT = (
     "Save the page with nbhd_step_prep_save: job.id, job.run_token and body. "
     "Then call nbhd_step_prep_report with job.id, ready or stuck, or needs_choice with at most "
     "one clear question (max 300 characters) and two or three short choices (max 40 each). "
+    "If stuck, pass one short plain sentence in question saying what is missing (max 300 characters), with no choices. "
     "Pass job.run_token and job.last_seen_note_at unchanged. Explain blockers on the page. "
     "Never send, book, change a project, create tasks, schedule anything or write memory."
 )

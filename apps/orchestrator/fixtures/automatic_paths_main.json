@@ -92,7 +92,7 @@
     "runtime/openclaw/plugins/nbhd-journal-tools/subagent-bridge/openclaw.plugin.json": "6f1bcd04923a47235c4ef60de50ba50122bcb0b8c872754ce65e7c5a80e3ebc4",
     "runtime/openclaw/plugins/nbhd-journal-tools/subagent-bridge/package.json": "875d54f5ed1d14bae7507fa6812d7c4443858a5239e197f22765b221f48d0901",
     "runtime/openclaw/plugins/nbhd-journal-tools/subagent-bridge/test.js": "d0819845a65984e94b9c30ff48d466a9ee73923907be0fa0132394dc00350eb3",
-    "runtime/openclaw/plugins/nbhd-project-tools/index.js": "ea81c62ed4335d3b42e1023f185ccc2863a67929a55e07c1e2a2e853e3b986aa",
+    "runtime/openclaw/plugins/nbhd-project-tools/index.js": "a028385a3fa5209b3902b8f986436ebde4de9116489ca57a7d61012c6fa588c5",
     "runtime/openclaw/plugins/nbhd-project-tools/index.test.mjs": "8c33d7dccf7316202838ba3f6d91adffe86e227732278b9d389853bd3d1b81f3",
     "runtime/openclaw/plugins/nbhd-project-tools/openclaw.plugin.json": "10846204a80a71b43f9f92e478eb907103adb695578a194793871a173f6daf3c",
     "runtime/openclaw/plugins/nbhd-project-tools/package.json": "ac5012216ed5a8c73fb5d22b1bd94f7d822f68874c90cbe5ea3a64d9044e2045",

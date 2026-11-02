@@ -43,8 +43,11 @@ class PrepReport(BaseModel):
         if self.status == "needs_choice":
             if not self.question or not 2 <= len(self.choices) <= 3 or len(set(self.choices)) != len(self.choices):
                 raise ValueError("needs_choice requires one question and two or three distinct choices")
+        elif self.status == "stuck":
+            if self.choices:
+                raise ValueError("stuck cannot include choices")
         elif self.question or self.choices:
-            raise ValueError("Only needs_choice can include a question or choices")
+            raise ValueError("ready cannot include a question or choices")
         if self.last_seen_note_at is not None and (
             timezone.is_naive(self.last_seen_note_at) or self.last_seen_note_at > timezone.now()
         ):

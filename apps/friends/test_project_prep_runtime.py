@@ -158,6 +158,49 @@ class StepPrepRuntimeTests(TestCase):
         self.assertEqual(self.runtime("next", {}, self.holder, self.owner.internal_api_key).status_code, 401)
         self.assertEqual(self.row().status, "working")
 
+    def test_stuck_question_is_stored_and_rehydrated_by_list_mine(self):
+        self.holder.pii_entity_map = {"[PERSON_1]": {"name": "Alice Private"}}
+        self.holder.save(update_fields=["pii_entity_map"])
+        question = "I couldn't find out if the yard delivers on weekends. Can you ask [PERSON_1]?"
+        job = self.next().json()["job"]
+        response = self.report(job, status="stuck", question=question)
+        self.assertEqual(response.status_code, 200, response.content)
+        prep = self.row()
+        self.assertEqual((prep.status, prep.question, prep.choices), ("stuck", question, []))
+        listed = project_prep.list_mine(self.holder)[0]
+        self.assertEqual(listed["status"], "stuck")
+        self.assertEqual(listed["question"], question.replace("[PERSON_1]", "Alice Private"))
+        self.assertEqual(listed["choices"], [])
+
+    def test_stuck_without_question_still_works(self):
+        job = self.next().json()["job"]
+        response = self.report(job, status="stuck")
+        self.assertEqual(response.status_code, 200, response.content)
+        prep = self.row()
+        self.assertEqual((prep.status, prep.question, prep.choices), ("stuck", "", []))
+        self.assertEqual(project_prep.list_mine(self.holder)[0]["question"], "")
+
+    def test_stuck_question_accepts_300_characters(self):
+        job = self.next().json()["job"]
+        response = self.report(job, status="stuck", question="x" * 300)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.row().question, "x" * 300)
+
+    def test_ready_after_stuck_clears_question(self):
+        job = self.next().json()["job"]
+        self.assertEqual(
+            self.report(job, status="stuck", question="The delivery schedule is missing.").status_code, 200
+        )
+        self.assertEqual(self.row().question, "The delivery schedule is missing.")
+        self.note("The yard delivers on Saturdays.")
+        job = self.next("update").json()["job"]
+        response = self.report(job)
+        self.assertEqual(response.status_code, 200, response.content)
+        prep = self.row()
+        self.assertEqual((prep.status, prep.question, prep.choices), ("ready", "", []))
+        listed = project_prep.list_mine(self.holder)[0]
+        self.assertEqual((listed["status"], listed["question"], listed["choices"]), ("ready", "", []))
+
     def test_invalid_status_choices_question_and_extra_slug_are_refused(self):
         job = self.next().json()["job"]
         for extra in [
@@ -169,11 +212,16 @@ class StepPrepRuntimeTests(TestCase):
             {"status": "needs_choice", "question": "Which?", "choices": ["A", "x" * 41]},
             {"status": "needs_choice", "question": "x" * 301, "choices": ["A", "B"]},
             {"status": "needs_choice", "question": "Which?", "choices": ["A", "A"]},
+            {"status": "stuck", "choices": ["A", "B"]},
+            {"status": "stuck", "question": "The delivery schedule is missing.", "choices": ["A", "B"]},
+            {"status": "stuck", "question": "x" * 301},
+            {"status": "ready", "question": "The delivery schedule is missing."},
             {"choices": ["A", "B"]},
             {"doc_slug": "memory"},
         ]:
             with self.subTest(extra=extra):
                 self.assertEqual(self.report(job, **extra).status_code, 400)
+        self.assertEqual((self.row().status, self.row().question, self.row().choices), ("working", "", []))
 
     def test_future_and_fabricated_cursors_are_refused(self):
         self.prepared()
