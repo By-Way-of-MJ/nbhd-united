@@ -185,6 +185,8 @@ def runtime_report(tenant, data):
     prep, snapshot = _runtime_row(tenant, spec.id, spec.run_token)
     if snapshot.get("cursor") != _iso(spec.last_seen_note_at):
         raise ValidationError("The note cursor was not returned by next. Call next again.")
+    if spec.status == "ready" and not prep.doc_slug:
+        raise ValidationError("Save the page before reporting ready.")
     access.update_step_prep(
         tenant,
         prep,
