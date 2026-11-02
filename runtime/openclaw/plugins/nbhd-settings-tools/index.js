@@ -153,6 +153,11 @@ async function callRuntime(
     return asObject(payload);
   } catch (error) {
     if (error && error.name === "AbortError") {
+      if (method !== "GET") {
+        throw new Error(
+          `NBHD runtime request timed out after ${runtime.requestTimeoutMs}ms. The server may still have saved this change. Check the current state before telling the user it failed, and do not repeat it blindly.`,
+        );
+      }
       throw new Error(`NBHD runtime request timed out after ${runtime.requestTimeoutMs}ms`);
     }
     throw error;
