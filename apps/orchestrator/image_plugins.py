@@ -1,4 +1,4 @@
-"""Which plugin dirs the tenant's RUNNING image actually ships.
+"""Which plugin dirs the tenant's last boot report says are available.
 
 The OpenClaw container reports the plugin dirs under ``/opt/nbhd/plugins`` in
 its container-started hook; we keep that list on the tenant together with the
@@ -12,10 +12,12 @@ canary images diverge from the stored tag). On 2026-10-08 opening
 ``PROJECTS_V2_TENANT_IDS`` to ``*`` crash-looped every woken tenant on an image
 without ``nbhd-project-tools``.
 
-Fail closed: an image that predates the report never sends one, so nothing is
-ever recorded for it and it is never handed a plugin gated here. A report
-recorded under a different image tag is ignored until the new image reports for
-itself.
+Fail closed until the tenant reports: a tenant that has never reported is never
+handed a plugin gated here. After that, keep the last reported set across image
+tag changes until a new report replaces it. Images in use since 2026-10-08 all
+ship ``nbhd-project-tools``. Forgetting its report at each image roll removes it
+from the new box's boot config, and adding it after boot does not load its tools
+into the running gateway. Keeping the report lets the new box load them at boot.
 
 A hook WITHOUT a report changes nothing. During an image roll the outgoing
 revision's replica can boot alongside the new one and fire its hook last; if
@@ -47,11 +49,8 @@ def _clean(reported: object) -> list[str]:
 
 
 def image_plugin_ids(tenant: object | None) -> frozenset[str]:
-    """Plugin ids the tenant's current image reported; empty when unknown."""
+    """Last reported plugin ids, retained across image rolls; empty when unknown."""
     if tenant is None:
-        return frozenset()
-    reported_tag = getattr(tenant, "image_plugins_tag", "") or ""
-    if reported_tag != (getattr(tenant, "container_image_tag", "") or ""):
         return frozenset()
     return frozenset(_clean(getattr(tenant, "image_plugin_ids", None)))
 

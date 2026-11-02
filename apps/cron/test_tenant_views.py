@@ -1948,7 +1948,7 @@ class RuntimeContainerStartedTest(TestCase):
         mock_publish.assert_not_called()
 
     @patch("apps.cron.publish.publish_task")
-    def test_report_from_another_image_tag_is_not_trusted(self, mock_publish):
+    def test_report_from_another_image_tag_keeps_tools_without_config_refresh(self, mock_publish):
         from django.test import override_settings as _ovr
 
         from apps.friends.project_flags import project_tools_ready
@@ -1958,17 +1958,48 @@ class RuntimeContainerStartedTest(TestCase):
             self._boot({"plugins": ["nbhd-project-tools"]})
             self.tenant.refresh_from_db()
             self.assertTrue(project_tools_ready(self.tenant))
-            # The tenant moves to another image: unknown until that image reports.
+            pending = self.tenant.pending_config_version
+            mock_publish.reset_mock()
+            # Keep the last report while the new image boots.
             self.tenant.container_image_tag = "2026.9.4-bbbbbbb"
             self.tenant.save(update_fields=["container_image_tag"])
-            self.assertFalse(project_tools_ready(self.tenant))
-            # An old image boots (no report) and stays without the tools.
-            mock_publish.reset_mock()
-            self._boot()
+            self.assertTrue(project_tools_ready(self.tenant))
+            # An outgoing replica's empty hook cannot withdraw the tools.
+            self.assertEqual(self._boot().status_code, 200)
             self.tenant.refresh_from_db()
-            self.assertFalse(project_tools_ready(self.tenant))
-        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+            self.assertTrue(project_tools_ready(self.tenant))
+            self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-aaaaaaa")
+            # Recording the same set under the new tag (even twice) is no flip.
+            for _ in range(2):
+                self.assertEqual(self._boot({"plugins": ["nbhd-project-tools"]}).status_code, 200)
+                self.tenant.refresh_from_db()
+                self.assertTrue(project_tools_ready(self.tenant))
+                self.assertEqual(self.tenant.pending_config_version, pending)
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-bbbbbbb")
         mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_new_image_report_replaces_set_and_refreshes_config_only_once(self, mock_publish):
+        from django.test import override_settings as _ovr
+
+        from apps.friends.project_flags import project_tools_ready
+
+        self._projects_tenant()
+        with _ovr(PROJECTS_V2_TENANT_IDS="*"):
+            self.assertEqual(self._boot({"plugins": ["nbhd-project-tools"]}).status_code, 200)
+            self.tenant.refresh_from_db()
+            pending = self.tenant.pending_config_version
+            mock_publish.reset_mock()
+            self.tenant.container_image_tag = "2026.9.4-bbbbbbb"
+            self.tenant.save(update_fields=["container_image_tag"])
+            for _ in range(2):
+                self.assertEqual(self._boot({"plugins": ["nbhd-journal-tools"]}).status_code, 200)
+                self.tenant.refresh_from_db()
+                self.assertFalse(project_tools_ready(self.tenant))
+                self.assertEqual(self.tenant.pending_config_version, pending + 1)
+        self.assertEqual(self.tenant.image_plugin_ids, ["nbhd-journal-tools"])
+        self.assertEqual(self.tenant.image_plugins_tag, "2026.9.4-bbbbbbb")
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
 
     @patch("apps.cron.publish.publish_task")
     def test_outgoing_replica_hook_without_report_does_not_withdraw_tools(self, mock_publish):

@@ -293,6 +293,29 @@ class PluginAndEnvelopeTests(TestCase):
             self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
             self.assertIn("nbhd_project_context", render_projects(self.a))
 
+    @override_settings(PROJECTS_V2_TENANT_IDS="*")
+    def test_image_roll_keeps_reported_plugin_and_unreported_tenant_stays_closed(self):
+        from .envelope import render_projects
+        from .project_flags import project_tools_ready
+
+        for tenant in (self.a, self.b):
+            tenant.neighborhood_enabled = True
+            tenant.container_image_tag = "2026.9.4-aaaaaaa"
+            tenant.save(update_fields=["neighborhood_enabled", "container_image_tag"])
+        self._image_reports_project_tools(self.a)
+        for tenant in (self.a, self.b):
+            tenant.container_image_tag = "2026.9.4-bbbbbbb"
+            tenant.save(update_fields=["container_image_tag"])
+            tenant.refresh_from_db()
+
+        self.assertEqual(self.a.image_plugins_tag, "2026.9.4-aaaaaaa")
+        self.assertTrue(project_tools_ready(self.a))
+        self.assertIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.a))
+        self.assertIn("nbhd_project_context", render_projects(self.a))
+        self.assertFalse(project_tools_ready(self.b))
+        self.assertNotIn("/opt/nbhd/plugins/nbhd-project-tools", self.paths(self.b))
+        self.assertNotIn("nbhd_project_context", render_projects(self.b))
+
     def test_envelope_never_carries_another_members_words(self):
         from .envelope import render_projects
 
