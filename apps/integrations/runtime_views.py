@@ -4005,25 +4005,29 @@ class RuntimeProfileUpdateView(APIView):
             except Exception:
                 logger.exception("Failed to update cron row timezones for tenant %s", tenant.id)
 
-        # Trigger config refresh so the agent picks up the new userTimezone
-        if "timezone" in updated_fields:
+        # Trigger config refresh so the agent picks up the new userTimezone /
+        # location. The file-share write (~20 files + cron refresh) used to run
+        # inline and made this endpoint take 25-51s while the assistant's
+        # plugin gives up after 20s. The save is already durable; queue the
+        # apply instead so the reply returns in seconds.
+        if any(f in updated_fields for f in ("timezone", "location_lat", "location_lon", "location_city")):
             try:
-                tenant.bump_pending_config()
-                from apps.orchestrator.services import update_tenant_config
+                from apps.cron.publish import publish_task
 
-                update_tenant_config(str(tenant.id))
+                tenant.bump_pending_config()
+
+                def _queue_config_apply():
+                    try:
+                        publish_task("apply_single_tenant_config", str(tenant.id))
+                    except Exception:
+                        logger.exception(
+                            "Failed to queue config refresh after profile update for tenant %s",
+                            tenant.id,
+                        )
+
+                transaction.on_commit(_queue_config_apply)
             except Exception:
                 logger.exception("Failed to refresh config after profile update for tenant %s", tenant.id)
-
-        # If location changed, trigger config refresh so weather URL updates
-        if any(f in updated_fields for f in ("location_lat", "location_lon", "location_city")):
-            try:
-                tenant.bump_pending_config()
-                from apps.orchestrator.services import update_tenant_config
-
-                update_tenant_config(str(tenant.id))
-            except Exception:
-                logger.exception("Failed to refresh config after location update for tenant %s", tenant.id)
 
         return Response(
             {
