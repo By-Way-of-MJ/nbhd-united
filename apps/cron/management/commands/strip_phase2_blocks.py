@@ -113,6 +113,8 @@ class Command(BaseCommand):
                     continue
 
                 new_message = _cleaned_message(message)
+                if new_message == message:
+                    continue
                 row.data = {**data, "payload": {**payload, "message": new_message}}
                 # Normal save: the post_save signal must fire so the reconciler
                 # pushes the clean prompt to the container.

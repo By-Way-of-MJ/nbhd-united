@@ -123,6 +123,35 @@ class StripPhase2BlocksCommandTest(TestCase):
         self.assertIn("rows_matched=0", second_stdout.getvalue())
         self.assertIn("rows_written=0", second_stdout.getvalue())
 
+    def test_leading_block_from_empty_base_writes_once_then_zero(self):
+        tenant = self._tenant("strip-leading")
+        leading = "---\n**" + PHASE2_SYNC_MARKER + ":**\nold"
+        row = self._row(tenant, "Leading", leading)
+        first_stdout = StringIO()
+
+        call_command(
+            "strip_phase2_blocks",
+            "--tenant",
+            str(tenant.id),
+            "--apply",
+            stdout=first_stdout,
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.data["payload"]["message"], "")
+        self.assertIn("rows_matched=1", first_stdout.getvalue())
+        self.assertIn("rows_written=1", first_stdout.getvalue())
+
+        second_stdout = StringIO()
+        call_command(
+            "strip_phase2_blocks",
+            "--tenant",
+            str(tenant.id),
+            "--apply",
+            stdout=second_stdout,
+        )
+        self.assertIn("rows_matched=0", second_stdout.getvalue())
+        self.assertIn("rows_written=0", second_stdout.getvalue())
+
     def test_noncanonical_tenant_is_counted_but_not_written(self):
         tenant = self._tenant("strip-noncanonical", canonical=False)
         row = self._row(tenant, "Marker", _legacy_message())

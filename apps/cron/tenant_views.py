@@ -79,6 +79,10 @@ def _strip_phase2_block(message: str) -> str:
 
     if not isinstance(message, str) or PHASE2_SYNC_MARKER not in message:
         return message
+    # OpenClaw trims stored messages, so a job whose base message was empty is
+    # stored starting with the block instead of after two newlines.
+    if message.lstrip().startswith("---\n**" + PHASE2_SYNC_MARKER):
+        return ""
     sentinel = "\n\n---\n**" + PHASE2_SYNC_MARKER
     head, _, _ = message.partition(sentinel)
     return head

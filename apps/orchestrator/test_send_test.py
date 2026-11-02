@@ -234,16 +234,21 @@ class SendTestRefreshTests(TestCase):
             )
 
     def test_legacy_final_step_rows_upgrade_as_default_but_real_edits_survive(self):
-        from apps.orchestrator.config_generator import _RETIRED_FINAL_STEP_PROSE
+        from apps.orchestrator.config_generator import (
+            _RETIRED_FINAL_STEP_PROSE,
+            upgrade_retired_final_step_prose,
+        )
 
         edited_name = "Morning Briefing"
         with override_settings(SEND_TEST_TENANT_IDS="*"):
             seed_jobs = {j["name"]: j for j in build_cron_seed_jobs(self.tenant)}
+            legacy_messages = {}
             legacy_edited = None
             for name in SEND_TEST_MANAGED_JOBS:
                 message = seed_jobs[name]["payload"]["message"]
-                for new, old in _RETIRED_FINAL_STEP_PROSE:
+                for old, new in _RETIRED_FINAL_STEP_PROSE:
                     message = message.replace(new, old)
+                legacy_messages[name] = message
                 if name == edited_name:
                     message += "\n\nMy genuine user edit."
                     legacy_edited = message
@@ -251,6 +256,11 @@ class SendTestRefreshTests(TestCase):
                 row.source = CronJobSource.SYSTEM
                 row.data["payload"]["message"] = message
                 row.save(update_fields=["data", "source"])
+
+            self.assertTrue(
+                any(legacy_messages[name] != seed_jobs[name]["payload"]["message"] for name in SEND_TEST_MANAGED_JOBS),
+                "at least one legacy row must actually differ from its seed message",
+            )
 
             summary = refresh_system_cron_rows_from_seed(self.tenant)
             self.assertEqual(summary["preserved_custom"], 1)
@@ -262,4 +272,7 @@ class SendTestRefreshTests(TestCase):
                     seed_jobs[name]["payload"]["message"],
                     f"{name} legacy default should be upgraded from the seed",
                 )
-            self.assertEqual(rows[edited_name].data["payload"]["message"], legacy_edited)
+            self.assertEqual(
+                rows[edited_name].data["payload"]["message"],
+                upgrade_retired_final_step_prose(legacy_edited),
+            )

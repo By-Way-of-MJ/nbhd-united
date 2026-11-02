@@ -752,6 +752,11 @@ class Phase2WrapHelperTest(SimpleTestCase):
         self.assertEqual(_strip_phase2_block("just a message"), "just a message")
         self.assertEqual(_strip_phase2_block(""), "")
 
+    def test_strip_leading_block_from_empty_base_message(self):
+        leading = "---\n**" + PHASE2_SYNC_MARKER + ":**\nold"
+        self.assertEqual(_strip_phase2_block(leading), "")
+        self.assertEqual(_strip_phase2_block("  \n" + leading), "")
+
     def test_marker_detection(self):
         legacy = self._legacy_wrapped("base")
         self.assertTrue(_message_has_phase2_marker(legacy))
