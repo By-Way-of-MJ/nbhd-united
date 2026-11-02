@@ -32,10 +32,11 @@ def _normalize_job_for_universal_isolation(data: dict) -> dict:
     """Force every full cron job dict to isolated/agentTurn before sending to OpenClaw.
 
     Two-phase cron model: ALL scheduled tasks run isolated. The user-facing
-    API still accepts a ``foreground`` boolean (default ``True``) that
-    controls whether the Phase 2 sync block is appended to the message body
-    by ``_wrap_message_with_phase2`` — this function only handles the
-    structural normalization (sessionTarget, payload kind/field).
+    API still accepts a ``foreground`` boolean (default ``True``) for
+    compatibility, but the Phase 2 sync block is retired —
+    ``_wrap_message_with_phase2`` only strips any legacy wrapper. This
+    function only handles the structural normalization (sessionTarget,
+    payload kind/field).
 
     Delivery is left untouched: OpenClaw allows ``delivery.channel``/``to``
     on isolated jobs (the previous main-only restriction is gone now that
@@ -78,32 +79,23 @@ def _strip_phase2_block(message: str) -> str:
 
     if not isinstance(message, str) or PHASE2_SYNC_MARKER not in message:
         return message
+    # OpenClaw trims stored messages, so a job whose base message was empty is
+    # stored starting with the block instead of after two newlines.
+    if message.lstrip().startswith("---\n**" + PHASE2_SYNC_MARKER):
+        return ""
     sentinel = "\n\n---\n**" + PHASE2_SYNC_MARKER
     head, _, _ = message.partition(sentinel)
     return head
 
 
 def _wrap_message_with_phase2(message: str, job_name: str, foreground: bool) -> str:
-    """Append Phase 2 sync instructions to a job's message if foreground.
+    """Strip any retired Phase 2 sync block from a job's message.
 
-    Idempotent: if foreground and the message already contains the Phase 2
-    marker, returns it unchanged. If not foreground, strips any existing
-    block so toggling off the flag actually removes the wrapper text.
+    The Phase 2 sync block is retired: this helper never appends it, regardless
+    of ``foreground``. The signature is kept so existing callers keep working;
+    the block is always stripped so a legacy wrapper cannot be re-added.
     """
-    from apps.orchestrator.config_generator import (
-        PHASE2_SYNC_MARKER,
-        _phase2_sync_block,
-    )
-
-    if not isinstance(message, str):
-        return message
-
-    has_marker = PHASE2_SYNC_MARKER in message
-    if not foreground:
-        return _strip_phase2_block(message) if has_marker else message
-    if has_marker:
-        return message
-    return message + _phase2_sync_block(job_name)
+    return _strip_phase2_block(message)
 
 
 def _message_has_phase2_marker(message: str) -> bool:
@@ -161,18 +153,14 @@ def _is_hidden_cron(name: str, source: str | None = None) -> bool:
 
 
 def _filter_visible_jobs(raw_jobs: list[dict]) -> list[dict]:
-    """Strip hidden system crons and tag each job with its ``foreground`` flag."""
+    """Strip hidden system crons and tag each visible job as foreground."""
     visible: list[dict] = []
     for j in raw_jobs:
         if not isinstance(j, dict):
             continue
         if _is_hidden_cron(j.get("name", ""), j.get("source")):
             continue
-        payload = j.get("payload") or {}
-        message = ""
-        if isinstance(payload, dict):
-            message = payload.get("message") or payload.get("text", "") or ""
-        visible.append({**j, "foreground": _message_has_phase2_marker(message)})
+        visible.append({**j, "foreground": True})
     return visible
 
 
@@ -369,9 +357,9 @@ class CronJobListCreateView(APIView):
             if chat_id and not delivery.get("to"):
                 data = {**data, "delivery": {**delivery, "to": str(chat_id)}}
 
-        # `foreground` is a Django-only flag — never sent to OpenClaw. We use
-        # it to decide whether to append the Phase 2 sync block to the message.
-        # Default True per the universal isolation model.
+        # `foreground` is a Django-only flag — never sent to OpenClaw. It is
+        # accepted for compatibility, but the Phase 2 sync block is retired and
+        # the message wrapper only strips it.
         foreground = bool(data.pop("foreground", True))
 
         data = _normalize_job_for_universal_isolation(data)
@@ -428,8 +416,8 @@ class CronJobDetailView(APIView):
                 data = {**data, "delivery": {**delivery, "to": str(chat_id)}}
 
         # `foreground` is a Django-only flag — never sent to OpenClaw.
-        # If present in the request, we must rebuild the message body and
-        # therefore force the delete+recreate path.
+        # If present in the request, we still force the delete+recreate path;
+        # the wrapper is strip-only now, so it is otherwise a prompt no-op.
         foreground_explicit = "foreground" in data
         foreground_request = bool(data.pop("foreground", True))
 
@@ -448,7 +436,7 @@ class CronJobDetailView(APIView):
             if not row:
                 return Response({"detail": "Job not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # If foreground was explicit OR payload was patched, rewrap the message.
+            # If foreground was explicit OR payload was patched, run the message wrapper.
             if foreground_explicit or "payload" in data:
                 base_payload = data.get("payload") or row.data.get("payload") or {}
                 base_message = ""
@@ -536,10 +524,9 @@ class CronJobDetailView(APIView):
                     merged["enabled"] = existing.get("enabled", True)
                 merged = _normalize_job_for_universal_isolation(merged)
 
-                # Decide foreground for the rewritten job:
-                # - If the request explicitly set it, honor that.
-                # - Otherwise preserve the existing job's foreground state by
-                #   detecting the marker in its message.
+                # Decide foreground for the rewritten job. The wrapper is
+                # strip-only now, so this no longer changes the prompt; the
+                # existing comparison is preserved for the API contract.
                 if foreground_explicit:
                     foreground_resolved = foreground_request
                 else:
@@ -549,12 +536,10 @@ class CronJobDetailView(APIView):
                         existing_message = existing_payload.get("message") or existing_payload.get("text", "") or ""
                     foreground_resolved = _message_has_phase2_marker(existing_message)
 
-                # Wrap the merged message with Phase 2 (or strip it if going background)
+                # Strip any legacy Phase 2 wrapper from the merged message.
                 merged_payload = merged.get("payload") or {}
                 if isinstance(merged_payload, dict):
                     base_message = merged_payload.get("message", "")
-                    # Strip any existing wrapper before re-wrapping so we never
-                    # double-append the block
                     base_message = _strip_phase2_block(base_message)
                     rewrapped = _wrap_message_with_phase2(
                         base_message,
@@ -964,7 +949,7 @@ class CronJobBulkUpdateForegroundView(APIView):
             merged = {k: v for k, v in existing.items() if k not in self._STRIP_FIELDS}
             merged = _normalize_job_for_universal_isolation(merged)
 
-            # Rewrap message
+            # Strip any legacy Phase 2 wrapper.
             merged_payload = merged.get("payload") or {}
             if isinstance(merged_payload, dict):
                 base_message = _strip_phase2_block(

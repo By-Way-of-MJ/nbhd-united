@@ -47,23 +47,15 @@ def _row_to_job_dict(row: CronJob) -> dict:
     """Render a ``CronJob`` row in the gateway-shape dict the dashboard expects.
 
     Overlays the canonical ``name`` + ``enabled`` from the columns, strips
-    gateway-internal fields, and tags ``foreground`` based on the Phase 2
-    marker in the payload message (matches ``_filter_visible_jobs`` in
-    ``tenant_views.py``).
+    gateway-internal fields, and tags every job as foreground (matches
+    ``_filter_visible_jobs`` in ``tenant_views.py``).
     """
-    from .tenant_views import _message_has_phase2_marker
-
     job = dict(row.data or {})
     for stripped in _STRIP_FIELDS:
         job.pop(stripped, None)
     job["name"] = row.name
     job["enabled"] = bool(row.enabled)
-
-    payload = job.get("payload") or {}
-    message = ""
-    if isinstance(payload, dict):
-        message = payload.get("message") or payload.get("text", "") or ""
-    job["foreground"] = _message_has_phase2_marker(message)
+    job["foreground"] = True
 
     return job
 
@@ -294,10 +286,11 @@ def bulk_delete_jobs(tenant: Tenant, ids_or_names: list[str]) -> dict:
 
 
 def bulk_update_foreground(tenant: Tenant, ids_or_names: list[str], foreground: bool) -> dict:
-    """Bulk-toggle the Phase 2 wrap on a set of jobs.
+    """Bulk-toggle foreground mode on a set of jobs.
 
-    Re-wraps each job's payload.message via the existing helpers from
-    ``tenant_views`` (idempotent strip+wrap).
+    Runs each job's payload.message through the existing helpers from
+    ``tenant_views``. The Phase 2 block is retired, so the rewrap only strips
+    any legacy wrapper.
     """
     from .tenant_views import (
         _is_hidden_cron,
@@ -373,10 +366,19 @@ def upsert_from_gateway_jobs(
 
     Returns ``{"upserted": N, "removed": M}``.
     """
+    from .tenant_views import _strip_phase2_block
+
     by_name: dict[str, dict] = {}
     for job in raw_jobs:
         if not isinstance(job, dict):
             continue
+        # Gateway imports must never restore the retired Phase 2 block. Copy
+        # the job/payload rather than mutating the caller's list.
+        payload = job.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            stripped = _strip_phase2_block(payload["message"])
+            if stripped != payload["message"]:
+                job = {**job, "payload": {**payload, "message": stripped}}
         name = job.get("name") or ""
         if not name:
             continue

@@ -10,7 +10,12 @@ from apps.cron.models import CronJob, CronJobSource
 from apps.cron.signals import suppress_cronjob_reconcile
 from apps.orchestrator.config_generator import build_cron_seed_jobs
 from apps.orchestrator.cron_drift import job_drift
-from apps.orchestrator.send_test import PERSONAL_QUESTION_SEND_TEST_BLOCK, SEND_TEST_BLOCK, SEND_TEST_JOBS
+from apps.orchestrator.send_test import (
+    PERSONAL_QUESTION_SEND_TEST_BLOCK,
+    SEND_TEST_BLOCK,
+    SEND_TEST_JOBS,
+    SEND_TEST_MANAGED_JOBS,
+)
 from apps.orchestrator.services import refresh_system_cron_rows_from_seed, update_system_cron_prompts
 from apps.tenants.services import create_tenant
 
@@ -209,3 +214,65 @@ class SendTestRefreshTests(TestCase):
         self.assertNotIn(evening["id"], removed, logs.output)
         added = [c.args[2]["job"] for c in gateway.call_args_list if c.args[1] == "cron.add"]
         self.assertEqual({j["name"] for j in added}, SEND_TEST_JOBS - {"Morning Briefing", "Evening Check-in"})
+
+    def test_retired_final_step_prose_is_gone_from_every_seed_job(self):
+        from apps.orchestrator.config_generator import (
+            _RETIRED_FINAL_STEP_PROSE,
+            upgrade_retired_final_step_prose,
+        )
+
+        self.assertTrue(_RETIRED_FINAL_STEP_PROSE)
+        for old, new in _RETIRED_FINAL_STEP_PROSE:
+            self.assertIn("FINAL STEP", old)
+            self.assertNotIn("FINAL STEP", new)
+            self.assertEqual(upgrade_retired_final_step_prose(old), new)
+        for job in build_cron_seed_jobs(self.tenant):
+            self.assertNotIn(
+                "FINAL STEP",
+                job["payload"]["message"],
+                f"{job['name']} must not point at the retired FINAL STEP",
+            )
+
+    def test_legacy_final_step_rows_upgrade_as_default_but_real_edits_survive(self):
+        from apps.orchestrator.config_generator import (
+            _RETIRED_FINAL_STEP_PROSE,
+            upgrade_retired_final_step_prose,
+        )
+
+        edited_name = "Morning Briefing"
+        with override_settings(SEND_TEST_TENANT_IDS="*"):
+            seed_jobs = {j["name"]: j for j in build_cron_seed_jobs(self.tenant)}
+            legacy_messages = {}
+            legacy_edited = None
+            for name in SEND_TEST_MANAGED_JOBS:
+                message = seed_jobs[name]["payload"]["message"]
+                for old, new in _RETIRED_FINAL_STEP_PROSE:
+                    message = message.replace(new, old)
+                legacy_messages[name] = message
+                if name == edited_name:
+                    message += "\n\nMy genuine user edit."
+                    legacy_edited = message
+                row = self.rows()[name]
+                row.source = CronJobSource.SYSTEM
+                row.data["payload"]["message"] = message
+                row.save(update_fields=["data", "source"])
+
+            self.assertTrue(
+                any(legacy_messages[name] != seed_jobs[name]["payload"]["message"] for name in SEND_TEST_MANAGED_JOBS),
+                "at least one legacy row must actually differ from its seed message",
+            )
+
+            summary = refresh_system_cron_rows_from_seed(self.tenant)
+            self.assertEqual(summary["preserved_custom"], 1)
+
+            rows = self.rows()
+            for name in SEND_TEST_MANAGED_JOBS - {edited_name}:
+                self.assertEqual(
+                    rows[name].data["payload"]["message"],
+                    seed_jobs[name]["payload"]["message"],
+                    f"{name} legacy default should be upgraded from the seed",
+                )
+            self.assertEqual(
+                rows[edited_name].data["payload"]["message"],
+                upgrade_retired_final_step_prose(legacy_edited),
+            )

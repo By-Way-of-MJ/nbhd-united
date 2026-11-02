@@ -1761,8 +1761,8 @@ class GravityWeeklyCheckinSeedJobTests(TestCase):
         self.assertIsNotNone(weekly)
         # Sunday at 19:00 in user's timezone.
         self.assertEqual(weekly["schedule"]["expr"], "0 19 * * 0")
-        # Foreground (Phase 2 sync) so summary lands in main session.
-        self.assertIn("FINAL STEP", weekly["payload"]["message"])
+        # The retired Phase 2 sync block is no longer referenced.
+        self.assertNotIn("FINAL STEP", weekly["payload"]["message"])
         # Prompt mentions the Gravity terminology and pulls from USER.md.
         self.assertIn("Gravity", weekly["payload"]["message"])
         self.assertIn("USER.md", weekly["payload"]["message"])

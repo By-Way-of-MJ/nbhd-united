@@ -274,49 +274,41 @@ def _cron_rule_index(tenant: Tenant) -> str:
 
 
 # Marker used by `_wrap_message_with_phase2` and `update_system_cron_prompts` to
-# detect that a job's message already contains the Phase 2 sync block. The
-# wrapper text below MUST contain this exact substring.
+# detect a legacy Phase 2 sync block in a job's message. The retired wrapper
+# text used this exact substring, so the stripper keys off it.
 PHASE2_SYNC_MARKER = "FINAL STEP — conditional sync to the main session"
 
+# Seed prompts used to point at the retired Phase 2 block. Stored default rows
+# keep the old prose until the seed refreshes them, so recognise each retired
+# sentence as an older version of the same default.
+_RETIRED_FINAL_STEP_PROSE: tuple[tuple[str, str], ...] = (
+    (
+        "After that message is sent, proceed to the FINAL STEP described below.**\n",
+        "After that message is sent, you are done.**\n",
+    ),
+    (
+        "After your message is sent (or skipped), proceed to the FINAL STEP described below.**\n",
+        "After your message is sent (or skipped), you are done.**\n",
+    ),
+    (
+        "reply `HEARTBEAT_OK` and STOP. Do NOT proceed to the FINAL STEP — silent runs skip the sync.\n\n",
+        "reply `HEARTBEAT_OK` and STOP.\n\n",
+    ),
+    (
+        "This prevents the next heartbeat from repeating the same nudge.\n"
+        "c. Then proceed to the FINAL STEP described below.\n\n",
+        "This prevents the next heartbeat from repeating the same nudge.\n\n",
+    ),
+)
 
-def _phase2_sync_block(job_name: str) -> str:
-    """Instructions appended to any foreground cron prompt.
 
-    Tells the agent to call ``nbhd_cron_phase2_summary`` after Phase 1
-    finishes — but ONLY if the run actually sent the user a message via
-    ``nbhd_send_to_user``. Silent runs (Heartbeat HEARTBEAT_OK, no-op
-    decisions) skip the call entirely; absence of the tool invocation IS
-    the verdict that nothing user-visible happened.
-
-    Django owns the rest: the tool's runtime handler computes the cron
-    expression, composes the systemEvent payload, sets sessionTarget=main,
-    and registers the one-shot ``_sync:<job_name>`` cron with the OpenClaw
-    gateway. The agent only contributes the summary text.
-
-    See ``apps/integrations/runtime_views.py::RuntimeCronPhase2SummaryView``
-    for the server-side contract.
-    """
-    return (
-        "\n\n---\n"
-        f"**{PHASE2_SYNC_MARKER}:**\n"
-        "**Guard:** Did you send the user a message via `nbhd_send_to_user` during this "
-        "run? If NO (you returned silently, replied HEARTBEAT_OK, or decided nothing was "
-        "new), STOP HERE — do not call any sync tool. The main session only needs to "
-        "know about user-visible activity.\n\n"
-        "If YES, invoke the `nbhd_cron_phase2_summary` tool with:\n"
-        f'   - `job_name`: `"{job_name}"`\n'
-        "   - `summary`: a 2-3 sentence recap — what sections you wrote, what you sent "
-        "the user, anything notable to surface later. This is for the main session's "
-        "CONTEXT, not a user message.\n\n"
-        "**This is a TOOL invocation, not a chat message.** Do NOT typeset, paraphrase, "
-        "or emit the parameters as text. Do NOT pass them through `nbhd_send_to_user`. "
-        "Just invoke `nbhd_cron_phase2_summary` directly. Backend handles cron "
-        "expression math, payload composition, and the underscore-prefixed sync name — "
-        "you only provide the summary.\n\n"
-        "If the tool call fails or the tool is unavailable, accept it — Phase 1 work "
-        "already completed. Do NOT retry, do NOT message the user, and do NOT send the "
-        "parameters above as a chat message.\n"
-    )
+def upgrade_retired_final_step_prose(message: str) -> str:
+    """Rewrite retired final-step prose to the current wording."""
+    if not isinstance(message, str):
+        return message
+    for old, new in _RETIRED_FINAL_STEP_PROSE:
+        message = message.replace(old, new)
+    return message
 
 
 def _build_cron_message(
@@ -325,7 +317,7 @@ def _build_cron_message(
     foreground: bool,
     tenant: Tenant,
 ) -> str:
-    """Compose a cron job's message: date preamble + shared preamble + prompt + (optional) Phase 2 sync.
+    """Compose a cron job's message: date preamble + shared preamble + prompt.
 
     Centralizes the message-building so seed jobs and tests stay consistent.
 
@@ -347,18 +339,17 @@ def _build_cron_message(
 
     base = apply_send_test(_prepare_cron_prompt(prompt, tenant), job_name, tenant)
     # Phase 2 sync prompt retired 2026-07-11 (refactor/retire-phase2-sync-prompt).
-    # Seed cron prompts no longer append ``_phase2_sync_block`` / instruct the
-    # agent to call ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session
-    # bridge (fired only if the model remembered the tool, injecting a summary
-    # into session "main") is superseded by the deterministic ProactiveOutbound
-    # bridge in ``apps/router/proactive_context.py``, which surfaces cron-fired
-    # outbounds on the user's next inbound reply across every channel. No live
-    # inbound conversation runs in session "main" anyway (iOS=thread:<id>,
-    # Telegram poller=chat_id, LINE=line_user_id, heartbeat=isolatedSession).
+    # Seed cron prompts no longer append the block / instruct the agent to call
+    # ``nbhd_cron_phase2_summary``. That LLM-mediated cross-session bridge (fired
+    # only if the model remembered the tool, injecting a summary into session
+    # "main") is superseded by the deterministic ProactiveOutbound bridge in
+    # ``apps/router/proactive_context.py``, which surfaces cron-fired outbounds
+    # on the user's next inbound reply across every channel. No live inbound
+    # conversation runs in session "main" anyway (iOS=thread:<id>, Telegram
+    # poller=chat_id, LINE=line_user_id, heartbeat=isolatedSession).
     #
-    # ``foreground`` stays on the signature (callers still pass it, and the
-    # user-console foreground toggle in ``apps/cron/tenant_views`` still appends
-    # the block via ``_phase2_sync_block``) so this is a one-line revert.
+    # ``foreground`` stays on the signature for callers that still pass it; the
+    # dashboard wrapper is strip-only now.
     # ``RuntimeCronPhase2SummaryView`` stays live for hibernated tenants that
     # wake on stale configs whose prompts still call the tool.
     return base.strip()
@@ -737,7 +728,7 @@ _MORNING_BRIEFING_PROMPT_TEMPLATE = (
     "Note: These are default sections. The user may customize or remove them — "
     "only fill in sections that exist in their template.\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -969,7 +960,7 @@ _EVENING_CHECKIN_PROMPT = (
     "parser strips it first, then parses the now-final journal-link line. Do not "
     "reverse these two marker lines.\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -1089,7 +1080,7 @@ _PERSONAL_QUESTION_PROMPT = (
     "**IMPORTANT: Send at most ONE user-facing message via "
     "`nbhd_send_to_user`. If step 5 short-circuits, send NO message and "
     "reply `PERSONAL_QUESTION_SKIPPED`. After your message is sent (or "
-    "skipped), proceed to the FINAL STEP described below.**\n"
+    "skipped), you are done.**\n"
 )
 
 _WEEK_AHEAD_REVIEW_TRAVEL_LINE = (
@@ -1141,7 +1132,7 @@ _WEEK_AHEAD_REVIEW_PROMPT_TEMPLATE = (
     "   - Any cron adjustments needed (or 'all good, no changes')\n"
     "   - If nothing conflicts, keep it short: 'All good for this week.'\n\n"
     "**IMPORTANT: Send exactly ONE user-facing message via `nbhd_send_to_user`. "
-    "After that message is sent, proceed to the FINAL STEP described below.**\n"
+    "After that message is sent, you are done.**\n"
 )
 
 
@@ -1203,14 +1194,12 @@ _HEARTBEAT_CHECKIN_PROMPT = (
     "- Was it already addressed in a message, with no new verified status? → skip it\n"
     "- Is it genuinely new information the user hasn't seen today? → keep it\n\n"
     "**Step 3 — Act.**\n"
-    "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP. "
-    "Do NOT proceed to the FINAL STEP — silent runs skip the sync.\n\n"
+    "If nothing survives the cross-reference: reply `HEARTBEAT_OK` and STOP.\n\n"
     "If something genuinely new needs attention:\n"
     "a. Send the user exactly ONE brief message via `nbhd_send_to_user`.\n"
     "b. Then append a one-line summary to the daily note under heading 'Heartbeat Log' "
     "via `nbhd_daily_note_append` (format: `- HH:MM — <what you nudged about>`). "
-    "This prevents the next heartbeat from repeating the same nudge.\n"
-    "c. Then proceed to the FINAL STEP described below.\n\n"
+    "This prevents the next heartbeat from repeating the same nudge.\n\n"
     "**IMPORTANT: Do NOT message unless you have something genuinely NEW to say. "
     "Do NOT send multiple messages. Quality over quantity.**\n"
 )
@@ -1264,8 +1253,7 @@ _WEEKLY_REFLECTION_PROMPT = (
     "If the user doesn't respond, that's OK — the Monday morning review will "
     "auto-generate a summary from available data.\n\n"
     "**Send exactly ONE user-facing message via `nbhd_send_to_user`. Keep it casual "
-    "and inviting, not a data dump. After that message is sent, proceed to the "
-    "FINAL STEP described below.**\n"
+    "and inviting, not a data dump. After that message is sent, you are done.**\n"
 )
 
 _PROJECT_CHECKIN_PROMPT = (
@@ -1425,7 +1413,7 @@ _GRAVITY_WEEKLY_PROMPT = (
     "track with [strategy from query (3)]. Anything to adjust?' Don't pad "
     "with stale content.\n\n"
     "**Send exactly ONE user-facing message via `nbhd_send_to_user`. After "
-    "that message is sent, proceed to the FINAL STEP described below.**\n"
+    "that message is sent, you are done.**\n"
 )
 
 
