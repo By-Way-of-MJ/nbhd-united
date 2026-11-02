@@ -121,7 +121,11 @@ async function callRuntime(api, { path, method = "GET", query, body, timeoutMs =
     return asObject(payload);
   } catch (error) {
     if (error && error.name === "AbortError") {
-      const timeoutError = new Error(`NBHD runtime request timed out after ${boundedTimeoutMs}ms`);
+      const timeoutMessage =
+        method === "GET"
+          ? `NBHD runtime request timed out after ${boundedTimeoutMs}ms`
+          : `NBHD runtime request timed out after ${boundedTimeoutMs}ms. The server may still have saved this change. Check the current state before telling the user it failed, and do not repeat it blindly.`;
+      const timeoutError = new Error(timeoutMessage);
       timeoutError.code = "runtime_timeout";
       throw timeoutError;
     }
