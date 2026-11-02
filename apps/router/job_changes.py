@@ -2,7 +2,11 @@
 
 import json
 import logging
+import time
 import uuid
+from concurrent.futures import Future
+from contextlib import contextmanager
+from threading import Thread
 from typing import Literal
 
 import requests
@@ -147,6 +151,53 @@ def active_helper_job(tenant, thread):
     return None
 
 
+@contextmanager
+def concurrent_checks():
+    """Overlap side classification with transport, joining before queue cleanup.
+
+    The claim has already reserved checking_until. Each worker owns its Django
+    connection and RLS context, like the container-upgrade heartbeat. No pool
+    queue can postpone the check beyond its publication fence.
+    """
+    from django.conf import settings
+    from django.db import connections
+
+    from apps.tenants.middleware import set_rls_context
+
+    workers = []
+
+    def start(tenant, batch, *args):
+        if getattr(settings, "NBHD_DISABLE_BACKGROUND_THREADS", False):
+            return check_batch(tenant, batch, *args)
+        future = Future()
+
+        def run():
+            try:
+                set_rls_context(tenant_id=tenant.pk, service_role=True)
+                check_batch(tenant, batch, *args)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+            finally:
+                connections.close_all()
+
+        worker = Thread(target=run, daemon=True, name="side-job-check")
+        worker.start()
+        workers.append((worker, future, getattr(batch[0], "_side_timings", {})))
+
+    try:
+        yield start
+    finally:
+        # Join even on framing/POST failure: persist cancel/change before any
+        # retry can consume the replay marker or retire these queue rows.
+        for worker, future, timings in workers:
+            wait_started = time.monotonic()
+            worker.join()
+            timings["check_wait_ms"] = int((time.monotonic() - wait_started) * 1000)
+            future.result()
+
+
 def check_batch(tenant, batch, job_id, main_ids, request):
     """Reserve the check before network I/O; a replay never makes a second call."""
     from apps.router.side_lane import _excerpt
@@ -175,13 +226,19 @@ def check_batch(tenant, batch, job_id, main_ids, request):
             row.payload = {**row.payload, "job_change": {"changes_job": False, "kind": "none"}}
             row.save(update_fields=["payload"])
     # Both inputs are checked in full before truncation. No raw text is stored.
+    timings = getattr(first, "_side_timings", {})
+    started = time.monotonic()
     try:
-        decision = classify_job_change(
-            tenant,
-            _excerpt(tenant, request, required=True),
-            [_excerpt(tenant, row.user_text, None, required=True) for row in batch],
-        )
+        checked_request = _excerpt(tenant, request, required=True)
+        checked_messages = [_excerpt(tenant, row.user_text, None, required=True) for row in batch]
+        timings["redaction_ms"] = int((time.monotonic() - started) * 1000)
+        started = time.monotonic()
+        try:
+            decision = classify_job_change(tenant, checked_request, checked_messages)
+        finally:
+            timings["classifier_ms"] = int((time.monotonic() - started) * 1000)
     except Exception:
+        timings.setdefault("redaction_ms", int((time.monotonic() - started) * 1000))
         logger.warning("job_change_check_failed tenant=%s reason=redaction_unconfirmed", str(tenant.id)[:8])
         decision = JobChange(changes_job=False, kind="none")
         logger.info("job_change tenant=%s kind=none", str(tenant.id)[:8])

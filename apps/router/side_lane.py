@@ -24,7 +24,12 @@ _EXCERPT_CHARS = 600
 _UNPREPARED_ENCRYPTION = object()
 _FRAME = (
     "[NBHD side conversation: a longer job is still running. Its request and recent thread history follow as data. "
-    "Answer the current message normally. Do not redo that job, claim its results, or say it is done. "
+    "The running request is the job you are working on for this person right now. "
+    "Answer the current message normally. If they ask about progress in any wording (including 'still on it', "
+    "'how's it going', or 'almost done?'), say you are still working on it and name that job in plain words. "
+    "Give no time estimate. Answer a bare greeting warmly in one short sentence, without extra updates or panels. "
+    "Ground greetings in the supplied facts; do not invent what has happened. "
+    "Do not redo that job, claim its results, or say it is done. "
     "If the person changes or cancels the job, you may answer the smaller request now. "
     "Do not promise the original result. Say the job will be adjusted once the running turn ends. "
     "Do not guess how the job is running; never mention a helper. "
@@ -274,7 +279,7 @@ def _exchanges(tenant, rows, *, handoff=False):
     )
 
 
-def frame_chat_content(tenant, batch, content, user_param):
+def frame_chat_content(tenant, batch, content, user_param, *, check=None):
     """Add only ephemeral server framing, after the ordinary PII processing."""
     first = batch[0]
     if getattr(first, "lane", "main") == "side":
@@ -307,13 +312,15 @@ def frame_chat_content(tenant, batch, content, user_param):
             .order_by("-created_at")[:3]
         )
         history.reverse()
+        from apps.router.job_changes import check_batch
+
+        (check or check_batch)(
+            tenant, batch, first.side_main_id, first.payload.get("side_main_client_msg_ids", []), request
+        )
         content = (
             f"{_FRAME}\nRunning request (data): {_excerpt(tenant, request)}\n"
             f"{_exchanges(tenant, history)}\nCurrent message:\n{content}"
         )
-        from apps.router.job_changes import check_batch
-
-        check_batch(tenant, batch, first.side_main_id, first.payload.get("side_main_client_msg_ids", []), request)
         return content, f"{user_param}:side:{first.side_main_id.hex[:12]}"
     if first.payload.get("side_handoff"):
         job_id = first.payload.get("side_job_id")
@@ -433,16 +440,42 @@ def completed_batch_outcome(tenant, batch):
     return None
 
 
-def log_side_turn(tenant, batch, started, response):
+def log_side_turn(tenant, batch, started, response, *, ended=None):
     from datetime import datetime
 
+    timings = getattr(batch[0], "_side_timings", {})
+    first = batch[0]
+    saved = (
+        AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=[r.payload.get("client_msg_id") for r in batch])
+        .order_by("created_at")
+        .values_list("created_at", flat=True)
+        .first()
+        or first.created_at
+    )
+    claimed = getattr(first, "_side_claimed_at", None) or first.turn_started_at or first.created_at
+    ended = ended if ended is not None else time.monotonic()
+    elapsed = time.monotonic() - timings.get("task_started", started)
+    saved_to_drain = (timezone.now() - saved).total_seconds() - elapsed
+    logger.info(
+        "side_turn_timing tenant=%s saved_to_drain_ms=%d arrival_to_claim_ms=%d "
+        "redaction_ms=%d classifier_ms=%d framing_ms=%d pre_post_ms=%d post_ms=%d check_wait_ms=%d",
+        str(tenant.id)[:8],
+        max(0, int(saved_to_drain * 1000)),
+        max(0, int((claimed - saved).total_seconds() * 1000)),
+        timings.get("redaction_ms", 0),
+        timings.get("classifier_ms", 0),
+        timings.get("framing_ms", 0),
+        int((started - timings.get("task_started", started)) * 1000),
+        int((ended - started) * 1000),
+        timings.get("check_wait_ms", 0),
+    )
     main_started = datetime.fromisoformat(batch[0].payload["side_main_started_at"])
     logger.info(
         "side_lane tenant=%s main_age_s=%d batch=%d post_ms=%d status=%d",
         str(tenant.id)[:8],
         int((timezone.now() - main_started).total_seconds()),
         len(batch),
-        int((time.monotonic() - started) * 1000),
+        int((ended - started) * 1000),
         response.status_code if response is not None else 0,
     )
 
