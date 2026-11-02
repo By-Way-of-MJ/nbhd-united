@@ -120,15 +120,17 @@ class AttentionConfigTests(SimpleTestCase):
 
         # Captured before Job C from 8afa16112fe98b9ffdfd7018a9e4d6ef6872e34d.
         # Clock fixed to 2026-11-01 08:00 UTC; every prompt byte is pinned.
+        # Re-captured 2026-11-02 when seed prompts stopped pointing at the
+        # retired FINAL STEP.
         expected = {
-            "Morning Briefing": "182733306b27e0cea473c1cd73dc95fefc22d5ff9babdfe377f7fa304245c6d1",
-            "Evening Check-in": "bad0696232c5d00036cf3c5af9238ed61debcc9cd299e5f827b2685ac54d4660",
-            "Personal Question": "a8be5c8fade4cbfd3e1ca91ef17ea6e3ba5e8696a138a3b92de40398376725fe",
-            "Weekly Reflection": "ba8d99949a4f7d234b7ffa48b63d8db3ad7cbba581e68513ccedae5dad21f93d",
-            "Week Ahead Review": "5814857d4b31fb81a7f9f40707843805c6d9cddf4575c41cef6a7f5fdad76753",
+            "Morning Briefing": "1932c7364ee5248d6351f2f0a207c7caeb8b7a2e9e3a2796a26b3bbafcc5a4ee",
+            "Evening Check-in": "398ef4a1cd1597eed2c1b01f3527c7fa160dc56f7167f96c97d22f8ac834628c",
+            "Personal Question": "be3f5757e314a98ab278b27d7c208e205fcba56febb284e8199fe27af91a983b",
+            "Weekly Reflection": "088f5b0ce265466c7678594775c2f77877652e5f09cf3614a8342949dfcbcf4c",
+            "Week Ahead Review": "b06a913fbe4f20ee8da453af33606ae0c8882b91e06b34375cfc7410a7303991",
             "Project Check-in": "a17cd24854cc958402cc41223bf92800c3c04598379f115e204bcd915c1a1399",
             "Background Tasks": "e5212badd1d433bd1c981ee06874ceb7ac2fd4264ddb1c0729c4aeadc4c23bc7",
-            "Heartbeat Check-in": "b89c65073fafa79495a11c3936fb5a8b6aa6da2bb2c12050a9f3e522f2437885",
+            "Heartbeat Check-in": "f6ed9943a5492b33dd48b5c1826a1da594050b4864a642d96f3a7b60057e0b19",
         }
         jobs = build_cron_seed_jobs(self.tenant)
         self.assertEqual(

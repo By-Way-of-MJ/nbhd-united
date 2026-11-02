@@ -12,6 +12,8 @@ model gets this wrong, because it resolves both of them:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from django.test import TestCase
 from django.test.utils import override_settings
 
@@ -77,3 +79,67 @@ class RuntimeProfileTimezoneTest(TestCase):
             list(ToolContractEvent.objects.filter(namespace="cron").values_list("reason_code", flat=True)),
             ["profile_tz_rejected"],
         )
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.cron.publish.publish_task")
+    def test_timezone_change_queues_config_apply_on_commit(self, mock_publish, mock_update):
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self._patch("Asia/Tokyo")
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["updated"], ["timezone"])
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+        mock_update.assert_not_called()
+        self.tenant.user.refresh_from_db()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.user.timezone, "Asia/Tokyo")
+        self.assertEqual(self.tenant.pending_config_version, 1)
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    def test_timezone_change_survives_queue_failure(self, mock_publish):
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self._patch("Asia/Tokyo")
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["updated"], ["timezone"])
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+        self.tenant.user.refresh_from_db()
+        self.assertEqual(self.tenant.user.timezone, "Asia/Tokyo")
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.cron.publish.publish_task")
+    def test_location_change_queues_config_apply_on_commit(self, mock_publish, mock_update):
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.patch(
+                f"/api/v1/integrations/runtime/{self.tenant.id}/profile/",
+                data={"location_city": "Tokyo"},
+                content_type="application/json",
+                HTTP_X_NBHD_INTERNAL_KEY="shared-key",
+                HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["updated"], ["location_city"])
+        mock_publish.assert_called_once_with("apply_single_tenant_config", str(self.tenant.id))
+        mock_update.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.pending_config_version, 1)
+
+    @patch("apps.orchestrator.services.update_tenant_config")
+    @patch("apps.cron.publish.publish_task")
+    def test_display_name_only_change_queues_nothing(self, mock_publish, mock_update):
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.patch(
+                f"/api/v1/integrations/runtime/{self.tenant.id}/profile/",
+                data={"display_name": "Renamed"},
+                content_type="application/json",
+                HTTP_X_NBHD_INTERNAL_KEY="shared-key",
+                HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["updated"], ["display_name"])
+        mock_publish.assert_not_called()
+        mock_update.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.pending_config_version, 0)

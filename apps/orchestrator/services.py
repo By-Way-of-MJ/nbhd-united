@@ -1984,7 +1984,9 @@ def refresh_system_cron_rows_from_seed(tenant: Tenant | str) -> dict:
         tenant = Tenant.objects.select_related("user").get(id=tenant)
 
     from apps.cron.models import CronJob, CronJobSource
+    from apps.cron.tenant_views import _strip_phase2_block
 
+    from .config_generator import upgrade_retired_final_step_prose
     from .cron_drift import strip_date_line
     from .send_test import (
         SEND_TEST_MANAGED_JOBS,
@@ -2044,8 +2046,12 @@ def refresh_system_cron_rows_from_seed(tenant: Tenant | str) -> dict:
             if isinstance(seed_payload, dict) and isinstance(existing_payload, dict):
                 merged_payload = dict(seed_payload)
                 # Custom message wins; non-message payload fields come from seed.
+                # A preserved prompt still must not carry the retired Phase 2
+                # block or the old FINAL STEP prose forward.
                 if "message" in existing_payload:
-                    merged_payload["message"] = existing_payload["message"]
+                    merged_payload["message"] = upgrade_retired_final_step_prose(
+                        _strip_phase2_block(existing_payload["message"])
+                    )
                     if name in SEND_TEST_MANAGED_JOBS and not send_test_enabled(name, tenant):
                         merged_payload["message"] = without_send_test(merged_payload["message"])
                 new_data["payload"] = merged_payload
@@ -2163,6 +2169,8 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
 
     tenant_id = str(tenant.id)
     desired_jobs = build_cron_seed_jobs(tenant)
+    from apps.cron.tenant_views import _strip_phase2_block
+
     from .send_test import (
         SEND_TEST_MANAGED_JOBS,
         is_send_test_default,
@@ -2281,6 +2289,18 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
     # same property go here.
     _NON_MESSAGE_PAYLOAD_DRIFT_FIELDS = ("model", "kind")
 
+    def _strip_payload_message(payload: dict) -> dict:
+        """Return a payload copy with any retired Phase 2 block removed."""
+        if not isinstance(payload, dict):
+            return payload
+        message = payload.get("message")
+        if not isinstance(message, str):
+            return payload
+        stripped = _strip_phase2_block(message)
+        if stripped == message:
+            return payload
+        return {**payload, "message": stripped}
+
     def _payload_non_message_drift(existing: dict, desired: dict) -> list[str]:
         """Return non-message payload fields that drifted between sides.
 
@@ -2347,7 +2367,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
             if not is_default:
                 # Preserve edits even when model/kind/timezone need repair.
                 desired_payload = dict(desired_payload)
-                desired_payload["message"] = (
+                desired_payload["message"] = _strip_phase2_block(
                     existing_message if send_test_enabled(name, tenant) else without_send_test(existing_message)
                 )
                 desired_message = desired_payload["message"]
@@ -2367,7 +2387,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
         message_differs = _strip_date_line(existing_message) != _strip_date_line(desired_message)
         if message_differs:
             if is_default or non_message_drift or (strict_send_test and desired_message != existing_message):
-                patch["payload"] = desired_payload
+                patch["payload"] = _strip_payload_message(desired_payload)
                 if non_message_drift and not _is_default_prompt(existing_message):
                     logger.warning(
                         "update_system_cron_prompts: recreating '%s' for tenant %s "
@@ -2386,7 +2406,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
                 skipped += 1
         elif non_message_drift:
             # Message matches but model/kind drifted — recreate to repair.
-            patch["payload"] = desired_payload
+            patch["payload"] = _strip_payload_message(desired_payload)
             logger.info(
                 "update_system_cron_prompts: recreating '%s' for tenant %s due to non-message payload drift (%s)",
                 name,
@@ -2431,7 +2451,7 @@ def update_system_cron_prompts(tenant: Tenant | str) -> dict:
                 if name == "Personal Question":
                     replacement["enabled"] = bool(existing.get("enabled", False))
                 if name in SEND_TEST_MANAGED_JOBS:
-                    replacement["payload"] = desired_payload
+                    replacement["payload"] = _strip_payload_message(desired_payload)
                 invoke_gateway_tool(tenant, "cron.add", {"job": replacement})
                 updated += 1
                 logger.info(

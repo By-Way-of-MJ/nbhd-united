@@ -377,11 +377,11 @@ class ConfigGeneratorTest(TestCase):
                 f"{job['name']} payload must use 'message' field, not 'text'",
             )
 
-    def test_seed_jobs_no_longer_carry_phase2_sync_block(self):
+    def test_seed_jobs_no_longer_carry_phase2_sync(self):
         """Retirement guard (2026-07-11): NO seed cron prompt appends the Phase 2
         sync block or instructs the agent to call ``nbhd_cron_phase2_summary``.
 
-        The LLM-mediated ``_phase2_sync_block`` cross-session bridge was
+        The LLM-mediated Phase 2 sync cross-session bridge was
         superseded by the deterministic ProactiveOutbound bridge
         (``apps/router/proactive_context.py``). Seed prompts stopped emitting it
         in ``config_generator._build_cron_message``. This asserts the emission
@@ -422,26 +422,7 @@ class ConfigGeneratorTest(TestCase):
             "expected at least one formerly-foreground seed job to be present",
         )
 
-    def test_phase2_sync_block_disambiguates_tool_from_message(self):
-        """The Phase 2 sync block must explicitly tell the agent that this is a
-        tool invocation, not a chat message. Regression guard for the cron-leak
-        incident where the model emitted ``/cron add ...`` text via
-        ``nbhd_send_to_user`` instead of invoking the sync tool.
-        """
-        from .config_generator import _phase2_sync_block
-
-        block = _phase2_sync_block("Evening Check-in")
-
-        # Tool-vs-message disambiguation must be explicit
-        self.assertIn("TOOL invocation", block)
-        self.assertIn("nbhd_send_to_user", block)
-
-        # The new contract delegates cron creation to Django; the agent only
-        # invokes nbhd_cron_phase2_summary with summary + job_name.
-        self.assertIn("nbhd_cron_phase2_summary", block)
-        self.assertIn('"Evening Check-in"', block)
-
-    def test_background_jobs_skip_phase2_sync_block(self):
+    def test_background_jobs_skip_phase2_sync(self):
         """Background seed jobs (foreground=false) do NOT carry the Phase 2 wrapper."""
         from .config_generator import build_cron_seed_jobs
 

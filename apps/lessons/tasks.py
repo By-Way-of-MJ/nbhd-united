@@ -47,6 +47,39 @@ def name_clusters_task(tenant_id: str) -> dict:
     return result
 
 
+def process_lesson_after_save(lesson_id: str) -> dict:
+    """Finish an assistant-created lesson after its save has committed.
+
+    The runtime lesson endpoint saves the row and returns immediately; this
+    task runs the same post-approval pipeline that used to run inline:
+    embedding + connections, then a constellation refresh once the tenant has
+    at least five approved lessons. Each stage stays best-effort exactly like
+    the view did — a failed embedding must not skip clustering.
+    """
+    from apps.lessons.clustering import refresh_constellation
+    from apps.lessons.models import Lesson
+    from apps.lessons.services import process_approved_lesson
+
+    lesson = Lesson.objects.select_related("tenant").filter(id=lesson_id).first()
+    if lesson is None:
+        logger.info("process_lesson_after_save: lesson %s no longer exists", lesson_id)
+        return {"ok": False, "reason": "lesson_not_found"}
+
+    tenant = lesson.tenant
+    try:
+        process_approved_lesson(lesson)
+    except Exception:
+        logger.exception("process_lesson_after_save: embedding failed for lesson %s", lesson.id)
+
+    try:
+        if Lesson.objects.filter(tenant=tenant, status="approved").count() >= 5:
+            refresh_constellation(tenant)
+    except Exception:
+        logger.exception("process_lesson_after_save: clustering failed for tenant %s", str(tenant.id)[:8])
+
+    return {"ok": True, "lesson_id": lesson.id}
+
+
 def reseed_lessons_task() -> dict:
     """Fan out reseed to each active tenant via QStash."""
     from apps.tenants.models import Tenant

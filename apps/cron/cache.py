@@ -54,10 +54,19 @@ def upsert_jobs_to_cache(tenant, jobs: list[dict[str, Any]]) -> None:
     behaviour of the legacy ``cron_jobs_snapshot`` writer. The list is
     expected to be the raw gateway response, not the user-filtered view.
     """
+    from .tenant_views import _strip_phase2_block
+
     by_name: dict[str, dict[str, Any]] = {}
     for job in jobs:
         if not isinstance(job, dict):
             continue
+        # Never let a gateway read re-import the retired Phase 2 block. Copy
+        # the job/payload instead of mutating the caller's list.
+        payload = job.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            stripped = _strip_phase2_block(payload["message"])
+            if stripped != payload["message"]:
+                job = {**job, "payload": {**payload, "message": stripped}}
         name = job.get("name") or ""
         if not name:
             continue

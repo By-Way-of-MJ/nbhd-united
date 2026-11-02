@@ -103,6 +103,18 @@ class UpsertJobsToCacheTest(TestCase):
         names = list(CronJob.objects.filter(tenant=self.tenant).values_list("name", flat=True))
         self.assertEqual(names, ["ok"])
 
+    def test_strips_retired_phase2_block_without_mutating_input(self):
+        from apps.orchestrator.config_generator import PHASE2_SYNC_MARKER
+
+        legacy = "base" + "\n\n---\n**" + PHASE2_SYNC_MARKER + ":**\nold"
+        job = {"name": "A", "id": "a-1", "payload": {"kind": "agentTurn", "message": legacy}}
+
+        upsert_jobs_to_cache(self.tenant, [job])
+
+        row = CronJob.objects.get(tenant=self.tenant, name="A")
+        self.assertEqual(row.data["payload"]["message"], "base")
+        self.assertEqual(job["payload"]["message"], legacy)
+
 
 class ReadJobsFromCacheTest(TestCase):
     def setUp(self):
