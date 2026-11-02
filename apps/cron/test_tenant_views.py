@@ -1809,6 +1809,20 @@ class RuntimeContainerStartedTest(TestCase):
         mock_regen.assert_called_once()
         mock_maintenance.assert_called_once()
 
+    def test_hook_clears_wake_in_progress_signal(self):
+        from django.core.cache import cache
+
+        from apps.orchestrator.hibernation import is_wake_in_progress, mark_wake_in_progress
+
+        self.addCleanup(cache.clear)
+        mark_wake_in_progress(self.tenant.id)
+        self.assertTrue(is_wake_in_progress(self.tenant.id))
+
+        resp = self._boot()
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(is_wake_in_progress(self.tenant.id))
+
     @patch("apps.orchestrator.cron_reconcile.regenerate_tenant_crons")
     def test_hook_skipped_when_flag_off(self, mock_regen):
         self.tenant.postgres_cron_canonical = False

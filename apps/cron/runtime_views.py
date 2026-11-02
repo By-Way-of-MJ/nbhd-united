@@ -72,6 +72,13 @@ class RuntimeContainerStartedView(APIView):
         if isinstance(tenant_or_resp, Response):
             return tenant_or_resp
         tenant = tenant_or_resp
+
+        # The container is up: clear the wake-in-progress signal the drain uses
+        # to show "waking" on messages that arrived during the boot.
+        from apps.orchestrator.hibernation import clear_wake_in_progress
+
+        clear_wake_in_progress(tenant.id)
+
         record_runtime_write_activity(tenant)
 
         # Record which plugin dirs this image ships (config_generator only loads
