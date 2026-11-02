@@ -3083,6 +3083,66 @@ class RuntimeConstellationNotesView(APIView):
 # ---------------------------------------------------------------------------
 
 
+def _put_runtime_document(tenant, *, kind, slug, markdown, title=""):
+    """Shared full-field journal write for runtime documents and scoped prep pages."""
+    markdown = neutralize_remote_image_markdown(markdown)
+    # PUT replaces the whole body, so both fields are authored outright.
+    # An omitted title falls back to the server-rendered default, which
+    # carries no user text and therefore earns no receipt.
+    authored_markdown = _author_runtime_document(
+        tenant,
+        markdown,
+        seam="journal.document.put.runtime",
+        field="markdown",
+    )
+    markdown = authored_markdown.text
+    receipts = {"markdown": authored_markdown.receipt}
+    if title:
+        authored_title = _author_runtime_document(
+            tenant,
+            title,
+            seam="journal.document.put.runtime",
+            field="title",
+        )
+        title = authored_title.text
+        receipts["title"] = authored_title.receipt
+
+    doc, created = Document.objects.get_or_create(
+        tenant=tenant,
+        kind=kind,
+        slug=slug,
+        defaults={
+            "title": title or _default_title(kind, slug),
+            "markdown": markdown,
+            "pii_receipts": receipts,
+        },
+    )
+
+    if not created:
+        # Merge onto the row read under the lock, carrying ONLY the fields
+        # this request authored. A PUT that omits ``title`` must leave the
+        # title receipt a concurrent writer just set exactly as it is — a
+        # receipt that no longer matches its text rehydrates the wrong
+        # binding. Authoring already happened above, outside the transaction
+        # (invariants §8).
+        with transaction.atomic():
+            doc = Document.objects.select_for_update().get(pk=doc.pk)
+            doc.markdown = markdown
+            update_fields = ["markdown"]
+            if title:
+                doc.title = title
+                update_fields.append("title")
+            doc.pii_receipts = {**(doc.pii_receipts or {}), **receipts}
+            doc.save(update_fields=[*update_fields, "pii_receipts", "updated_at"])
+
+    if doc.kind != Document.Kind.MEMORY:
+        record_runtime_write_event(
+            tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if created else "updated"
+        )
+
+    return doc, created
+
+
 class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
     """GET/PUT a document by kind+slug (agent access)."""
 
@@ -3218,59 +3278,7 @@ class RuntimeDocumentView(KnownValueResponseGuardMixin, APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # PUT replaces the whole body, so both fields are authored outright.
-        # An omitted title falls back to the server-rendered default, which
-        # carries no user text and therefore earns no receipt.
-        authored_markdown = _author_runtime_document(
-            tenant,
-            markdown,
-            seam="journal.document.put.runtime",
-            field="markdown",
-        )
-        markdown = authored_markdown.text
-        receipts = {"markdown": authored_markdown.receipt}
-        if title:
-            authored_title = _author_runtime_document(
-                tenant,
-                title,
-                seam="journal.document.put.runtime",
-                field="title",
-            )
-            title = authored_title.text
-            receipts["title"] = authored_title.receipt
-
-        doc, created = Document.objects.get_or_create(
-            tenant=tenant,
-            kind=kind,
-            slug=slug,
-            defaults={
-                "title": title or _default_title(kind, slug),
-                "markdown": markdown,
-                "pii_receipts": receipts,
-            },
-        )
-
-        if not created:
-            # Merge onto the row read under the lock, carrying ONLY the fields
-            # this request authored. A PUT that omits ``title`` must leave the
-            # title receipt a concurrent writer just set exactly as it is — a
-            # receipt that no longer matches its text rehydrates the wrong
-            # binding. Authoring already happened above, outside the transaction
-            # (invariants §8).
-            with transaction.atomic():
-                doc = Document.objects.select_for_update().get(pk=doc.pk)
-                doc.markdown = markdown
-                update_fields = ["markdown"]
-                if title:
-                    doc.title = title
-                    update_fields.append("title")
-                doc.pii_receipts = {**(doc.pii_receipts or {}), **receipts}
-                doc.save(update_fields=[*update_fields, "pii_receipts", "updated_at"])
-
-        if doc.kind != Document.Kind.MEMORY:
-            record_runtime_write_event(
-                tenant, kind="journal_doc", ref={"document_id": doc.id}, verb="created" if created else "updated"
-            )
+        doc, created = _put_runtime_document(tenant, kind=kind, slug=slug, markdown=markdown, title=title)
 
         return Response(
             {
@@ -6439,6 +6447,78 @@ class RuntimeProjectsContextView(RLSRequestTransactionMixin, KnownValueResponseG
         from apps.friends import project_assistant
 
         return Response(project_assistant.runtime_context(tenant))
+
+
+class RuntimeStepPrepNextView(RLSRequestTransactionMixin, KnownValueResponseGuardMixin, APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    pii_egress_seam = "friends_projects_runtime_response"
+    pii_egress_text_fields = _PROJECT_EGRESS_TEXT_FIELDS | {"description", "text", "answer", "body"}
+    update = False
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, failure = _load_tenant_or_404(tenant_id)
+        if failure is not None or tenant is None:
+            return failure
+        from apps.router.chat_gates import _tenant_allowed
+
+        if not _tenant_allowed(tenant, "STEP_PREP_TENANT_IDS"):
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        from apps.friends import project_prep
+
+        return Response(project_prep.runtime_next(tenant, request.data, update=self.update))
+
+
+class RuntimeStepPrepUpdateNextView(RuntimeStepPrepNextView):
+    update = True
+
+
+class RuntimeStepPrepSaveView(RLSRequestTransactionMixin, APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, failure = _load_tenant_or_404(tenant_id)
+        if failure is not None or tenant is None:
+            return failure
+        from apps.router.chat_gates import _tenant_allowed
+
+        if not _tenant_allowed(tenant, "STEP_PREP_TENANT_IDS"):
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        blocked = assert_write_allowed_for_document_turn(tenant)
+        if blocked is not None:
+            return blocked
+        from apps.friends import project_prep
+
+        record_runtime_write_activity(tenant)
+        return Response(project_prep.runtime_save(tenant, request.data))
+
+
+class RuntimeStepPrepReportView(RLSRequestTransactionMixin, APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request, tenant_id):
+        auth_failure = _internal_auth_or_401(request, tenant_id)
+        if auth_failure is not None:
+            return auth_failure
+        tenant, failure = _load_tenant_or_404(tenant_id)
+        if failure is not None or tenant is None:
+            return failure
+        from apps.router.chat_gates import _tenant_allowed
+
+        if not _tenant_allowed(tenant, "STEP_PREP_TENANT_IDS"):
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        from apps.friends import project_prep
+
+        record_runtime_write_activity(tenant)
+        return Response(project_prep.runtime_report(tenant, request.data))
 
 
 class RuntimeProjectDraftView(RLSRequestTransactionMixin, APIView):

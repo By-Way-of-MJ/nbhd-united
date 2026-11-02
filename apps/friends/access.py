@@ -29,7 +29,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import connection, transaction
-from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q, Window
+from django.db.models import Count, Exists, F, Max, OuterRef, Prefetch, Q, Subquery, Window
 from django.db.models.functions import RowNumber
 from django.utils import timezone
 
@@ -1465,7 +1465,7 @@ def note_profiles(notes):
     return {p.tenant_id: p for p in NeighborProfile.objects.filter(tenant_id__in={n.author.tenant_id for n in notes})}
 
 
-def newest_shared_notes(goal, *, viewer=None):
+def newest_shared_notes(goal, *, viewer=None, with_cursor=False):
     """Newest three per step in one metadata-only query, including the photo count."""
     return (
         project_notes(goal, viewer=viewer)
@@ -1479,7 +1479,13 @@ def newest_shared_notes(goal, *, viewer=None):
         )
         .filter(position__lte=3)
         .order_by("step_id", "-created_at", "-id")
-        .values("step_id", "text", "author_id", "photo_count")
+        .values(
+            "step_id",
+            "text",
+            "author_id",
+            "photo_count",
+            *(["created_at", "author__tenant__neighbor_profile__handle"] if with_cursor else []),
+        )
     )
 
 
@@ -1904,6 +1910,24 @@ def create_step_prep(tenant, membership, step, brief):
     if membership.tenant_id != _tenant_id(tenant) or membership.shared_goal_id != step.shared_goal_id:
         raise NotFound("No such project item.")
     return StepPrep.objects.create(tenant_id=_tenant_id(tenant), membership=membership, step=step, brief=brief)
+
+
+def step_preps_with_unseen_notes(tenant):
+    """Select due rows in SQL, without reading every idle preparation's notes."""
+    newest = (
+        project_notes(OuterRef("step__shared_goal_id"), viewer=tenant)
+        .filter(step_id=OuterRef("step_id"))
+        .order_by("-created_at")
+        .values("created_at")[:1]
+    )
+    return (
+        my_step_preps(tenant)
+        .alias(_newest_note_at=Subquery(newest))
+        .filter(
+            Q(last_seen_note_at__isnull=True, _newest_note_at__isnull=False)
+            | Q(_newest_note_at__gt=F("last_seen_note_at"))
+        )
+    )
 
 
 def update_step_prep(tenant, prep, **fields):
