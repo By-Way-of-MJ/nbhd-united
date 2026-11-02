@@ -138,6 +138,10 @@ urlpatterns = [
 ]
 
 urlpatterns += [
+    path("step-preps/", project_views.StepPrepsView.as_view()),
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/prep/", project_views.StepPrepView.as_view()),
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/prep/stop/", project_views.StepPrepStopView.as_view()),
+    path("missions/<uuid:mission_id>/steps/<uuid:step_id>/prep/choose/", project_views.StepPrepChooseView.as_view()),
     path("missions/<uuid:mission_id>/steps/<uuid:step_id>/notes/", project_views.StepNotesView.as_view()),
     path("missions/<uuid:mission_id>/notes/<uuid:note_id>/", project_views.StepNoteView.as_view()),
     path("missions/<uuid:mission_id>/notes/photos/<uuid:photo_id>/", project_views.StepNotePhotoView.as_view()),
