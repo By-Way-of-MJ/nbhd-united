@@ -621,7 +621,11 @@ class DocumentAppendView(APIView):
                 set_rls_context(tenant_id=tenant.pk, as_tenant=True)
                 op = JournalAppendOp.objects.filter(tenant=tenant, op_id=op_id).first()
                 if op is not None:
-                    doc = Document.objects.get(tenant=tenant, kind="daily", slug=op.document_slug)
+                    doc = Document.objects.filter(
+                        tenant=tenant, kind="daily", slug=op.document_slug
+                    ).first() or Document(
+                        tenant=tenant, kind="daily", slug=op.document_slug, title=op.document_slug, markdown=""
+                    )
             if op is not None:
                 response = DocumentSerializer(doc, context={"tenant": tenant}).data
                 response.update(entry_heading=op.entry_heading, replayed=True)
@@ -667,7 +671,9 @@ class DocumentAppendView(APIView):
                 replayed = not created
                 entry_heading = op.entry_heading
             if replayed:
-                doc = Document.objects.get(tenant=tenant, kind="daily", slug=op.document_slug)
+                doc = Document.objects.filter(tenant=tenant, kind="daily", slug=op.document_slug).first() or Document(
+                    tenant=tenant, kind="daily", slug=op.document_slug, title=op.document_slug, markdown=""
+                )
             else:
                 entry_block = f"\n\n{entry_heading}\n{content}\n"
                 doc.markdown = (doc.markdown or "").rstrip() + entry_block

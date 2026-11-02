@@ -1392,6 +1392,28 @@ class DocumentAPITest(TestCase):
         self.assertEqual(replay.data, {**edited.data, "entry_heading": first.data["entry_heading"], "replayed": True})
         self.assertFalse(Document.objects.filter(tenant=self.tenant, slug="2026-02-17").exists())
 
+    def test_append_op_replay_after_deletion_returns_empty_page_without_recreating_it(self):
+        op_id = str(uuid4())
+        url = "/api/v1/journal/documents/daily/2026-02-16/append/"
+        first = self.client.post(url, {"op_id": op_id, "content": "Thought", "time": "23:48"}, format="json")
+        self.assertEqual(first.status_code, 201)
+        Document.objects.get(pk=first.data["id"]).delete()
+
+        with patch("apps.journal.document_views._author_owner_document") as author:
+            replay = self.client.post(url, {"op_id": op_id, "content": "Different thought"}, format="json")
+
+        author.assert_not_called()
+        self.assertEqual(replay.status_code, 201)
+        self.assertEqual(set(replay.data), set(first.data))
+        self.assertIs(replay.data["replayed"], True)
+        self.assertEqual(replay.data["entry_heading"], first.data["entry_heading"])
+        self.assertEqual(replay.data["kind"], "daily")
+        self.assertEqual(replay.data["slug"], "2026-02-16")
+        self.assertEqual(replay.data["title"], "2026-02-16")
+        self.assertEqual(replay.data["markdown"], "")
+        self.assertFalse(Document.objects.filter(tenant=self.tenant, kind="daily", slug="2026-02-16").exists())
+        self.assertEqual(JournalAppendOp.objects.filter(tenant=self.tenant, op_id=op_id).count(), 1)
+
     def test_append_op_is_tenant_scoped_and_cascades_on_tenant_deletion(self):
         url = "/api/v1/journal/documents/daily/2026-02-16/append/"
         op_id = str(uuid4())

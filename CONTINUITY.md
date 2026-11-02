@@ -58,7 +58,7 @@ CONTINUITY.md
 - Release prerequisites: #1651 deployed; actual MI/ACR/console/health canaries and synthetic delivery checks remain release work.
 - Follow-ups outside this PR: poller payload logging (pre-existing REVIEW3 #8), noncanonical job persistence, lifecycle queue/Azure/concurrent-wake hardening.
 ## Trivial Log
-- None.
+- [2026-11-03] JB-A2: both deleted-page append replays serialize an unsaved empty page; one regression test added. Journal: 646 tests pass; Ruff lint/format and diff checks pass. See DSH_REPORT.md; local commit only.
 ## Open questions
 - None blocking.
 ## Working set
