@@ -569,9 +569,14 @@ class KeepChattingTests(TestCase):
         self.row("secret text must not be logged")
         with self.assertLogs("apps.router.side_lane", level="INFO") as logs:
             self.drain()
-        self.assertEqual(len(logs.output), 1)
-        self.assertRegex(logs.output[0], r"side_lane tenant=[0-9a-f]{8} main_age_s=\d+ batch=1 post_ms=\d+ status=200$")
-        self.assertNotIn("secret", logs.output[0])
+        self.assertEqual(len(logs.output), 2)
+        self.assertRegex(
+            logs.output[0],
+            r"side_turn_timing tenant=[0-9a-f]{8} saved_to_drain_ms=\d+ arrival_to_claim_ms=\d+ "
+            r"redaction_ms=\d+ classifier_ms=\d+ framing_ms=\d+ pre_post_ms=\d+ post_ms=\d+ check_wait_ms=\d+$",
+        )
+        self.assertRegex(logs.output[1], r"side_lane tenant=[0-9a-f]{8} main_age_s=\d+ batch=1 post_ms=\d+ status=200$")
+        self.assertNotIn("secret", " ".join(logs.output))
 
     def test_main_recap_precedes_an_older_waiting_attachment(self):
         main = self.main()

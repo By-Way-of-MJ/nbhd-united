@@ -2,7 +2,7 @@ import json
 from unittest.mock import patch
 
 import requests
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from pydantic import ValidationError
 
 from apps.router import test_keep_chatting as keep_tests
@@ -193,3 +193,139 @@ class JobPublicationTests(TestCase):
         self.assertTrue(seen)
         self.finish(main)
         self.assertEqual(self.app(main).reply_text, "")
+
+
+@override_settings(
+    KEEP_CHATTING_TENANT_IDS="*", NBHD_INTERNAL_API_KEY="test-key", NBHD_DISABLE_BACKGROUND_THREADS=False
+)
+class ConcurrentJobPublicationTests(TransactionTestCase):
+    setUp = keep_tests.KeepChattingTests.setUp
+    row = keep_tests.KeepChattingTests.row
+    main = keep_tests.KeepChattingTests.main
+    drain = keep_tests.KeepChattingTests.drain
+    app = keep_tests.KeepChattingTests.app
+
+    def test_post_overlaps_check_and_main_waits_then_suppresses_change_or_cancel(self):
+        from threading import Event
+
+        from apps.router.job_changes import JobChangePending
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        for kind in ("change", "cancel"):
+            with self.subTest(kind=kind):
+                main = self.main()
+                self.row("please " + kind + " the day plan")
+                entered, release = Event(), Event()
+
+                def classify(*args, entered=entered, release=release, kind=kind):
+                    from django.db import connection
+
+                    self.assertFalse(connection.in_atomic_block)
+                    entered.set()
+                    self.assertTrue(release.wait(5), "POST never ran while the check was pending")
+                    return JobChange(changes_job=True, kind=kind)
+
+                def post(*args, entered=entered, release=release, main=main, **kwargs):
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        self.thread.refresh_from_db()
+                        entry = self.thread.side_jobs[str(main.id)]
+                        from django.utils import timezone
+
+                        remaining = entry["checking_until"] - timezone.now().timestamp()
+                        self.assertGreater(remaining, 20)
+                        self.assertLessEqual(remaining, 30)
+                        with self.assertRaises(JobChangePending):
+                            _store_ios_turn_reply(self.tenant, [main], "OLD FULL DAY PLAN")
+                    finally:
+                        release.set()
+                    return _ok_chat_response("I am still here.")
+
+                self.change_check.side_effect = classify
+                self.post.side_effect = post
+                self.drain()
+                self.thread.refresh_from_db()
+                self.assertNotIn("checking_until", self.thread.side_jobs[str(main.id)])
+                _store_ios_turn_reply(self.tenant, [main], "OLD FULL DAY PLAN")
+                self.assertEqual(self.app(main).reply_text, "")
+                self.assertEqual(self.thread.side_jobs[str(main.id)]["kind"], kind)
+                self.assertTrue(PendingMessage.objects.filter(payload__side_job_id=str(main.id)).exists())
+                main.delete()
+                # Remove the scheduled handoff to isolate the next subcase.
+                PendingMessage.objects.filter(payload__side_handoff=True).delete()
+
+    def test_failed_or_timed_out_check_frees_fence_and_replay_does_not_classify(self):
+        import httpx
+
+        from apps.router.job_changes import check_batch
+        from apps.router.side_lane import claim_chat_batch
+
+        for error in (requests.Timeout(), RuntimeError("unavailable")):
+            with self.subTest(error=type(error).__name__):
+                main = self.main()
+                side = self.row("never mind the plan")
+                self.change_check.side_effect = error
+                self.post.side_effect = httpx.ReadTimeout("offline")
+                with self.assertRaises(RuntimeError):
+                    self.drain()
+                side.refresh_from_db()
+                self.assertEqual(side.payload["job_change"], {"changes_job": False, "kind": "none"})
+                self.thread.refresh_from_db()
+                self.assertNotIn("checking_until", self.thread.side_jobs[str(main.id)])
+                calls = self.change_check.call_count
+                batch, _ = claim_chat_batch(self.tenant, str(self.thread.id), 120)
+                check_batch(self.tenant, batch, main.id, [], "day plan")
+                self.assertEqual(self.change_check.call_count, calls)
+                PendingMessage.objects.all().delete()
+
+    def test_worker_sets_tenant_rls_and_closes_connections_on_success_and_failure(self):
+        from threading import get_ident
+
+        from django.db import connection, connections
+
+        from apps.router.job_changes import concurrent_checks
+        from apps.tenants.middleware import set_rls_context
+
+        owner = get_ident()
+        closed = []
+        close = connections.close_all
+
+        def close_worker():
+            closed.append(get_ident())
+            close()
+
+        def check(tenant, *args):
+            self.assertNotEqual(get_ident(), owner)
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_setting('app.tenant_id'), current_setting('app.service_role')")
+                self.assertEqual(cursor.fetchone(), (str(tenant.pk), "true"))
+            if args[0][0]:
+                raise RuntimeError("check failed")
+
+        with (
+            patch("apps.tenants.middleware.set_rls_context", wraps=set_rls_context) as rls,
+            patch("django.db.connections.close_all", side_effect=close_worker),
+            patch("apps.router.job_changes.check_batch", side_effect=check),
+        ):
+            with concurrent_checks() as start:
+                start(self.tenant, [False])
+            with self.assertRaisesRegex(RuntimeError, "check failed"), concurrent_checks() as start:
+                start(self.tenant, [True])
+        self.assertEqual(len(closed), 2)
+        self.assertNotIn(owner, closed)
+        self.assertEqual(rls.call_count, 2)
+        rls.assert_called_with(tenant_id=self.tenant.pk, service_role=True)
+
+    def test_expired_check_fence_does_not_hold_main_forever(self):
+        from django.utils import timezone
+
+        from apps.router.job_changes import finish_main
+        from apps.router.side_lane import claim_chat_batch
+
+        main = self.main()
+        self.row("hi")
+        claim_chat_batch(self.tenant, str(self.thread.id), 120)
+        self.thread.refresh_from_db()
+        self.thread.side_jobs[str(main.id)]["checking_until"] = timezone.now().timestamp() - 1
+        self.thread.save(update_fields=["side_jobs"])
+        self.assertFalse(finish_main(self.tenant, [main]))

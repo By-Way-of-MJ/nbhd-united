@@ -4,6 +4,9 @@ import json
 import logging
 import time
 import uuid
+from concurrent.futures import Future
+from contextlib import contextmanager
+from threading import Thread
 from typing import Literal
 
 import requests
@@ -146,6 +149,53 @@ def active_helper_job(tenant, thread):
             if run.occurrence_key in entry["helpers"]:
                 return job_id, entry
     return None
+
+
+@contextmanager
+def concurrent_checks():
+    """Overlap side classification with transport, joining before queue cleanup.
+
+    The claim has already reserved checking_until. Each worker owns its Django
+    connection and RLS context, like the container-upgrade heartbeat. No pool
+    queue can postpone the check beyond its publication fence.
+    """
+    from django.conf import settings
+    from django.db import connections
+
+    from apps.tenants.middleware import set_rls_context
+
+    workers = []
+
+    def start(tenant, batch, *args):
+        if getattr(settings, "NBHD_DISABLE_BACKGROUND_THREADS", False):
+            return check_batch(tenant, batch, *args)
+        future = Future()
+
+        def run():
+            try:
+                set_rls_context(tenant_id=tenant.pk, service_role=True)
+                check_batch(tenant, batch, *args)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(None)
+            finally:
+                connections.close_all()
+
+        worker = Thread(target=run, daemon=True, name="side-job-check")
+        worker.start()
+        workers.append((worker, future, getattr(batch[0], "_side_timings", {})))
+
+    try:
+        yield start
+    finally:
+        # Join even on framing/POST failure: persist cancel/change before any
+        # retry can consume the replay marker or retire these queue rows.
+        for worker, future, timings in workers:
+            wait_started = time.monotonic()
+            worker.join()
+            timings["check_wait_ms"] = int((time.monotonic() - wait_started) * 1000)
+            future.result()
 
 
 def check_batch(tenant, batch, job_id, main_ids, request):
