@@ -3056,6 +3056,15 @@ def _drain_ios_batch(
             if getattr(batch[0], "lease_token", None):
                 headers["X-NBHD-Chat-Request-Id"] = str(batch[0].batch_id)
 
+            # A wake may already be in flight from a pre-warm (or another
+            # caller) rather than this drain. The POST below can then block for
+            # the whole boot without failing, so stamp "waking" before it
+            # starts instead of waiting for a 404 that never comes.
+            from apps.orchestrator.hibernation import is_wake_in_progress
+
+            if is_wake_in_progress(tenant.id):
+                _mark_ios_waking(PendingMessage.Channel.IOS, batch)
+
             post_started = time.monotonic()
             try:
                 resp = httpx.post(url, json=chat_payload, headers=headers, timeout=timeout)

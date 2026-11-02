@@ -2079,6 +2079,89 @@ class WakeBootGraceTest(TestCase):
 
 
 @override_settings(NBHD_INTERNAL_API_KEY="test-key", LINE_CHANNEL_ACCESS_TOKEN="test-token")
+class WakeInProgressTest(TestCase):
+    """A message sent while a wake is already in flight (e.g. the app's chat
+    pre-warm started it) must show "waking" even though the drain's POST does
+    not fail — it just blocks until the container boots."""
+
+    def _ios_batch(self):
+        from django.core.cache import cache
+
+        from apps.orchestrator.hibernation import _wake_in_progress_key
+
+        user = _make_user()
+        tenant = _make_tenant(user)
+        key = _wake_in_progress_key(tenant.id)
+        self.addCleanup(cache.delete, key)
+        cache.delete(key)
+        thread = ChatThread.objects.create(tenant=tenant, user=user, title="", is_main=True)
+        turn = AppChatMessage.objects.create(
+            tenant=tenant,
+            user=user,
+            thread=thread,
+            client_msg_id="cmid-wake-in-progress",
+            user_text="are you there?",
+        )
+        row = PendingMessage.objects.create(
+            tenant=tenant,
+            channel=PendingMessage.Channel.IOS,
+            channel_user_id=str(thread.id),
+            payload={
+                "message_text": "are you there?",
+                "user_param": f"thread:{thread.id}",
+                "user_timezone": "UTC",
+                "client_msg_id": turn.client_msg_id,
+            },
+            user_text="are you there?",
+        )
+        return tenant, turn, row
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_wake_in_progress_stamps_waking_at_before_slow_post(self, mock_post, _mock_credit, _mock_publish):
+        from apps.orchestrator.hibernation import mark_wake_in_progress
+
+        tenant, turn, row = self._ios_batch()
+        mark_wake_in_progress(tenant.id)
+        waking_at_during_post = []
+
+        def slow_post(*args, **kwargs):
+            turn.refresh_from_db()
+            waking_at_during_post.append(turn.waking_at)
+            return _ok_chat_response("yes")
+
+        mock_post.side_effect = slow_post
+        result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(len(waking_at_during_post), 1)
+        self.assertIsNotNone(waking_at_during_post[0])
+        turn.refresh_from_db()
+        self.assertEqual(turn.status, AppChatMessage.Status.READY)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_no_wake_in_progress_leaves_waking_at_null(self, mock_post, _mock_credit, _mock_publish):
+        tenant, turn, row = self._ios_batch()
+        waking_at_during_post = []
+
+        def warm_post(*args, **kwargs):
+            turn.refresh_from_db()
+            waking_at_during_post.append(turn.waking_at)
+            return _ok_chat_response("yes")
+
+        mock_post.side_effect = warm_post
+        result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(waking_at_during_post, [None])
+
+
+@override_settings(NBHD_INTERNAL_API_KEY="test-key", LINE_CHANNEL_ACCESS_TOKEN="test-token")
 class DrainDuringProvisioningTest(TestCase):
     """A brand-new tenant's container is built asynchronously (~1 min) and has
     no FQDN yet. Messages that arrive in that window must be BUFFERED + re-driven

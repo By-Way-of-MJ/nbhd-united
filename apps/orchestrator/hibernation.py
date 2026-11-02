@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import InterfaceError, OperationalError, models
 from django.utils import timezone
 
@@ -30,6 +31,47 @@ from apps.router.telegram_availability import TELEGRAM_UNAVAILABLE_DETAIL, teleg
 from apps.tenants.models import Tenant
 
 logger = logging.getLogger(__name__)
+
+# A wake has been initiated but the container has not yet reported started via
+# the container-started hook. The drain reads this to stamp ``waking_at`` on an
+# iOS turn that arrives while a pre-warm (or another caller) is still booting
+# the container. TTL bounds a lost callback; the hook deletes it on boot.
+WAKE_IN_PROGRESS_CACHE_PREFIX = "wake_in_progress:"
+WAKE_IN_PROGRESS_TTL_SECONDS = 180
+
+
+def _wake_in_progress_key(tenant_id) -> str:
+    return f"{WAKE_IN_PROGRESS_CACHE_PREFIX}{tenant_id}"
+
+
+def mark_wake_in_progress(tenant_id) -> None:
+    """Record that a wake was initiated and the container has not started yet."""
+    try:
+        cache.set(
+            _wake_in_progress_key(tenant_id),
+            timezone.now().isoformat(),
+            timeout=WAKE_IN_PROGRESS_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception("idle_wake: failed to mark wake in progress for %s", str(tenant_id)[:8])
+
+
+def clear_wake_in_progress(tenant_id) -> None:
+    """Clear the wake signal once the container reports started (or wake fails)."""
+    try:
+        cache.delete(_wake_in_progress_key(tenant_id))
+    except Exception:
+        logger.exception("idle_wake: failed to clear wake in progress for %s", str(tenant_id)[:8])
+
+
+def is_wake_in_progress(tenant_id) -> bool:
+    """True while a wake is in flight and the container has not reported started."""
+    try:
+        return cache.get(_wake_in_progress_key(tenant_id)) is not None
+    except Exception:
+        logger.exception("idle_wake: failed to read wake in progress for %s", str(tenant_id)[:8])
+        return False
+
 
 # How early (seconds) to wake the container before a cron fires.
 #
@@ -514,6 +556,10 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
     # 1. The claimant wakes the container. A concurrent caller skips Azure and
     # joins the same follow-up path below.
     if claimed:
+        # Publish the in-progress signal before the blocking Azure call so a
+        # message that arrives during the boot can render "waking" even though
+        # this wake was started by a pre-warm rather than the drain itself.
+        mark_wake_in_progress(tenant.pk)
         try:
             status_updates = {"last_wake_at": timezone.now()}
 
@@ -614,6 +660,7 @@ def wake_hibernated_tenant(tenant: Tenant, *, cron_wake: bool = False) -> bool:
                 logger.info("idle_wake: rolled back failed wake claim for %s (rows=%d)", tid, rolled_back)
             except Exception:
                 logger.exception("idle_wake: failed to roll back wake claim for %s", tid)
+            clear_wake_in_progress(tenant.pk)
             return False
 
     # 2. The hibernation flag (and cron stamp, when applicable) was committed

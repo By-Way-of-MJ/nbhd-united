@@ -72,6 +72,27 @@ class RuntimeContainerStartedView(APIView):
         if isinstance(tenant_or_resp, Response):
             return tenant_or_resp
         tenant = tenant_or_resp
+
+        # The container is up: clear the wake-in-progress signal the drain uses
+        # to show "waking" on messages that arrived during the boot.
+        from apps.orchestrator.hibernation import clear_wake_in_progress
+
+        clear_wake_in_progress(tenant.id)
+
+        # The boot also ends the "waking" label on any turn that arrived while
+        # the container was starting. Only PENDING rows carry it; READY/ERROR
+        # rows are already terminal. Never fail the hook.
+        try:
+            from apps.router.models import AppChatMessage
+
+            AppChatMessage.objects.filter(
+                tenant=tenant,
+                status=AppChatMessage.Status.PENDING,
+                waking_at__isnull=False,
+            ).update(waking_at=None)
+        except Exception:
+            logger.exception("RuntimeContainerStartedView: failed to clear waking_at for tenant %s", tenant_id)
+
         record_runtime_write_activity(tenant)
 
         # Record which plugin dirs this image ships (config_generator only loads
