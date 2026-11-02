@@ -366,10 +366,19 @@ def upsert_from_gateway_jobs(
 
     Returns ``{"upserted": N, "removed": M}``.
     """
+    from .tenant_views import _strip_phase2_block
+
     by_name: dict[str, dict] = {}
     for job in raw_jobs:
         if not isinstance(job, dict):
             continue
+        # Gateway imports must never restore the retired Phase 2 block. Copy
+        # the job/payload rather than mutating the caller's list.
+        payload = job.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+            stripped = _strip_phase2_block(payload["message"])
+            if stripped != payload["message"]:
+                job = {**job, "payload": {**payload, "message": stripped}}
         name = job.get("name") or ""
         if not name:
             continue
