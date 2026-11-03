@@ -6,6 +6,7 @@ from .document_views import (
     DocumentClearView,
     DocumentDetailView,
     DocumentListCreateView,
+    JournalDaysView,
     SidebarTreeView,
     TodayView,
 )
@@ -65,6 +66,7 @@ urlpatterns = [
     ),
     path("documents/<str:kind>/<path:slug>/", DocumentDetailView.as_view(), name="document-detail"),
     path("today/", TodayView.as_view(), name="today"),
+    path("days/", JournalDaysView.as_view(), name="journal-days"),
     path("tree/", SidebarTreeView.as_view(), name="sidebar-tree"),
     path("status/", JournalStatusView.as_view(), name="journal-status"),
     # ── Typed lifecycle reads/writes (session-auth; companion to runtime CRUD) ──

@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 from django.db import DatabaseError, IntegrityError, connection, connections, transaction
 from django.db.models.query import QuerySet
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory, force_authenticate
 
@@ -1590,6 +1592,159 @@ class DocumentAPITest(TestCase):
         self.assertIn("goals", kinds)
         daily_node = next(n for n in resp.data if n["kind"] == "daily")
         self.assertEqual(len(daily_node["items"]), 1)
+
+    def _create_days(self, count, *, start=date(2026, 10, 1)):
+        Document.objects.bulk_create(
+            [
+                Document(
+                    tenant=self.tenant,
+                    kind="daily",
+                    slug=str(start + timedelta(days=i)),
+                    title="Day",
+                    markdown="### 09:30\nMy words" if i % 2 else "## Morning Report\n### Overnight Summary",
+                )
+                for i in range(count)
+            ]
+        )
+
+    def test_days_requires_authentication(self):
+        self.assertEqual(APIClient().get(reverse("journal-days")).status_code, 401)
+
+    def test_days_empty_and_persona_name(self):
+        self.user.preferences = {"agent_persona": "coach"}
+        self.user.save(update_fields=["preferences"])
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {"assistant_name": "Coach", "days": []})
+
+    def test_days_are_tenant_scoped(self):
+        self._create_days(1)
+        other_user = User.objects.create_user(username="other-days", password="pass")
+        other_tenant = Tenant.objects.create(user=other_user, status="active")
+        # Same slug must not turn the owner's assistant-only day into wrote=True.
+        for slug in ("2026-10-01", "2026-09-01"):
+            Document.objects.create(tenant=other_tenant, kind="daily", slug=slug, markdown="### 09:30\nPrivate")
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["days"], [{"date": "2026-10-01", "wrote": False}])
+
+    @patch("apps.common.llm_contracts.dj_tz.now")
+    def test_days_excludes_future_using_tenant_timezone(self, mock_now):
+        self.user.timezone = "Asia/Tokyo"
+        self.user.save(update_fields=["timezone"])
+        mock_now.return_value = datetime(2026, 7, 22, 16, 30, tzinfo=ZoneInfo("UTC"))
+        self._create_days(3, start=date(2026, 7, 22))
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(
+            [day["date"] for day in response.data["days"]],
+            ["2026-07-23", "2026-07-22"],
+        )
+
+    @patch("apps.journal.document_views.today_in_tenant_tz", return_value=date(2026, 11, 4))
+    def test_days_returns_all_35_newest_first_without_paging(self, _today):
+        self._create_days(35)
+        response = self.client.get(reverse("journal-days"), {"page": 2, "page_size": 1})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["days"],
+            [{"date": str(date(2026, 10, 1) + timedelta(days=i)), "wrote": bool(i % 2)} for i in reversed(range(35))],
+        )
+
+    @patch("apps.journal.document_views._get_persona_name", return_value="  Nova  ")
+    def test_days_recognizes_only_non_assistant_timed_headings(self, _persona):
+        cases = [
+            ("### 09:30\nMy words", True),
+            ("### 09:30 — Casey Park\nMy words", True),
+            ("### 09:30 — Nova  \nAssistant words\n\n### 11:30 — Nova\nMore", False),
+            ("### 09:30 — Nova\nAssistant words\n\n### 11:30 — Casey Park\nMy words", True),
+            ("## Morning Report\n### Overnight Summary\nReport", False),
+            ("## 09:30\n### 9:30\n### 09:3\n#### 09:30\n ### 09:30\n### 09:30 extra", False),
+            ("# Day\n\n### 09:30\t\r\nMy words", True),
+        ]
+        for i, (markdown, _wrote) in enumerate(cases):
+            Document.objects.create(tenant=self.tenant, kind="daily", slug=f"2026-10-{i + 1:02}", markdown=markdown)
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(response.data["assistant_name"], "Nova")
+        self.assertEqual(
+            response.data["days"],
+            [{"date": f"2026-10-{i + 1:02}", "wrote": cases[i][1]} for i in reversed(range(len(cases)))],
+        )
+
+    @patch("apps.journal.document_views._get_persona_name", return_value=" [PERSON_1] ")
+    def test_days_rehydrates_assistant_name_and_heading_signatures(self, _persona):
+        self.tenant.pii_entity_map = {"[PERSON_1]": {"name": "Nova"}}
+        self.tenant.save(update_fields=["pii_entity_map"])
+        for day, author in ((1, "[PERSON_1]"), (2, "Nova"), (3, "Casey Park")):
+            Document.objects.create(
+                tenant=self.tenant, kind="daily", slug=f"2026-10-{day:02}", markdown=f"### 09:30 — {author}\nWords"
+            )
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(
+            response.data,
+            {
+                "assistant_name": "Nova",
+                "days": [
+                    {"date": "2026-10-03", "wrote": True},
+                    {"date": "2026-10-02", "wrote": False},
+                    {"date": "2026-10-01", "wrote": False},
+                ],
+            },
+        )
+
+    @patch("apps.journal.document_views._get_persona_name", return_value=" \t ")
+    def test_days_empty_assistant_name_counts_every_timed_heading(self, _persona):
+        for day, markdown in ((1, "### 09:30 — Nova"), (2, "### 09:30"), (3, "### Overnight Summary")):
+            Document.objects.create(tenant=self.tenant, kind="daily", slug=f"2026-10-{day:02}", markdown=markdown)
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(response.data["assistant_name"], "")
+        self.assertEqual([day["wrote"] for day in response.data["days"]], [False, True, True])
+
+    def test_days_skips_non_dates_and_non_daily_documents(self):
+        self._create_days(1)
+        for slug in ("0000-01-01", "2026-02-30", "2026-2-01", "20260201", "2026-W01", "000-not-a-date"):
+            Document.objects.create(tenant=self.tenant, kind="daily", slug=slug, markdown="### 09:30")
+        Document.objects.create(tenant=self.tenant, kind="weekly", slug="2026-09-01", markdown="### 09:30")
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual(response.data["days"], [{"date": "2026-10-01", "wrote": False}])
+
+    def test_days_ignores_timed_headings_inside_code_fences(self):
+        cases = [
+            ("```md\n### 09:30\n```", False),
+            ("## Morning Report\n  ~~~~md\n### 09:30\n  ~~~~", False),
+            ("```md\n### 09:30\n```\n### 10:00", True),
+            ("### Overnight Summary\n```\n### 09:30", False),
+        ]
+        for i, (markdown, _wrote) in enumerate(cases):
+            Document.objects.create(tenant=self.tenant, kind="daily", slug=f"2026-10-{i + 1:02}", markdown=markdown)
+        response = self.client.get(reverse("journal-days"))
+        self.assertEqual([day["wrote"] for day in response.data["days"]], [case[1] for case in reversed(cases)])
+
+    @patch("apps.journal.document_views.today_in_tenant_tz", return_value=date(2026, 11, 4))
+    def test_days_uses_at_most_two_document_queries_with_3_and_35_pages(self, _today):
+        from .document_views import JournalDaysView
+
+        for count in (3, 35):
+            with self.subTest(count=count):
+                Document.objects.filter(tenant=self.tenant).delete()
+                self._create_days(count)
+                request = APIRequestFactory().get(reverse("journal-days"))
+                force_authenticate(request, user=self.user)
+                with CaptureQueriesContext(connection) as queries:
+                    response = JournalDaysView.as_view()(request)
+                self.assertLessEqual(len(queries), 2)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(len(response.data["days"]), count)
+                self.assertEqual(sum(day["wrote"] for day in response.data["days"]), count // 2)
+                document_queries = [query["sql"] for query in queries if 'FROM "journal_document"' in query["sql"]]
+                self.assertEqual(len(document_queries), 1)
+                self.assertIn('"markdown"', document_queries[0].split(" FROM ", 1)[0])
+                self.assertNotIn('"markdown"', document_queries[0].split(" WHERE ", 1)[1])
+
+    def test_days_marks_encrypted_markdown_read_as_written(self):
+        self.skipTest(
+            "Document.markdown encryption is deferred to Phase 3b; this clone has no "
+            "markdown_enc sidecar or Document encryption read helper to exercise."
+        )
 
     def test_sidebar_orders_weekly_reviews_by_updated_at(self):
         now = timezone.now()

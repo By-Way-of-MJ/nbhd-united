@@ -32,11 +32,12 @@ from .document_serializers import (
 from .md_utils import format_author_suffix
 from .models import Document, JournalAppendOp
 from .services import (
-    get_default_template as get_tenant_template,
-)
-from .services import (
+    _get_persona_name,
     materialize_sections_markdown,
     seed_default_templates_for_tenant,
+)
+from .services import (
+    get_default_template as get_tenant_template,
 )
 from .templates_md import (
     daily_note_context,
@@ -83,6 +84,7 @@ import re
 # slashes (compound path slugs like week-ahead/2026-W09 via <path:slug>)
 _VALID_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-/]*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TIMED_HEADING_RE = re.compile(r"### \d{2}:\d{2}(?: — (?P<author>.+))?\s*")
 
 
 def _validate_slug(kind: str, slug: str) -> None:
@@ -703,6 +705,52 @@ class TodayView(APIView):
         today = today_in_tenant_tz(tenant)
         doc = _get_or_create_document(tenant, "daily", str(today))
         return Response(DocumentSerializer(doc, context={"tenant": tenant}).data)
+
+
+class JournalDaysView(APIView):
+    """GET /api/v1/journal/days/ — every day and whether the owner wrote.
+
+    Read daily documents once through model instances, like memory sync, and
+    find owner-written headings in Python without database text predicates.
+    Tenant filtering follows the sidebar's RLS-scoped read path; no external
+    calls or document creation are needed.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant = _get_tenant(request.user)
+        assistant_name = rehydrate_for_tenant(tenant, _get_persona_name(tenant)).strip()
+        documents = Document.objects.filter(
+            tenant=tenant, kind=Document.Kind.DAILY, slug__lte=str(today_in_tenant_tz(tenant))
+        )
+        days = []
+        wrote = set()
+        for document in documents.order_by("-slug"):
+            slug = document.slug
+            if not _DATE_RE.fullmatch(slug):
+                continue
+            try:
+                datetime.date.fromisoformat(slug)
+            except ValueError:
+                continue
+            days.append({"date": slug, "wrote": False})
+            markdown = document.markdown
+            if "### " not in markdown:
+                continue
+            # Reuse the editor's fence-aware splitter. Only a block's leading
+            # heading is evidence; headings inside fenced code stay in its body.
+            for block in split_markdown_blocks(markdown):
+                heading = _TIMED_HEADING_RE.fullmatch(block.split("\n", 1)[0])
+                if heading is None:
+                    continue
+                author = rehydrate_for_tenant(tenant, heading["author"] or "").strip()
+                if not assistant_name or not author or author != assistant_name:
+                    wrote.add(slug)
+                    break
+        for day in days:
+            day["wrote"] = day["date"] in wrote
+        return Response({"assistant_name": assistant_name, "days": days})
 
 
 class SidebarTreeView(APIView):
