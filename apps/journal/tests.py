@@ -1720,7 +1720,7 @@ class DocumentAPITest(TestCase):
         self.assertEqual([day["wrote"] for day in response.data["days"]], [case[1] for case in reversed(cases)])
 
     @patch("apps.journal.document_views.today_in_tenant_tz", return_value=date(2026, 11, 4))
-    def test_days_uses_two_document_queries_with_3_and_35_pages(self, _today):
+    def test_days_uses_at_most_two_document_queries_with_3_and_35_pages(self, _today):
         from .document_views import JournalDaysView
 
         for count in (3, 35):
@@ -1729,13 +1729,22 @@ class DocumentAPITest(TestCase):
                 self._create_days(count)
                 request = APIRequestFactory().get(reverse("journal-days"))
                 force_authenticate(request, user=self.user)
-                with self.assertNumQueries(2), CaptureQueriesContext(connection) as queries:
+                with CaptureQueriesContext(connection) as queries:
                     response = JournalDaysView.as_view()(request)
+                self.assertLessEqual(len(queries), 2)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(len(response.data["days"]), count)
                 self.assertEqual(sum(day["wrote"] for day in response.data["days"]), count // 2)
-                self.assertNotIn('"markdown"', queries[0]["sql"])
-                self.assertIn('"markdown"::text ~', queries[1]["sql"])
+                document_queries = [query["sql"] for query in queries if 'FROM "journal_document"' in query["sql"]]
+                self.assertEqual(len(document_queries), 1)
+                self.assertIn('"markdown"', document_queries[0].split(" FROM ", 1)[0])
+                self.assertNotIn('"markdown"', document_queries[0].split(" WHERE ", 1)[1])
+
+    def test_days_marks_encrypted_markdown_read_as_written(self):
+        self.skipTest(
+            "Document.markdown encryption is deferred to Phase 3b; this clone has no "
+            "markdown_enc sidecar or Document encryption read helper to exercise."
+        )
 
     def test_sidebar_orders_weekly_reviews_by_updated_at(self):
         now = timezone.now()

@@ -710,7 +710,8 @@ class TodayView(APIView):
 class JournalDaysView(APIView):
     """GET /api/v1/journal/days/ — every day and whether the owner wrote.
 
-    Read slugs first, then fetch bodies only for timed-heading candidates.
+    Read daily documents once through model instances, like memory sync, and
+    find owner-written headings in Python without database text predicates.
     Tenant filtering follows the sidebar's RLS-scoped read path; no external
     calls or document creation are needed.
     """
@@ -724,7 +725,9 @@ class JournalDaysView(APIView):
             tenant=tenant, kind=Document.Kind.DAILY, slug__lte=str(today_in_tenant_tz(tenant))
         )
         days = []
-        for slug in documents.order_by("-slug").values_list("slug", flat=True):
+        wrote = set()
+        for document in documents.order_by("-slug"):
+            slug = document.slug
             if not _DATE_RE.fullmatch(slug):
                 continue
             try:
@@ -732,10 +735,9 @@ class JournalDaysView(APIView):
             except ValueError:
                 continue
             days.append({"date": slug, "wrote": False})
-
-        wrote = set()
-        candidates = documents.filter(markdown__regex=r"(?n)^### [0-9]{2}:[0-9]{2}")
-        for slug, markdown in candidates.order_by().values_list("slug", "markdown"):
+            markdown = document.markdown
+            if "### " not in markdown:
+                continue
             # Reuse the editor's fence-aware splitter. Only a block's leading
             # heading is evidence; headings inside fenced code stay in its body.
             for block in split_markdown_blocks(markdown):
