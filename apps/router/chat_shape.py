@@ -253,12 +253,18 @@ def decide_panel(
         panel = "log_table" if surface.probabilities.get("body_weight", 0.0) >= 0.6 else "training_week"
     if tie:
         panel = "workout"
-    if panel is None or (visual_helps < 0.75 and follow_up < 0.5):
+    # A follow-up may only skip the visual-help gate when it continues the card
+    # already open. Compute this before the gate so another family cannot open.
+    family = {"training_week", "workout"}
+    same_family = (
+        open_panel is not None
+        and panel is not None
+        and (panel == open_panel.kind or {panel, open_panel.kind} <= family)
+    )
+    if panel is None or (visual_helps < 0.75 and not (follow_up >= 0.5 and same_family)):
         return "none", None, "no_panel"
     if surface.confidence < 0.5 and not (tie or family_confident):
         return "none", None, "low_confidence"
-    family = {"training_week", "workout"}
-    same_family = open_panel is not None and (panel == open_panel.kind or {panel, open_panel.kind} <= family)
     decision = "update" if follow_up >= 0.5 and same_family else "open"
     if panel not in enabled_panels:
         return "none", None, "panel_disabled"
