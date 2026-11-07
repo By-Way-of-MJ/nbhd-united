@@ -15,6 +15,7 @@ from apps.router.chat_gates import chat_panels_tool_enabled, chat_shape_enabled
 from apps.router.panels import (
     PANEL_KINDS,
     PanelKind,
+    asks_for_timer,
     extract_panels,
     tool_schema_module,
     validate_panels,
@@ -63,6 +64,29 @@ class PanelSchemaTests(SimpleTestCase):
             with self.subTest(panel=panel):
                 self.assertEqual(validate_panels([panel]), [panel])
         self.assertEqual(validate_panels([{"kind": "tasks"}]), [{"kind": "tasks", "params": {}}])
+
+    def test_asks_for_timer(self):
+        for text in (
+            "set a timer for 10 minutes",
+            "Start a 25 min pomodoro",
+            "focus session please",
+            "Countdown 5 min",
+            "タイマー5分",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_for_timer(text))
+        for text in ("what are the numbers on AI and jobs?", "research this for me", "", "remind me at 5"):
+            with self.subTest(text=text):
+                self.assertFalse(asks_for_timer(text))
+        self.assertFalse(asks_for_timer(None))
+
+    def test_prepare_panels_tool_gate_keeps_timer(self):
+        from apps.router.panels import prepare_panels
+
+        tenant = SimpleNamespace(id=uuid4())
+        timer_panel = [{"kind": "timer", "params": {"duration_seconds": 180}}]
+        with override_settings(CHAT_PANELS_TOOL_TENANT_IDS=str(tenant.id)):
+            self.assertEqual(prepare_panels(tenant, timer_panel, tool=True), timer_panel)
 
     def test_invalid_schema_table_drops_individually_without_content(self):
         bad = [
@@ -385,6 +409,58 @@ class PanelPersistenceTests(TestCase):
             self.assertIsNone(rows[0].panels)
             self.assertEqual(rows[1].reply_text, "Before\nAfter")
             self.assertEqual(rows[1].panels or [], MORNING_PANELS if enabled else [])
+
+    def test_ordinary_reply_drops_timer_panel_user_did_not_request(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        user_text = "what are the numbers on AI and jobs?"
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text=user_text,
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}, user_text=user_text)]
+        panels = [
+            {"kind": "timer", "params": {"duration_seconds": 180}, "title": "Research ETA ~3 min"},
+            {"kind": "schedule", "params": {"range": "today"}},
+        ]
+        with (
+            override_settings(CHAT_SHAPE_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "Research in progress.\n" + block(panels))
+        row.refresh_from_db()
+        self.assertEqual(row.reply_text, "Research in progress.")
+        self.assertEqual(row.panels, [{"kind": "schedule", "params": {"range": "today"}}])
+
+    def test_ordinary_reply_keeps_timer_panel_user_requested(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        user_text = "set a timer for 3 minutes"
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text=user_text,
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}, user_text=user_text)]
+        panels = [
+            {"kind": "timer", "params": {"duration_seconds": 180}, "title": "Research ETA ~3 min"},
+            {"kind": "schedule", "params": {"range": "today"}},
+        ]
+        with (
+            override_settings(CHAT_SHAPE_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "Research in progress.\n" + block(panels))
+        row.refresh_from_db()
+        self.assertEqual(row.reply_text, "Research in progress.")
+        self.assertEqual(row.panels, panels)
 
     def test_panel_only_proactive_send(self):
         from apps.router.chat_history import _proactive_rows

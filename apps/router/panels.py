@@ -98,6 +98,18 @@ def validate_panels(value: Any) -> list[dict]:
     return valid
 
 
+_TIMER_REQUEST = re.compile(
+    r"\b(?:timers?|countdown|count\s+down|pomodoro|stopwatch|focus\s+session|focus\s+for)\b|タイマー|ポモドーロ",
+    re.IGNORECASE,
+)
+
+
+def asks_for_timer(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(_TIMER_REQUEST.search(text))
+
+
 _BRACKET_PANEL = re.compile(r"\[\[panel:([^\[\]\r\n]*)\]\]")
 _BRACKET_PARTIAL = re.compile(r"\[\[panel:[^\[\]\r\n]*\]?$")
 
@@ -217,7 +229,7 @@ def strip_streaming_panels(text: str) -> str:
     return clean
 
 
-def prepare_panels(tenant, value, *, tool: bool = False) -> list[dict]:
+def prepare_panels(tenant, value, *, tool: bool = False, user_text: str | None = None) -> list[dict]:
     """Gate the originating surface and keep titles in placeholder space at rest.
 
     Proactive/tool writers must pass tool=True; ordinary chat uses the shape gate.
@@ -231,6 +243,14 @@ def prepare_panels(tenant, value, *, tool: bool = False) -> list[dict]:
             logger.warning("panels_dropped reason=tenant_disabled")
         return []
     panels = validate_panels(value)
+    if not tool and not (user_text is not None and asks_for_timer(user_text)):
+        kept = []
+        for panel in panels:
+            if panel["kind"] == "timer":
+                logger.warning("panel_dropped reason=timer_not_requested")
+            else:
+                kept.append(panel)
+        panels = kept
     for panel in panels:
         if "title" in panel:
             panel["title"] = truncate_placeholder_safe(
