@@ -97,6 +97,28 @@ class PanelSchemaTests(SimpleTestCase):
             with self.subTest(text=text):
                 self.assertFalse(asks_for_timer(text))
 
+    def test_asks_for_timer_ignores_ordinary_words(self):
+        for text in (
+            "I am curious about AI jobs",
+            "research as much as possible",
+            "ah ok",
+            "as soon as you can",
+            "集中できない",
+            "集中豪雨のニュース",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(asks_for_timer(text))
+        for text in (
+            "10-minute break",
+            "take 5 min",
+            "25分集中したい",
+            "30秒",
+            "1h",
+            "2 hours of focus",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_for_timer(text))
+
     def test_prepare_panels_tool_gate_keeps_timer(self):
         from apps.router.panels import prepare_panels
 

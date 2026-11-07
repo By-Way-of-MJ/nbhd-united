@@ -100,7 +100,12 @@ def validate_panels(value: Any) -> list[dict]:
 
 _TIMER_REQUEST = re.compile(
     r"\b(?:timers?|countdown|count[\s-]+down|pomodoro|stopwatch|focus\s+session|focus\s+for|time\s+me|time\s+my)\b"
-    r"|タイマー|ポモドーロ|カウントダウン|ストップウォッチ|測って|計って|はかって|集中",
+    r"|タイマー|ポモドーロ|カウントダウン|ストップウォッチ|測って|計って|はかって",
+    re.IGNORECASE,
+)
+_TIMER_DURATION = re.compile(
+    r"\b\d+(?:\.\d+)?[\s-]*(?:h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\b"
+    r"|\d+\s*(?:分|秒|時間)",
     re.IGNORECASE,
 )
 
@@ -108,13 +113,7 @@ _TIMER_REQUEST = re.compile(
 def asks_for_timer(text: str) -> bool:
     if not isinstance(text, str) or not text:
         return False
-    if _TIMER_REQUEST.search(text):
-        return True
-    # Lazy import: chat_shape imports panels at module top, so a top-level import
-    # here would be circular.
-    from apps.router.chat_shape import parse_duration
-
-    return parse_duration(text) is not None
+    return bool(_TIMER_REQUEST.search(text) or _TIMER_DURATION.search(text))
 
 
 _BRACKET_PANEL = re.compile(r"\[\[panel:([^\[\]\r\n]*)\]\]")
