@@ -99,7 +99,8 @@ def validate_panels(value: Any) -> list[dict]:
 
 
 _TIMER_REQUEST = re.compile(
-    r"\b(?:timers?|countdown|count\s+down|pomodoro|stopwatch|focus\s+session|focus\s+for)\b|タイマー|ポモドーロ",
+    r"\b(?:timers?|countdown|count[\s-]+down|pomodoro|stopwatch|focus\s+session|focus\s+for|time\s+me|time\s+my)\b"
+    r"|タイマー|ポモドーロ|カウントダウン|ストップウォッチ|測って|計って|はかって|集中",
     re.IGNORECASE,
 )
 
@@ -107,7 +108,13 @@ _TIMER_REQUEST = re.compile(
 def asks_for_timer(text: str) -> bool:
     if not isinstance(text, str) or not text:
         return False
-    return bool(_TIMER_REQUEST.search(text))
+    if _TIMER_REQUEST.search(text):
+        return True
+    # Lazy import: chat_shape imports panels at module top, so a top-level import
+    # here would be circular.
+    from apps.router.chat_shape import parse_duration
+
+    return parse_duration(text) is not None
 
 
 _BRACKET_PANEL = re.compile(r"\[\[panel:([^\[\]\r\n]*)\]\]")
@@ -243,7 +250,9 @@ def prepare_panels(tenant, value, *, tool: bool = False, user_text: str | None =
             logger.warning("panels_dropped reason=tenant_disabled")
         return []
     panels = validate_panels(value)
-    if not tool and not (user_text is not None and asks_for_timer(user_text)):
+    # user_text=None means "do not filter" (e.g. a panel-only reply): filter
+    # timers only for ordinary chat where we know what the user actually asked.
+    if not tool and user_text is not None and not asks_for_timer(user_text):
         kept = []
         for panel in panels:
             if panel["kind"] == "timer":
@@ -279,7 +288,8 @@ PANEL_VOCABULARY = (
 CHAT_PANEL_INSTRUCTION = (
     "For useful live cards, end the reply with ONE fenced `nbhd-panels` JSON list of "
     "{kind,params,title?} references (max 6; title <=60 chars; no snapshots); " + PANEL_VOCABULARY + ". "
-    "Put panels ONLY in the panels argument (or the fenced block for chat), never in message text.\n"
+    "Put panels ONLY in the panels argument (or the fenced block for chat), never in message text. "
+    "Use timer ONLY when the user asks for a timer or countdown; never as a progress or ETA indicator.\n"
 )
 MORNING_PANEL_INSTRUCTION = (
     "In that same single nbhd_send_to_user call, attach panels only where fresh tool results show relevant data: "

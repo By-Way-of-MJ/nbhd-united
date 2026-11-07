@@ -80,6 +80,23 @@ class PanelSchemaTests(SimpleTestCase):
                 self.assertFalse(asks_for_timer(text))
         self.assertFalse(asks_for_timer(None))
 
+    def test_asks_for_timer_broader_phrasings(self):
+        for text in (
+            "count-down from 10",
+            "time my plank for 60s",
+            "time me",
+            "take a 10 minute break",
+            "5分測って",
+            "カウントダウンして",
+            "25分集中したい",
+            "ストップウォッチ",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_for_timer(text))
+        for text in ("what are the numbers on AI and jobs?", "research this for me"):
+            with self.subTest(text=text):
+                self.assertFalse(asks_for_timer(text))
+
     def test_prepare_panels_tool_gate_keeps_timer(self):
         from apps.router.panels import prepare_panels
 
@@ -460,6 +477,81 @@ class PanelPersistenceTests(TestCase):
             _store_ios_turn_reply(self.tenant, batch, "Research in progress.\n" + block(panels))
         row.refresh_from_db()
         self.assertEqual(row.reply_text, "Research in progress.")
+        self.assertEqual(row.panels, panels)
+
+    def test_timer_only_reply_without_text_is_kept_not_errored(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        user_text = "what are the numbers on AI and jobs?"
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text=user_text,
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}, user_text=user_text)]
+        panels = [{"kind": "timer", "params": {"duration_seconds": 180}}]
+        with (
+            override_settings(CHAT_SHAPE_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, block(panels))
+        row.refresh_from_db()
+        self.assertEqual(row.panels, panels)
+        # The empty-response branch sets status=error + error="empty_response";
+        # a timer-only reply must stay a normal READY turn.
+        self.assertEqual(row.status, AppChatMessage.Status.READY)
+        self.assertEqual(row.error, "")
+
+    def test_coalesced_batch_keeps_timer_when_any_message_asks(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        rows = [
+            AppChatMessage.objects.create(
+                tenant=self.tenant,
+                user=self.user,
+                thread=self.thread,
+                client_msg_id=str(uuid4()),
+                user_text=user_text,
+            )
+            for user_text in ("hi", "set a timer for 3 minutes")
+        ]
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}, user_text=row.user_text) for row in rows]
+        panels = [{"kind": "timer", "params": {"duration_seconds": 180}}]
+        with (
+            override_settings(CHAT_SHAPE_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "Timer started.\n" + block(panels))
+        for row in rows:
+            row.refresh_from_db()
+        self.assertEqual(rows[-1].panels, panels)
+        self.assertEqual(rows[0].reply_text, "")
+        self.assertIsNone(rows[0].panels)
+
+    def test_japanese_request_keeps_timer_through_store(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        user_text = "5分測って"
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text=user_text,
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}, user_text=user_text)]
+        panels = [{"kind": "timer", "params": {"duration_seconds": 300}}]
+        with (
+            override_settings(CHAT_SHAPE_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "5分のタイマーを開始します。\n" + block(panels))
+        row.refresh_from_db()
         self.assertEqual(row.panels, panels)
 
     def test_panel_only_proactive_send(self):
