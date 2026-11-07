@@ -46,11 +46,14 @@ class RuntimeTaskListTests(TestCase):
         # server-computed date context every task read now carries.
         today = tenant_today(self.tenant)
         today_iso = today.isoformat()
+        tzinfo = safe_zoneinfo(tenant_tz_name(self.tenant))
         rows = []
         for row in TaskSerializer(qs, many=True).data:
             row = dict(row)
             row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today_iso)
-            row["days_untouched"], row["stale"] = task_staleness(row.get("status"), row.get("updated_at"), today)
+            row["days_untouched"], row["stale"] = task_staleness(
+                row.get("status"), row.get("updated_at"), today, tzinfo=tzinfo
+            )
             rows.append(row)
         expected = JSONRenderer().render(
             {

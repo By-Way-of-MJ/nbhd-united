@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -50,6 +51,16 @@ class TaskStalenessUnitTests(unittest.TestCase):
         self.assertEqual(task_staleness("open", "2026-09-01T03:04:05+09:00", today), (14, True))
         self.assertEqual(task_staleness("open", None, today), (None, False))
         self.assertEqual(task_staleness("done", "2026-08-26T03:04:05Z", today), (20, False))
+
+    def test_timezone_conversion_uses_tenant_local_date(self):
+        today = date(2026, 9, 15)
+        updated_at = "2026-09-01T16:00:00Z"
+        self.assertEqual(task_staleness("open", updated_at, today, tzinfo=ZoneInfo("Asia/Tokyo")), (13, False))
+        self.assertEqual(
+            task_staleness("open", updated_at, today, tzinfo=ZoneInfo("America/Los_Angeles")),
+            (14, True),
+        )
+        self.assertEqual(task_staleness("open", updated_at, today), (14, True))
 
 
 class ObligationProjectionUnitTests(TestCase):

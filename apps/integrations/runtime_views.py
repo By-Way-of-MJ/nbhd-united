@@ -100,12 +100,13 @@ _WORKSPACE_DELETE_CONFIRM_GUIDANCE = (
     "Show this workspace deletion preview, obtain explicit confirmation, then retry with confirm_token unchanged."
 )
 TASK_DATE_NOTE = (
-    "Compare every task with `today` before presenting it. A task whose due_date is before today "
-    "(date_passed: true), or whose title or description names a dated one-off event (a flight, trip, "
-    "appointment, booking, ticket, deadline) that falls before today, is already past: never present "
-    "it as upcoming or still to do. A task with stale: true has not been touched for days_untouched days. "
-    "When tasks come up, lead with the past and stale ones as one short batch and ask the user whether to "
-    "close, defer, or keep each, instead of just listing them. Never close a task without the user's yes."
+    "Compare every task with `today`. date_passed: true means its due_date is before today. A dated one-off "
+    "event (a flight, trip, appointment, booking) whose own date, in due_date or the title, is before today "
+    "is over: never present it as upcoming. Any other task with a past due date is overdue and may still "
+    "need doing: call it overdue, not done or past. stale: true means it has not been touched for "
+    "days_untouched days. In a live conversation where the user asks about their tasks, lead with the "
+    "past events, overdue and stale ones as one short batch and ask whether to close, defer, or keep each; "
+    "never close one without their yes. In a scheduled turn, follow that turn's own instructions instead."
 )
 
 
@@ -1363,7 +1364,12 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
         for row in serializer.data:
             row = dict(row)
             row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today_iso)
-            row["days_untouched"], row["stale"] = task_staleness(row.get("status"), row.get("updated_at"), today)
+            row["days_untouched"], row["stale"] = task_staleness(
+                row.get("status"),
+                row.get("updated_at"),
+                today,
+                tzinfo=safe_zoneinfo(tenant_tz_name(tenant)),
+            )
             rows.append(row)
         return Response(
             {
