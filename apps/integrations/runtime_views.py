@@ -103,7 +103,9 @@ TASK_DATE_NOTE = (
     "Compare every task with `today` before presenting it. A task whose due_date is before today "
     "(date_passed: true), or whose title or description names a dated one-off event (a flight, trip, "
     "appointment, booking, ticket, deadline) that falls before today, is already past: never present "
-    "it as upcoming or still to do. Say its date has passed and offer to close it."
+    "it as upcoming or still to do. A task with stale: true has not been touched for days_untouched days. "
+    "When tasks come up, lead with the past and stale ones as one short batch and ask the user whether to "
+    "close, defer, or keep each, instead of just listing them. Never close a task without the user's yes."
 )
 
 
@@ -1288,6 +1290,7 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
     def get(self, request, tenant_id):
         from apps.journal.lifecycle_serializers import TaskCompactSerializer, TaskSerializer
         from apps.journal.models import Task
+        from apps.journal.status_projection import task_staleness
 
         auth_failure = _internal_auth_or_401(request, tenant_id)
         if auth_failure is not None:
@@ -1360,6 +1363,7 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
         for row in serializer.data:
             row = dict(row)
             row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today_iso)
+            row["days_untouched"], row["stale"] = task_staleness(row.get("status"), row.get("updated_at"), today)
             rows.append(row)
         return Response(
             {

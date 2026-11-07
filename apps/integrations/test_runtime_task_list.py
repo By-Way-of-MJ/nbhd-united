@@ -1,6 +1,6 @@
 """Runtime task candidates are filtered and bounded before serialization."""
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from unittest.mock import patch
 
 from django.db import connection
@@ -13,6 +13,7 @@ from apps.common.tenant_tz import safe_zoneinfo, tenant_today, tenant_tz_name
 from apps.integrations.runtime_views import TASK_DATE_NOTE
 from apps.journal.lifecycle_serializers import TaskSerializer
 from apps.journal.models import Goal, Task
+from apps.journal.status_projection import task_staleness
 from apps.tenants.services import create_tenant
 from apps.tenants.test_utils import seed_internal_key
 
@@ -43,16 +44,18 @@ class RuntimeTaskListTests(TestCase):
     def assert_legacy_bytes(self, response, qs):
         # The pre-candidate endpoint's exact response construction, plus the
         # server-computed date context every task read now carries.
-        today = tenant_today(self.tenant).isoformat()
+        today = tenant_today(self.tenant)
+        today_iso = today.isoformat()
         rows = []
         for row in TaskSerializer(qs, many=True).data:
             row = dict(row)
-            row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today)
+            row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today_iso)
+            row["days_untouched"], row["stale"] = task_staleness(row.get("status"), row.get("updated_at"), today)
             rows.append(row)
         expected = JSONRenderer().render(
             {
                 "tenant_id": str(self.tenant.id),
-                "today": today,
+                "today": today_iso,
                 "date_note": TASK_DATE_NOTE,
                 "tasks": rows,
                 "count": len(rows),
@@ -82,6 +85,8 @@ class RuntimeTaskListTests(TestCase):
                 "created_at",
                 "updated_at",
                 "date_passed",
+                "days_untouched",
+                "stale",
             ],
         )
 
@@ -141,6 +146,26 @@ class RuntimeTaskListTests(TestCase):
         compact_by_id = {row["id"]: row for row in compact_rows}
         self.assertTrue(compact_by_id[str(yesterday_task.id)]["date_passed"])
 
+    def test_task_reads_mark_stale_tasks_server_side(self):
+        with patch("apps.integrations.runtime_views.tz.now", return_value=self.now):
+            today = tenant_today(self.tenant)
+            stale_task = self.task(0, status="open")
+            fresh_task = self.task(0, status="open")
+            done_task = self.task(0, status="done")
+            old_updated_at = datetime.combine(today - timedelta(days=20), time(12, 0), tzinfo=UTC)
+            Task.objects.filter(pk=stale_task.pk).update(updated_at=old_updated_at)
+            Task.objects.filter(pk=done_task.pk).update(updated_at=old_updated_at)
+
+            response = self.get()
+
+        self.assertEqual(response.status_code, 200)
+        rows = {row["id"]: row for row in response.json()["tasks"]}
+        self.assertTrue(rows[str(stale_task.id)]["stale"])
+        self.assertEqual(rows[str(stale_task.id)]["days_untouched"], 20)
+        self.assertFalse(rows[str(fresh_task.id)]["stale"])
+        self.assertEqual(rows[str(fresh_task.id)]["days_untouched"], 0)
+        self.assertFalse(rows[str(done_task.id)]["stale"])
+
     def test_order_has_stable_ties_and_limit_is_applied_in_sql(self):
         tasks = [self.task(30) for _ in range(27)]
         expected = sorted(str(task.id) for task in tasks)[:25]
@@ -197,7 +222,18 @@ class RuntimeTaskListTests(TestCase):
         self.assertEqual(rows[1]["parent_goal"], {"id": str(goal.id), "title": "Organize"})
         self.assertEqual(
             set(rows[1]),
-            {"id", "title", "status", "pillar", "due_date", "updated_at", "parent_goal", "date_passed"},
+            {
+                "id",
+                "title",
+                "status",
+                "pillar",
+                "due_date",
+                "updated_at",
+                "parent_goal",
+                "date_passed",
+                "days_untouched",
+                "stale",
+            },
         )
         lifecycle_queries = [
             q for q in queries if 'FROM "journal_tasks"' in q["sql"] or 'FROM "journal_goals"' in q["sql"]
