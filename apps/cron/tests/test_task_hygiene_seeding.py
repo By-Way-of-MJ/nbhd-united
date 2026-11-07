@@ -308,10 +308,11 @@ class TaskHygieneRenderedTurnTests(TestCase):
         payload = self.cron.data["payload"]
         self.assertEqual(payload["timeoutSeconds"], 300)
         for marker in (
-            "Call `nbhd_task_list` exactly three times",
+            "Call `nbhd_task_list` exactly four times",
             "{status: 'open', stale_days: 14, order: 'updated_at', limit: 40, fields: 'compact'}",
             "{status: 'in_progress', stale_days: 14, order: 'updated_at', limit: 20, fields: 'compact'}",
             "{status: 'open', limit: 50, fields: 'compact'}",
+            "{status: 'open', due_before:",
             "from lists 1 and 2",
             "Call `nbhd_goal_list` exactly once",
             "only when a selected row is truly ambiguous",
@@ -324,6 +325,7 @@ class TaskHygieneRenderedTurnTests(TestCase):
         message = self.cron.data["payload"]["message"]
         self.assertIn("If a call errors on the new keys", message)
         self.assertIn("retry it once with only `{status: ...}`", message)
+        self.assertIn("review at most the 25 rows with the oldest", message)
 
     def test_toolsallow_on_the_real_row_is_pinned_exactly(self):
         self.assertEqual(

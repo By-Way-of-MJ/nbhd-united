@@ -644,11 +644,18 @@ class TaskHygieneTests(SimpleTestCase):
             name="Task Hygiene",
             schedule=_RECURRING_SCHEDULE,
         )["payload"]["message"]
+        self.assertIn("exactly four times", message)
         self.assertIn("status: 'in_progress'", message)
         self.assertIn("limit: 40", message)
         self.assertIn("limit: 50", message)
+        self.assertIn("due_before", message)
+        self.assertIn("most recently updated", message)
         self.assertIn("PAST-DATED", message)
         self.assertIn("date passed", message)
+        self.assertIn("overdue since", message)
+        self.assertIn("List EVERY change", message)
+        self.assertNotIn("title/description", message)
+        self.assertNotIn("push it to a realistic date", message)
         self.assertNotIn("Do not list in_progress tasks", message)
 
     def test_prompt_requires_silence_when_nothing_changed(self):

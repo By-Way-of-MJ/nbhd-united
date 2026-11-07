@@ -62,13 +62,15 @@ _TURN_TIMEOUT_SECONDS = 300
 
 _MARKER = "[block: task_hygiene]"
 
-# Per-run read budgets for the three LOOK calls. Stale open tasks are the main
+# Per-run read budgets for the four LOOK calls. Stale open tasks are the main
 # triage pool; stale in-progress tasks are a smaller, higher-signal set (work
-# the user started and forgot); the recent-open list exists only so a dated
-# one-off event (a flight, a booking) gets checked even when it is NOT stale.
+# the user started and forgot); the recent-open and past-due lists exist only
+# so a dated one-off event (a flight, a booking) gets checked even when it is
+# NOT stale, and so an overdue item inside the recent window is never missed.
 _STALE_OPEN_LIMIT = 40
 _STALE_IN_PROGRESS_LIMIT = 20
 _RECENT_OPEN_LIMIT = 50
+_PAST_DUE_LIMIT = 50
 
 # Read-only context tools.
 _HYGIENE_QUERY_TOOLS: tuple[str, ...] = (
@@ -123,7 +125,7 @@ class TaskHygieneHandler(PatternHandler):
             "this turn. Work quietly and only interrupt them if you actually "
             "changed something or need a decision.\n"
             "\n"
-            "STEP 1 — LOOK. Call `nbhd_task_list` exactly three times, in this order:\n"
+            "STEP 1 — LOOK. Call `nbhd_task_list` exactly four times, in this order:\n"
             f"  1. `nbhd_task_list({{status: 'open', stale_days: {payload.stale_after_days}, "
             f"order: 'updated_at', limit: {_STALE_OPEN_LIMIT}, fields: 'compact'}})` "
             "→ stale open tasks, oldest first.\n"
@@ -131,24 +133,31 @@ class TaskHygieneHandler(PatternHandler):
             f"order: 'updated_at', limit: {_STALE_IN_PROGRESS_LIMIT}, fields: 'compact'}})` "
             "→ stale in-progress tasks.\n"
             f"  3. `nbhd_task_list({{status: 'open', limit: {_RECENT_OPEN_LIMIT}, "
-            "fields: 'compact'})` → the 50 newest open tasks. Use these ONLY "
-            "for the past-date check in STEP 2, not for stale triage.\n"
+            "fields: 'compact'})` → the 50 most recently updated open tasks. Use "
+            "these ONLY for the past-date check in STEP 2, not for stale triage.\n"
+            f"  4. `nbhd_task_list({{status: 'open', due_before: '<yesterday as YYYY-MM-DD>', "
+            f"limit: {_PAST_DUE_LIMIT}, fields: 'compact'}})` → open tasks whose due "
+            "date has passed. Use these ONLY for the past-date check in STEP 2.\n"
             "Then call `nbhd_goal_list` exactly once to see which goals are still live. "
             "Call `nbhd_task_get` only when a selected row is truly ambiguous, "
             "at most 5 calls per run. Every judgement you make below must trace to one of "
             "those tool results — never to memory or assumption. If a call errors on the "
-            "new keys, retry it once with only `{status: ...}`.\n"
+            "new keys, retry it once with only `{status: ...}`; from such an unfiltered "
+            "list review at most the 25 rows with the oldest `updated_at`.\n"
             "\n"
-            "STEP 2 — PAST DATES FIRST (any age, from all three lists). Today's "
+            "STEP 2 — PAST DATES FIRST (any age, from all four lists). Today's "
             "date is the current date shown in this turn (the runtime adds the "
-            "live date/time). A task is PAST-DATED when its `due_date` is before "
-            "today, OR its title/description names a specific dated one-off event "
-            "(a flight, trip, appointment, booking, reservation, ticket, deadline, "
-            "event) whose date is before today. Only use a date that is actually "
-            "written. If no clear date is written, the task is NOT past-dated. "
-            "For a past-dated task: if the record shows the work happened → "
-            "`nbhd_task_complete`; otherwise → `nbhd_task_skip` (the moment "
-            "passed). Reason line in the summary: `date passed (<the date>)`.\n"
+            "live date/time). Only a DATED ONE-OFF EVENT whose moment is over counts "
+            "as PAST-DATED and may be auto-closed here: a flight, trip, appointment, "
+            "booking, reservation, ticket, or event whose written date (in "
+            "`due_date` or the title) is before today. For those: if the record "
+            "shows it happened → `nbhd_task_complete`; otherwise → "
+            "`nbhd_task_skip` (the moment passed). Reason line in the summary: "
+            "`date passed (<the date>)`. Any OTHER task with a past `due_date` or a "
+            "missed deadline (a bill, a form, a 'deadline' item) is NOT closed — it "
+            "may still need doing late. List it in the summary as `overdue since "
+            "<date> — still need it?`. Only use a date that is actually written; if "
+            "no clear date is written, the task is NOT past-dated.\n"
             "\n"
             "STEP 3 — CLOSE what is already done, then TRIAGE stale tasks (from "
             "lists 1 and 2). If the record shows the work happened (a completed "
@@ -157,8 +166,7 @@ class TaskHygieneHandler(PatternHandler):
             "happened, do NOT complete it — propose it in the summary instead. "
             f"Then, for each stale task untouched for at least "
             f"{payload.stale_after_days} days, pick ONE:\n"
-            "  - `nbhd_task_defer` when it still matters but not now — push it "
-            "to a realistic date.\n"
+            "  - `nbhd_task_defer` when it still matters but not now.\n"
             "  - `nbhd_task_skip` when the moment for it has passed and doing "
             "it no longer makes sense.\n"
             "  - leave it alone when neither is clearly right.\n"
@@ -181,12 +189,11 @@ class TaskHygieneHandler(PatternHandler):
             "deletion candidates, send NOTHING AT ALL and end the turn — a "
             "message saying 'everything looks fine' is noise the user did not "
             "ask for. Otherwise call `nbhd_send_to_user` EXACTLY ONCE with a "
-            "short, scannable summary. The summary lists past-dated closures "
-            "first. Keep it to at most 15 bullet lines; if there are more "
-            "proposals than that, show the oldest 15 and say how many more "
-            "there are. Include what you closed, what you deferred or skipped "
-            "and why, then the deletion candidates as a list the user can say "
-            "yes or no to. You can make at most 20 changes per run; if you hit "
+            "short, scannable summary. List EVERY change you made (up to 20), "
+            "each with its one-line reason, past-dated closures first. Then at "
+            "most 10 proposals (overdue items, stale items you left alone but "
+            "want to ask about, deletion candidates); if there are more, say how "
+            "many more. You can make at most 20 changes per run; if you hit "
             "that, list the rest as proposals. Do not send a second message. "
             "Do not narrate your tool calls.\n"
             "\n"
