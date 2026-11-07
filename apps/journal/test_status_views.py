@@ -204,6 +204,26 @@ class JournalStatusBuildTests(TestCase):
         titles = [t["title"] for t in result["open_tasks"]]
         self.assertIn("Pay the loan", titles)
 
+    def test_open_tasks_flag_past_due_dates(self):
+        past = Task.objects.create(
+            tenant=self.tenant,
+            title="Past flight",
+            status=Task.Status.OPEN,
+            due_date=date(2026, 6, 3),
+        )
+        current = Task.objects.create(
+            tenant=self.tenant,
+            title="Today's appointment",
+            status=Task.Status.OPEN,
+            due_date=date(2026, 6, 4),
+        )
+
+        result = build_journal_status(self.tenant, today=date(2026, 6, 4))
+
+        rows = {row["id"]: row for row in result["open_tasks"]}
+        self.assertTrue(rows[str(past.id)]["date_passed"])
+        self.assertFalse(rows[str(current.id)]["date_passed"])
+
     def test_typed_flag_off_yields_no_tasks_or_goals(self):
         Task.objects.create(tenant=self.tenant, title="t", status=Task.Status.OPEN)
         Goal.objects.create(tenant=self.tenant, title="g", status=Goal.Status.ACTIVE)

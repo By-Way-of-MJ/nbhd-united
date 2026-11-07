@@ -110,13 +110,14 @@ def obligation_for_account(account: FinanceAccount, paid_amount: Decimal, today:
     }
 
 
-def _task_dict(task: Task) -> dict:
+def _task_dict(task: Task, today: date) -> dict:
     return {
         "id": str(task.id),
         "title": task.title,
         "status": task.status,
         "due_date": task.due_date.isoformat() if task.due_date else None,
         "pillar": task.pillar,
+        "date_passed": bool(task.due_date and task.due_date < today),
     }
 
 
@@ -162,7 +163,7 @@ def _provide_tasks(tenant: Tenant, today: date) -> dict:
         ref = task.related_ref if isinstance(task.related_ref, dict) else None
         if finance_on and ref and ref.get("object_type") == "FinanceAccount":
             continue
-        open_tasks.append(_task_dict(task))
+        open_tasks.append(_task_dict(task, today))
     return {"open_tasks": open_tasks}
 
 

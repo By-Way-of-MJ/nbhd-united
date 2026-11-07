@@ -99,6 +99,12 @@ _WORKSPACE_DELETE_CONFIRM_TOKEN_SALT = "apps.integrations.workspace.delete-confi
 _WORKSPACE_DELETE_CONFIRM_GUIDANCE = (
     "Show this workspace deletion preview, obtain explicit confirmation, then retry with confirm_token unchanged."
 )
+TASK_DATE_NOTE = (
+    "Compare every task with `today` before presenting it. A task whose due_date is before today "
+    "(date_passed: true), or whose title or description names a dated one-off event (a flight, trip, "
+    "appointment, booking, ticket, deadline) that falls before today, is already past: never present "
+    "it as upcoming or still to do. Say its date has passed and offer to close it."
+)
 
 
 def _action_confirmation_context(*, tenant: Tenant, action: str, parameters: dict) -> dict:
@@ -1260,7 +1266,7 @@ class RuntimeCurrentStatusView(APIView):
 
         data = build_journal_status(tenant, _tenant_today(tenant))
         return Response(
-            {"tenant_id": str(tenant.id), **data},
+            {"tenant_id": str(tenant.id), "date_note": TASK_DATE_NOTE, **data},
             status=status.HTTP_200_OK,
         )
 
@@ -1291,6 +1297,7 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
         if tenant_failure is not None or tenant is None:
             return tenant_failure
 
+        today = _tenant_today(tenant)
         qs = Task.objects.filter(tenant=tenant)
         for field in ("status", "pillar"):
             value = request.query_params.get(field)
@@ -1348,11 +1355,19 @@ class RuntimeTaskListCreateView(KnownValueResponseGuardMixin, APIView):
             serializer = TaskCompactSerializer(qs, many=True)
         else:
             serializer = TaskSerializer(qs, many=True)
+        today_iso = today.isoformat()
+        rows = []
+        for row in serializer.data:
+            row = dict(row)
+            row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today_iso)
+            rows.append(row)
         return Response(
             {
                 "tenant_id": str(tenant.id),
-                "tasks": serializer.data,
-                "count": len(serializer.data),
+                "today": today_iso,
+                "date_note": TASK_DATE_NOTE,
+                "tasks": rows,
+                "count": len(rows),
             },
             status=status.HTTP_200_OK,
         )

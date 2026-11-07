@@ -9,6 +9,8 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.renderers import JSONRenderer
 
+from apps.common.tenant_tz import safe_zoneinfo, tenant_today, tenant_tz_name
+from apps.integrations.runtime_views import TASK_DATE_NOTE
 from apps.journal.lifecycle_serializers import TaskSerializer
 from apps.journal.models import Goal, Task
 from apps.tenants.services import create_tenant
@@ -39,9 +41,23 @@ class RuntimeTaskListTests(TestCase):
         return task
 
     def assert_legacy_bytes(self, response, qs):
-        # This is the pre-candidate endpoint's exact response construction.
-        rows = TaskSerializer(qs, many=True).data
-        expected = JSONRenderer().render({"tenant_id": str(self.tenant.id), "tasks": rows, "count": len(rows)})
+        # The pre-candidate endpoint's exact response construction, plus the
+        # server-computed date context every task read now carries.
+        today = tenant_today(self.tenant).isoformat()
+        rows = []
+        for row in TaskSerializer(qs, many=True).data:
+            row = dict(row)
+            row["date_passed"] = bool(row.get("due_date") and row["due_date"] < today)
+            rows.append(row)
+        expected = JSONRenderer().render(
+            {
+                "tenant_id": str(self.tenant.id),
+                "today": today,
+                "date_note": TASK_DATE_NOTE,
+                "tasks": rows,
+                "count": len(rows),
+            }
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, expected)
 
@@ -65,6 +81,7 @@ class RuntimeTaskListTests(TestCase):
                 "related_ref",
                 "created_at",
                 "updated_at",
+                "date_passed",
             ],
         )
 
@@ -98,6 +115,31 @@ class RuntimeTaskListTests(TestCase):
         self.assertEqual([row["id"] for row in response.json()["tasks"]], [str(oldest.id), str(next_oldest.id)])
         self.assertNotIn(str(boundary.id), response.content.decode())
         self.assertEqual(response.json()["count"], 2)
+
+    def test_task_reads_carry_today_and_date_passed(self):
+        with patch("apps.integrations.runtime_views.tz.now", return_value=self.now):
+            today = self.now.astimezone(safe_zoneinfo(tenant_tz_name(self.tenant))).date()
+            yesterday_task = self.task(0, status="open", due_date=today - timedelta(days=1))
+            today_task = self.task(0, status="open", due_date=today)
+            undated_task = self.task(0, status="open", due_date=None)
+
+            response = self.get(status="open")
+            compact_response = self.get(status="open", fields="compact")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["today"], today.isoformat())
+        self.assertTrue(body["date_note"])
+        rows = {row["id"]: row for row in body["tasks"]}
+        self.assertTrue(rows[str(yesterday_task.id)]["date_passed"])
+        self.assertFalse(rows[str(today_task.id)]["date_passed"])
+        self.assertFalse(rows[str(undated_task.id)]["date_passed"])
+
+        compact_rows = compact_response.json()["tasks"]
+        self.assertEqual(len(compact_rows), 3)
+        self.assertTrue(all("date_passed" in row for row in compact_rows))
+        compact_by_id = {row["id"]: row for row in compact_rows}
+        self.assertTrue(compact_by_id[str(yesterday_task.id)]["date_passed"])
 
     def test_order_has_stable_ties_and_limit_is_applied_in_sql(self):
         tasks = [self.task(30) for _ in range(27)]
@@ -153,7 +195,10 @@ class RuntimeTaskListTests(TestCase):
         self.assertIsNone(rows[0]["parent_goal"])
         self.assertEqual(rows[1]["id"], str(tasks[0].id))
         self.assertEqual(rows[1]["parent_goal"], {"id": str(goal.id), "title": "Organize"})
-        self.assertEqual(set(rows[1]), {"id", "title", "status", "pillar", "due_date", "updated_at", "parent_goal"})
+        self.assertEqual(
+            set(rows[1]),
+            {"id", "title", "status", "pillar", "due_date", "updated_at", "parent_goal", "date_passed"},
+        )
         lifecycle_queries = [
             q for q in queries if 'FROM "journal_tasks"' in q["sql"] or 'FROM "journal_goals"' in q["sql"]
         ]
@@ -180,5 +225,11 @@ class RuntimeTaskListTests(TestCase):
         self.task(0)
         self.assertEqual(
             self.get(stale_days=14, order="updated_at", limit=25, fields="compact").json(),
-            {"tenant_id": str(self.tenant.id), "tasks": [], "count": 0},
+            {
+                "tenant_id": str(self.tenant.id),
+                "today": tenant_today(self.tenant).isoformat(),
+                "date_note": TASK_DATE_NOTE,
+                "tasks": [],
+                "count": 0,
+            },
         )
