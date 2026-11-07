@@ -195,7 +195,7 @@ class TaskHygieneSeedingTests(TestCase):
                 self.assertEqual(cron.enabled, enabled)
                 self.assertIn("at least 21 days", cron.data["payload"]["message"])
                 self.assertIn(
-                    "{status: 'open', stale_days: 21, order: 'updated_at', limit: 25, fields: 'compact'}",
+                    "{status: 'open', stale_days: 21, order: 'updated_at', limit: 40, fields: 'compact'}",
                     cron.data["payload"]["message"],
                 )
                 self.assertNotIn("nbhd_current_status", cron.data["payload"]["message"])
@@ -308,25 +308,24 @@ class TaskHygieneRenderedTurnTests(TestCase):
         payload = self.cron.data["payload"]
         self.assertEqual(payload["timeoutSeconds"], 300)
         for marker in (
-            "Call `nbhd_task_list` exactly once",
-            "{status: 'open', stale_days: 14, order: 'updated_at', limit: 25, fields: 'compact'}",
-            "no activity for at least 14 days",
-            "`updated_at`, oldest first",
-            "at most 25 stale candidates",
-            "Steps 2–4 apply only to these candidates",
-            "Call `nbhd_goal_list` exactly once",
+            "Call `nbhd_task_list` exactly four times",
+            "{status: 'open', stale_days: 14, order: 'updated_at', limit: 40, fields: 'compact'}",
+            "{status: 'in_progress', stale_days: 14, order: 'updated_at', limit: 20, fields: 'compact'}",
+            "{status: 'open', limit: 50, fields: 'compact'}",
+            "{status: 'open', due_before:",
+            "from lists 1 and 2",
+            "call `nbhd_goal_list` exactly once",
             "only when a selected row is truly ambiguous",
             "at most 5 calls per run",
         ):
             self.assertIn(marker, payload["message"])
-        self.assertNotIn("status: 'in_progress'", payload["message"])
+        self.assertIn("status: 'in_progress'", payload["message"])
 
     def test_old_images_have_a_bounded_fallback_after_schema_error(self):
         message = self.cron.data["payload"]["message"]
-        self.assertIn("Older images may reject these new keys with a schema error", message)
-        self.assertIn("Only if that call errors, fall back once to `nbhd_task_list({status: 'open'})`", message)
-        self.assertIn("or the result is an unfiltered full list", message)
-        self.assertIn("review at most 25 stale candidates before fetching details", message)
+        self.assertIn("If a call errors on the new keys", message)
+        self.assertIn("retry it once with only `{status: ...}`", message)
+        self.assertIn("review at most the 25 rows with the oldest", message)
 
     def test_toolsallow_on_the_real_row_is_pinned_exactly(self):
         self.assertEqual(
@@ -386,7 +385,29 @@ class TaskHygieneRenderedTurnTests(TestCase):
         it through, the caps vanish silently: the cron still fires, still sends,
         and nothing enforces one-message-only or the mutation ceiling."""
         contract = json.loads(self.cron.data["description"][len(CRON_CONTRACT_PREFIX) :])
-        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 10})
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
+
+    def test_refresh_rebakes_an_old_contract_with_the_current_mutation_cap(self):
+        """An existing row must pick up a changed cap. The pre-save signal skips
+        unchanged typed rows, so without the refresh re-bake the row would keep
+        the cap it was first seeded with forever."""
+        old_contract = {
+            "v": 1,
+            "pattern": "task_hygiene",
+            "check": {"kind": "marker", "marker": "[block: task_hygiene]"},
+            "on_fail": {"action": "revise_then_allow", "max_revisions": 1},
+            "limits": {"sends": 1, "mutations": 10},
+        }
+        old_data = deepcopy(self.cron.data)
+        old_data["description"] = CRON_CONTRACT_PREFIX + json.dumps(old_contract, separators=(",", ":"))
+        CronJob.objects.filter(pk=self.cron.pk).update(data=old_data)
+
+        with override_settings(TASK_HYGIENE_TENANT_IDS=str(self.tenant.id)):
+            seed_task_hygiene_cron(self.tenant)
+
+        self.cron.refresh_from_db()
+        contract = json.loads(self.cron.data["description"][len(CRON_CONTRACT_PREFIX) :])
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
 
     def test_a_pattern_without_limits_bakes_no_limits_key(self):
         """The signal change must be a pure addition. A pure_reminder row baked

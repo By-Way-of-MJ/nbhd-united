@@ -62,6 +62,16 @@ _TURN_TIMEOUT_SECONDS = 300
 
 _MARKER = "[block: task_hygiene]"
 
+# Per-run read budgets for the four LOOK calls. Stale open tasks are the main
+# triage pool; stale in-progress tasks are a smaller, higher-signal set (work
+# the user started and forgot); the recent-open and past-due lists exist only
+# so a dated one-off event (a flight, a booking) gets checked even when it is
+# NOT stale, and so an overdue item inside the recent window is never missed.
+_STALE_OPEN_LIMIT = 40
+_STALE_IN_PROGRESS_LIMIT = 20
+_RECENT_OPEN_LIMIT = 50
+_PAST_DUE_LIMIT = 50
+
 # Read-only context tools.
 _HYGIENE_QUERY_TOOLS: tuple[str, ...] = (
     "nbhd_task_list",
@@ -115,33 +125,52 @@ class TaskHygieneHandler(PatternHandler):
             "this turn. Work quietly and only interrupt them if you actually "
             "changed something or need a decision.\n"
             "\n"
-            "STEP 1 — LOOK. Call `nbhd_task_list` exactly once with "
-            f"`{{status: 'open', stale_days: {payload.stale_after_days}, "
-            "order: 'updated_at', limit: 25, fields: 'compact'}`. "
-            "The server returns at most 25 stale candidates, oldest first; "
-            "review only those rows and leave all other tasks for a later run. "
-            "Older images may reject these new keys with a schema error. "
-            "Only if that call errors, fall back once to `nbhd_task_list({status: 'open'})`. "
-            "If using that fallback (or the result is an unfiltered full list), select only "
-            f"tasks with no activity for at least {payload.stale_after_days} days "
-            "using `updated_at`, oldest first, and review at most 25 stale candidates "
-            "before fetching details or making judgements. Do not list in_progress tasks. "
-            "Steps 2–4 apply only to these candidates. "
-            "Call `nbhd_goal_list` exactly once to see which goals are still live. "
+            "STEP 1 — LOOK. Call `nbhd_task_list` exactly four times, in this order:\n"
+            f"  1. `nbhd_task_list({{status: 'open', stale_days: {payload.stale_after_days}, "
+            f"order: 'updated_at', limit: {_STALE_OPEN_LIMIT}, fields: 'compact'}})` "
+            "→ stale open tasks, oldest first.\n"
+            f"  2. `nbhd_task_list({{status: 'in_progress', stale_days: {payload.stale_after_days}, "
+            f"order: 'updated_at', limit: {_STALE_IN_PROGRESS_LIMIT}, fields: 'compact'}})` "
+            "→ stale in-progress tasks.\n"
+            f"  3. `nbhd_task_list({{status: 'open', limit: {_RECENT_OPEN_LIMIT}, "
+            "fields: 'compact'})` → the 50 most recently updated open tasks. Use "
+            "these ONLY for the past-date check in STEP 2, not for stale triage.\n"
+            f"  4. `nbhd_task_list({{status: 'open', due_before: '<yesterday as YYYY-MM-DD>', "
+            f"limit: {_PAST_DUE_LIMIT}, fields: 'compact'}})` → open tasks whose due "
+            "date has passed. Use these ONLY for the past-date check in STEP 2.\n"
+            "Then call `nbhd_goal_list` exactly once to see which goals are still live. "
             "Call `nbhd_task_get` only when a selected row is truly ambiguous, "
             "at most 5 calls per run. Every judgement you make below must trace to one of "
-            "those tool results — never to memory or assumption.\n"
+            "those tool results — never to memory or assumption. If a call errors on the "
+            "new keys, retry it once with only `{status: ...}`; from such an unfiltered "
+            "list review at most the 25 rows with the oldest `updated_at`.\n"
             "\n"
-            "STEP 2 — CLOSE what is already done. If the record shows the work "
-            "happened (a completed session, a paid bill, a goal the task fed "
-            "into that is already achieved), call `nbhd_task_complete`. If you "
-            "are not sure it happened, do NOT complete it — propose it in the "
-            "summary instead.\n"
+            "STEP 2 — PAST DATES FIRST (any age, from all four lists). Today's "
+            "date is the current date shown in this turn (the runtime adds the "
+            "live date/time). Only a DATED ONE-OFF EVENT whose moment is over counts "
+            "as PAST-DATED and may be auto-closed here: a flight, trip, appointment, "
+            "booking, reservation, ticket, or event whose written date (in "
+            "`due_date` or the title) is before today. "
+            "The written date must be the date of the event itself. A task to "
+            "arrange something (buy tickets, make a booking, reserve a table) "
+            "whose deadline passed is a missed deadline, not a past event — "
+            "treat it as overdue, never close it. For a past event: if the record "
+            "shows it happened → `nbhd_task_complete`; otherwise → "
+            "`nbhd_task_skip` (the moment passed). Reason line in the summary: "
+            "`date passed (<the date>)`. Any OTHER task with a past `due_date` or a "
+            "missed deadline (a bill, a form, a 'deadline' item) is NOT closed — it "
+            "may still need doing late. List it in the summary as `overdue since "
+            "<date> — still need it?`. Only use a date that is actually written; if "
+            "no clear date is written, the task is NOT past-dated.\n"
             "\n"
-            f"STEP 3 — TRIAGE what has gone stale (untouched for at least "
-            f"{payload.stale_after_days} days). For each one pick ONE:\n"
-            "  - `nbhd_task_defer` when it still matters but not now — push it "
-            "to a realistic date.\n"
+            "STEP 3 — CLOSE what is already done, then TRIAGE stale tasks (from "
+            "lists 1 and 2). If the record shows the work happened (a completed "
+            "session, a paid bill, a goal the task fed into that is already "
+            "achieved), call `nbhd_task_complete`. If you are not sure it "
+            "happened, do NOT complete it — propose it in the summary instead. "
+            f"Then, for each stale task untouched for at least "
+            f"{payload.stale_after_days} days, pick ONE:\n"
+            "  - `nbhd_task_defer` when it still matters but not now.\n"
             "  - `nbhd_task_skip` when the moment for it has passed and doing "
             "it no longer makes sense.\n"
             "  - leave it alone when neither is clearly right.\n"
@@ -160,14 +189,18 @@ class TaskHygieneHandler(PatternHandler):
             "instead, with a short reason each, and let the user confirm them "
             "in chat whenever they get to it.\n"
             "\n"
-            "STEP 5 — REPORT, at most once. If you changed nothing AND have no "
-            "deletion candidates, send NOTHING AT ALL and end the turn — a "
+            "STEP 5 — REPORT, at most once. If you changed nothing AND have no proposals "
+            "(no overdue items, no stale items to ask about, no deletion "
+            "candidates), send NOTHING AT ALL and end the turn — a "
             "message saying 'everything looks fine' is noise the user did not "
             "ask for. Otherwise call `nbhd_send_to_user` EXACTLY ONCE with a "
-            "short, scannable summary: what you closed, what you deferred or "
-            "skipped and why, then the deletion candidates as a list the user "
-            "can say yes or no to. Do not send a second message. Do not "
-            "narrate your tool calls.\n"
+            "short, scannable summary. List EVERY change you made (up to 20), "
+            "each with its one-line reason, past-dated closures first. Then at "
+            "most 10 proposals (overdue items, stale items you left alone but "
+            "want to ask about, deletion candidates); if there are more, say how "
+            "many more. You can make at most 20 changes per run; if you hit "
+            "that, list the rest as proposals. Do not send a second message. "
+            "Do not narrate your tool calls.\n"
             "\n"
             f"The first line of that message must include the literal marker "
             f"`{_MARKER}` so downstream tooling can identify the render type."
@@ -221,12 +254,13 @@ class TaskHygieneHandler(PatternHandler):
             # unmarked-second-message path: a message that never dispatches
             # cannot arrive without a marker.
             #
-            # mutations=10 bounds the worst case of an unattended turn that
-            # misreads the task list — ten wrong closures is recoverable and
-            # visible in one summary; a hundred is a data-loss incident. Past
-            # the cap the model is told to list the rest as proposals, which is
-            # the same escape hatch deletion already uses.
-            "limits": {"sends": 1, "mutations": 10},
+            # mutations=20 bounds the worst case of an unattended turn that
+            # misreads the task list. Twenty is still small — every change is a
+            # reversible status flip shown in one summary — while twenty wrong
+            # closures is recoverable and visible; a hundred is a data-loss
+            # incident. Past the cap the model is told to list the rest as
+            # proposals, which is the same escape hatch deletion already uses.
+            "limits": {"sends": 1, "mutations": 20},
         }
 
     def validate_outbound_message(

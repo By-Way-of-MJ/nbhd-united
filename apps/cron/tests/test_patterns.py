@@ -576,7 +576,7 @@ class TaskHygieneTests(SimpleTestCase):
         neither."""
         payload = self.handler.validate_payload({})
         contract = self.handler.get_outbound_contract(payload, name="Task Hygiene")
-        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 10})
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
 
     def test_only_the_mutating_pattern_declares_limits(self):
         """Read-only patterns must stay uncapped — their toolsAllow already
@@ -635,6 +635,31 @@ class TaskHygieneTests(SimpleTestCase):
             schedule=_RECURRING_SCHEDULE,
         )["payload"]["message"]
         self.assertIn("30 days", message)
+
+    def test_prompt_covers_past_dated_and_in_progress_tasks(self):
+        payload = self.handler.validate_payload({})
+        message = self.handler.build_oc_data(
+            payload,
+            tenant=None,
+            name="Task Hygiene",
+            schedule=_RECURRING_SCHEDULE,
+        )["payload"]["message"]
+        self.assertIn("exactly four times", message)
+        self.assertIn("status: 'in_progress'", message)
+        self.assertIn("limit: 40", message)
+        self.assertIn("limit: 50", message)
+        self.assertIn("due_before", message)
+        self.assertIn("most recently updated", message)
+        self.assertIn("PAST-DATED", message)
+        self.assertIn("date passed", message)
+        self.assertIn("overdue since", message)
+        self.assertIn("List EVERY change", message)
+        self.assertIn("date of the event itself", message)
+        self.assertIn("For a past event:", message)
+        self.assertIn("no proposals", message)
+        self.assertNotIn("title/description", message)
+        self.assertNotIn("push it to a realistic date", message)
+        self.assertNotIn("Do not list in_progress tasks", message)
 
     def test_prompt_requires_silence_when_nothing_changed(self):
         """A new proactive sender that messages every week regardless is a

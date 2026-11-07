@@ -62,7 +62,7 @@ class SignedParameterCarryTest(SimpleTestCase):
                     self.assertTrue(row.data["description"].startswith("nbhd.v1 "))
                     if pattern == CronPattern.TASK_HYGIENE:
                         contract = json.loads(row.data["description"].removeprefix("nbhd.v1 "))
-                        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 10})
+                        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
                     with (
                         mock.patch.object(CronJob.objects, "filter") as rows,
                         mock.patch("apps.orchestrator.azure_client._put_share_file") as put,
