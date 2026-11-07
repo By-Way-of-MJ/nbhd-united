@@ -583,6 +583,19 @@ def seed_task_hygiene_cron(tenant: Tenant) -> dict[str, Any]:
                 data = deepcopy(existing.data)
                 for field in ("message", "timeoutSeconds", "toolsAllow", "thinking"):
                     data["payload"][field] = rendered["payload"][field]
+                # Re-bake the outbound contract so an existing row picks up
+                # changed fire-time caps (the typed pre-save signal skips this
+                # row because its pattern/payload are unchanged).
+                from apps.cron.signals import build_contract_description
+
+                description = build_contract_description(
+                    handler,
+                    payload,
+                    name=existing.name,
+                    pattern=existing.pattern,
+                )
+                if description is not None:
+                    data["description"] = description
                 if data != existing.data:
                     # The typed pre-save signal skips unchanged inputs. Persist
                     # just these derived fields; post-save queues reconciliation.

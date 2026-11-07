@@ -18,6 +18,7 @@ import json
 import logging
 import threading
 from contextlib import contextmanager
+from typing import Any
 
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
@@ -73,6 +74,40 @@ def _enqueue_regen(tenant_id: str) -> bool:
             exc_info=True,
         )
         return False
+
+
+def build_contract_description(
+    handler: Any,
+    payload: Any,
+    *,
+    name: str,
+    pattern: str,
+) -> str | None:
+    """Bake a pattern's fire-time outbound-enforcement contract into a string.
+
+    Returns ``CRON_CONTRACT_PREFIX + json.dumps(full_contract)`` or ``None``
+    when the handler defines no contract. Shared by the pre_save signal and the
+    task-hygiene refresh path so an existing row gets the CURRENT caps, not the
+    ones baked when it was first seeded.
+    """
+    contract = handler.get_outbound_contract(payload, name=name)
+    if contract is None:
+        return None
+    full_contract = {
+        "v": 1,
+        "pattern": pattern,
+        "check": contract.get("check"),
+        "on_fail": contract.get("on_fail"),
+    }
+    # Optional per-fire hard caps: {"sends": N, "mutations": N}. Omitted for
+    # every pattern that doesn't declare them, so the plugin's cap logic
+    # stays entirely dormant for the read-only patterns (a briefing with no
+    # ``limits`` key is uncapped, exactly as before). Only patterns whose
+    # turn can mutate — today just task_hygiene — opt in.
+    limits = contract.get("limits")
+    if limits:
+        full_contract["limits"] = limits
+    return CRON_CONTRACT_PREFIX + json.dumps(full_contract, separators=(",", ":"), ensure_ascii=False)
 
 
 @receiver(pre_save, sender=CronJob)
@@ -143,25 +178,14 @@ def cronjob_derive_data_from_typed_payload(sender, instance, **kwargs):
     # push paths (immediate at-cron push + reconciler render of managed
     # rows) because both read CronJob.data verbatim. See CRON_CONTRACT_PREFIX
     # above and apps/cron/patterns/base.py:get_outbound_contract.
-    contract = handler.get_outbound_contract(payload, name=instance.name)
-    if contract is not None:
-        full_contract = {
-            "v": 1,
-            "pattern": instance.pattern,
-            "check": contract.get("check"),
-            "on_fail": contract.get("on_fail"),
-        }
-        # Optional per-fire hard caps: {"sends": N, "mutations": N}. Omitted for
-        # every pattern that doesn't declare them, so the plugin's cap logic
-        # stays entirely dormant for the read-only patterns (a briefing with no
-        # ``limits`` key is uncapped, exactly as before). Only patterns whose
-        # turn can mutate — today just task_hygiene — opt in.
-        limits = contract.get("limits")
-        if limits:
-            full_contract["limits"] = limits
-        instance.data["description"] = CRON_CONTRACT_PREFIX + json.dumps(
-            full_contract, separators=(",", ":"), ensure_ascii=False
-        )
+    description = build_contract_description(
+        handler,
+        payload,
+        name=instance.name,
+        pattern=instance.pattern,
+    )
+    if description is not None:
+        instance.data["description"] = description
 
 
 @receiver(post_save, sender=CronJob)
