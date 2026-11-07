@@ -96,6 +96,7 @@ class RuntimeCurrentStatusViewTest(TestCase):
             set(body),
             {
                 "tenant_id",
+                "date_note",
                 "as_of",
                 "typed_lifecycle",
                 "finance_enabled",

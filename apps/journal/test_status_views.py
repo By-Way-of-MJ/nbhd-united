@@ -8,8 +8,10 @@ the current cycle read as paid).
 
 from __future__ import annotations
 
-from datetime import date
+import unittest
+from datetime import date, datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -22,6 +24,7 @@ from apps.journal.status_projection import (
     current_period_bounds,
     effective_due_date,
     obligation_for_account,
+    task_staleness,
 )
 from apps.tenants.models import Tenant, User
 
@@ -39,6 +42,25 @@ def _unsaved_account(**kw) -> FinanceAccount:
     )
     defaults.update(kw)
     return FinanceAccount(**defaults)
+
+
+class TaskStalenessUnitTests(unittest.TestCase):
+    def test_iso_strings_none_and_done_status(self):
+        today = date(2026, 9, 15)
+        self.assertEqual(task_staleness("open", "2026-09-01T03:04:05.123456Z", today), (14, True))
+        self.assertEqual(task_staleness("open", "2026-09-01T03:04:05+09:00", today), (14, True))
+        self.assertEqual(task_staleness("open", None, today), (None, False))
+        self.assertEqual(task_staleness("done", "2026-08-26T03:04:05Z", today), (20, False))
+
+    def test_timezone_conversion_uses_tenant_local_date(self):
+        today = date(2026, 9, 15)
+        updated_at = "2026-09-01T16:00:00Z"
+        self.assertEqual(task_staleness("open", updated_at, today, tzinfo=ZoneInfo("Asia/Tokyo")), (13, False))
+        self.assertEqual(
+            task_staleness("open", updated_at, today, tzinfo=ZoneInfo("America/Los_Angeles")),
+            (14, True),
+        )
+        self.assertEqual(task_staleness("open", updated_at, today), (14, True))
 
 
 class ObligationProjectionUnitTests(TestCase):
@@ -203,6 +225,40 @@ class JournalStatusBuildTests(TestCase):
         result = build_journal_status(self.tenant, today=date(2026, 6, 4))
         titles = [t["title"] for t in result["open_tasks"]]
         self.assertIn("Pay the loan", titles)
+
+    def test_open_tasks_flag_past_due_dates(self):
+        past = Task.objects.create(
+            tenant=self.tenant,
+            title="Past flight",
+            status=Task.Status.OPEN,
+            due_date=date(2026, 6, 3),
+        )
+        current = Task.objects.create(
+            tenant=self.tenant,
+            title="Today's appointment",
+            status=Task.Status.OPEN,
+            due_date=date(2026, 6, 4),
+        )
+
+        result = build_journal_status(self.tenant, today=date(2026, 6, 4))
+
+        rows = {row["id"]: row for row in result["open_tasks"]}
+        self.assertTrue(rows[str(past.id)]["date_passed"])
+        self.assertFalse(rows[str(current.id)]["date_passed"])
+
+    def test_open_tasks_flag_stale_tasks(self):
+        stale = Task.objects.create(tenant=self.tenant, title="Old task", status=Task.Status.OPEN)
+        fresh = Task.objects.create(tenant=self.tenant, title="Fresh task", status=Task.Status.OPEN)
+        Task.objects.filter(pk=stale.pk).update(updated_at=timezone.make_aware(datetime(2026, 5, 15, 12, 0)))
+        Task.objects.filter(pk=fresh.pk).update(updated_at=timezone.make_aware(datetime(2026, 6, 4, 12, 0)))
+
+        result = build_journal_status(self.tenant, today=date(2026, 6, 4))
+
+        rows = {row["id"]: row for row in result["open_tasks"]}
+        self.assertTrue(rows[str(stale.id)]["stale"])
+        self.assertEqual(rows[str(stale.id)]["days_untouched"], 20)
+        self.assertFalse(rows[str(fresh.id)]["stale"])
+        self.assertEqual(rows[str(fresh.id)]["days_untouched"], 0)
 
     def test_typed_flag_off_yields_no_tasks_or_goals(self):
         Task.objects.create(tenant=self.tenant, title="t", status=Task.Status.OPEN)

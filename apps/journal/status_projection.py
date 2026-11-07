@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import calendar
 import logging
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -34,6 +34,22 @@ if TYPE_CHECKING:
     from .models import Goal, Task
 
 logger = logging.getLogger(__name__)
+
+STALE_TASK_DAYS = 14
+
+
+def task_staleness(status: str, updated_at, today: date, tzinfo=None) -> tuple[int | None, bool]:
+    """(days_untouched, stale). days_untouched = today - updated_at's date, never negative;
+    None when updated_at is None. stale only for open/in_progress tasks untouched >= STALE_TASK_DAYS."""
+    if updated_at is None:
+        return None, False
+    if isinstance(updated_at, str):
+        updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    if tzinfo is not None and updated_at.tzinfo is not None:
+        updated_at = updated_at.astimezone(tzinfo)
+    days_untouched = max(0, (today - updated_at.date()).days)
+    stale = status in ("open", "in_progress") and days_untouched >= STALE_TASK_DAYS
+    return days_untouched, stale
 
 
 def current_period_bounds(today: date) -> tuple[date, date]:
@@ -110,13 +126,17 @@ def obligation_for_account(account: FinanceAccount, paid_amount: Decimal, today:
     }
 
 
-def _task_dict(task: Task) -> dict:
+def _task_dict(task: Task, today: date, tzinfo=None) -> dict:
+    days_untouched, stale = task_staleness(task.status, task.updated_at, today, tzinfo)
     return {
         "id": str(task.id),
         "title": task.title,
         "status": task.status,
         "due_date": task.due_date.isoformat() if task.due_date else None,
         "pillar": task.pillar,
+        "date_passed": bool(task.due_date and task.due_date < today),
+        "days_untouched": days_untouched,
+        "stale": stale,
     }
 
 
@@ -150,8 +170,11 @@ def _provide_tasks(tenant: Tenant, today: date) -> dict:
     this stops a done task from reading as "loan handled" while a cycle is
     outstanding. When finance is paused there is no obligation, so the task
     stays visible."""
+    from apps.common.tenant_tz import safe_zoneinfo, tenant_tz_name
+
     from .models import Task
 
+    tzinfo = safe_zoneinfo(tenant_tz_name(tenant))
     finance_on = _finance_active(tenant)
     open_tasks: list[dict] = []
     task_qs = Task.objects.filter(
@@ -162,7 +185,7 @@ def _provide_tasks(tenant: Tenant, today: date) -> dict:
         ref = task.related_ref if isinstance(task.related_ref, dict) else None
         if finance_on and ref and ref.get("object_type") == "FinanceAccount":
             continue
-        open_tasks.append(_task_dict(task))
+        open_tasks.append(_task_dict(task, today, tzinfo))
     return {"open_tasks": open_tasks}
 
 
