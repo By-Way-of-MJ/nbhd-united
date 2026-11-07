@@ -655,6 +655,7 @@ class TaskHygieneTests(SimpleTestCase):
         self.assertIn("overdue since", message)
         self.assertIn("List EVERY change", message)
         self.assertIn("date of the event itself", message)
+        self.assertIn("For a past event:", message)
         self.assertIn("no proposals", message)
         self.assertNotIn("title/description", message)
         self.assertNotIn("push it to a realistic date", message)

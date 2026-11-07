@@ -154,7 +154,7 @@ class TaskHygieneHandler(PatternHandler):
             "The written date must be the date of the event itself. A task to "
             "arrange something (buy tickets, make a booking, reserve a table) "
             "whose deadline passed is a missed deadline, not a past event — "
-            "treat it as overdue, never close it. For those: if the record "
+            "treat it as overdue, never close it. For a past event: if the record "
             "shows it happened → `nbhd_task_complete`; otherwise → "
             "`nbhd_task_skip` (the moment passed). Reason line in the summary: "
             "`date passed (<the date>)`. Any OTHER task with a past `due_date` or a "
