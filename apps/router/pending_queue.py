@@ -3207,7 +3207,10 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
     from apps.router.panels import extract_panels, prepare_panels
 
     ai_text, panels = extract_panels(ai_text or "")
-    panels = prepare_panels(tenant, panels)
+    # A panel-only reply has no prose: pass user_text=None so prepare_panels does
+    # not filter timers and turn a legitimate timer-only turn into an error.
+    joined_user_text = " ".join(getattr(m, "user_text", None) or "" for m in batch) if ai_text.strip() else None
+    panels = prepare_panels(tenant, panels, user_text=joined_user_text)
     from apps.router.character_drawing import has_character_drawing
 
     if has_character_drawing(ai_text):

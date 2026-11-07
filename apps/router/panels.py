@@ -98,6 +98,24 @@ def validate_panels(value: Any) -> list[dict]:
     return valid
 
 
+_TIMER_REQUEST = re.compile(
+    r"\b(?:timers?|countdown|count[\s-]+down|pomodoro|stopwatch|focus\s+session|focus\s+for|time\s+me|time\s+my)\b"
+    r"|タイマー|ポモドーロ|カウントダウン|ストップウォッチ|測って|計って|はかって",
+    re.IGNORECASE,
+)
+_TIMER_DURATION = re.compile(
+    r"\b\d+(?:\.\d+)?[\s-]*(?:h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\b"
+    r"|\d+\s*(?:分|秒|時間)",
+    re.IGNORECASE,
+)
+
+
+def asks_for_timer(text: str) -> bool:
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(_TIMER_REQUEST.search(text) or _TIMER_DURATION.search(text))
+
+
 _BRACKET_PANEL = re.compile(r"\[\[panel:([^\[\]\r\n]*)\]\]")
 _BRACKET_PARTIAL = re.compile(r"\[\[panel:[^\[\]\r\n]*\]?$")
 
@@ -217,7 +235,7 @@ def strip_streaming_panels(text: str) -> str:
     return clean
 
 
-def prepare_panels(tenant, value, *, tool: bool = False) -> list[dict]:
+def prepare_panels(tenant, value, *, tool: bool = False, user_text: str | None = None) -> list[dict]:
     """Gate the originating surface and keep titles in placeholder space at rest.
 
     Proactive/tool writers must pass tool=True; ordinary chat uses the shape gate.
@@ -231,6 +249,16 @@ def prepare_panels(tenant, value, *, tool: bool = False) -> list[dict]:
             logger.warning("panels_dropped reason=tenant_disabled")
         return []
     panels = validate_panels(value)
+    # user_text=None means "do not filter" (e.g. a panel-only reply): filter
+    # timers only for ordinary chat where we know what the user actually asked.
+    if not tool and user_text is not None and not asks_for_timer(user_text):
+        kept = []
+        for panel in panels:
+            if panel["kind"] == "timer":
+                logger.warning("panel_dropped reason=timer_not_requested")
+            else:
+                kept.append(panel)
+        panels = kept
     for panel in panels:
         if "title" in panel:
             panel["title"] = truncate_placeholder_safe(
@@ -259,7 +287,8 @@ PANEL_VOCABULARY = (
 CHAT_PANEL_INSTRUCTION = (
     "For useful live cards, end the reply with ONE fenced `nbhd-panels` JSON list of "
     "{kind,params,title?} references (max 6; title <=60 chars; no snapshots); " + PANEL_VOCABULARY + ". "
-    "Put panels ONLY in the panels argument (or the fenced block for chat), never in message text.\n"
+    "Put panels ONLY in the panels argument (or the fenced block for chat), never in message text. "
+    "Use timer ONLY when the user asks for a timer or countdown; never as a progress or ETA indicator.\n"
 )
 MORNING_PANEL_INSTRUCTION = (
     "In that same single nbhd_send_to_user call, attach panels only where fresh tool results show relevant data: "
