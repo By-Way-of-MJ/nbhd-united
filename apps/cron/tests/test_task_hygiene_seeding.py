@@ -314,7 +314,7 @@ class TaskHygieneRenderedTurnTests(TestCase):
             "{status: 'open', limit: 50, fields: 'compact'}",
             "{status: 'open', due_before:",
             "from lists 1 and 2",
-            "Call `nbhd_goal_list` exactly once",
+            "call `nbhd_goal_list` exactly once",
             "only when a selected row is truly ambiguous",
             "at most 5 calls per run",
         ):
