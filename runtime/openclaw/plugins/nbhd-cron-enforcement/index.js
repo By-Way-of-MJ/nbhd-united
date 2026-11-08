@@ -61,6 +61,15 @@ const RUN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const CONTRACT_PREFIX = "nbhd.v1 ";
 const SEND_TOOL_ID = "nbhd_send_to_user";
 const TOOL_DISPATCH_META = "tool_call";
+// A send with no string `message` field cannot pass OpenClaw's own schema
+// validation, so it can never reach the user. Bounce it with a shape hint a
+// few times (never counting it as a send or revision), then let the runtime's
+// schema check reject it rather than loop forever.
+const MAX_SEND_SHAPE_BLOCKS = 3;
+const SEND_SHAPE_BLOCK_REASON =
+  'nbhd_send_to_user needs its text in a "message" string field: ' +
+  'call nbhd_send_to_user({ message: "<your whole summary>" }). ' +
+  "Nothing was sent and your one message is still available.";
 
 // Tools that COUNT against a contract's ``limits.mutations`` budget. Must stay
 // in lockstep with apps/cron/patterns/task_hygiene.py::_HYGIENE_LIFECYCLE_TOOLS
@@ -317,6 +326,18 @@ export function resolveDispatchedToolId(event) {
   return toolName.toLowerCase();
 }
 
+// Attach hasMessageField without making it enumerable: existing callers/tests
+// deep-compare the dispatch object's original fields exactly, while the
+// enforcement path still needs to tell a missing/non-string `message` apart
+// from an explicit string (including "").
+function withMessageField(result, hasMessageField) {
+  Object.defineProperty(result, "hasMessageField", {
+    value: hasMessageField,
+    enumerable: false,
+  });
+  return result;
+}
+
 // Resolve the outgoing nbhd_send_to_user message from EITHER dispatch shape.
 // Returns {matched:false} for anything that isn't a dispatch of that tool —
 // the caller no-ops on that. Exported for unit tests.
@@ -325,20 +346,29 @@ export function extractSendMessage(event) {
   const params = asObject(event && event.params);
 
   if (toolName === SEND_TOOL_ID) {
-    return { matched: true, shape: "direct", nestedKey: null, message: asTrimmedString(params.message) };
+    return withMessageField(
+      { matched: true, shape: "direct", nestedKey: null, message: asTrimmedString(params.message) },
+      typeof params.message === "string",
+    );
   }
   if (toolName === TOOL_DISPATCH_META) {
     if (extractDispatchedToolId(params) !== SEND_TOOL_ID) return { matched: false };
     if (params.params && typeof params.params === "object" && !Array.isArray(params.params)) {
-      return { matched: true, shape: "meta", nestedKey: "params", message: asTrimmedString(params.params.message) };
+      return withMessageField(
+        { matched: true, shape: "meta", nestedKey: "params", message: asTrimmedString(params.params.message) },
+        typeof params.params.message === "string",
+      );
     }
     if (params.arguments && typeof params.arguments === "object" && !Array.isArray(params.arguments)) {
-      return {
-        matched: true,
-        shape: "meta",
-        nestedKey: "arguments",
-        message: asTrimmedString(params.arguments.message),
-      };
+      return withMessageField(
+        {
+          matched: true,
+          shape: "meta",
+          nestedKey: "arguments",
+          message: asTrimmedString(params.arguments.message),
+        },
+        typeof params.arguments.message === "string",
+      );
     }
     // Dispatched to nbhd_send_to_user but no recognizable nested-args shape —
     // nothing we can validate or rewrite; let the call proceed untouched.
@@ -558,6 +588,7 @@ export default function register(api) {
             revisions: 0,
             sends: 0,
             mutations: 0,
+            shapeBlocks: 0,
           });
         }
       }
@@ -633,6 +664,24 @@ export default function register(api) {
 
       const dispatch = extractSendMessage(guardedEvent);
       if (!dispatch.matched) return origin.result;
+
+      // A dispatch with no string `message` field is guaranteed to fail
+      // OpenClaw's schema validation, so it can never reach the user. Bounce it
+      // with a shape hint BEFORE spending the send or revision budget; after a
+      // few tries let the runtime's own schema check reject it (still uncounted)
+      // rather than block forever.
+      if (!dispatch.hasMessageField) {
+        const shapeBlocks = run.shapeBlocks || 0;
+        if (shapeBlocks >= MAX_SEND_SHAPE_BLOCKS) return origin.result;
+        run.shapeBlocks = shapeBlocks + 1;
+        safeLog(
+          api,
+          "warn",
+          `nbhd-cron-enforcement: malformed send blocked (no message field) ` +
+            `cron=${job.cronName} pattern=${(job.contract && job.contract.pattern) || "?"}`,
+        );
+        return { block: true, blockReason: SEND_SHAPE_BLOCK_REASON };
+      }
 
       // Send budget, evaluated BEFORE the content contract: dispatch number two
       // is refused outright rather than being revised into shape. This is what
