@@ -300,6 +300,70 @@ class CronDeliveryViewTest(TestCase):
 
     @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
     @patch("apps.router.cron_delivery.httpx.Client")
+    def test_line_flex_400_retry_keeps_quick_replies(self, mock_client_cls):
+        self.user.telegram_chat_id = None
+        self.user.line_user_id = "Ulineflex400qr"
+        self.user.save(update_fields=["telegram_chat_id", "line_user_id"])
+
+        rejected = MagicMock()
+        rejected.is_success = False
+        rejected.status_code = 400
+        rejected.text = (
+            '{"message":"A message (messages[0]) in the request body is invalid",'
+            '"details":[{"message":"invalid","property":"/footer/action/clipboardText"}]}'
+        )
+        accepted = MagicMock()
+        accepted.is_success = True
+        accepted.status_code = 200
+        accepted.text = ""
+        accepted.json.return_value = {}
+
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [rejected, accepted]
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        message = "Weekly summary\n[[button:Yes|confirm_yes]]\n" + "\n".join(f"- task {i}" for i in range(36))
+        resp = self.client.post(self.url, {"message": message}, format="json", **self._headers())
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+        second_batch = mock_http.post.call_args_list[1].kwargs["json"]["messages"]
+        self.assertTrue(all(msg["type"] == "text" for msg in second_batch))
+        self.assertIn("quickReply", second_batch[-1])
+
+    @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
+    @patch("apps.router.line_webhook._strip_markdown", return_value="")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_line_flex_400_empty_plain_does_not_report_sent(self, mock_client_cls, _strip_markdown):
+        self.user.telegram_chat_id = None
+        self.user.line_user_id = "Ulineflex400empty"
+        self.user.save(update_fields=["telegram_chat_id", "line_user_id"])
+
+        rejected = MagicMock()
+        rejected.is_success = False
+        rejected.status_code = 400
+        rejected.text = (
+            '{"message":"A message (messages[0]) in the request body is invalid",'
+            '"details":[{"message":"invalid","property":"/footer/action/clipboardText"}]}'
+        )
+
+        mock_http = MagicMock()
+        mock_http.post.return_value = rejected
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        resp = self.client.post(self.url, {"message": "Weekly summary"}, format="json", **self._headers())
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(resp.json()["error"], "line_send_failed")
+        self.assertEqual(mock_http.post.call_count, 1)
+
+    @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
+    @patch("apps.router.cron_delivery.httpx.Client")
     def test_line_flex_400_then_plain_400_returns_502(self, mock_client_cls):
         self.user.telegram_chat_id = None
         self.user.line_user_id = "Ulineflex400fail"

@@ -1126,8 +1126,13 @@ class CronDeliveryView(APIView):
             plain = _strip_markdown(text)
             plain = re.sub(r"\[\[button:[^\]]+\]\]", "", plain)
             plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+            if not plain:
+                return []
             chunks = _split_message(plain, max_len=5000)
-            return [{"type": "text", "text": c} for c in chunks[:5]]
+            messages = [{"type": "text", "text": c} for c in chunks[:5]]
+            if quick_reply_items:
+                messages[-1] = attach_quick_reply(messages[-1], quick_reply_items)
+            return messages
 
         # Build Flex message
         messages_are_flex = False
@@ -1140,6 +1145,15 @@ class CronDeliveryView(APIView):
         except Exception:
             logger.debug("Cron Flex build failed, falling back to plain text", exc_info=True)
             messages = _plain_text_messages(clean_text)
+            if not messages:
+                logger.warning("Cron delivery LINE plain-text fallback is empty; nothing to send")
+                return _with_delivery_state(
+                    Response(
+                        {"error": "line_send_failed", "detail": "empty plain-text fallback"},
+                        status=http_status.HTTP_502_BAD_GATEWAY,
+                    ),
+                    "failed",
+                )
 
         from apps.router.line_webhook import _record_line_outbound
 
@@ -1177,15 +1191,17 @@ class CronDeliveryView(APIView):
                             and 400 <= resp.status_code < 500
                             and resp.status_code != 429
                         ):
-                            logger.warning(
-                                "Cron delivery LINE flex rejected (%s); retrying as plain text",
-                                resp.status_code,
-                            )
-                            retried_as_plain = True
-                            messages_are_flex = False
-                            messages = _plain_text_messages(clean_text)
-                            index = 0
-                            continue
+                            plain_messages = _plain_text_messages(clean_text)
+                            if plain_messages:
+                                logger.warning(
+                                    "Cron delivery LINE flex rejected (%s); retrying as plain text",
+                                    resp.status_code,
+                                )
+                                retried_as_plain = True
+                                messages_are_flex = False
+                                messages = plain_messages
+                                index = 0
+                                continue
                         state = "ambiguous" if sent_count or resp.status_code >= 500 else "failed"
                         return _with_delivery_state(
                             Response(
