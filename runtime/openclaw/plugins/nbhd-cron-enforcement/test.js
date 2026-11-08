@@ -1265,3 +1265,105 @@ describe("end-to-end caps via register() — the real before_tool_call path", ()
     assert.equal(second(sendCall("cap-session-b", `${HYGIENE_MARKER}\nb`)), undefined);
   });
 });
+
+// ── malformed sends (no message field) ──────────────────────────────────────
+// Production regression (2026-11-08): a task_hygiene cron called
+// nbhd_send_to_user with { id, args: { text } } — no `message`. The old code
+// revised, then allowed it, spending the only send on a call OpenClaw's schema
+// then rejected. A malformed shape must be bounced with a hint and never touch
+// the revision or send budget.
+
+function malformedDirectSend(runId, text = `${HYGIENE_MARKER} hi`) {
+  return { runId, toolName: "nbhd_send_to_user", params: { id: "x", args: { text } } };
+}
+
+describe("malformed sends (no message field) never spend the send budget", () => {
+  it("blocks a direct send with no message field, then the corrected send passes", () => {
+    const beforeToolCall = startHygieneCron("shape-direct");
+
+    const malformed = beforeToolCall(malformedDirectSend("shape-direct"));
+    assert.equal(malformed.block, true);
+    assert.match(malformed.blockReason, /message/);
+
+    const corrected = beforeToolCall(sendCall("shape-direct", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(corrected, undefined, "the corrected first send must still be allowed");
+  });
+
+  it("two malformed sends leave the revision and send budgets untouched", () => {
+    const beforeToolCall = startHygieneCron("shape-two");
+
+    assert.equal(beforeToolCall(malformedDirectSend("shape-two")).block, true);
+    assert.equal(beforeToolCall(malformedDirectSend("shape-two")).block, true);
+
+    const corrected = beforeToolCall(sendCall("shape-two", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(corrected, undefined, "the corrected first send must still be allowed");
+
+    // The corrected send spent the budget; a second one is now refused, proving
+    // neither malformed call had spent it.
+    const extra = beforeToolCall(sendCall("shape-two", `${HYGIENE_MARKER}\nanother`));
+    assert.equal(extra.block, true);
+    assert.match(extra.blockReason, /already sent/);
+  });
+
+  it("keeps blocking malformed sends (no fall-through); a later correct send still passes", () => {
+    const beforeToolCall = startHygieneCron("shape-limit");
+
+    for (let i = 0; i < 5; i += 1) {
+      const blocked = beforeToolCall(malformedDirectSend("shape-limit"));
+      assert.equal(blocked.block, true, `malformed send ${i + 1} must be blocked`);
+      assert.match(blocked.blockReason, /message/);
+    }
+
+    // ...and none of the five malformed calls spent the send budget.
+    const corrected = beforeToolCall(sendCall("shape-limit", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(corrected, undefined, "the corrected first send must still be allowed");
+  });
+
+  it("a malformed send after the budget is spent gets the cap reason", () => {
+    const beforeToolCall = startHygieneCron("shape-after-cap");
+
+    const first = beforeToolCall(sendCall("shape-after-cap", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(first, undefined, "the first correct send must pass");
+
+    const malformed = beforeToolCall(malformedDirectSend("shape-after-cap"));
+    assert.equal(malformed.block, true);
+    assert.match(malformed.blockReason, /already sent/);
+  });
+
+  it("a malformed send's blockReason does not claim the message is still available", () => {
+    const beforeToolCall = startHygieneCron("shape-no-hint");
+
+    const malformed = beforeToolCall(malformedDirectSend("shape-no-hint"));
+    assert.equal(malformed.block, true);
+    assert.match(malformed.blockReason, /message/);
+    assert.doesNotMatch(malformed.blockReason, /still available/);
+  });
+
+  it("blocks a toolSearch meta send with no message field, budget untouched", () => {
+    const beforeToolCall = startHygieneCron("shape-meta");
+    const malformed = {
+      runId: "shape-meta",
+      toolName: "tool_call",
+      params: { id: "nbhd_send_to_user", params: { id: "x", args: { text: `${HYGIENE_MARKER} hi` } } },
+    };
+
+    const blocked = beforeToolCall(malformed);
+    assert.equal(blocked.block, true);
+    assert.match(blocked.blockReason, /message/);
+
+    const corrected = beforeToolCall(sendCall("shape-meta", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(corrected, undefined, "the corrected first send must still be allowed");
+  });
+
+  it("an explicit empty-string message keeps the existing revise path", () => {
+    const beforeToolCall = startHygieneCron("shape-empty");
+
+    const empty = beforeToolCall(sendCall("shape-empty", ""));
+    assert.equal(empty.block, true);
+    assert.match(empty.blockReason, /marker/);
+
+    // The revise did not spend the send budget: the corrected send goes out.
+    const corrected = beforeToolCall(sendCall("shape-empty", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(corrected, undefined);
+  });
+});
