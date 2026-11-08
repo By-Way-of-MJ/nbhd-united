@@ -72,8 +72,9 @@ _STALE_IN_PROGRESS_LIMIT = 20
 _RECENT_OPEN_LIMIT = 50
 _PAST_DUE_LIMIT = 50
 
-# An undated task untouched for this many days is auto-deferred rather than
-# left in the active list. Deferral is reversible, so this is the safe default.
+# Floor for auto-defer: an undated task untouched for this many days is
+# auto-deferred rather than left in the active list. Deferral is reversible, so
+# this is the safe default. A tenant's larger stale_after_days raises it.
 _AUTO_DEFER_DAYS = 30
 
 # Fire-time hard cap on lifecycle mutations per run (mirrors the outbound
@@ -127,6 +128,17 @@ class TaskHygieneHandler(PatternHandler):
         name: str,
         schedule: dict[str, Any],
     ) -> dict[str, Any]:
+        defer_days = max(payload.stale_after_days, _AUTO_DEFER_DAYS)
+        if defer_days > payload.stale_after_days:
+            left_alone_bullet = (
+                f"  - A stale task untouched for at least {payload.stale_after_days} "
+                f"days but fewer than {defer_days}, or any task that has a date: "
+                "leave it alone (dated ones were already handled in STEP 2).\n"
+            )
+        else:
+            left_alone_bullet = (
+                "  - Any task that has a date: leave it alone (dated ones were already handled in STEP 2).\n"
+            )
         message = (
             "You are running the weekly task-hygiene pass. Nobody asked for "
             "this and nobody is waiting on it — the user is not present in "
@@ -179,16 +191,14 @@ class TaskHygieneHandler(PatternHandler):
             "Then go through lists 1 and 2 using each row's `days_untouched` "
             "field (the server computes it).\n"
             "  - DEFAULT ACTION: a task with `days_untouched` of at least "
-            f"{_AUTO_DEFER_DAYS}, no `due_date`, and no date written in its "
+            f"{defer_days} days, no `due_date`, and no date written in its "
             "title → `nbhd_task_defer` with no new date. Do this without "
             "asking: deferring is reversible (the task leaves the active list "
             "but is kept and can be reopened any time), and the user asked for "
             "old tasks to be cleared this way.\n"
             "  - `nbhd_task_skip` only when the moment for it has clearly "
             "passed and doing it no longer makes sense.\n"
-            f"  - A task untouched for fewer than {_AUTO_DEFER_DAYS} days, or "
-            "one that has a date: leave it alone (dated ones were already "
-            "handled in STEP 2).\n"
+            f"{left_alone_bullet}"
             "  - Be conservative with skip: a wrongly-skipped task is worse "
             "than a stale one. Defer is the safe default.\n"
             "\n"
@@ -212,7 +222,7 @@ class TaskHygieneHandler(PatternHandler):
             "short, scannable summary. List every completion and skip with its "
             "one-line reason, past-dated closures first; then group ALL "
             "deferrals into ONE line: `Put off N old tasks (untouched "
-            f'{_AUTO_DEFER_DAYS}+ days, nothing deleted — say "bring back '
+            f'{defer_days}+ days, nothing deleted — say "bring back '
             '<task>" to restore): <title>, <title>, ...`. Then at '
             "most 10 proposals (overdue items, stale items you left alone but "
             "want to ask about, deletion candidates); if there are more, say how "

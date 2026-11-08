@@ -683,6 +683,20 @@ class TaskHygieneTests(SimpleTestCase):
         contract = self.handler.get_outbound_contract(payload, name="Task Hygiene")
         self.assertEqual(contract["limits"]["mutations"], 40)
 
+    def test_auto_defer_threshold_respects_larger_stale_setting(self):
+        """A tenant that calls tasks stale later than the 30-day floor must not
+        have tasks auto-deferred before its own staleness threshold."""
+        payload = self.handler.validate_payload({"stale_after_days": 45})
+        message = self.handler.build_oc_data(
+            payload,
+            tenant=None,
+            name="Task Hygiene",
+            schedule=_RECURRING_SCHEDULE,
+        )["payload"]["message"]
+        self.assertIn("at least 45", message)
+        self.assertIn("untouched 45+ days", message)
+        self.assertNotIn("fewer than 45", message)
+
     def test_prompt_requires_silence_when_nothing_changed(self):
         """A new proactive sender that messages every week regardless is a
         weekly spam channel. The no-news-no-message rule is load-bearing."""
