@@ -72,6 +72,15 @@ _STALE_IN_PROGRESS_LIMIT = 20
 _RECENT_OPEN_LIMIT = 50
 _PAST_DUE_LIMIT = 50
 
+# Floor for auto-defer: an undated task untouched for this many days is
+# auto-deferred rather than left in the active list. Deferral is reversible, so
+# this is the safe default. A tenant's larger stale_after_days raises it.
+_AUTO_DEFER_DAYS = 30
+
+# Fire-time hard cap on lifecycle mutations per run (mirrors the outbound
+# contract's ``limits.mutations``).
+_MUTATION_CAP = 40
+
 # Read-only context tools.
 _HYGIENE_QUERY_TOOLS: tuple[str, ...] = (
     "nbhd_task_list",
@@ -119,6 +128,17 @@ class TaskHygieneHandler(PatternHandler):
         name: str,
         schedule: dict[str, Any],
     ) -> dict[str, Any]:
+        defer_days = max(payload.stale_after_days, _AUTO_DEFER_DAYS)
+        if defer_days > payload.stale_after_days:
+            left_alone_bullet = (
+                f"  - A stale task untouched for at least {payload.stale_after_days} "
+                f"days but fewer than {defer_days}, or any task that has a date: "
+                "leave it alone (dated ones were already handled in STEP 2).\n"
+            )
+        else:
+            left_alone_bullet = (
+                "  - Any task that has a date: leave it alone (dated ones were already handled in STEP 2).\n"
+            )
         message = (
             "You are running the weekly task-hygiene pass. Nobody asked for "
             "this and nobody is waiting on it — the user is not present in "
@@ -168,14 +188,19 @@ class TaskHygieneHandler(PatternHandler):
             "session, a paid bill, a goal the task fed into that is already "
             "achieved), call `nbhd_task_complete`. If you are not sure it "
             "happened, do NOT complete it — propose it in the summary instead. "
-            f"Then, for each stale task untouched for at least "
-            f"{payload.stale_after_days} days, pick ONE:\n"
-            "  - `nbhd_task_defer` when it still matters but not now.\n"
-            "  - `nbhd_task_skip` when the moment for it has passed and doing "
-            "it no longer makes sense.\n"
-            "  - leave it alone when neither is clearly right.\n"
-            "Give every change a one-line reason in the summary. Be "
-            "conservative: a wrongly-skipped task is worse than a stale one.\n"
+            "Then go through lists 1 and 2 using each row's `days_untouched` "
+            "field (the server computes it).\n"
+            "  - DEFAULT ACTION: a task with `days_untouched` of at least "
+            f"{defer_days} days, no `due_date`, and no date written in its "
+            "title → `nbhd_task_defer` with no new date. Do this without "
+            "asking: deferring is reversible (the task leaves the active list "
+            "but is kept and can be reopened any time), and the user asked for "
+            "old tasks to be cleared this way.\n"
+            "  - `nbhd_task_skip` only when the moment for it has clearly "
+            "passed and doing it no longer makes sense.\n"
+            f"{left_alone_bullet}"
+            "  - Be conservative with skip: a wrongly-skipped task is worse "
+            "than a stale one. Defer is the safe default.\n"
             "\n"
             "STEP 4 — PROPOSE deletions, never perform them. Some items are "
             "stale junk: test entries, exact duplicates, fragments "
@@ -194,13 +219,16 @@ class TaskHygieneHandler(PatternHandler):
             "candidates), send NOTHING AT ALL and end the turn — a "
             "message saying 'everything looks fine' is noise the user did not "
             "ask for. Otherwise call `nbhd_send_to_user` EXACTLY ONCE with a "
-            "short, scannable summary. List EVERY change you made (up to 20), "
-            "each with its one-line reason, past-dated closures first. Then at "
+            "short, scannable summary. List every completion and skip with its "
+            "one-line reason, past-dated closures first; then group ALL "
+            "deferrals into ONE line: `Put off N old tasks (untouched "
+            f'{defer_days}+ days, nothing deleted — say "bring back '
+            '<task>" to restore): <title>, <title>, ...`. Then at '
             "most 10 proposals (overdue items, stale items you left alone but "
             "want to ask about, deletion candidates); if there are more, say how "
-            "many more. You can make at most 20 changes per run; if you hit "
-            "that, list the rest as proposals. Do not send a second message. "
-            "Do not narrate your tool calls.\n"
+            f"many more. You can make at most {_MUTATION_CAP} changes per run; "
+            "if you hit that, list the rest as proposals. Do not send a second "
+            "message. Do not narrate your tool calls.\n"
             "\n"
             f"The first line of that message must include the literal marker "
             f"`{_MARKER}` so downstream tooling can identify the render type."
@@ -254,13 +282,14 @@ class TaskHygieneHandler(PatternHandler):
             # unmarked-second-message path: a message that never dispatches
             # cannot arrive without a marker.
             #
-            # mutations=20 bounds the worst case of an unattended turn that
-            # misreads the task list. Twenty is still small — every change is a
-            # reversible status flip shown in one summary — while twenty wrong
-            # closures is recoverable and visible; a hundred is a data-loss
-            # incident. Past the cap the model is told to list the rest as
-            # proposals, which is the same escape hatch deletion already uses.
-            "limits": {"sends": 1, "mutations": 20},
+            # mutations=40 bounds the worst case of an unattended turn that
+            # misreads the task list: 40 is up to 40 stale open+in-progress
+            # rows reviewed per run. Every change is a reversible status flip
+            # shown in one summary, so a wrong one is recoverable and visible;
+            # a hundred is a data-loss incident. Past the cap the model is told
+            # to list the rest as proposals, which is the same escape hatch
+            # deletion already uses.
+            "limits": {"sends": 1, "mutations": _MUTATION_CAP},
         }
 
     def validate_outbound_message(

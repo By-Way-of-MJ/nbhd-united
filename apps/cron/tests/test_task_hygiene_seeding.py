@@ -385,7 +385,7 @@ class TaskHygieneRenderedTurnTests(TestCase):
         it through, the caps vanish silently: the cron still fires, still sends,
         and nothing enforces one-message-only or the mutation ceiling."""
         contract = json.loads(self.cron.data["description"][len(CRON_CONTRACT_PREFIX) :])
-        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 40})
 
     def test_refresh_rebakes_an_old_contract_with_the_current_mutation_cap(self):
         """An existing row must pick up a changed cap. The pre-save signal skips
@@ -407,7 +407,7 @@ class TaskHygieneRenderedTurnTests(TestCase):
 
         self.cron.refresh_from_db()
         contract = json.loads(self.cron.data["description"][len(CRON_CONTRACT_PREFIX) :])
-        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 40})
 
     def test_a_pattern_without_limits_bakes_no_limits_key(self):
         """The signal change must be a pure addition. A pure_reminder row baked

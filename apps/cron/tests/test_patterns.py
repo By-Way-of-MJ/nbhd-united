@@ -576,7 +576,7 @@ class TaskHygieneTests(SimpleTestCase):
         neither."""
         payload = self.handler.validate_payload({})
         contract = self.handler.get_outbound_contract(payload, name="Task Hygiene")
-        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 20})
+        self.assertEqual(contract["limits"], {"sends": 1, "mutations": 40})
 
     def test_only_the_mutating_pattern_declares_limits(self):
         """Read-only patterns must stay uncapped — their toolsAllow already
@@ -653,13 +653,49 @@ class TaskHygieneTests(SimpleTestCase):
         self.assertIn("PAST-DATED", message)
         self.assertIn("date passed", message)
         self.assertIn("overdue since", message)
-        self.assertIn("List EVERY change", message)
+        self.assertIn("List every completion and skip", message)
         self.assertIn("date of the event itself", message)
         self.assertIn("For a past event:", message)
         self.assertIn("no proposals", message)
         self.assertNotIn("title/description", message)
         self.assertNotIn("push it to a realistic date", message)
         self.assertNotIn("Do not list in_progress tasks", message)
+
+    def test_prompt_auto_defers_old_undated_tasks(self):
+        """Old undated tasks must actually leave the active list. Defer is the
+        reversible default, so the prompt says do it without asking; skip stays
+        the conservative exception."""
+        payload = self.handler.validate_payload({})
+        message = self.handler.build_oc_data(
+            payload,
+            tenant=None,
+            name="Task Hygiene",
+            schedule=_RECURRING_SCHEDULE,
+        )["payload"]["message"]
+        self.assertIn("days_untouched", message)
+        self.assertIn("30", message)
+        self.assertIn("nbhd_task_defer", message)
+        self.assertIn("reversible", message)
+        self.assertIn("Put off", message)
+        self.assertIn("bring back", message)
+        self.assertIn("at most 40", message)
+        self.assertNotIn("leave it alone when neither is clearly right", message)
+        contract = self.handler.get_outbound_contract(payload, name="Task Hygiene")
+        self.assertEqual(contract["limits"]["mutations"], 40)
+
+    def test_auto_defer_threshold_respects_larger_stale_setting(self):
+        """A tenant that calls tasks stale later than the 30-day floor must not
+        have tasks auto-deferred before its own staleness threshold."""
+        payload = self.handler.validate_payload({"stale_after_days": 45})
+        message = self.handler.build_oc_data(
+            payload,
+            tenant=None,
+            name="Task Hygiene",
+            schedule=_RECURRING_SCHEDULE,
+        )["payload"]["message"]
+        self.assertIn("at least 45", message)
+        self.assertIn("untouched 45+ days", message)
+        self.assertNotIn("fewer than 45", message)
 
     def test_prompt_requires_silence_when_nothing_changed(self):
         """A new proactive sender that messages every week regardless is a
