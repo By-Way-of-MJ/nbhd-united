@@ -195,6 +195,7 @@ class WorkoutSerializer(_FuelPiiSerializerMixin, serializers.ModelSerializer):
             "window_end_at",
             "status",
             "completed_at",
+            "created_at",
             "source",
             "original_workout",
             "skip_reason",
@@ -213,7 +214,6 @@ class WorkoutSerializer(_FuelPiiSerializerMixin, serializers.ModelSerializer):
             "edit_lock_until",
             "edit_lock_owner",
             "last_edited_by_user_at",
-            "created_at",
             "updated_at",
         ]
         read_only_fields = [
@@ -426,6 +426,7 @@ class WorkoutStubSerializer(OwnerStoreSerializerMixin, serializers.ModelSerializ
             "activity",
             "status",
             "completed_at",
+            "created_at",
             "duration_minutes",
             "rpe",
             "plan_id",
