@@ -61,15 +61,13 @@ const RUN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const CONTRACT_PREFIX = "nbhd.v1 ";
 const SEND_TOOL_ID = "nbhd_send_to_user";
 const TOOL_DISPATCH_META = "tool_call";
-// A send with no string `message` field cannot pass OpenClaw's own schema
-// validation, so it can never reach the user. Bounce it with a shape hint a
-// few times (never counting it as a send or revision), then let the runtime's
-// schema check reject it rather than loop forever.
-const MAX_SEND_SHAPE_BLOCKS = 3;
+// A send with no string `message` field is always blocked: a shape we cannot
+// read might still be delivered by the runtime, bypassing the send cap and
+// marker check. Blocking it never counts it as a send or revision.
 const SEND_SHAPE_BLOCK_REASON =
   'nbhd_send_to_user needs its text in a "message" string field: ' +
   'call nbhd_send_to_user({ message: "<your whole summary>" }). ' +
-  "Nothing was sent and your one message is still available.";
+  "Nothing was sent.";
 
 // Tools that COUNT against a contract's ``limits.mutations`` budget. Must stay
 // in lockstep with apps/cron/patterns/task_hygiene.py::_HYGIENE_LIFECYCLE_TOOLS
@@ -665,24 +663,6 @@ export default function register(api) {
       const dispatch = extractSendMessage(guardedEvent);
       if (!dispatch.matched) return origin.result;
 
-      // A dispatch with no string `message` field is guaranteed to fail
-      // OpenClaw's schema validation, so it can never reach the user. Bounce it
-      // with a shape hint BEFORE spending the send or revision budget; after a
-      // few tries let the runtime's own schema check reject it (still uncounted)
-      // rather than block forever.
-      if (!dispatch.hasMessageField) {
-        const shapeBlocks = run.shapeBlocks || 0;
-        if (shapeBlocks >= MAX_SEND_SHAPE_BLOCKS) return origin.result;
-        run.shapeBlocks = shapeBlocks + 1;
-        safeLog(
-          api,
-          "warn",
-          `nbhd-cron-enforcement: malformed send blocked (no message field) ` +
-            `cron=${job.cronName} pattern=${(job.contract && job.contract.pattern) || "?"}`,
-        );
-        return { block: true, blockReason: SEND_SHAPE_BLOCK_REASON };
-      }
-
       // Send budget, evaluated BEFORE the content contract: dispatch number two
       // is refused outright rather than being revised into shape. This is what
       // makes "exactly one summary" structural instead of prose — and it also
@@ -697,6 +677,23 @@ export default function register(api) {
             `pattern=${(job.contract && job.contract.pattern) || "?"}`,
         );
         return { block: true, blockReason: sendLimit.reason };
+      }
+
+      // A dispatch with no string `message` field is ALWAYS blocked: a shape we
+      // cannot read might still be delivered by the runtime, bypassing the send
+      // cap and marker check. It never counts as a send or revision. This check
+      // runs AFTER the cap so a malformed send when the budget is spent reports
+      // the cap reason instead of a false "still available" hint. `shapeBlocks`
+      // only tracks how many malformed sends this run attempted, for the log.
+      if (!dispatch.hasMessageField) {
+        run.shapeBlocks = (run.shapeBlocks || 0) + 1;
+        safeLog(
+          api,
+          "warn",
+          `nbhd-cron-enforcement: malformed send blocked (no message field) ` +
+            `cron=${job.cronName} pattern=${(job.contract && job.contract.pattern) || "?"}`,
+        );
+        return { block: true, blockReason: SEND_SHAPE_BLOCK_REASON };
       }
 
       const decision = decideGuardAction(job.contract, dispatch.message, run.revisions);

@@ -1305,21 +1305,38 @@ describe("malformed sends (no message field) never spend the send budget", () =>
     assert.match(extra.blockReason, /already sent/);
   });
 
-  it("stops blocking after three shape blocks; a later correct send still passes", () => {
+  it("keeps blocking malformed sends (no fall-through); a later correct send still passes", () => {
     const beforeToolCall = startHygieneCron("shape-limit");
 
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 5; i += 1) {
       const blocked = beforeToolCall(malformedDirectSend("shape-limit"));
-      assert.equal(blocked.block, true, `shape block ${i + 1} must be blocked`);
+      assert.equal(blocked.block, true, `malformed send ${i + 1} must be blocked`);
       assert.match(blocked.blockReason, /message/);
     }
 
-    // The fourth is left to OpenClaw's schema validation, not blocked by us.
-    assert.equal(beforeToolCall(malformedDirectSend("shape-limit")), undefined);
-
-    // ...and none of the four malformed calls spent the send budget.
+    // ...and none of the five malformed calls spent the send budget.
     const corrected = beforeToolCall(sendCall("shape-limit", `${HYGIENE_MARKER}\nsummary`));
     assert.equal(corrected, undefined, "the corrected first send must still be allowed");
+  });
+
+  it("a malformed send after the budget is spent gets the cap reason", () => {
+    const beforeToolCall = startHygieneCron("shape-after-cap");
+
+    const first = beforeToolCall(sendCall("shape-after-cap", `${HYGIENE_MARKER}\nsummary`));
+    assert.equal(first, undefined, "the first correct send must pass");
+
+    const malformed = beforeToolCall(malformedDirectSend("shape-after-cap"));
+    assert.equal(malformed.block, true);
+    assert.match(malformed.blockReason, /already sent/);
+  });
+
+  it("a malformed send's blockReason does not claim the message is still available", () => {
+    const beforeToolCall = startHygieneCron("shape-no-hint");
+
+    const malformed = beforeToolCall(malformedDirectSend("shape-no-hint"));
+    assert.equal(malformed.block, true);
+    assert.match(malformed.blockReason, /message/);
+    assert.doesNotMatch(malformed.blockReason, /still available/);
   });
 
   it("blocks a toolSearch meta send with no message field, budget untouched", () => {
