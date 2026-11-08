@@ -29,7 +29,7 @@ COLORS = {
     "amber_text": "#92400e",
 }
 
-CLIPBOARD_MAX = 5000  # safe limit for clipboard action text
+CLIPBOARD_MAX = 1000  # LINE's documented limit for a clipboard action's clipboardText
 
 _TONE_MAP = {
     "success": {"bg": COLORS["emerald_bg"], "fg": COLORS["emerald_text"], "icon": "\u2713"},

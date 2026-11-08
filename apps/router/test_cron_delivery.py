@@ -260,6 +260,102 @@ class CronDeliveryViewTest(TestCase):
         self.assertEqual(stored.quick_replies, ["👍 Good day", "🫤 Mixed", "👎 Rough"])
         self.assertNotIn("quick-replies", stored.message_text)
 
+    @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_line_flex_400_retries_as_plain_text(self, mock_client_cls):
+        self.user.telegram_chat_id = None
+        self.user.line_user_id = "Ulineflex400"
+        self.user.save(update_fields=["telegram_chat_id", "line_user_id"])
+
+        rejected = MagicMock()
+        rejected.is_success = False
+        rejected.status_code = 400
+        rejected.text = (
+            '{"message":"A message (messages[0]) in the request body is invalid",'
+            '"details":[{"message":"invalid","property":"/footer/action/clipboardText"}]}'
+        )
+        accepted = MagicMock()
+        accepted.is_success = True
+        accepted.status_code = 200
+        accepted.text = ""
+        accepted.json.return_value = {}
+
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [rejected, accepted]
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        message = "Weekly summary\n" + "\n".join(f"- task {i}" for i in range(36))
+        resp = self.client.post(self.url, {"message": message}, format="json", **self._headers())
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+        first_batch = mock_http.post.call_args_list[0].kwargs["json"]["messages"]
+        self.assertEqual(first_batch[0]["type"], "flex")
+        second_batch = mock_http.post.call_args_list[1].kwargs["json"]["messages"]
+        self.assertTrue(second_batch)
+        self.assertTrue(all(msg["type"] == "text" for msg in second_batch))
+
+    @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_line_flex_400_then_plain_400_returns_502(self, mock_client_cls):
+        self.user.telegram_chat_id = None
+        self.user.line_user_id = "Ulineflex400fail"
+        self.user.save(update_fields=["telegram_chat_id", "line_user_id"])
+
+        rejected_flex = MagicMock()
+        rejected_flex.is_success = False
+        rejected_flex.status_code = 400
+        rejected_flex.text = (
+            '{"message":"A message (messages[0]) in the request body is invalid",'
+            '"details":[{"message":"invalid","property":"/footer/action/clipboardText"}]}'
+        )
+        rejected_plain = MagicMock()
+        rejected_plain.is_success = False
+        rejected_plain.status_code = 400
+        rejected_plain.text = '{"message":"invalid plain text"}'
+
+        mock_http = MagicMock()
+        mock_http.post.side_effect = [rejected_flex, rejected_plain]
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        message = "Weekly summary\n" + "\n".join(f"- task {i}" for i in range(36))
+        resp = self.client.post(self.url, {"message": message}, format="json", **self._headers())
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(resp.json()["error"], "line_send_failed")
+        self.assertEqual(mock_http.post.call_count, 2)
+        second_batch = mock_http.post.call_args_list[1].kwargs["json"]["messages"]
+        self.assertTrue(all(msg["type"] == "text" for msg in second_batch))
+
+    @override_settings(LINE_CHANNEL_ACCESS_TOKEN="line-token")
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_line_429_does_not_retry_as_plain_text(self, mock_client_cls):
+        self.user.telegram_chat_id = None
+        self.user.line_user_id = "Uline429"
+        self.user.save(update_fields=["telegram_chat_id", "line_user_id"])
+
+        limited = MagicMock()
+        limited.is_success = False
+        limited.status_code = 429
+        limited.text = '{"message":"Too many requests"}'
+
+        mock_http = MagicMock()
+        mock_http.post.return_value = limited
+        mock_http.__enter__ = MagicMock(return_value=mock_http)
+        mock_http.__exit__ = MagicMock(return_value=False)
+        mock_client_cls.return_value = mock_http
+
+        resp = self.client.post(self.url, {"message": "Weekly summary"}, format="json", **self._headers())
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertEqual(resp.json()["error"], "line_send_failed")
+        self.assertEqual(mock_http.post.call_count, 1)
+
     @patch("apps.router.proactive_context._dispatch_ios_push")
     def test_app_insight_marker_stripped_and_recorded(self, _push):
         """A scheduled send never shows raw ``[[insight:...]]`` in the app feed."""
