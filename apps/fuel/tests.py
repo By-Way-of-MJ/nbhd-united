@@ -1096,6 +1096,77 @@ class ConsumerFuelViewTests(TestCase):
         self.assertEqual(len(resp.data), 1)  # one date entry
         self.assertEqual(len(resp.data[0]["workouts"]), 2)
 
+    def test_calendar_rows_include_completed_at(self):
+        Workout.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 21),
+            category="strength",
+            activity="Done Push",
+            status="done",
+            completed_at=datetime(2026, 4, 21, 18, 0, tzinfo=UTC),
+        )
+        Workout.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 21),
+            category="mobility",
+            activity="Unfinished Flow",
+        )
+
+        resp = self.client.get("/api/v1/fuel/calendar/?year=2026&month=4")
+        self.assertEqual(resp.status_code, 200)
+        rows = [row for day in resp.data for row in day["workouts"]]
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertIn("completed_at", row)
+            self.assertIn("created_at", row)
+            self.assertIsNotNone(row["created_at"])
+        done_row = next(row for row in rows if row["activity"] == "Done Push")
+        unfinished_row = next(row for row in rows if row["activity"] == "Unfinished Flow")
+        self.assertIsNotNone(done_row["completed_at"])
+        self.assertIsNone(unfinished_row["completed_at"])
+
+        resp = self.client.get("/api/v1/fuel/overview/?year=2026&month=4")
+        self.assertEqual(resp.status_code, 200)
+        overview_done_row = next(
+            row for day in resp.data["calendar"] for row in day["workouts"] if row["activity"] == "Done Push"
+        )
+        self.assertIsNotNone(overview_done_row["completed_at"])
+        overview_workout_row = next(row for row in resp.data["workouts"] if row["activity"] == "Done Push")
+        self.assertIsNotNone(overview_workout_row["created_at"])
+        self.assertIsNotNone(overview_workout_row["completed_at"])
+
+    def test_created_at_is_read_only(self):
+        w = Workout.objects.create(
+            tenant=self.tenant,
+            date=date(2026, 4, 21),
+            category="strength",
+            activity="Push",
+        )
+        original_created_at = w.created_at
+
+        resp = self.client.patch(
+            f"/api/v1/fuel/workouts/{w.id}/",
+            {"created_at": "2020-01-01T00:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        w.refresh_from_db()
+        self.assertEqual(w.created_at, original_created_at)
+
+        resp = self.client.post(
+            "/api/v1/fuel/workouts/",
+            {
+                "date": "2026-04-22",
+                "category": "strength",
+                "activity": "Pull",
+                "created_at": "2020-01-01T00:00:00Z",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        created = Workout.objects.get(id=resp.data["id"])
+        self.assertNotEqual(created.created_at.year, 2020)
+
     def test_calendar_does_not_n_plus_one_on_plan(self):
         """Calendar serialization must never query fuel_workout_plans per row.
 
