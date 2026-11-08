@@ -710,6 +710,26 @@ class TaskHygieneTests(SimpleTestCase):
         self.assertIn("send NOTHING AT ALL", message)
         self.assertIn("EXACTLY ONCE", message)
 
+    def test_prompt_has_weekly_focus_step(self):
+        """Hygiene should leave the user with a short, actionable shortlist,
+        not just a tidier list. The picks must stay grounded in the task's own
+        text so the model never invents details the user never wrote."""
+        payload = self.handler.validate_payload({})
+        message = self.handler.build_oc_data(
+            payload,
+            tenant=None,
+            name="Task Hygiene",
+            schedule=_RECURRING_SCHEDULE,
+        )["payload"]["message"]
+        self.assertIn("STEP 5 — FOCUS", message)
+        self.assertIn("STEP 6 — REPORT", message)
+        self.assertIn("This week:", message)
+        self.assertIn("first step", message)
+        self.assertIn("15 minutes", message)
+        self.assertIn("never invent", message)
+        self.assertIn("AND picked no focus tasks", message)
+        self.assertNotIn("the user asked for old tasks", message)
+
     def test_validate_outbound_requires_marker(self):
         payload = self.handler.validate_payload({})
         ok, _ = self.handler.validate_outbound_message(
