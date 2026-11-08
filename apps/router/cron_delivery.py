@@ -1121,28 +1121,50 @@ class CronDeliveryView(APIView):
         clean_text = _convert_tables(clean_text)
         clean_text = re.sub(r"```[^\n]*\n(.*?)```", r"\1", clean_text, flags=re.DOTALL)
 
+        def _plain_text_messages(text: str) -> list[dict]:
+            """Build the plain-text fallback LINE messages for ``text``."""
+            plain = _strip_markdown(text)
+            plain = re.sub(r"\[\[button:[^\]]+\]\]", "", plain)
+            plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+            if not plain:
+                return []
+            chunks = _split_message(plain, max_len=5000)
+            messages = [{"type": "text", "text": c} for c in chunks[:5]]
+            if quick_reply_items:
+                messages[-1] = attach_quick_reply(messages[-1], quick_reply_items)
+            return messages
+
         # Build Flex message
+        messages_are_flex = False
         try:
             flex_msg = build_flex_bubble(clean_text)
             if quick_reply_items:
                 flex_msg = attach_quick_reply(flex_msg, quick_reply_items)
             messages = [flex_msg]
+            messages_are_flex = True
         except Exception:
             logger.debug("Cron Flex build failed, falling back to plain text", exc_info=True)
-            plain = _strip_markdown(clean_text)
-            plain = re.sub(r"\[\[button:[^\]]+\]\]", "", plain)
-            plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
-            chunks = _split_message(plain, max_len=5000)
-            messages = [{"type": "text", "text": c} for c in chunks[:5]]
+            messages = _plain_text_messages(clean_text)
+            if not messages:
+                logger.warning("Cron delivery LINE plain-text fallback is empty; nothing to send")
+                return _with_delivery_state(
+                    Response(
+                        {"error": "line_send_failed", "detail": "empty plain-text fallback"},
+                        status=http_status.HTTP_502_BAD_GATEWAY,
+                    ),
+                    "failed",
+                )
 
         from apps.router.line_webhook import _record_line_outbound
 
         sent_count = 0
+        retried_as_plain = False
         try:
             with httpx.Client(timeout=10) as http:
                 # Send in batches of 5 (LINE limit)
-                for i in range(0, len(messages), 5):
-                    batch = messages[i : i + 5]
+                index = 0
+                while index < len(messages):
+                    batch = messages[index : index + 5]
                     resp = http.post(
                         "https://api.line.me/v2/bot/message/push",
                         headers={
@@ -1162,6 +1184,24 @@ class CronDeliveryView(APIView):
                         from apps.router.line_webhook import _maybe_trip_monthly_quota
 
                         _maybe_trip_monthly_quota(resp.status_code, resp.text)
+                        if (
+                            messages_are_flex
+                            and not retried_as_plain
+                            and sent_count == 0
+                            and 400 <= resp.status_code < 500
+                            and resp.status_code != 429
+                        ):
+                            plain_messages = _plain_text_messages(clean_text)
+                            if plain_messages:
+                                logger.warning(
+                                    "Cron delivery LINE flex rejected (%s); retrying as plain text",
+                                    resp.status_code,
+                                )
+                                retried_as_plain = True
+                                messages_are_flex = False
+                                messages = plain_messages
+                                index = 0
+                                continue
                         state = "ambiguous" if sent_count or resp.status_code >= 500 else "failed"
                         return _with_delivery_state(
                             Response(
@@ -1179,6 +1219,7 @@ class CronDeliveryView(APIView):
                             tenant_obj, line_user_id, sent_messages, batch, excerpt_override=excerpt_override
                         )
                     sent_count += len(batch)
+                    index += 5
 
         except httpx.HTTPError as exc:
             logger.exception("Cron delivery LINE HTTP error for tenant %s", tenant_id)
