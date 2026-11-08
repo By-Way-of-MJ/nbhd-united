@@ -425,6 +425,7 @@ class WorkoutStubSerializer(OwnerStoreSerializerMixin, serializers.ModelSerializ
             "category",
             "activity",
             "status",
+            "completed_at",
             "duration_minutes",
             "rpe",
             "plan_id",
