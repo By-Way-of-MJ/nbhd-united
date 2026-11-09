@@ -12,11 +12,13 @@ so any at-cron firing within the look-ahead window has a wake guaranteed.
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 
+from apps.cron.models import CronJob
 from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
 
@@ -200,3 +202,158 @@ class Oc94StateFileTest(TestCase):
         self.assertEqual(result["scheduled"], 1)
         mock_invoke.assert_not_called()
         self.assertEqual(mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{tenant.id}-{fires_ms}")
+
+
+class HibernatedCronWakesTest(TestCase):
+    """Hibernated tenants get a DB-backed wake for rows added while asleep."""
+
+    def setUp(self):
+        self.tenant = _make_active_tenant(name="Hibernated Sweep", chat_id=333333333)
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=timezone.now())
+        self.tenant.refresh_from_db()
+
+    def _row(self, *, name: str, data: dict, enabled: bool = True) -> CronJob:
+        return CronJob.objects.create(tenant=self.tenant, name=name, data=data, enabled=enabled)
+
+    def _at_data(self, *, minutes: int) -> tuple[dict, int]:
+        fires_at = timezone.now() + timedelta(minutes=minutes)
+        return {"schedule": {"kind": "at", "at": fires_at.isoformat()}}, int(fires_at.timestamp() * 1000)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_at_row_in_window_schedules_wake(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, fires_ms = self._at_data(minutes=10)
+        self._row(name="at-ten", data=data)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 1)
+        self.assertEqual(result["hibernated_scheduled"], 1)
+        mock_publish.assert_called_once()
+        self.assertEqual(mock_publish.call_args.args, ("wake_for_cron", str(self.tenant.id)))
+        self.assertEqual(
+            mock_publish.call_args.kwargs["idempotency_key"],
+            f"wake-cron-{self.tenant.id}-{fires_ms}",
+        )
+        self.assertGreaterEqual(mock_publish.call_args.kwargs["delay_seconds"], 60)
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_cron_row_within_window_schedules_wake(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        target = timezone.now() + timedelta(minutes=10)
+        expr = f"{target.minute} {target.hour} * * *"
+        self._row(name="cron-ten", data={"schedule": {"kind": "cron", "expr": expr, "tz": "UTC"}})
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_scheduled"], 1)
+        mock_publish.assert_called_once()
+        self.assertEqual(mock_publish.call_args.args, ("wake_for_cron", str(self.tenant.id)))
+        key = mock_publish.call_args.kwargs["idempotency_key"]
+        self.assertTrue(key.startswith(f"wake-cron-{self.tenant.id}-"))
+        self.assertTrue(key.rsplit("-", 1)[-1].isdigit())
+        self.assertGreaterEqual(mock_publish.call_args.kwargs["delay_seconds"], 60)
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_two_rows_schedules_only_earliest(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        ten_data, ten_ms = self._at_data(minutes=10)
+        fifteen_data, _ = self._at_data(minutes=15)
+        self._row(name="at-fifteen", data=fifteen_data)
+        self._row(name="at-ten", data=ten_data)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_scheduled"], 1)
+        mock_publish.assert_called_once()
+        self.assertEqual(
+            mock_publish.call_args.kwargs["idempotency_key"],
+            f"wake-cron-{self.tenant.id}-{ten_ms}",
+        )
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_row_firing_in_two_hours_is_outside_window(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=120)
+        self._row(name="at-far", data=data)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 1)
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_disabled_row_is_ignored(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-disabled", data=data, enabled=False)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
+        mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_awake_tenant_row_is_not_scheduled_by_hibernated_pass(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=None)
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-awake", data=data)
+        mock_invoke.return_value = {"details": {"jobs": []}}
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 0)
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_suspended_hibernated_tenant_is_ignored(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(status=Tenant.Status.SUSPENDED)
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-suspended", data=data)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 0)
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_every_kind_row_is_ignored_without_crashing(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        self._row(
+            name="every-row",
+            data={"schedule": {"kind": "every", "everyMs": 600000}},
+        )
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 1)
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        self.assertEqual(result["errors"], 0)
+        mock_publish.assert_not_called()
+        mock_invoke.assert_not_called()
