@@ -1761,6 +1761,55 @@ def remove_zombie_heartbeats_task() -> dict:
 # to imminent work rather than the tenant's full reminder queue.
 _AT_WAKE_LOOKAHEAD_SECONDS = 2 * 60 * 60  # 2 hours
 
+# Hibernated tenants get one QStash wake at hibernation time from the cron list
+# the container reported then. A CronJob row created or re-enabled in Postgres
+# while the tenant sleeps gets no wake, so this sweep also checks the canonical
+# rows for hibernated tenants and schedules the earliest fire inside this window.
+_HIBERNATED_WAKE_LOOKAHEAD_SECONDS = 20 * 60
+
+
+def _next_fire_ms_from_row_data(data: dict, now_ms: int) -> int | None:
+    """Return a CronJob row's next fire after ``now_ms``, or ``None``.
+
+    Only ``cron`` and ``at`` schedules have a predictable next fire. ``every``
+    is relative to the container's last run and cannot be computed from the row,
+    so it stays on the hibernation-time wake path.
+    """
+    if not isinstance(data, dict):
+        return None
+    schedule = data.get("schedule")
+    if not isinstance(schedule, dict):
+        return None
+
+    kind = schedule.get("kind")
+    fire_ms = None
+    if kind == "cron":
+        expr = schedule.get("expr")
+        if not isinstance(expr, str) or not expr.strip():
+            return None
+        from .hibernation import _next_run_from_expr
+
+        fire_ms = _next_run_from_expr(expr, schedule.get("tz") or "UTC")
+    elif kind == "at":
+        at = schedule.get("at")
+        if not isinstance(at, str) or not at.strip():
+            return None
+        try:
+            from datetime import UTC, datetime
+
+            parsed = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            fire_ms = int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+
+    if not isinstance(fire_ms, int) or fire_ms <= now_ms:
+        return None
+    return fire_ms
+
 
 def ensure_at_cron_wakes_task() -> dict:
     """Backstop wake scheduling for one-off ``kind:"at"`` crons.
@@ -1777,8 +1826,15 @@ def ensure_at_cron_wakes_task() -> dict:
     postgres-cron-canonical flow it asks the gateway for current
     ``kind:"at"`` jobs, computes the fire time, and publishes a
     ``wake_for_cron`` task idempotency-keyed on ``(tenant, fire_time_ms)``
-    so duplicates collapse. Hibernated tenants are skipped — the
-    hibernation snapshot path already covers them.
+    so duplicates collapse.
+
+    Hibernated tenants are handled by a second, DB-only pass: their CronJob
+    rows remain ``enabled=True`` while asleep, and rows created or re-enabled
+    after the hibernation snapshot had no QStash wake. For each such tenant we
+    read the canonical rows, compute the earliest ``cron``/``at`` fire inside
+    the short look-ahead window, and publish one ``wake_for_cron`` using the
+    same key format so it dedupes with the hibernation-time wake. No gateway
+    calls are made — the container is asleep.
 
     Worst-case window: 5 minutes between cron creation and wake
     registration. Acceptable for ``at`` reminders, which typically have
@@ -1788,7 +1844,11 @@ def ensure_at_cron_wakes_task() -> dict:
     import logging
     import time as _time
 
+    from django.core.cache import cache
+    from django.db.models import Q
+
     from apps.cron.gateway_client import GatewayError, list_tenant_crons
+    from apps.cron.models import CronJob
     from apps.cron.pending_at_views import _at_fires_at_ms
     from apps.cron.publish import publish_task
     from apps.orchestrator.hibernation import _CRON_WAKE_LEAD_SECONDS
@@ -1799,7 +1859,14 @@ def ensure_at_cron_wakes_task() -> dict:
 
     now_ms = int(_time.time() * 1000)
     cutoff_ms = now_ms + _AT_WAKE_LOOKAHEAD_SECONDS * 1000
-    totals = {"tenants": 0, "scheduled": 0, "errors": 0, "skipped": 0}
+    totals = {
+        "tenants": 0,
+        "scheduled": 0,
+        "errors": 0,
+        "skipped": 0,
+        "hibernated_tenants": 0,
+        "hibernated_scheduled": 0,
+    }
 
     tenants = (
         Tenant.objects.filter(status="active")
@@ -1845,6 +1912,82 @@ def ensure_at_cron_wakes_task() -> dict:
                     str(tenant.id)[:8],
                 )
                 totals["errors"] += 1
+
+    # Second pass: hibernated tenants. Their CronJob rows stay enabled in
+    # Postgres while asleep, but no gateway call is possible. A row created or
+    # re-enabled after the hibernation snapshot never got a wake, so schedule
+    # one from the DB and use the same idempotency key as the snapshot path.
+    hibernated_cutoff_ms = now_ms + _HIBERNATED_WAKE_LOOKAHEAD_SECONDS * 1000
+    hibernated_tenants = Tenant.objects.filter(status="active", hibernated_at__isnull=False).exclude(container_fqdn="")
+    for tenant in hibernated_tenants:
+        totals["hibernated_tenants"] += 1
+        try:
+            earliest_ms = None
+            # Only rows changed after the hibernation snapshot: rows that
+            # existed then already got their wake from that snapshot.
+            rows = CronJob.objects.filter(
+                Q(created_at__gt=tenant.hibernated_at) | Q(updated_at__gt=tenant.hibernated_at),
+                tenant=tenant,
+                enabled=True,
+            )
+            for row in rows:
+                try:
+                    fire_ms = _next_fire_ms_from_row_data(row.data, now_ms)
+                except Exception:
+                    logger.exception(
+                        "ensure_at_cron_wakes: failed to read cron row %s for tenant %s",
+                        row.pk,
+                        str(tenant.id)[:8],
+                    )
+                    totals["errors"] += 1
+                    continue
+                if fire_ms is None or fire_ms > hibernated_cutoff_ms:
+                    continue
+                if earliest_ms is None or fire_ms < earliest_ms:
+                    earliest_ms = fire_ms
+
+            if earliest_ms is None:
+                continue
+
+            idempotency_key = f"wake-cron-{tenant.id}-{earliest_ms}"
+            cache_key = f"hib-wake-sent:{idempotency_key}"
+            # Skip only on an explicit False (key already set). django-redis returns None on outage (IGNORE_EXCEPTIONS) — fail open.
+            try:
+                if cache.add(cache_key, 1, timeout=3600) is False:
+                    continue
+            except Exception:
+                # Fail open: a duplicate wake beats a missed cron.
+                logger.warning(
+                    "ensure_at_cron_wakes: cache.add failed for hibernated tenant %s",
+                    str(tenant.id)[:8],
+                    exc_info=True,
+                )
+
+            delay = max(60, (earliest_ms - now_ms) // 1000 - _CRON_WAKE_LEAD_SECONDS)
+            try:
+                publish_task(
+                    "wake_for_cron",
+                    str(tenant.id),
+                    delay_seconds=delay,
+                    idempotency_key=idempotency_key,
+                )
+                totals["hibernated_scheduled"] += 1
+            except Exception:
+                try:
+                    cache.delete(cache_key)
+                except Exception:
+                    pass
+                logger.exception(
+                    "ensure_at_cron_wakes: publish_task failed for hibernated tenant %s",
+                    str(tenant.id)[:8],
+                )
+                totals["errors"] += 1
+        except Exception:
+            logger.exception(
+                "ensure_at_cron_wakes: hibernated pass failed for tenant %s",
+                str(tenant.id)[:8],
+            )
+            totals["errors"] += 1
 
     logger.info("ensure_at_cron_wakes: %s", totals)
     return totals
