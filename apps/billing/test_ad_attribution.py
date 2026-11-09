@@ -11,9 +11,11 @@ from unittest.mock import Mock, patch
 from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
+from django.utils.module_loading import import_string
 from rest_framework.test import APIClient
 
 from apps.billing.models import AdAttribution
+from apps.cron.views import TASK_MAP
 from apps.tenants.services import create_tenant
 
 URL = "/api/v1/billing/ad-attribution/"
@@ -74,7 +76,7 @@ class AdAttributionTests(TestCase):
         self.assertEqual(args[0], "https://api-adservices.apple.com/api/v1/")
         self.assertEqual(kwargs["content"], token)
         self.assertEqual(kwargs["headers"], {"Content-Type": "text/plain"})
-        self.assertEqual(kwargs["timeout"], 5)
+        self.assertEqual(kwargs["timeout"], 2)
 
     def test_organic_install_records_no_campaign(self):
         with patch("httpx.post", return_value=apple_response(200, {"attribution": False})):
@@ -118,6 +120,7 @@ class AdAttributionTests(TestCase):
         self.assertNotIn("bad-secret-token", response.content.decode())
         row = self.row()
         self.assertEqual(row.status, AdAttribution.Status.ERROR)
+        self.assertEqual(row.raw, {"reason": "token_invalid"})
         self.assertEqual(row.token, "")
         self.assertEqual(row.attempts, 0)
 
@@ -168,7 +171,28 @@ class AdAttributionTests(TestCase):
         post.assert_not_called()
         row.refresh_from_db()
         self.assertEqual(row.status, AdAttribution.Status.ERROR)
+        self.assertEqual(row.raw, {"reason": "expired"})
         self.assertEqual(row.token, "")
+
+    def test_resolve_failure_returns_pending_and_never_echoes_the_token(self):
+        token = "secret-apple-token"
+        with patch("apps.billing.adservices.resolve", side_effect=RuntimeError("boom")):
+            response = self.post(token)
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json(), {"status": "pending"})
+        self.assertNotIn(token, response.content.decode())
+        self.assertEqual(self.row().status, AdAttribution.Status.PENDING)
+
+    def test_retry_task_is_registered_and_calls_the_command(self):
+        task = import_string(TASK_MAP["resolve_ad_attributions"])
+        self.assertTrue(callable(task))
+
+        with patch("django.core.management.call_command") as call_command:
+            result = task()
+
+        call_command.assert_called_once_with("resolve_ad_attributions")
+        self.assertEqual(result, {"status": "completed"})
 
     def test_report_counts_accounts_and_paying_now(self):
         self.tenant.stripe_subscription_id = "sub_paying"
@@ -176,7 +200,8 @@ class AdAttributionTests(TestCase):
         second = create_tenant(display_name="Ben", telegram_chat_id=990102)
         organic = create_tenant(display_name="Cora", telegram_chat_id=990103)
         pending = create_tenant(display_name="Dee", telegram_chat_id=990104)
-        errored = create_tenant(display_name="Eli", telegram_chat_id=990105)
+        errored_invalid = create_tenant(display_name="Eli", telegram_chat_id=990105)
+        errored_expired = create_tenant(display_name="Fay", telegram_chat_id=990106)
 
         for tenant in (self.tenant, second):
             AdAttribution.objects.create(
@@ -189,11 +214,20 @@ class AdAttributionTests(TestCase):
             )
         AdAttribution.objects.create(tenant=organic, status=AdAttribution.Status.ORGANIC)
         AdAttribution.objects.create(tenant=pending, status=AdAttribution.Status.PENDING, token="retry")
-        AdAttribution.objects.create(tenant=errored, status=AdAttribution.Status.ERROR)
+        AdAttribution.objects.create(
+            tenant=errored_invalid,
+            status=AdAttribution.Status.ERROR,
+            raw={"reason": "token_invalid"},
+        )
+        AdAttribution.objects.create(
+            tenant=errored_expired,
+            status=AdAttribution.Status.ERROR,
+            raw={"reason": "expired"},
+        )
 
         out = StringIO()
         call_command("ad_attribution_report", "--days", "1", stdout=out)
         output = out.getvalue()
 
         self.assertIn("campaign_id=111 ad_group_id=222 keyword_id=333 accounts=2 paying_now=1", output)
-        self.assertIn("totals organic=1 pending=1 error=1", output)
+        self.assertIn("totals organic=1 pending=1 error_expired=1 error_token_invalid=1", output)

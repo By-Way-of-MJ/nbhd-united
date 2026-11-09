@@ -44,7 +44,8 @@ class Command(BaseCommand):
         totals = {
             AdAttribution.Status.ORGANIC: 0,
             AdAttribution.Status.PENDING: 0,
-            AdAttribution.Status.ERROR: 0,
+            "error_expired": 0,
+            "error_token_invalid": 0,
         }
         for row in rows:
             if row.status == AdAttribution.Status.ATTRIBUTED:
@@ -52,6 +53,12 @@ class Command(BaseCommand):
                 groups[key]["accounts"] += 1
                 if is_paying(row.tenant):
                     groups[key]["paying_now"] += 1
+            elif row.status == AdAttribution.Status.ERROR:
+                reason = row.raw.get("reason") if isinstance(row.raw, dict) else None
+                if reason == "expired":
+                    totals["error_expired"] += 1
+                else:
+                    totals["error_token_invalid"] += 1
             elif row.status in totals:
                 totals[row.status] += 1
 
@@ -69,5 +76,6 @@ class Command(BaseCommand):
         self.stdout.write(
             f"totals organic={totals[AdAttribution.Status.ORGANIC]} "
             f"pending={totals[AdAttribution.Status.PENDING]} "
-            f"error={totals[AdAttribution.Status.ERROR]}"
+            f"error_expired={totals['error_expired']} "
+            f"error_token_invalid={totals['error_token_invalid']}"
         )

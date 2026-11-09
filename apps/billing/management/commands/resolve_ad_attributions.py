@@ -34,7 +34,12 @@ class Command(BaseCommand):
         expired = AdAttribution.objects.filter(
             status=AdAttribution.Status.PENDING,
             created_at__lt=cutoff,
-        ).update(status=AdAttribution.Status.ERROR, token="", resolved_at=timezone.now())
+        ).update(
+            status=AdAttribution.Status.ERROR,
+            raw={"reason": "expired"},
+            token="",
+            resolved_at=timezone.now(),
+        )
 
         retryable = (
             AdAttribution.objects.filter(

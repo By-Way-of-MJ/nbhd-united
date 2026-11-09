@@ -562,5 +562,8 @@ class AdAttributionView(APIView):
         if not created:
             return Response({"status": row.status})
 
-        resolve(row)
+        try:
+            resolve(row)
+        except Exception:
+            logger.exception("ad attribution resolve failed")
         return Response({"status": row.status})

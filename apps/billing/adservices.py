@@ -21,7 +21,7 @@ from django.utils.dateparse import parse_date, parse_datetime
 from .models import AdAttribution
 
 ADSERVICES_URL = "https://api-adservices.apple.com/api/v1/"
-TIMEOUT_SECONDS = 5
+TIMEOUT_SECONDS = 2
 
 
 class AdTokenInvalid(Exception):
@@ -112,9 +112,10 @@ def resolve(row: AdAttribution) -> AdAttribution:
         payload = fetch_attribution(row.token)
     except AdTokenInvalid:
         row.status = AdAttribution.Status.ERROR
+        row.raw = {"reason": "token_invalid"}
         row.token = ""
         row.resolved_at = timezone.now()
-        row.save(update_fields=["status", "token", "resolved_at"])
+        row.save(update_fields=["status", "raw", "token", "resolved_at"])
         return row
     except AdServicesUnavailable:
         row.attempts += 1
