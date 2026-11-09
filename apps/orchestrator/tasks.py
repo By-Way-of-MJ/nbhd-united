@@ -1951,8 +1951,9 @@ def ensure_at_cron_wakes_task() -> dict:
 
             idempotency_key = f"wake-cron-{tenant.id}-{earliest_ms}"
             cache_key = f"hib-wake-sent:{idempotency_key}"
+            # Skip only on an explicit False (key already set). django-redis returns None on outage (IGNORE_EXCEPTIONS) — fail open.
             try:
-                if not cache.add(cache_key, 1, timeout=3600):
+                if cache.add(cache_key, 1, timeout=3600) is False:
                     continue
             except Exception:
                 # Fail open: a duplicate wake beats a missed cron.

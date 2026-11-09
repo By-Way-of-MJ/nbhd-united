@@ -443,3 +443,17 @@ class HibernatedCronWakesTest(TestCase):
         self.assertEqual(result["errors"], 0)
         mock_publish.assert_not_called()
         mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_cache_outage_returning_none_still_publishes(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-cache-down", data=data)
+
+        with patch("django.core.cache.cache.add", return_value=None):
+            result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_scheduled"], 1)
+        self.assertEqual(mock_publish.call_count, 1)
