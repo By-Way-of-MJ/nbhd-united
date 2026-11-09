@@ -1844,6 +1844,9 @@ def ensure_at_cron_wakes_task() -> dict:
     import logging
     import time as _time
 
+    from django.core.cache import cache
+    from django.db.models import Q
+
     from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.cron.models import CronJob
     from apps.cron.pending_at_views import _at_fires_at_ms
@@ -1915,12 +1918,18 @@ def ensure_at_cron_wakes_task() -> dict:
     # re-enabled after the hibernation snapshot never got a wake, so schedule
     # one from the DB and use the same idempotency key as the snapshot path.
     hibernated_cutoff_ms = now_ms + _HIBERNATED_WAKE_LOOKAHEAD_SECONDS * 1000
-    hibernated_tenants = Tenant.objects.filter(status="active", hibernated_at__isnull=False)
+    hibernated_tenants = Tenant.objects.filter(status="active", hibernated_at__isnull=False).exclude(container_fqdn="")
     for tenant in hibernated_tenants:
         totals["hibernated_tenants"] += 1
         try:
             earliest_ms = None
-            rows = CronJob.objects.filter(tenant=tenant, enabled=True)
+            # Only rows changed after the hibernation snapshot: rows that
+            # existed then already got their wake from that snapshot.
+            rows = CronJob.objects.filter(
+                Q(created_at__gt=tenant.hibernated_at) | Q(updated_at__gt=tenant.hibernated_at),
+                tenant=tenant,
+                enabled=True,
+            )
             for row in rows:
                 try:
                     fire_ms = _next_fire_ms_from_row_data(row.data, now_ms)
@@ -1940,16 +1949,33 @@ def ensure_at_cron_wakes_task() -> dict:
             if earliest_ms is None:
                 continue
 
+            idempotency_key = f"wake-cron-{tenant.id}-{earliest_ms}"
+            cache_key = f"hib-wake-sent:{idempotency_key}"
+            try:
+                if not cache.add(cache_key, 1, timeout=3600):
+                    continue
+            except Exception:
+                # Fail open: a duplicate wake beats a missed cron.
+                logger.warning(
+                    "ensure_at_cron_wakes: cache.add failed for hibernated tenant %s",
+                    str(tenant.id)[:8],
+                    exc_info=True,
+                )
+
             delay = max(60, (earliest_ms - now_ms) // 1000 - _CRON_WAKE_LEAD_SECONDS)
             try:
                 publish_task(
                     "wake_for_cron",
                     str(tenant.id),
                     delay_seconds=delay,
-                    idempotency_key=f"wake-cron-{tenant.id}-{earliest_ms}",
+                    idempotency_key=idempotency_key,
                 )
                 totals["hibernated_scheduled"] += 1
             except Exception:
+                try:
+                    cache.delete(cache_key)
+                except Exception:
+                    pass
                 logger.exception(
                     "ensure_at_cron_wakes: publish_task failed for hibernated tenant %s",
                     str(tenant.id)[:8],

@@ -14,7 +14,9 @@ from __future__ import annotations
 import time
 from datetime import timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
+from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 
@@ -208,6 +210,7 @@ class HibernatedCronWakesTest(TestCase):
     """Hibernated tenants get a DB-backed wake for rows added while asleep."""
 
     def setUp(self):
+        cache.clear()
         self.tenant = _make_active_tenant(name="Hibernated Sweep", chat_id=333333333)
         Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=timezone.now())
         self.tenant.refresh_from_db()
@@ -254,11 +257,94 @@ class HibernatedCronWakesTest(TestCase):
         self.assertEqual(result["hibernated_scheduled"], 1)
         mock_publish.assert_called_once()
         self.assertEqual(mock_publish.call_args.args, ("wake_for_cron", str(self.tenant.id)))
-        key = mock_publish.call_args.kwargs["idempotency_key"]
-        self.assertTrue(key.startswith(f"wake-cron-{self.tenant.id}-"))
-        self.assertTrue(key.rsplit("-", 1)[-1].isdigit())
+        expected = int(target.replace(second=0, microsecond=0).timestamp() * 1000)
+        self.assertEqual(
+            mock_publish.call_args.kwargs["idempotency_key"],
+            f"wake-cron-{self.tenant.id}-{expected}",
+        )
         self.assertGreaterEqual(mock_publish.call_args.kwargs["delay_seconds"], 60)
         mock_invoke.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_row_unchanged_since_hibernation_is_skipped(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-old", data=data)
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=timezone.now() + timedelta(seconds=1))
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_second_sweep_does_not_republish_same_fire(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-once", data=data)
+
+        ensure_at_cron_wakes_task()
+        second = ensure_at_cron_wakes_task()
+
+        self.assertEqual(mock_publish.call_count, 1)
+        self.assertEqual(second["hibernated_scheduled"], 0)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_publish_failure_allows_retry_next_sweep(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-retry", data=data)
+        mock_publish.side_effect = [RuntimeError("x"), None]
+
+        first = ensure_at_cron_wakes_task()
+        second = ensure_at_cron_wakes_task()
+
+        self.assertEqual(mock_publish.call_count, 2)
+        self.assertGreaterEqual(first["errors"], 1)
+        self.assertEqual(second["hibernated_scheduled"], 1)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_non_utc_cron_row(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        target = timezone.now().astimezone(ZoneInfo("Asia/Tokyo")) + timedelta(minutes=10)
+        expr = f"{target.minute} {target.hour} * * *"
+        self._row(
+            name="cron-tokyo",
+            data={"schedule": {"kind": "cron", "expr": expr, "tz": "Asia/Tokyo"}},
+        )
+
+        result = ensure_at_cron_wakes_task()
+
+        expected = int(target.replace(second=0, microsecond=0).timestamp() * 1000)
+        self.assertEqual(result["hibernated_scheduled"], 1)
+        mock_publish.assert_called_once()
+        self.assertEqual(
+            mock_publish.call_args.kwargs["idempotency_key"],
+            f"wake-cron-{self.tenant.id}-{expected}",
+        )
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_tenant_without_container_is_skipped(self, mock_invoke, mock_publish):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(container_fqdn="")
+        data, _ = self._at_data(minutes=10)
+        self._row(name="at-no-container", data=data)
+
+        result = ensure_at_cron_wakes_task()
+
+        self.assertEqual(result["hibernated_tenants"], 0)
+        self.assertEqual(result["hibernated_scheduled"], 0)
+        mock_publish.assert_not_called()
 
     @patch("apps.cron.publish.publish_task")
     @patch("apps.cron.gateway_client.invoke_gateway_tool")
