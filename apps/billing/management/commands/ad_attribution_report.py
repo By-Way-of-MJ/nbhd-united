@@ -2,10 +2,10 @@
 
     python manage.py ad_attribution_report [--days N]
 
-One line per (campaign_id, ad_group_id, keyword_id) shows how many accounts
-that keyword brought in and how many of them are paying now. Rows that are not
-attributed are totalled separately, so "no campaign" is never mistaken for a
-campaign with zero accounts.
+One line per (campaign_id, ad_group_id, keyword_id) splits the accounts into
+new signups and existing/redownload accounts, and shows how many new signups are
+paying now. Rows that are not attributed are totalled separately, so "no
+campaign" is never mistaken for a campaign with zero accounts.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class Command(BaseCommand):
             "--days",
             type=int,
             default=30,
-            help="Only include rows created in the last N days (default: 30; 0 = all).",
+            help="Only include tenants created in the last N days (default: 30; 0 = all).",
         )
 
     def handle(self, *args, **options):
@@ -38,25 +38,37 @@ class Command(BaseCommand):
         rows = AdAttribution.objects.select_related("tenant")
         days = options["days"]
         if days > 0:
-            rows = rows.filter(created_at__gte=timezone.now() - timedelta(days=days))
+            rows = rows.filter(tenant__created_at__gte=timezone.now() - timedelta(days=days))
 
-        groups: dict[tuple, dict[str, int]] = defaultdict(lambda: {"accounts": 0, "paying_now": 0})
+        groups: dict[tuple, dict[str, int]] = defaultdict(
+            lambda: {"new_signups": 0, "existing_or_redownload": 0, "paying_now": 0}
+        )
         totals = {
             AdAttribution.Status.ORGANIC: 0,
             AdAttribution.Status.PENDING: 0,
             "error_expired": 0,
             "error_token_invalid": 0,
+            "error_test_build": 0,
         }
         for row in rows:
             if row.status == AdAttribution.Status.ATTRIBUTED:
                 key = (row.campaign_id, row.ad_group_id, row.keyword_id)
-                groups[key]["accounts"] += 1
-                if is_paying(row.tenant):
-                    groups[key]["paying_now"] += 1
+                conversion_type = row.raw.get("conversionType") if isinstance(row.raw, dict) else None
+                is_new_signup = (
+                    row.created_at - row.tenant.created_at <= timedelta(days=1) and conversion_type != "Redownload"
+                )
+                if is_new_signup:
+                    groups[key]["new_signups"] += 1
+                    if is_paying(row.tenant):
+                        groups[key]["paying_now"] += 1
+                else:
+                    groups[key]["existing_or_redownload"] += 1
             elif row.status == AdAttribution.Status.ERROR:
                 reason = row.raw.get("reason") if isinstance(row.raw, dict) else None
                 if reason == "expired":
                     totals["error_expired"] += 1
+                elif reason == "test_build":
+                    totals["error_test_build"] += 1
                 else:
                     totals["error_token_invalid"] += 1
             elif row.status in totals:
@@ -70,12 +82,15 @@ class Command(BaseCommand):
             counts = groups[key]
             self.stdout.write(
                 f"campaign_id={campaign_id} ad_group_id={ad_group_id} keyword_id={keyword_id} "
-                f"accounts={counts['accounts']} paying_now={counts['paying_now']}"
+                f"new_signups={counts['new_signups']} "
+                f"existing_or_redownload={counts['existing_or_redownload']} "
+                f"paying_now={counts['paying_now']}"
             )
 
         self.stdout.write(
             f"totals organic={totals[AdAttribution.Status.ORGANIC]} "
             f"pending={totals[AdAttribution.Status.PENDING]} "
             f"error_expired={totals['error_expired']} "
-            f"error_token_invalid={totals['error_token_invalid']}"
+            f"error_token_invalid={totals['error_token_invalid']} "
+            f"error_test_build={totals['error_test_build']}"
         )

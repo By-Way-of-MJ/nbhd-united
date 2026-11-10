@@ -4,6 +4,22 @@ from importlib import import_module
 
 from django.db import migrations
 
+RELOCK_SQL = (
+    import_module("apps.tenants.migrations.0184_relock_after_chat_attachment_paths").RELOCK_SQL
+    + r"""
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON public.ad_attributions FROM anon';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'REVOKE ALL ON public.ad_attributions FROM authenticated';
+  END IF;
+END
+$$;
+"""
+)
+
 
 class Migration(migrations.Migration):
     dependencies = [
@@ -12,8 +28,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunSQL(
-            import_module("apps.tenants.migrations.0184_relock_after_chat_attachment_paths").RELOCK_SQL,
-            migrations.RunSQL.noop,
-        ),
+        migrations.RunSQL(RELOCK_SQL, migrations.RunSQL.noop),
     ]

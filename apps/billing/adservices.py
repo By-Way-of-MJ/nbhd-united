@@ -56,10 +56,8 @@ def fetch_attribution(token: str) -> dict | None:
         return None
     if response.status_code == 400:
         raise AdTokenInvalid("adservices_token_invalid")
-    if response.status_code >= 500:
-        raise AdServicesUnavailable("adservices_server_error")
-    if 400 <= response.status_code < 500:
-        raise AdTokenInvalid("adservices_token_rejected")
+    if response.status_code >= 400:
+        raise AdServicesUnavailable("adservices_retryable_status")
     raise AdServicesUnavailable("adservices_unexpected_status")
 
 
@@ -125,6 +123,18 @@ def resolve(row: AdAttribution) -> AdAttribution:
     if payload is None:
         row.attempts += 1
         row.save(update_fields=["attempts"])
+        return row
+
+    if (
+        payload.get("attribution")
+        and _as_int(payload.get("campaignId")) == 1234567890
+        and _as_int(payload.get("orgId")) == 1234567890
+    ):
+        row.status = AdAttribution.Status.ERROR
+        row.raw = {"reason": "test_build"}
+        row.token = ""
+        row.resolved_at = timezone.now()
+        row.save(update_fields=["status", "raw", "token", "resolved_at"])
         return row
 
     row.raw = payload

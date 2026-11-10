@@ -16,6 +16,7 @@ from rest_framework.test import APIClient
 
 from apps.billing.models import AdAttribution
 from apps.cron.views import TASK_MAP
+from apps.tenants.models import Tenant
 from apps.tenants.services import create_tenant
 
 URL = "/api/v1/billing/ad-attribution/"
@@ -135,6 +136,40 @@ class AdAttributionTests(TestCase):
         self.assertEqual(row.attempts, 1)
         self.assertEqual(row.token, "token-1")
 
+    def test_other_4xx_leaves_the_row_pending_and_keeps_the_token(self):
+        for status_code in (403, 429):
+            with self.subTest(status_code=status_code):
+                tenant = create_tenant(display_name=f"Retry {status_code}", telegram_chat_id=990400 + status_code)
+                client = APIClient()
+                client.force_authenticate(user=tenant.user)
+
+                with patch("httpx.post", return_value=apple_response(status_code)):
+                    response = client.post(URL, {"token": f"token-{status_code}"}, format="json")
+
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.json(), {"status": "pending"})
+                row = AdAttribution.objects.get(tenant=tenant)
+                self.assertEqual(row.status, AdAttribution.Status.PENDING)
+                self.assertEqual(row.attempts, 1)
+                self.assertEqual(row.token, f"token-{status_code}")
+
+    def test_test_build_payload_becomes_error_without_campaign_ids(self):
+        fake = dict(ATTRIBUTED, campaignId=1234567890, orgId=1234567890)
+
+        with patch("httpx.post", return_value=apple_response(200, fake)):
+            response = self.post("test-build-token")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json(), {"status": "error"})
+        row = self.row()
+        self.assertEqual(row.status, AdAttribution.Status.ERROR)
+        self.assertEqual(row.raw, {"reason": "test_build"})
+        self.assertEqual(row.token, "")
+        self.assertIsNone(row.org_id)
+        self.assertIsNone(row.campaign_id)
+        self.assertIsNone(row.ad_group_id)
+        self.assertIsNone(row.keyword_id)
+
     def test_second_post_is_a_no_op_and_the_first_token_wins(self):
         different = dict(ATTRIBUTED, campaignId=999)
         with patch(
@@ -174,6 +209,17 @@ class AdAttributionTests(TestCase):
         self.assertEqual(row.raw, {"reason": "expired"})
         self.assertEqual(row.token, "")
 
+    def test_retry_command_ignores_the_old_attempt_cap_within_24_hours(self):
+        row = AdAttribution.objects.create(tenant=self.tenant, token="many-attempts", attempts=99)
+
+        with patch("httpx.post", return_value=apple_response(200, ATTRIBUTED)):
+            call_command("resolve_ad_attributions", stdout=StringIO())
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, AdAttribution.Status.ATTRIBUTED)
+        self.assertEqual(row.campaign_id, 111)
+        self.assertEqual(row.token, "")
+
     def test_resolve_failure_returns_pending_and_never_echoes_the_token(self):
         token = "secret-apple-token"
         with patch("apps.billing.adservices.resolve", side_effect=RuntimeError("boom")):
@@ -194,7 +240,7 @@ class AdAttributionTests(TestCase):
         call_command.assert_called_once_with("resolve_ad_attributions")
         self.assertEqual(result, {"status": "completed"})
 
-    def test_report_counts_accounts_and_paying_now(self):
+    def test_report_counts_new_signups_and_paying_now(self):
         self.tenant.stripe_subscription_id = "sub_paying"
         self.tenant.save(update_fields=["stripe_subscription_id"])
         second = create_tenant(display_name="Ben", telegram_chat_id=990102)
@@ -202,6 +248,7 @@ class AdAttributionTests(TestCase):
         pending = create_tenant(display_name="Dee", telegram_chat_id=990104)
         errored_invalid = create_tenant(display_name="Eli", telegram_chat_id=990105)
         errored_expired = create_tenant(display_name="Fay", telegram_chat_id=990106)
+        errored_test_build = create_tenant(display_name="Gus", telegram_chat_id=990107)
 
         for tenant in (self.tenant, second):
             AdAttribution.objects.create(
@@ -211,6 +258,7 @@ class AdAttributionTests(TestCase):
                 ad_group_id=222,
                 keyword_id=333,
                 org_id=123456,
+                raw={"conversionType": "Download"},
             )
         AdAttribution.objects.create(tenant=organic, status=AdAttribution.Status.ORGANIC)
         AdAttribution.objects.create(tenant=pending, status=AdAttribution.Status.PENDING, token="retry")
@@ -224,10 +272,99 @@ class AdAttributionTests(TestCase):
             status=AdAttribution.Status.ERROR,
             raw={"reason": "expired"},
         )
+        AdAttribution.objects.create(
+            tenant=errored_test_build,
+            status=AdAttribution.Status.ERROR,
+            raw={"reason": "test_build"},
+        )
 
         out = StringIO()
         call_command("ad_attribution_report", "--days", "1", stdout=out)
         output = out.getvalue()
 
-        self.assertIn("campaign_id=111 ad_group_id=222 keyword_id=333 accounts=2 paying_now=1", output)
-        self.assertIn("totals organic=1 pending=1 error_expired=1 error_token_invalid=1", output)
+        self.assertIn(
+            "campaign_id=111 ad_group_id=222 keyword_id=333 new_signups=2 existing_or_redownload=0 paying_now=1",
+            output,
+        )
+        self.assertIn(
+            "totals organic=1 pending=1 error_expired=1 error_token_invalid=1 error_test_build=1",
+            output,
+        )
+
+    def test_report_classifies_old_tenants_and_redownloads_as_existing(self):
+        old = create_tenant(display_name="Old", telegram_chat_id=990108)
+        redownload = create_tenant(display_name="Redownload", telegram_chat_id=990109)
+        new_signup = create_tenant(display_name="New", telegram_chat_id=990110)
+        for tenant in (old, redownload, new_signup):
+            tenant.stripe_subscription_id = f"sub_{tenant.pk}"
+            tenant.save(update_fields=["stripe_subscription_id"])
+
+        AdAttribution.objects.create(
+            tenant=old,
+            status=AdAttribution.Status.ATTRIBUTED,
+            campaign_id=901,
+            ad_group_id=902,
+            keyword_id=903,
+            raw={"conversionType": "Download"},
+        )
+        AdAttribution.objects.create(
+            tenant=redownload,
+            status=AdAttribution.Status.ATTRIBUTED,
+            campaign_id=911,
+            ad_group_id=912,
+            keyword_id=913,
+            raw={"conversionType": "Redownload"},
+        )
+        AdAttribution.objects.create(
+            tenant=new_signup,
+            status=AdAttribution.Status.ATTRIBUTED,
+            campaign_id=921,
+            ad_group_id=922,
+            keyword_id=923,
+            raw={"conversionType": "Download"},
+        )
+        Tenant.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=30))
+
+        out = StringIO()
+        call_command("ad_attribution_report", "--days", "0", stdout=out)
+        output = out.getvalue()
+
+        self.assertIn(
+            "campaign_id=901 ad_group_id=902 keyword_id=903 new_signups=0 existing_or_redownload=1 paying_now=0",
+            output,
+        )
+        self.assertIn(
+            "campaign_id=911 ad_group_id=912 keyword_id=913 new_signups=0 existing_or_redownload=1 paying_now=0",
+            output,
+        )
+        self.assertIn(
+            "campaign_id=921 ad_group_id=922 keyword_id=923 new_signups=1 existing_or_redownload=0 paying_now=1",
+            output,
+        )
+
+    def test_report_days_filters_on_tenant_created_at(self):
+        fresh_tenant = create_tenant(display_name="Fresh", telegram_chat_id=990111)
+        stale_tenant = create_tenant(display_name="Stale", telegram_chat_id=990112)
+        AdAttribution.objects.create(
+            tenant=fresh_tenant,
+            status=AdAttribution.Status.ATTRIBUTED,
+            campaign_id=931,
+            ad_group_id=932,
+            keyword_id=933,
+        )
+        AdAttribution.objects.create(
+            tenant=stale_tenant,
+            status=AdAttribution.Status.ATTRIBUTED,
+            campaign_id=941,
+            ad_group_id=942,
+            keyword_id=943,
+        )
+        AdAttribution.objects.filter(tenant=fresh_tenant).update(created_at=timezone.now() - timedelta(days=10))
+        Tenant.objects.filter(pk=stale_tenant.pk).update(created_at=timezone.now() - timedelta(days=10))
+
+        out = StringIO()
+        call_command("ad_attribution_report", "--days", "5", stdout=out)
+        output = out.getvalue()
+
+        self.assertIn("campaign_id=931", output)
+        self.assertNotIn("campaign_id=941", output)

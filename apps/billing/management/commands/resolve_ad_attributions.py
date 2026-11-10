@@ -2,8 +2,8 @@
 
 Apple answers 404 until an attribution token is ready, so the endpoint resolves
 once inline and this command retries while the token is still fresh. Rows older
-than 24 h (or with 6 failed attempts) are closed as ``error`` rather than kept
-pending forever. Scheduling is intentionally out of scope here.
+than 24 h are closed as ``error`` rather than kept pending forever. Scheduling is
+intentionally out of scope here.
 
     python manage.py resolve_ad_attributions
 """
@@ -19,7 +19,6 @@ from apps.billing.adservices import resolve
 from apps.billing.models import AdAttribution
 
 RETRY_WINDOW = timedelta(hours=24)
-MAX_ATTEMPTS = 6
 
 
 class Command(BaseCommand):
@@ -45,7 +44,6 @@ class Command(BaseCommand):
             AdAttribution.objects.filter(
                 status=AdAttribution.Status.PENDING,
                 created_at__gte=cutoff,
-                attempts__lt=MAX_ATTEMPTS,
             )
             .select_related("tenant")
             .order_by("created_at")
