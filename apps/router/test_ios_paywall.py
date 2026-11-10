@@ -955,3 +955,173 @@ class PaywallFlagValueTest(TestCase):
         for value, expected in cases:
             with self.subTest(value=value), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=value):
                 self.assertIs(_tenant_allowed(tenant, "IOS_PAYWALL_ENFORCE_TENANT_IDS"), expected)
+
+
+@override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+@patch("apps.pii.redactor._detect_pii", return_value=[])
+@patch("apps.cron.publish.publish_task")
+@patch("apps.router.chat_views.enqueue_message_for_tenant")
+@patch("apps.router.conversation_capture.schedule_user_md_refresh")
+class FreeTierSyncTest(_PaywallClientMixin, TestCase):
+    """The free tier's lifecycle for one turn: the chat POST is refused, the client
+    answers on the phone and records the pair under the SAME client_msg_id via
+    ``/chat/turns/``. The refusal persists nothing, so the record is one fresh pair,
+    a replayed record is idempotent, and nothing after acceptance ever reports
+    ``subscription_required``."""
+
+    def setUp(self):
+        cache.clear()  # throttles
+        self.paused = _make_tenant()
+
+    def chat(self, client_msg_id="ft-1"):
+        return self.client_for(self.paused).post(
+            "/api/v1/chat/messages/", {"text": "plan my week", "client_msg_id": client_msg_id}, format="json"
+        )
+
+    def sync(self, client_msg_id="ft-1"):
+        return self.client_for(self.paused).post(
+            "/api/v1/chat/turns/",
+            {
+                "text": "plan my week",
+                "reply_text": "Here is a plan.",
+                "client_msg_id": client_msg_id,
+                "engine": "apple_on_device",
+            },
+            format="json",
+        )
+
+    def test_refused_then_synced_is_one_pair_and_a_replayed_sync_is_idempotent(self, refresh, enqueue, wake, _pii):
+        refused = self.chat()
+        self.assertEqual(refused.data, {"client_msg_id": "ft-1", **SUBSCRIPTION_REQUIRED})
+        self.assertFalse(AppChatMessage.objects.filter(tenant=self.paused).exists())
+
+        first = self.sync()
+        self.assertEqual(first.status_code, 201, first.content)
+        self.assertEqual(
+            (first.data["status"], first.data["source"], first.data["user_text"], first.data["reply_text"]),
+            ("ready", "on_device", "plan my week", "Here is a plan."),
+        )
+        rows = AppChatMessage.objects.filter(tenant=self.paused)
+        self.assertEqual(rows.count(), 1)
+        row = rows.get()
+        self.assertEqual((row.client_msg_id, row.source), ("ft-1", AppChatMessage.Source.ON_DEVICE))
+
+        replay = self.sync()
+        self.assertEqual(replay.status_code, 200, replay.content)
+        self.assertEqual(replay.data, first.data)
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+        refresh.assert_called_once()  # the replay schedules no second USER.md push
+
+        # A late retry of the original chat POST replays the recorded pair; it is
+        # neither refused again nor enqueued.
+        retry = self.chat()
+        self.assertEqual(retry.status_code, 200, retry.content)
+        self.assertEqual((retry.data["source"], retry.data["reply_text"]), ("on_device", "Here is a plan."))
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+        enqueue.assert_not_called()
+        wake.assert_not_called()
+
+    def test_poll_of_an_accepted_turn_never_reports_subscription_required(self, refresh, enqueue, wake, _pii):
+        # Accepted while the flag was off; the flag then opens the tenant.
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""):
+            accepted = self.chat("ft-acc")
+        self.assertEqual((accepted.status_code, accepted.data["status"]), (201, "pending"), accepted.content)
+
+        poll = self.client_for(self.paused).get("/api/v1/chat/messages/ft-acc/")
+        self.assertEqual(poll.status_code, 200, poll.content)
+        self.assertEqual((poll.data["status"], poll.data["error"]), ("pending", ""))
+        self.assertNotIn(b"subscription_required", poll.content)
+
+        retry = self.chat("ft-acc")
+        self.assertEqual((retry.status_code, retry.data["status"]), (200, "pending"), retry.content)
+        self.assertNotIn(b"subscription_required", retry.content)
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+
+
+@override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+@patch("apps.pii.redactor._detect_pii", return_value=[])
+@patch("apps.cron.publish.publish_task")
+class FreeTierAccountEndpointsTest(_PaywallClientMixin, TestCase):
+    """Every account endpoint the free tier's on-device tools call (nbhd-ios
+    ``OnDeviceToolProfile.privateConnected``) plus the on-device digest read, for a
+    paused tenant the flag opens on a paywall=2 build. Product rule: only AI is
+    gated, so every one of these is served."""
+
+    def setUp(self):
+        cache.clear()  # throttles
+        self.paused = _make_tenant()
+        self.client = self.client_for(self.paused)
+        self.today = timezone.localdate().isoformat()
+
+    def ok(self, method: str, path: str, body: dict | None = None, expected: int = 200):
+        resp = getattr(self.client, method)(path, body or {}, format="json")
+        self.assertEqual(resp.status_code, expected, f"{method.upper()} {path}: {resp.content[:300]!r}")
+        self.assertNotIn(b"subscription_required", resp.content)
+        return resp
+
+    def test_free_tier_tool_endpoints_are_served(self, wake, _pii):
+        self.ok("get", "/api/v1/journal/")
+        self.ok("post", "/api/v1/journal/", {"date": self.today, "mood": "good", "energy": "medium"}, 201)
+        self.ok("get", "/api/v1/journal/documents/")
+        self.ok("get", "/api/v1/journal/documents/memory/memory/")
+
+        self.ok("get", "/api/v1/finance/accounts/")
+        account = self.ok(
+            "post",
+            "/api/v1/finance/accounts/",
+            {"nickname": "Visa", "account_type": "credit_card", "current_balance": "100.00"},
+            201,
+        )
+        self.ok(
+            "post",
+            "/api/v1/finance/transactions/",
+            {"account": account.data["id"], "transaction_type": "payment", "amount": "10.00", "date": self.today},
+            201,
+        )
+
+        self.ok("get", "/api/v1/fuel/workouts/")
+        # A done workout also schedules the agent-authored congrats cron (an AI turn
+        # when it fires). For a billing-paused tenant ``hibernated_at`` is None, so
+        # congrats' hibernation gate does not stop it; only the scaled-to-zero
+        # container makes the gateway push fail and roll back. Pinned as-is (an open
+        # finding on PR #1832), with the slow gateway push stubbed out.
+        with patch("apps.fuel.congrats._dispatch_schedule") as congrats:
+            self.ok(
+                "post",
+                "/api/v1/fuel/workouts/",
+                {"activity": "Run", "category": "cardio", "date": self.today, "status": "done"},
+                201,
+            )
+        congrats.assert_called_once()
+        # No profile yet: the view's own 404, not a gate.
+        profile = self.client.get("/api/v1/fuel/profile/")
+        self.assertIn(profile.status_code, (200, 404), profile.content)
+        self.assertNotIn(b"subscription_required", profile.content)
+
+        self.ok("get", "/api/v1/insights/insights/")
+        self.ok(
+            "post",
+            "/api/v1/insights/insights/record/",
+            {"pillar": "gravity", "topic": "saving", "statement": "Saves on payday."},
+            201,
+        )
+
+        self.ok("get", "/api/v1/journal/tasks/")
+        task = self.ok("post", "/api/v1/journal/tasks/", {"title": "Call the bank"}, 201)
+        self.ok("post", f"/api/v1/journal/tasks/{task.data['id']}/complete/")
+
+        self.ok("get", "/api/v1/journal/goals/")
+        goal = self.ok("post", "/api/v1/journal/goals/", {"title": "Run a 10k"}, 201)
+        self.ok("post", f"/api/v1/journal/goals/{goal.data['id']}/achieve/")
+
+        context = self.ok("get", "/api/v1/chat/context/")
+        self.assertIsInstance(context.data["context_md"], str)
+
+        # None of it wakes the paused tenant's container.
+        wake.assert_not_called()
+
+    def test_prewarm_is_a_no_op_for_a_paused_tenant(self, wake, _pii):
+        Tenant.objects.filter(pk=self.paused.pk).update(hibernated_at=timezone.now() - timedelta(hours=1))
+        resp = self.client_for(self.paused).post("/api/v1/chat/prewarm/")
+        self.assertEqual((resp.status_code, resp.data), (200, {"state": "unavailable"}))
+        wake.assert_not_called()
