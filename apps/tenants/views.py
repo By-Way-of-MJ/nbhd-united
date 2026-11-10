@@ -49,10 +49,15 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         share a value, and a status change shows up immediately, not after the TTL.
 
         The rest of ``subscription`` (``active``, ``source``, ``status``, dates) is
-        cached for up to 60 s. Every Tenant save and every Apple refresh bumps the
-        ``tenant`` tag, so in practice they move together; the window where they can
-        disagree is a write that skips both (a queryset ``.update()``) or a trial
-        that expires by the clock. The disagreement that matters is ``paywall``
+        cached for up to 60 s under the ``tenant`` tag. Three writes bump that tag:
+        a Tenant ``save()`` (``post_save`` in ``apps/common/cache_signals.py``), an
+        ``apple_iap.refresh()`` that is not stale and is bound to a tenant, and a
+        successful ``AppleLinkView`` link. Nothing else does, so the two halves can
+        disagree until the TTL after a queryset ``.update()``, an
+        ``AppStoreSubscription`` written any other way, a refresh that lost the race
+        to a newer one, or a trial that expires by the clock. (Without Redis the
+        cache is per-process LocMem and a bump only reaches the worker that made
+        it.) The disagreement that matters is ``paywall``
         true beside a stale ``active`` true — e.g. a lapsed subscriber in the
         seconds before the body refreshes — and the client resolves it toward
         service: ``active == true`` wins over ``paywall`` (nbhd-ios

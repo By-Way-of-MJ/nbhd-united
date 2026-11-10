@@ -543,6 +543,60 @@ class SiriPaywallTest(_PaywallClientMixin, TestCase):
         self.assertTrue(resp.data["answered"])
         replay.assert_not_called()
 
+    def ask_as(self, tenant, header=PAYWALL_2, **extra):
+        return self.client_for(tenant, header).post(
+            "/api/v1/siri/respond/", {"intent": "what's due?", **extra}, format="json"
+        )
+
+    def test_replay_never_serves_another_tenants_turn(self, completion, enqueue, _pii):
+        # client_msg_id is unique per tenant, not globally: tenant A's stored turn
+        # under an id is invisible to tenant B refused with the same id.
+        self._stored_turn("siri-shared")
+        other = _make_tenant()
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            resp = self.ask_as(other, client_msg_id="siri-shared")
+        self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
+        self.assertNotIn(b"An earlier answer.", resp.content)
+        self.assertEqual(AppChatMessage.objects.filter(tenant=other).count(), 0)
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+        completion.assert_not_called()
+        enqueue.assert_not_called()
+
+    def test_refusal_and_replay_stay_with_their_tenant(self, completion, enqueue, _pii):
+        # A refusal persists nothing under its id, so an active tenant escalating
+        # with the same id gets a fresh turn of its own; and a stored turn of the
+        # refused tenant never comes back to the active one either.
+        completion.return_value = _completion(siri_views._ESCALATE_SENTINEL)
+        self._stored_turn("siri-stored")
+        active = _make_tenant(status=Tenant.Status.ACTIVE)
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            refused = self.ask(client_msg_id="siri-fresh")
+            served = {cid: self.ask_as(active, client_msg_id=cid) for cid in ("siri-fresh", "siri-stored")}
+        self.assertEqual(refused.data, {"answered": False, "escalated": False, "error": "subscription_required"})
+        self.assertFalse(AppChatMessage.objects.filter(tenant=self.paused, client_msg_id="siri-fresh").exists())
+        for cid, resp in served.items():
+            with self.subTest(client_msg_id=cid):
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual((resp.data["answered"], resp.data["escalated"]), (False, True))
+                self.assertEqual(resp.data["client_msg_id"], cid)
+                self.assertNotIn("error", resp.data)
+                self.assertEqual(resp.data["turn"]["reply_text"], "")
+                self.assertTrue(AppChatMessage.objects.filter(tenant=active, client_msg_id=cid).exists())
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+
+    def test_active_tenant_on_paywall2_with_flag_on_gets_a_normal_reply(self, completion, enqueue, _pii):
+        active = _make_tenant(status=Tenant.Status.ACTIVE)
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+            self.assertNoLogs("apps.router.chat_gates", level="DEBUG"),
+        ):
+            resp = self.ask_as(active)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data, {"answered": True, "escalated": False, "text": "Two tasks are due."})
+        self.snapshot.assert_called_once()
+        completion.assert_called_once()
+        enqueue.assert_not_called()
+
 
 _SHAPE_BODY = {"client_msg_id": "6f1c1f0e-3d7c-4c55-9a51-1b2f7f0e9a01", "text": "how did I sleep"}
 
@@ -747,6 +801,129 @@ class TenantMePaywallFieldTest(_PaywallClientMixin, TestCase):
         self.assertEqual(after["X-Cache"], "HIT")
         self.assertIs(after.data["subscription"]["paywall"], False)
         self.assertIs(after.data["subscription"]["active"], False)  # stale until the TTL or a bump
+
+    def test_cached_body_never_carries_paywall_in_either_order(self):
+        # The cache key (view, tenant, tag version, path, query) cannot see the
+        # header, so the body is shared by every client of the tenant. paywall is
+        # added after the cached read and never written into the cache: a web-built
+        # body serves a paywall=2 client its true value, and the paywall=2 request
+        # does not leave a true value behind for the next web/paywall=1 read.
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+            patch("apps.common.cache.cache.set", wraps=cache.set) as cache_set,
+        ):
+            reads = [self.me(self.paused, header) for header in (None, PAYWALL_2, PAYWALL_1, PAYWALL_2)]
+        self.assertEqual([r["X-Cache"] for r in reads], ["MISS", "HIT", "HIT", "HIT"])
+        self.assertEqual([r.data["subscription"]["paywall"] for r in reads], [False, True, False, True])
+        view_writes = [c for c in cache_set.call_args_list if str(c.args[0]).startswith("nbhd:view:")]
+        self.assertEqual(len(view_writes), 1)
+        self.assertNotIn("paywall", view_writes[0].args[1]["data"]["subscription"])
+
+    def test_flag_off_paused_paywall2_is_false_with_no_added_query_or_log(self):
+        self.me(_make_tenant(), header=None)  # warm per-process caches
+        baseline_tenant, gated_tenant = _make_tenant(), _make_tenant()
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""),
+            patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+        ):
+            with CaptureQueriesContext(connection) as baseline_queries:
+                baseline = self.me(baseline_tenant, header=None)
+            with (
+                CaptureQueriesContext(connection) as gated_queries,
+                self.assertNoLogs("apps.router.chat_gates", level="DEBUG"),
+                self.assertNoLogs("apps.tenants.views", level="DEBUG"),
+            ):
+                gated = self.me(gated_tenant)
+        self.assertEqual((baseline["X-Cache"], gated["X-Cache"]), ("MISS", "MISS"))
+        self.assertIs(gated.data["subscription"]["paywall"], False)
+        self.assertEqual(gated.data["subscription"], baseline.data["subscription"])
+        self.assertEqual(len(gated_queries.captured_queries), len(baseline_queries.captured_queries))
+        paused_check.assert_not_called()
+
+
+# Headers that must never be refused, however the tenant and flag are set: no
+# header (web), shipped builds, and anything that is not exactly a paywall>=2 iOS
+# contract (wrong product, wrong case, zero, leading zero, repeated param, joined copies).
+_NEVER_REFUSED = (
+    None,
+    PAYWALL_1,
+    DUPLICATED,
+    "ios/2.4.4/110; paywall=0",
+    "ios/2.4.4/110; paywall=02",
+    "ios/2.4.4/110; paywall=2; paywall=2",
+    "iOS/2.4.4/110; paywall=2",
+    "android/2.4.4/110; paywall=2",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
+)
+
+
+@override_settings(OPENROUTER_API_KEY="test-only", TEST_MODE=True, TALK_ROUTE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS="*")
+@patch("apps.pii.redactor._detect_pii", return_value=[])
+@patch("apps.cron.publish.publish_task")
+@patch("apps.router.chat_views.enqueue_message_for_tenant")
+@patch("apps.common.openrouter.chat_completion", return_value=_completion("Two tasks are due."))
+class HeaderFirstPerViewTest(_PaywallClientMixin, TestCase):
+    """Each gated view, for a paused tenant the flag opens: a request that does not
+    declare paywall>=2 is served, and the gate neither reads the flag nor runs
+    ``ai_paused`` nor logs for it."""
+
+    def setUp(self):
+        cache.clear()  # throttles
+        self.paused = _make_tenant()
+        for target, attr, kwargs in (
+            (siri_views, "_placeholder_snapshot", {"return_value": "STATE"}),
+            (siri_views, "_placeholder_intent", {"side_effect": lambda tenant, text, ingress=None: text}),
+            (chat_shape_views, "shape_chat", {"return_value": ChatShapeResponse(reason="no_panel")}),
+        ):
+            patcher = patch.object(target, attr, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch(
+            "apps.router.talk_route._route_talk", return_value=TalkRouteResponse(ack_kind="tasks", reason="ok")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_served(self, endpoint: str, header: str | None, n: int) -> None:
+        client = self.client_for(self.paused, header)
+        if endpoint == "chat_messages":
+            resp = client.post(
+                "/api/v1/chat/messages/", {"text": "plan my week", "client_msg_id": f"hf-{n}"}, format="json"
+            )
+            self.assertEqual((resp.status_code, resp.data["status"]), (201, "pending"), resp.content)
+        elif endpoint == "siri_respond":
+            resp = client.post("/api/v1/siri/respond/", {"intent": "what's due?"}, format="json")
+            self.assertEqual(resp.data, {"answered": True, "escalated": False, "text": "Two tasks are due."})
+        elif endpoint == "talk_route":
+            resp = client.post("/api/v1/chat/talk-route/", {"text": "log a run"}, format="json")
+            self.assertEqual((resp.data["ack_kind"], resp.data["reason"]), ("tasks", "ok"))
+        else:
+            resp = client.post("/api/v1/chat/shape/", _SHAPE_BODY, format="json")
+            self.assertEqual((resp.data["enabled"], resp.data["reason"]), (True, "no_panel"))
+        self.assertNotIn(b"subscription_required", resp.content)
+
+    def test_non_paywall2_requests_never_refused_on_any_gated_view(self, completion, enqueue, wake, _pii):
+        n = 0
+        for endpoint in ("chat_messages", "siri_respond", "talk_route", "chat_shape"):
+            for header in _NEVER_REFUSED:
+                n += 1
+                with (
+                    self.subTest(endpoint=endpoint, header=header),
+                    override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)),
+                    patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+                    patch("apps.router.chat_gates._tenant_allowed", wraps=_tenant_allowed) as flag_check,
+                    self.assertNoLogs("apps.router.chat_gates", level="DEBUG"),
+                ):
+                    self.assert_served(endpoint, header, n)
+                    paused_check.assert_not_called()
+                    paywall_flag_reads = [
+                        c for c in flag_check.call_args_list if c.args[1] == "IOS_PAYWALL_ENFORCE_TENANT_IDS"
+                    ]
+                    self.assertEqual(paywall_flag_reads, [])
+        # The same tenant and flag with a paywall=2 header IS refused (the control).
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)):
+            resp = self.client_for(self.paused).post("/api/v1/siri/respond/", {"intent": "what's due?"}, format="json")
+        self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
 
 
 class PaywallFlagValueTest(TestCase):
