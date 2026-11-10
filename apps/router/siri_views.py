@@ -190,6 +190,19 @@ class SiriRespondView(APIView):
       "turn": {...}}`` — routed to the full tenant agent (Tier 3). The client
       polls ``GET /api/v1/chat/messages/<client_msg_id>/`` for the reply (and may
       surface a budget error there if the tenant is over budget).
+    * ``{"answered": false, "escalated": false, "error": "subscription_required"}``
+      — the iOS paywall refused a paused tenant on a paywall>=2 build (dark
+      unless ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` opens the tenant).
+
+    Unlike ``POST /chat/messages/``, which replays a known ``client_msg_id``
+    before the paywall check, this view has no up-front replay read: the fast
+    answer is a stateless read and runs on every ask, and the ``client_msg_id``
+    is only consulted inside ``enqueue_tenant_turn`` at escalation, after the
+    fast model. So a refused Siri retry of a turn escalated before the pause
+    gets ``subscription_required``, not the stored turn; the turn itself stays
+    readable through ``GET /chat/messages/<client_msg_id>/``. Adding a replay
+    read here would put a query on every ask from every client to serve a retry
+    the client does not make (it polls the message endpoint instead).
     """
 
     permission_classes = [IsAuthenticated]

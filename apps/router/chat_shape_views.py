@@ -10,7 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.router.chat_gates import ios_paywall_refuses
+from apps.router.chat_gates import chat_shape_enabled, ios_paywall_refuses
 from apps.router.chat_shape import SHAPE_BUDGET_SECONDS, ChatShapeRequest, ChatShapeResponse, shape_chat
 from apps.tenants.throttling import _UserScopedThrottle
 
@@ -39,8 +39,10 @@ class ChatShapeView(APIView):
         try:
             tenant = getattr(request.user, "tenant", None)
             # iOS paywall (dark by default): a paused tenant on a paywall>=2 build gets
-            # the existing "unavailable" answer (no panel) and no model call.
-            if ios_paywall_refuses(request, tenant, endpoint="chat_shape"):
+            # the existing "unavailable" answer (no panel) and no model call. Only
+            # where shape is enabled: a tenant outside CHAT_SHAPE_TENANT_IDS keeps
+            # today's enabled=false/"disabled" answer, which the app latches on.
+            if chat_shape_enabled(tenant) and ios_paywall_refuses(request, tenant, endpoint="chat_shape"):
                 result = ChatShapeResponse(reason="unavailable")
                 result.latency_ms = max(0, round((perf_counter() - started) * 1000))
                 return Response(result.model_dump(mode="json"))

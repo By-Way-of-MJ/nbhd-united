@@ -332,6 +332,7 @@ class MeView(APIView):
 
         try:
             tenant = user.tenant
+            # subscription: no `paywall` here; only `/tenants/me/` computes it; clients default to false.
             user_data["tenant"] = TenantSerializer(tenant).data
         except Tenant.DoesNotExist:
             user_data["tenant"] = None

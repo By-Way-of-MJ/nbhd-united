@@ -14,20 +14,26 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.core.cache import cache
+from django.db import connection
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from apps.billing.entitlement import ai_paused
 from apps.billing.models import AppStoreSubscription
 from apps.router import chat_shape_views, siri_views, talk_route_views
-from apps.router.chat_gates import ios_paywall_version
+from apps.router.chat_gates import _tenant_allowed, ios_paywall_version
+from apps.router.chat_shape import ChatShapeResponse
 from apps.router.chat_views import _get_or_create_main_thread
 from apps.router.models import AppChatMessage
+from apps.router.talk_route import TalkRouteResponse
 from apps.tenants.models import Tenant, User
 
 PAYWALL_1 = "ios/2.4.2/108; paywall=1"
 PAYWALL_2 = "ios/2.4.4/110; paywall=2"
+# Two copies of the header comma-joined by a proxy: must read as an old client.
+DUPLICATED = "ios/2.4.2/108, ios/2.4.4/110; paywall=2"
 SUBSCRIPTION_REQUIRED = {"status": "error", "error": "subscription_required"}
 
 
@@ -46,30 +52,72 @@ class IOSPaywallVersionParseTest(SimpleTestCase):
             ("   ", 0),
             (PAYWALL_1, 1),
             (PAYWALL_2, 2),
+            # The exact string the shipped app builds (nbhd-ios ClientIdentity.headerValue).
+            ("ios/2.4.2/108; paywall=1", 1),
+            ("ios/0/0; paywall=1", 1),  # its fallback when Info.plist keys are missing
             ("ios/2.4.4/110;paywall=3", 3),
             ("  ios/2.4.4/110 ;  locale=ja ; PayWall = 2 ; extra  ", 2),
-            ("ios/2.4.4/110; locale=ja; paywall=2; paywall=0", 2),  # first one wins
+            ("\tios/2.4.4/110;\tpaywall=2\t", 2),  # ASCII tab is HTTP whitespace
+            ("ios/2.4.4/110; paywall=0", 0),
+            ("ios/2.4.4/110; paywall=999999", 999999),
+            # More than one paywall param: ambiguous, so 0 (whichever order).
+            ("ios/2.4.4/110; locale=ja; paywall=2; paywall=0", 0),
+            ("ios/2.4.4/110; paywall=2; paywall=2", 0),
+            ("ios/2.4.4/110; paywall; paywall=2", 0),
+            ("ios/2.4.4/110; PAYWALL=2; paywall=2", 0),
+            # Any comma: a proxy comma-joined two copies of the header.
+            ("ios/2.4.2/108, ios/2.4.4/110; paywall=2", 0),
+            ("ios/2.4.4/110; paywall=2, ios/2.4.2/108; paywall=1", 0),
+            ("ios/2.4.4/110; paywall=2,", 0),
+            # Leading zeros are not a contract value.
+            ("ios/2.4.4/110; paywall=02", 0),
+            ("ios/2.4.4/110; paywall=000002", 0),
+            ("ios/2.4.4/110; paywall=00", 0),
+            # Only ASCII space/tab is stripped.
+            ("ios/2.4.4/110; paywall=\u00a02", 0),  # NBSP
+            ("ios/2.4.4/110; paywall=2\u00a0", 0),
+            ("ios/2.4.4/110;\u00a0paywall=2", 0),
+            ("ios/2.4.4/110; paywall=2\x0b", 0),  # vertical tab
+            ("\u00a0ios/2.4.4/110; paywall=2", 0),
+            ("ios/2.4.4/110; paywall=\u20032", 0),  # em space
+            # A product token is required after ios/.
+            ("ios/; paywall=2", 0),
+            ("ios/ ; paywall=2", 0),
+            ("ios; paywall=2", 0),
+            ("ios/;=;paywall==2", 0),
             ("ios/2.4.4/110", 0),
             ("ios/2.4.4/110; paywall", 0),
             ("ios/2.4.4/110; paywall=", 0),
             ("ios/2.4.4/110; paywall=abc", 0),
             ("ios/2.4.4/110; paywall=2abc", 0),
+            ("ios/2.4.4/110; paywall=2x", 0),
+            ("ios/2.4.4/110; paywall=+2", 0),
             ("ios/2.4.4/110; paywall=-2", 0),
             ("ios/2.4.4/110; paywall=2.0", 0),
-            ("ios/2.4.4/110; paywall=٢", 0),  # Arabic-Indic digit two
-            ("ios/2.4.4/110; paywall=" + "9" * 400, 0),  # absurdly large
+            ("ios/2.4.4/110; paywall=2 2", 0),
+            ("ios/2.4.4/110; paywall=\u0662", 0),  # Arabic-Indic digit two
+            ("ios/2.4.4/110; paywall=\uff12", 0),  # fullwidth digit two
+            ("ios/2.4.4/110; paywall=\u00b2", 0),  # superscript two
             ("ios/2.4.4/110; paywall=9999999", 0),  # 7 digits: junk, not a contract
-            ("ios/2.4.4/110; paywall=999999", 999999),
+            ("ios/2.4.4/110; paywall=" + "9" * 400, 0),  # absurdly large
+            ("ios/" + "1" * 242 + "; paywall=2", 0),  # 257 characters: over the limit
             ("web/1.0; paywall=2", 0),
             ("android/1.0/1; paywall=2", 0),
             ("iOS/2.4.4/110; paywall=2", 0),  # the app always sends lowercase
+            ("IOS/2.4.4/110; paywall=2", 0),
             ("paywall=2", 0),
             ("garbage;;;===;", 0),
-            ("ios/;=;paywall==2", 0),
         ]
         for value, expected in cases:
             with self.subTest(value=value):
                 self.assertEqual(self._version(value), expected)
+
+    def test_header_at_the_length_limit_still_parses(self):
+        tail = "; paywall=2"
+        value = "ios/" + "1" * (256 - len("ios/") - len(tail)) + tail
+        self.assertEqual(len(value), 256)
+        self.assertEqual(self._version(value), 2)
+        self.assertEqual(self._version(value[:4] + "1" + value[4:]), 0)
 
     def test_never_raises_on_odd_request_objects(self):
         class NoMeta:
@@ -119,6 +167,23 @@ class AiPausedTest(TestCase):
         _apple(lapsed_apple, entitles=False)
         self.assertTrue(ai_paused(lapsed_apple))
         self.assertFalse(ai_paused(None))
+        # Only SUSPENDED is paused. In particular a normal Stripe cancellation goes
+        # DEPROVISIONING -> DELETED, so a churned Stripe user is never refused (known gap).
+        for status in (
+            Tenant.Status.PENDING,
+            Tenant.Status.PROVISIONING,
+            Tenant.Status.DEPROVISIONING,
+            Tenant.Status.DELETED,
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(ai_paused(_make_tenant(status=status)))
+        # SUSPENDED with is_trial still true is never paused (same as Telegram/LINE).
+        self.assertFalse(ai_paused(_make_tenant(is_trial=True)))
+
+    def test_paused_tenant_costs_one_query(self):
+        tenant = _make_tenant()
+        with self.assertNumQueries(1):
+            self.assertTrue(ai_paused(tenant))
 
     def test_active_tenant_costs_no_query(self):
         tenant = _make_tenant(status=Tenant.Status.ACTIVE)
@@ -257,15 +322,73 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
         self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
         enqueue.assert_not_called()
 
-    def test_flag_off_still_logs_paused_turn_for_adoption(self, enqueue, wake, _pii):
+    def test_flag_off_paywall2_logs_paused_turn_for_adoption(self, enqueue, wake, _pii):
+        # A new build from a paused tenant is still measured while the flag is off.
         with (
             override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""),
             self.assertLogs("apps.router.chat_gates", level="INFO") as logs,
         ):
-            self.post(self.paused, header=PAYWALL_1)
-        self.assertEqual(logs.records[0].paywall, 1)
+            resp = self.post(self.paused)
+        self.assert_served(resp, self.paused, enqueue)
+        self.assertEqual(len(logs.records), 1)
+        self.assertEqual(logs.records[0].paywall, 2)
         self.assertIs(logs.records[0].flag_allowed, False)
         self.assertIs(logs.records[0].refused, False)
+
+    def counted_post(self, tenant, header=PAYWALL_2):
+        """``(response, number of queries)`` for one chat send."""
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.post(tenant, header=header)
+        return resp, len(ctx.captured_queries)
+
+    def assert_gate_adds_nothing(self, enqueue, *, header, status=Tenant.Status.SUSPENDED):
+        """The same send with the gate stubbed out vs. real: equal query counts and
+        no gate log line, from two identically-built tenants."""
+        baseline_tenant, gated_tenant = _make_tenant(status=status), _make_tenant(status=status)
+        with patch("apps.router.chat_views.ios_paywall_refuses", return_value=False):
+            _resp, baseline = self.counted_post(baseline_tenant, header)
+        enqueue.reset_mock()
+        with self.assertNoLogs("apps.router.chat_gates", level="DEBUG"):
+            resp, gated = self.counted_post(gated_tenant, header)
+        self.assert_served(resp, gated_tenant, enqueue)
+        self.assertEqual(gated, baseline)
+
+    def test_old_clients_cost_no_query_and_no_log(self, enqueue, wake, _pii):
+        # Web (no header), every shipped build (paywall=1) and a comma-joined
+        # duplicate header return before ai_paused: no added query, no log line —
+        # with the flag on and the tenant paused, i.e. the worst case for them.
+        self.post(_make_tenant(), header=None, client_msg_id="warm")  # warm per-process caches
+        for label, header in (("web", None), ("paywall1", PAYWALL_1), ("dup", DUPLICATED)):
+            with (
+                self.subTest(label),
+                override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+                patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+            ):
+                enqueue.reset_mock()
+                self.assert_gate_adds_nothing(enqueue, header=header)
+                paused_check.assert_not_called()
+
+    def test_active_tenant_on_paywall2_costs_no_query(self, enqueue, wake, _pii):
+        self.post(_make_tenant(status=Tenant.Status.ACTIVE), client_msg_id="warm")
+        enqueue.reset_mock()
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            self.assert_gate_adds_nothing(enqueue, header=PAYWALL_2, status=Tenant.Status.ACTIVE)
+
+    def test_refused_without_client_msg_id(self, enqueue, wake, _pii):
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            resp = self.client_for(self.paused).post("/api/v1/chat/messages/", {"text": "hi"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(set(resp.data), {"client_msg_id", "status", "error"})
+        self.assertEqual({k: resp.data[k] for k in ("status", "error")}, SUBSCRIPTION_REQUIRED)
+        self.assertRegex(resp.data["client_msg_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 0)
+        enqueue.assert_not_called()
+        wake.assert_not_called()
+
+    def test_duplicated_header_served_as_today(self, enqueue, wake, _pii):
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            resp = self.post(self.paused, header=DUPLICATED)
+        self.assert_served(resp, self.paused, enqueue)
 
 
 def _completion(text: str) -> tuple[dict, str]:
@@ -285,14 +408,25 @@ class SiriPaywallTest(_PaywallClientMixin, TestCase):
         self.addCleanup(snapshot.stop)
         self.addCleanup(intent.stop)
 
-    def ask(self, header=PAYWALL_2):
+    def ask(self, header=PAYWALL_2, **extra):
         return self.client_for(self.paused, header).post(
-            "/api/v1/siri/respond/", {"intent": "what's due?"}, format="json"
+            "/api/v1/siri/respond/", {"intent": "what's due?", **extra}, format="json"
         )
 
     def test_refused_before_placeholder_work_and_any_model(self, completion, enqueue, _pii):
-        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)):
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)),
+            self.assertLogs("apps.router.chat_gates", level="INFO") as logs,
+        ):
             resp = self.ask()
+        self.assertEqual(len(logs.records), 1)
+        record = logs.records[0]
+        self.assertEqual(record.endpoint, "siri_respond")
+        self.assertEqual(record.tenant_id, str(self.paused.id))
+        self.assertEqual(record.paywall, 2)
+        self.assertIs(record.flag_allowed, True)
+        self.assertIs(record.refused, True)
+        self.assertNotIn("what's due", logs.output[0])
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
         self.snapshot.assert_not_called()
@@ -315,61 +449,121 @@ class SiriPaywallTest(_PaywallClientMixin, TestCase):
         self.assertTrue(resp.data["answered"])
         completion.assert_called_once()
 
+    def test_no_replay_before_refusal_unlike_chat_send(self, completion, enqueue, _pii):
+        # Documented difference from POST /chat/messages/: Siri has no up-front
+        # replay read, so a known client_msg_id is refused too, and the stored
+        # turn is left exactly as it was.
+        AppChatMessage.objects.create(
+            tenant=self.paused,
+            user=self.paused.user,
+            thread=_get_or_create_main_thread(self.paused, self.paused.user),
+            client_msg_id="siri-old",
+            user_text="from before the pause",
+            reply_text="An earlier answer.",
+            status=AppChatMessage.Status.READY,
+        )
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            resp = self.ask(client_msg_id="siri-old")
+        self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
+        stored = AppChatMessage.objects.get(tenant=self.paused)
+        self.assertEqual((stored.client_msg_id, stored.status), ("siri-old", AppChatMessage.Status.READY))
+        completion.assert_not_called()
+        enqueue.assert_not_called()
+
+
+_SHAPE_BODY = {"client_msg_id": "6f1c1f0e-3d7c-4c55-9a51-1b2f7f0e9a01", "text": "how did I sleep"}
+
 
 @override_settings(OPENROUTER_API_KEY="test-only", TEST_MODE=True)
 class TalkAndShapePaywallTest(_PaywallClientMixin, TestCase):
+    """The gate only applies where the feature is enabled for the tenant; a tenant
+    outside the feature's allowlist keeps today's ``disabled`` answer either way."""
+
     def setUp(self):
         self.paused = _make_tenant()
 
-    def test_talk_route_degraded_without_model_call(self):
+    def talk(self, header=PAYWALL_2, **flags):
+        ok = TalkRouteResponse(ack_kind="tasks", reason="ok")
         with (
             patch.object(talk_route_views, "route_talk", wraps=talk_route_views.route_talk) as route_talk,
-            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="*"),
+            patch("apps.router.talk_route._route_talk", return_value=ok),
+            override_settings(**flags),
         ):
-            resp = self.client_for(self.paused).post("/api/v1/chat/talk-route/", {"text": "log a run"}, format="json")
+            resp = self.client_for(self.paused, header).post(
+                "/api/v1/chat/talk-route/", {"text": "log a run"}, format="json"
+            )
         self.assertEqual(resp.status_code, 200, resp.content)
         body = dict(resp.data)
-        body.pop("latency_ms")
+        self.assertGreaterEqual(body.pop("latency_ms"), 0)
+        return body, route_talk
+
+    def shape(self, header=PAYWALL_2, **flags):
+        served = ChatShapeResponse(reason="no_panel")
+        with (
+            patch.object(chat_shape_views, "shape_chat", return_value=served) as shape_chat,
+            override_settings(**flags),
+        ):
+            resp = self.client_for(self.paused, header).post("/api/v1/chat/shape/", _SHAPE_BODY, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        return resp.data, shape_chat
+
+    # -- talk-route --------------------------------------------------------
+
+    def test_talk_route_degraded_without_model_call(self):
+        body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="*")
         self.assertEqual(body, {"ack_kind": "other", "quick_read": "none", "reason": "unavailable"})
         route_talk.assert_not_called()
 
-    def test_talk_route_paywall1_reaches_model_function(self):
-        with (
-            patch.object(talk_route_views, "route_talk", wraps=talk_route_views.route_talk) as route_talk,
-            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS=""),
-        ):
-            resp = self.client_for(self.paused, PAYWALL_1).post(
-                "/api/v1/chat/talk-route/", {"text": "log a run"}, format="json"
-            )
-        self.assertEqual(resp.data["reason"], "disabled")
+    def test_talk_route_feature_off_keeps_disabled_answer(self):
+        body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="")
+        self.assertEqual(body, {"ack_kind": "other", "quick_read": "none", "reason": "disabled"})
         route_talk.assert_called_once()
 
+    def test_talk_route_paywall1_served(self):
+        body, route_talk = self.talk(PAYWALL_1, IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="*")
+        self.assertEqual(body, {"ack_kind": "tasks", "quick_read": "none", "reason": "ok"})
+        route_talk.assert_called_once()
+
+    def test_talk_route_paywall_flag_off_served(self):
+        body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="", TALK_ROUTE_TENANT_IDS="*")
+        self.assertEqual(body, {"ack_kind": "tasks", "quick_read": "none", "reason": "ok"})
+        route_talk.assert_called_once()
+
+    # -- chat shape --------------------------------------------------------
+
     def test_chat_shape_degraded_without_model_call(self):
-        with (
-            patch.object(chat_shape_views, "shape_chat", wraps=chat_shape_views.shape_chat) as shape_chat,
-            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS="*"),
-        ):
-            resp = self.client_for(self.paused).post(
-                "/api/v1/chat/shape/",
-                {"client_msg_id": "6f1c1f0e-3d7c-4c55-9a51-1b2f7f0e9a01", "text": "how did I sleep"},
-                format="json",
-            )
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(resp.data["reason"], "unavailable")
-        self.assertIs(resp.data["enabled"], True)
-        self.assertIsNone(resp.data["panel"])
+        data, shape_chat = self.shape(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS="*")
+        self.assertEqual(data["reason"], "unavailable")
+        self.assertIs(data["enabled"], True)  # not latched off: the app asks again after payment
+        self.assertIsNone(data["panel"])
         shape_chat.assert_not_called()
 
-    def test_chat_shape_flag_off_reaches_model_function(self):
+    def test_chat_shape_feature_off_keeps_disabled_answer(self):
+        with (
+            patch.object(chat_shape_views, "shape_chat", wraps=chat_shape_views.shape_chat) as shape_chat,
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS=""),
+        ):
+            resp = self.client_for(self.paused).post("/api/v1/chat/shape/", _SHAPE_BODY, format="json")
+        self.assertEqual(resp.data["reason"], "disabled")
+        self.assertIs(resp.data["enabled"], False)
+        shape_chat.assert_called_once()
+
+    def test_chat_shape_paywall1_served(self):
+        data, shape_chat = self.shape(PAYWALL_1, IOS_PAYWALL_ENFORCE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS="*")
+        self.assertEqual((data["enabled"], data["reason"]), (True, "no_panel"))
+        shape_chat.assert_called_once()
+
+    def test_chat_shape_paywall_flag_off_served(self):
+        data, shape_chat = self.shape(IOS_PAYWALL_ENFORCE_TENANT_IDS="", CHAT_SHAPE_TENANT_IDS="*")
+        self.assertEqual((data["enabled"], data["reason"]), (True, "no_panel"))
+        shape_chat.assert_called_once()
+
+    def test_chat_shape_flag_off_feature_off_reaches_model_function(self):
         with (
             patch.object(chat_shape_views, "shape_chat", wraps=chat_shape_views.shape_chat) as shape_chat,
             override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="", CHAT_SHAPE_TENANT_IDS=""),
         ):
-            resp = self.client_for(self.paused).post(
-                "/api/v1/chat/shape/",
-                {"client_msg_id": "6f1c1f0e-3d7c-4c55-9a51-1b2f7f0e9a01", "text": "how did I sleep"},
-                format="json",
-            )
+            resp = self.client_for(self.paused).post("/api/v1/chat/shape/", _SHAPE_BODY, format="json")
         self.assertEqual(resp.data["reason"], "disabled")
         shape_chat.assert_called_once()
 
@@ -412,17 +606,24 @@ class TenantMePaywallFieldTest(_PaywallClientMixin, TestCase):
         cache.clear()  # /tenants/me/ body is tenant-cached for 60 s
         self.paused = _make_tenant()
 
-    def paywall(self, tenant, header=PAYWALL_2):
+    def me(self, tenant, header=PAYWALL_2):
         resp = self.client_for(tenant, header).get("/api/v1/tenants/me/")
         self.assertEqual(resp.status_code, 200, resp.content)
-        return resp.data["subscription"]["paywall"]
+        return resp
+
+    def paywall(self, tenant, header=PAYWALL_2):
+        return self.me(tenant, header).data["subscription"]["paywall"]
 
     def test_true_only_in_the_refuse_case(self):
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)):
-            self.assertIs(self.paywall(self.paused), True)
-            self.assertIs(self.paywall(self.paused, PAYWALL_1), False)
-            self.assertIs(self.paywall(self.paused, None), False)  # web
-            self.assertIs(self.paywall(self.paused), True)  # cached body, fresh value
+            first = self.me(self.paused)
+            self.assertEqual(first["X-Cache"], "MISS")
+            self.assertIs(first.data["subscription"]["paywall"], True)
+            for header, expected in ((PAYWALL_1, False), (None, False), (DUPLICATED, False), (PAYWALL_2, True)):
+                with self.subTest(header=header):
+                    resp = self.me(self.paused, header)
+                    self.assertEqual(resp["X-Cache"], "HIT")  # cached body, fresh value
+                    self.assertIs(resp.data["subscription"]["paywall"], expected)
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""):
             self.assertIs(self.paywall(self.paused), False)
 
@@ -439,3 +640,60 @@ class TenantMePaywallFieldTest(_PaywallClientMixin, TestCase):
             {"apple_status", "active", "source", "status", "renews_at", "auto_renew", "trial_ends_at", "paywall"},
         )
         self.assertIs(subscription["active"], False)
+
+    def test_gate_failure_never_breaks_the_profile(self):
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+            patch("apps.router.chat_gates.ios_paywall_refuses", side_effect=RuntimeError("boom")),
+            self.assertLogs("apps.tenants.views", level="ERROR") as logs,
+        ):
+            resp = self.me(self.paused)
+        self.assertIs(resp.data["subscription"]["paywall"], False)
+        self.assertEqual(resp.data["id"], str(self.paused.id))
+        self.assertIn("paywall computation failed", logs.output[0])
+
+    def test_paywall_flips_on_payment_while_body_is_still_cached(self):
+        # The Apple row below is created directly (no refresh(), so no tag bump):
+        # the cached body still says active=False, but paywall is computed fresh.
+        # This is the documented up-to-60 s disagreement; the client treats
+        # paywall=false + active=false as "unknown", never as "unpaid".
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            before = self.me(self.paused)
+            self.assertEqual(before["X-Cache"], "MISS")
+            self.assertIs(before.data["subscription"]["paywall"], True)
+            _apple(self.paused, entitles=True)
+            after = self.me(self.paused)
+        self.assertEqual(after["X-Cache"], "HIT")
+        self.assertIs(after.data["subscription"]["paywall"], False)
+        self.assertIs(after.data["subscription"]["active"], False)  # stale until the TTL or a bump
+
+
+class PaywallFlagValueTest(TestCase):
+    """How ``_tenant_allowed`` (shared by every rollout flag) reads odd values."""
+
+    def test_malformed_flag_values(self):
+        tenant = _make_tenant()
+        tid = str(tenant.id)
+        other = "00000000-0000-0000-0000-000000000001"
+        cases = [
+            ("", False),
+            ("garbage", False),
+            ("*x", False),  # only a lone "*" token means everyone
+            ("**", False),
+            ("x*", False),
+            (" * ", True),  # tokens are trimmed
+            ("garbage,*", True),  # any lone "*" token opens every tenant
+            (f"{tid},", True),
+            (f",{tid},,", True),
+            (f" {tid} ", True),
+            (tid.upper(), True),  # uuid.UUID is case-insensitive
+            (tid.replace("-", ""), True),  # and accepts the 32-hex form
+            (f"{{{tid}}}", True),  # and braces
+            (f"urn:uuid:{tid}", True),  # and the URN form
+            (f"{other},garbage", False),
+            (f"{tid}x", False),
+            (tid[:-1], False),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=value):
+                self.assertIs(_tenant_allowed(tenant, "IOS_PAYWALL_ENFORCE_TENANT_IDS"), expected)

@@ -47,16 +47,31 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         which the tenant cache key cannot see, so it is computed per request on top
         of the cached body: a web call and an iOS call for the same tenant never
         share a value, and a status change shows up immediately, not after the TTL.
+
+        The rest of ``subscription`` (``active``, ``source``, ``status``, dates) is
+        cached for up to 60 s. Every Tenant save and every Apple refresh bumps the
+        ``tenant`` tag, so in practice they move together; the window where they can
+        disagree is a write that skips both (a queryset ``.update()``) or a trial
+        that expires by the clock. The disagreement that matters is ``paywall``
+        true beside a stale ``active`` true — e.g. a lapsed subscriber in the
+        seconds before the body refreshes — and the client resolves it toward
+        service: ``active == true`` wins over ``paywall`` (nbhd-ios
+        ``PlanGate(plan:)``), and chat send is refused server-side regardless. The
+        reverse (``paywall`` false, stale ``active`` false right after paying) only
+        shows the plan screen for the remainder of the TTL.
         """
         response = self._me_cached(request)
         subscription = response.data.get("subscription") if response.status_code == 200 else None
         if isinstance(subscription, dict):
             from apps.router.chat_gates import ios_paywall_refuses
 
-            response.data = {
-                **response.data,
-                "subscription": {**subscription, "paywall": ios_paywall_refuses(request, request.user.tenant)},
-            }
+            try:
+                paywall = ios_paywall_refuses(request, request.user.tenant)
+            except Exception:
+                # Never fail the profile over this field; false = "not refused".
+                logger.exception("tenants/me: paywall computation failed")
+                paywall = False
+            response.data = {**response.data, "subscription": {**subscription, "paywall": paywall}}
         return response
 
     @tenant_cache(
@@ -135,6 +150,7 @@ class OnboardTenantView(APIView):
         if invite_token:
             self._claim_invite_quietly(tenant, user, invite_token)
 
+        # subscription: no `paywall` here; only `/tenants/me/` computes it; clients default to false.
         return Response(TenantSerializer(tenant).data, status=status.HTTP_201_CREATED)
 
     @staticmethod

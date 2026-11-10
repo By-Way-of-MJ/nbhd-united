@@ -38,7 +38,10 @@ def ai_paused(tenant) -> bool:
     The same predicate the Telegram/LINE channels inline at their five refusal sites
     (``status == SUSPENDED and not is_trial and not is_paying``), plus the budget-exempt
     exclusion: canary/internal accounts sit outside the billing lifecycle and are never
-    paused. Status is checked first so an active tenant costs no query.
+    paused. Status, trial and exemption are checked first, so only a suspended,
+    non-trial, non-exempt tenant without a Stripe id reaches the one query (the
+    entitling Apple-subscription ``exists()``): an active tenant costs none, a paused
+    one costs exactly one.
     """
     if tenant is None:
         return False

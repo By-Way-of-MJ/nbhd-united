@@ -516,4 +516,5 @@ class AppleSyncView(APIView):
             logger.warning("Apple sync failed for tenant %s", tenant.id, exc_info=True)
             return Response({"detail": "That purchase couldn't be applied."}, status=http_status.HTTP_400_BAD_REQUEST)
         tenant.refresh_from_db()
+        # No `paywall` here; only `/tenants/me/` computes it; clients default to false.
         return Response({"subscription": apple_iap.subscription_summary(tenant)})
