@@ -95,6 +95,10 @@ _PAYWALL_VALUE = re.compile(r"0|[1-9][0-9]{0,5}")
 # HTTP optional whitespace is space and tab only; ``str.strip()`` would also eat
 # NBSP, vertical tab and other Unicode spaces, which no real client sends.
 _OWS = " \t"
+# The whole header must be printable ASCII plus tab: the app builds it from its
+# version strings, so a control character or any non-ASCII byte anywhere (not
+# just around the paywall value) means it was not our client that wrote it.
+_HEADER_CHARS = re.compile(r"[\t\x20-\x7e]*")
 
 
 def ios_paywall_version(request) -> int:
@@ -108,11 +112,22 @@ def ios_paywall_version(request) -> int:
     missing, non-iOS, over 256 characters, any comma (a proxy can comma-join two
     copies of the header, and ``ios/2.4.2/108, ios/2.4.4/110; paywall=2`` must not
     read as 2), a repeated ``paywall`` param, signs, decimals, leading zeros,
-    non-ASCII digits, and whitespace other than ASCII space/tab around tokens.
+    any character outside printable ASCII and tab (non-ASCII digits, NBSP,
+    vertical tab, control characters), and whitespace other than ASCII space/tab
+    around tokens.
+
+    The real header (nbhd-ios ``ClientIdentity.headerValue``, stamped on every
+    backend request by ``BackendClient``) is ``ios/<CFBundleShortVersionString>/
+    <CFBundleVersion>; paywall=<n>``, e.g. ``ios/2.4.4/110; paywall=2``.
     """
     try:
         raw = request.META.get("HTTP_X_NBHD_CLIENT", "")
-        if not isinstance(raw, str) or len(raw) > _IOS_CLIENT_HEADER_MAX or "," in raw:
+        if (
+            not isinstance(raw, str)
+            or len(raw) > _IOS_CLIENT_HEADER_MAX
+            or "," in raw
+            or not _HEADER_CHARS.fullmatch(raw)
+        ):
             return 0
         product, *params = raw.split(";")
         product = product.strip(_OWS)
@@ -122,7 +137,7 @@ def ios_paywall_version(request) -> int:
         for param in params:
             key, sep, value = param.partition("=")
             key = key.strip(_OWS)
-            if key.isascii() and key.lower() == "paywall":
+            if key.lower() == "paywall":
                 values.append(value.strip(_OWS) if sep else "")
         if len(values) != 1 or not _PAYWALL_VALUE.fullmatch(values[0]):
             return 0

@@ -55,6 +55,8 @@ class IOSPaywallVersionParseTest(SimpleTestCase):
             # The exact string the shipped app builds (nbhd-ios ClientIdentity.headerValue).
             ("ios/2.4.2/108; paywall=1", 1),
             ("ios/0/0; paywall=1", 1),  # its fallback when Info.plist keys are missing
+            ("ios/2.5.0/120; paywall=2", 2),  # the same shape from a free-tier build
+            ("ios/0/0; paywall=2", 2),
             ("ios/2.4.4/110;paywall=3", 3),
             ("  ios/2.4.4/110 ;  locale=ja ; PayWall = 2 ; extra  ", 2),
             ("\tios/2.4.4/110;\tpaywall=2\t", 2),  # ASCII tab is HTTP whitespace
@@ -80,6 +82,14 @@ class IOSPaywallVersionParseTest(SimpleTestCase):
             ("ios/2.4.4/110; paywall=2\x0b", 0),  # vertical tab
             ("\u00a0ios/2.4.4/110; paywall=2", 0),
             ("ios/2.4.4/110; paywall=\u20032", 0),  # em space
+            # Nothing outside printable ASCII + tab anywhere in the header, so a
+            # second, mangled paywall param can't hide behind a non-ASCII key.
+            ("ios/2.4.4/110; paywall=2;\x0bpaywall=3", 0),
+            ("ios/2.4.4/110; paywall=2; \u00a0paywall=3", 0),
+            ("ios/2.4.4/110\u00e9; paywall=2", 0),
+            ("ios/2.4.4/110\x01; paywall=2", 0),
+            ("ios/2.4.4/110; paywall=2\r\n", 0),
+            ("ios/2.4.4/110; paywall=2\x7f", 0),
             # A product token is required after ios/.
             ("ios/; paywall=2", 0),
             ("ios/ ; paywall=2", 0),
@@ -355,18 +365,25 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
 
     def test_old_clients_cost_no_query_and_no_log(self, enqueue, wake, _pii):
         # Web (no header), every shipped build (paywall=1) and a comma-joined
-        # duplicate header return before ai_paused: no added query, no log line —
-        # with the flag on and the tenant paused, i.e. the worst case for them.
+        # duplicate header return before the flag or ai_paused is read: no added
+        # query, no log line, for a paused tenant, with the flag off (today) and on.
         self.post(_make_tenant(), header=None, client_msg_id="warm")  # warm per-process caches
-        for label, header in (("web", None), ("paywall1", PAYWALL_1), ("dup", DUPLICATED)):
-            with (
-                self.subTest(label),
-                override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
-                patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
-            ):
-                enqueue.reset_mock()
-                self.assert_gate_adds_nothing(enqueue, header=header)
-                paused_check.assert_not_called()
+        for flag in ("", "*"):
+            for label, header in (("web", None), ("paywall1", PAYWALL_1), ("dup", DUPLICATED)):
+                self._assert_old_client_untouched(enqueue, flag=flag, label=label, header=header)
+
+    def _assert_old_client_untouched(self, enqueue, *, flag, label, header):
+        with (
+            self.subTest(flag=flag, client=label),
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=flag),
+            patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+            patch("apps.router.chat_gates._tenant_allowed", wraps=_tenant_allowed) as flag_check,
+        ):
+            enqueue.reset_mock()
+            self.assert_gate_adds_nothing(enqueue, header=header)
+            paused_check.assert_not_called()
+            paywall_flag_reads = [c for c in flag_check.call_args_list if c.args[1] == "IOS_PAYWALL_ENFORCE_TENANT_IDS"]
+            self.assertEqual(paywall_flag_reads, [])
 
     def test_active_tenant_on_paywall2_costs_no_query(self, enqueue, wake, _pii):
         self.post(_make_tenant(status=Tenant.Status.ACTIVE), client_msg_id="warm")
@@ -384,6 +401,30 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
         self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 0)
         enqueue.assert_not_called()
         wake.assert_not_called()
+
+    def test_non_suspended_statuses_served_as_today(self, enqueue, wake, _pii):
+        # Known gap pinned: only SUSPENDED is refused. A churned Stripe user goes
+        # DEPROVISIONING -> DELETED and keeps today's response, whatever that is.
+        for tenant_status in (
+            Tenant.Status.PENDING,
+            Tenant.Status.PROVISIONING,
+            Tenant.Status.DEPROVISIONING,
+            Tenant.Status.DELETED,
+        ):
+            with self.subTest(status=tenant_status), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+                baseline_tenant, gated_tenant = _make_tenant(status=tenant_status), _make_tenant(status=tenant_status)
+                with patch("apps.router.chat_views.ios_paywall_refuses", return_value=False):
+                    baseline = self.post(baseline_tenant, client_msg_id=f"base-{tenant_status}")
+                with self.assertNoLogs("apps.router.chat_gates", level="DEBUG"):
+                    gated = self.post(gated_tenant, client_msg_id=f"gated-{tenant_status}")
+                self.assertEqual(gated.status_code, baseline.status_code, gated.content)
+                self.assertEqual(gated.data.get("status"), baseline.data.get("status"))
+                self.assertEqual(gated.data.get("error"), baseline.data.get("error"))
+                self.assertNotEqual(gated.data.get("error"), "subscription_required")
+                self.assertEqual(
+                    AppChatMessage.objects.filter(tenant=gated_tenant).count(),
+                    AppChatMessage.objects.filter(tenant=baseline_tenant).count(),
+                )
 
     def test_duplicated_header_served_as_today(self, enqueue, wake, _pii):
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
@@ -449,26 +490,58 @@ class SiriPaywallTest(_PaywallClientMixin, TestCase):
         self.assertTrue(resp.data["answered"])
         completion.assert_called_once()
 
-    def test_no_replay_before_refusal_unlike_chat_send(self, completion, enqueue, _pii):
-        # Documented difference from POST /chat/messages/: Siri has no up-front
-        # replay read, so a known client_msg_id is refused too, and the stored
-        # turn is left exactly as it was.
-        AppChatMessage.objects.create(
+    def _stored_turn(self, client_msg_id="siri-old"):
+        return AppChatMessage.objects.create(
             tenant=self.paused,
             user=self.paused.user,
             thread=_get_or_create_main_thread(self.paused, self.paused.user),
-            client_msg_id="siri-old",
+            client_msg_id=client_msg_id,
             user_text="from before the pause",
             reply_text="An earlier answer.",
             status=AppChatMessage.Status.READY,
         )
+
+    def test_known_client_msg_id_replays_instead_of_refusal(self, completion, enqueue, _pii):
+        # Same order as POST /chat/messages/: replay beats the refusal, and still
+        # nothing runs — no placeholder work, no model, no enqueue, no new row.
+        self._stored_turn()
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
             resp = self.ask(client_msg_id="siri-old")
-        self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
-        stored = AppChatMessage.objects.get(tenant=self.paused)
-        self.assertEqual((stored.client_msg_id, stored.status), ("siri-old", AppChatMessage.Status.READY))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            (resp.data["answered"], resp.data["escalated"], resp.data["client_msg_id"]), (False, True, "siri-old")
+        )
+        self.assertEqual(resp.data["turn"]["status"], "ready")
+        self.assertEqual(resp.data["turn"]["reply_text"], "An earlier answer.")
+        self.assertNotIn("error", resp.data)
+        self.assertIn("no-store", resp["Cache-Control"])
+        self.snapshot.assert_not_called()
+        self.intent.assert_not_called()
         completion.assert_not_called()
         enqueue.assert_not_called()
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+
+    def test_unknown_or_invalid_client_msg_id_is_refused(self, completion, enqueue, _pii):
+        self._stored_turn()
+        for client_msg_id in ("siri-new", "x" * 65, "", "   "):
+            with self.subTest(client_msg_id=client_msg_id), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+                resp = self.ask(client_msg_id=client_msg_id)
+                self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
+        completion.assert_not_called()
+        enqueue.assert_not_called()
+        self.assertEqual(AppChatMessage.objects.filter(tenant=self.paused).count(), 1)
+
+    def test_served_ask_does_no_replay_read(self, completion, enqueue, _pii):
+        # The replay read lives in the refusal branch only: a served paywall=1
+        # ask with a known id pays no extra query (it answers fast, as today).
+        self._stored_turn()
+        with (
+            override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+            patch.object(siri_views.SiriRespondView, "_replay", wraps=siri_views.SiriRespondView._replay) as replay,
+        ):
+            resp = self.ask(header=PAYWALL_1, client_msg_id="siri-old")
+        self.assertTrue(resp.data["answered"])
+        replay.assert_not_called()
 
 
 _SHAPE_BODY = {"client_msg_id": "6f1c1f0e-3d7c-4c55-9a51-1b2f7f0e9a01", "text": "how did I sleep"}
@@ -515,7 +588,14 @@ class TalkAndShapePaywallTest(_PaywallClientMixin, TestCase):
         route_talk.assert_not_called()
 
     def test_talk_route_feature_off_keeps_disabled_answer(self):
-        body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="")
+        # Paywall flag on, feature off: the gate is never consulted (no log line).
+        with self.assertNoLogs("apps.router.chat_gates", level="DEBUG"):
+            body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", TALK_ROUTE_TENANT_IDS="")
+        self.assertEqual(body, {"ack_kind": "other", "quick_read": "none", "reason": "disabled"})
+        route_talk.assert_called_once()
+
+    def test_talk_route_both_flags_off_keeps_disabled_answer(self):
+        body, route_talk = self.talk(IOS_PAYWALL_ENFORCE_TENANT_IDS="", TALK_ROUTE_TENANT_IDS="")
         self.assertEqual(body, {"ack_kind": "other", "quick_read": "none", "reason": "disabled"})
         route_talk.assert_called_once()
 
@@ -542,6 +622,7 @@ class TalkAndShapePaywallTest(_PaywallClientMixin, TestCase):
         with (
             patch.object(chat_shape_views, "shape_chat", wraps=chat_shape_views.shape_chat) as shape_chat,
             override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*", CHAT_SHAPE_TENANT_IDS=""),
+            self.assertNoLogs("apps.router.chat_gates", level="DEBUG"),
         ):
             resp = self.client_for(self.paused).post("/api/v1/chat/shape/", _SHAPE_BODY, format="json")
         self.assertEqual(resp.data["reason"], "disabled")
