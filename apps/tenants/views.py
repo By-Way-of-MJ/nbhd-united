@@ -40,6 +40,25 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         return Tenant.objects.none()
 
     @action(detail=False, methods=["get"])
+    def me(self, request):
+        """Get current user's tenant.
+
+        ``subscription.paywall`` depends on the caller's ``X-NBHD-Client`` header,
+        which the tenant cache key cannot see, so it is computed per request on top
+        of the cached body: a web call and an iOS call for the same tenant never
+        share a value, and a status change shows up immediately, not after the TTL.
+        """
+        response = self._me_cached(request)
+        subscription = response.data.get("subscription") if response.status_code == 200 else None
+        if isinstance(subscription, dict):
+            from apps.router.chat_gates import ios_paywall_refuses
+
+            response.data = {
+                **response.data,
+                "subscription": {**subscription, "paywall": ios_paywall_refuses(request, request.user.tenant)},
+            }
+        return response
+
     @tenant_cache(
         ttl=60,
         tag="tenant",
@@ -47,8 +66,7 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
             f"multi_attachments_v1:{telegram_inbound_enabled()}:keep_chatting:{settings.KEEP_CHATTING_TENANT_IDS}"
         ),
     )
-    def me(self, request):
-        """Get current user's tenant."""
+    def _me_cached(self, request):
         try:
             tenant = request.user.tenant
         except Tenant.DoesNotExist:

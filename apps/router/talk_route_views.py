@@ -10,6 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.router.chat_gates import ios_paywall_refuses
 from apps.router.talk_route import TALK_ROUTE_BUDGET_SECONDS, TalkRouteRequest, TalkRouteResponse, route_talk
 from apps.tenants.throttling import _UserScopedThrottle
 
@@ -36,6 +37,12 @@ class TalkRouteView(APIView):
         tenant = None
         try:
             tenant = getattr(request.user, "tenant", None)
+            # iOS paywall (dark by default): a paused tenant on a paywall>=2 build gets
+            # the existing degraded answer (the client acks locally) and no model call.
+            if ios_paywall_refuses(request, tenant, endpoint="talk_route"):
+                result = TalkRouteResponse()
+                result.latency_ms = max(0, round((perf_counter() - started) * 1000))
+                return Response(result.model_dump(mode="json"))
             result = route_talk(payload, tenant, deadline=deadline)
         except Exception:
             result = TalkRouteResponse()

@@ -38,6 +38,7 @@ from rest_framework.views import APIView
 from apps.billing.services import check_budget
 from apps.crypto.nolog import RedactedStr
 from apps.router import enc_columns, enc_read
+from apps.router.chat_gates import ios_paywall_refuses
 from apps.router.conversation_capture import scrub_chat_thread_title
 from apps.router.inbound_media import (
     MAX_APP_ATTACHMENTS_BYTES,
@@ -61,6 +62,10 @@ from apps.tenants.throttling import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Optional ``engine`` on ``POST /chat/turns/``: Apple Private Cloud Compute or the
+# on-device model (iOS free tier). Recorded in logs only; no schema change.
+_LOCAL_TURN_ENGINES = frozenset({"apple_cloud", "on_device"})
 
 # Upper bound on a single inbound chat message. Generous for a chat UI but
 # bounded so a pathological payload can't bloat the queue row / prompt.
@@ -1070,6 +1075,19 @@ class ChatMessageView(APIView):
             existing.tenant = tenant
             return Response(_serialize_message(existing), status=status.HTTP_200_OK)
 
+        # iOS paywall (dark unless IOS_PAYWALL_ENFORCE_TENANT_IDS opens this
+        # tenant): a paused tenant on a paywall>=2 build is refused BEFORE any
+        # row, share write, enqueue, wake or last_message_at stamp. Nothing is
+        # persisted, so the client's later /chat/turns/ record of the free-tier
+        # reply under this same client_msg_id is a fresh insert, not a replay.
+        # Placed after the replay so a retry of an already-accepted turn still
+        # returns its stored row.
+        if ios_paywall_refuses(request, tenant, endpoint="chat_messages"):
+            return Response(
+                {"client_msg_id": client_msg_id, "status": "error", "error": "subscription_required"},
+                status=status.HTTP_200_OK,
+            )
+
         text = str(request.data.get("text") or "").strip()
 
         # Validate every file before storing any, while preserving the legacy
@@ -1308,6 +1326,17 @@ class ChatLocalTurnView(APIView):
         from apps.router.conversation_capture import schedule_user_md_refresh
 
         schedule_user_md_refresh(tenant)
+
+        # Which Apple model produced a free-tier reply (Phase D). Log-only, for
+        # measuring adoption; anything but the two known engines is ignored.
+        engine = request.data.get("engine")
+        if isinstance(engine, str) and engine in _LOCAL_TURN_ENGINES:
+            logger.info(
+                "chat_local_turn engine=%s tenant_id=%s",
+                engine,
+                tenant.id,
+                extra={"engine": engine, "tenant_id": str(tenant.id)},
+            )
 
         return Response(_serialize_message(turn), status=status.HTTP_201_CREATED)
 

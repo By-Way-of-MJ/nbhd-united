@@ -348,6 +348,12 @@ SEND_TEST_TENANT_IDS = env("SEND_TEST_TENANT_IDS", default="")
 ATTENTION_HOLD_TENANT_IDS = env("ATTENTION_HOLD_TENANT_IDS", default="")
 KEEP_CHATTING_TENANT_IDS = env("KEEP_CHATTING_TENANT_IDS", default="")
 
+# iOS paywall (Phase D free tier): refuse the server assistant to PAUSED tenants
+# (suspended, no trial, not paying, not budget-exempt) asking from an iOS build
+# that declares `X-NBHD-Client: ...; paywall=2` or higher. Comma-separated tenant
+# UUIDs or "*"; empty/unset means nobody (dark). Container App env var name MUST match.
+IOS_PAYWALL_ENFORCE_TENANT_IDS = env("IOS_PAYWALL_ENFORCE_TENANT_IDS", default="")
+
 # Hourly Jev "worth a message?" SHADOW check: comma-separated tenant UUIDs or
 # "*"; empty/unset means nobody. Logs Jev's decision only — never sends.
 JEV_HEARTBEAT_SHADOW_TENANT_IDS = env("JEV_HEARTBEAT_SHADOW_TENANT_IDS", default="")

@@ -36,6 +36,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.router.chat_gates import ios_paywall_refuses
 from apps.router.chat_views import (
     _get_or_create_main_thread,
     _no_store,
@@ -206,6 +207,12 @@ class SiriRespondView(APIView):
             return Response({"error": "empty_intent"}, status=status.HTTP_400_BAD_REQUEST)
         if len(intent) > _MAX_ASK_CHARS:
             return Response({"error": "intent_too_long"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # iOS paywall (dark by default): refuse a paused tenant on a paywall>=2
+        # build BEFORE the snapshot/intent redaction (PII work + writes), the fast
+        # model, and the escalation into enqueue_tenant_turn.
+        if ios_paywall_refuses(request, tenant, endpoint="siri_respond"):
+            return _no_store(Response({"answered": False, "escalated": False, "error": "subscription_required"}))
 
         from apps.pii.provisional import PiiIngress
 
