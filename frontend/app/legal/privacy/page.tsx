@@ -176,9 +176,13 @@ export default function PrivacyPage() {
           <strong>Your message</strong> and the recent conversation.
         </li>
         <li>
-          <strong>A summary of your account</strong> — your goals, tasks, recent
-          journal entries, finances, workouts, a summary of your earlier chats
-          with your assistant, and recent reminders it sent you.
+          <strong>A summary of your account</strong>. It can include your
+          profile (name, home city, time zone and interests), your North Star,
+          goals, tasks, recent journal entries and mood, finances, workouts and
+          health data, your current location if you share it, calendar events
+          and reminders, recent lessons, neighbors and shared projects if you
+          use them, patterns your assistant has noticed, a summary of your
+          earlier chats with your assistant, and recent reminders it sent you.
         </li>
       </ul>
       <p>
@@ -188,9 +192,9 @@ export default function PrivacyPage() {
         searches, and a location you choose to share.
       </p>
       <p>
-        Workouts include workouts you chose to sync from Apple Health into
-        Neighborhood United. We do not otherwise read Apple Health data for
-        these replies.
+        If you connect Apple Health, the summary can include the data the app
+        syncs from it: your workouts (with distance, heart rate and active
+        energy), body weight, resting heart rate and sleep.
       </p>
       <p>
         The PII redaction in Section 5 is applied by our servers to prompts they
