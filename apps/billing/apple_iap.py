@@ -512,7 +512,11 @@ def recheck_lapsed(limit: int = 200) -> dict:
 
 
 def subscription_summary(tenant) -> dict:
-    """What the app shows: who bills, whether it's live, renewal and trial dates."""
+    """What the app shows: who bills, whether it's live, renewal and trial dates.
+
+    No ``paywall`` here; only ``/tenants/me/`` computes it (it depends on the
+    caller's ``X-NBHD-Client`` header); clients default to false.
+    """
     from .entitlement import billing_source
 
     source = billing_source(tenant)

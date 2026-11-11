@@ -32,6 +32,28 @@ def is_paying(tenant) -> bool:
     return bool(getattr(tenant, "stripe_subscription_id", "")) or has_apple_subscription(tenant)
 
 
+def ai_paused(tenant) -> bool:
+    """The assistant is paused for this person: suspended, not on a trial, nobody paying.
+
+    The same predicate the Telegram/LINE channels inline at their five refusal sites
+    (``status == SUSPENDED and not is_trial and not is_paying``), plus the budget-exempt
+    exclusion: canary/internal accounts sit outside the billing lifecycle and are never
+    paused. Status, trial and exemption are checked first, so only a suspended,
+    non-trial, non-exempt tenant without a Stripe id reaches the one query (the
+    entitling Apple-subscription ``exists()``): an active tenant costs none, a paused
+    one costs exactly one.
+    """
+    if tenant is None:
+        return False
+    from apps.tenants.models import Tenant
+
+    if getattr(tenant, "status", None) != Tenant.Status.SUSPENDED:
+        return False
+    if getattr(tenant, "is_trial", False) or getattr(tenant, "is_budget_exempt", False):
+        return False
+    return not is_paying(tenant)
+
+
 def paying_q(prefix: str = "") -> Q:
     """``is_paying`` as a queryset filter on Tenant (``prefix`` for related lookups,
     e.g. ``"tenant__"``). ``Exists`` rather than a join, so a tenant with several App

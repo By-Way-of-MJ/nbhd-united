@@ -40,6 +40,45 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
         return Tenant.objects.none()
 
     @action(detail=False, methods=["get"])
+    def me(self, request):
+        """Get current user's tenant.
+
+        ``subscription.paywall`` depends on the caller's ``X-NBHD-Client`` header,
+        which the tenant cache key cannot see, so it is computed per request on top
+        of the cached body: a web call and an iOS call for the same tenant never
+        share a value, and a status change shows up immediately, not after the TTL.
+
+        The rest of ``subscription`` (``active``, ``source``, ``status``, dates) is
+        cached for up to 60 s under the ``tenant`` tag. Three writes bump that tag:
+        a Tenant ``save()`` (``post_save`` in ``apps/common/cache_signals.py``), an
+        ``apple_iap.refresh()`` that is not stale and is bound to a tenant, and a
+        successful ``AppleLinkView`` link. Nothing else does, so the two halves can
+        disagree until the TTL after a queryset ``.update()``, an
+        ``AppStoreSubscription`` written any other way, a refresh that lost the race
+        to a newer one, or a trial that expires by the clock. (Without Redis the
+        cache is per-process LocMem and a bump only reaches the worker that made
+        it.) The disagreement that matters is ``paywall``
+        true beside a stale ``active`` true — e.g. a lapsed subscriber in the
+        seconds before the body refreshes — and the client resolves it toward
+        service: ``active == true`` wins over ``paywall`` (nbhd-ios
+        ``PlanGate(plan:)``), and chat send is refused server-side regardless. The
+        reverse (``paywall`` false, stale ``active`` false right after paying) only
+        shows the plan screen for the remainder of the TTL.
+        """
+        response = self._me_cached(request)
+        subscription = response.data.get("subscription") if response.status_code == 200 else None
+        if isinstance(subscription, dict):
+            from apps.router.chat_gates import ios_paywall_refuses
+
+            try:
+                paywall = ios_paywall_refuses(request, request.user.tenant)
+            except Exception:
+                # Never fail the profile over this field; false = "not refused".
+                logger.exception("tenants/me: paywall computation failed")
+                paywall = False
+            response.data = {**response.data, "subscription": {**subscription, "paywall": paywall}}
+        return response
+
     @tenant_cache(
         ttl=60,
         tag="tenant",
@@ -47,8 +86,7 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
             f"multi_attachments_v1:{telegram_inbound_enabled()}:keep_chatting:{settings.KEEP_CHATTING_TENANT_IDS}"
         ),
     )
-    def me(self, request):
-        """Get current user's tenant."""
+    def _me_cached(self, request):
         try:
             tenant = request.user.tenant
         except Tenant.DoesNotExist:
@@ -117,6 +155,7 @@ class OnboardTenantView(APIView):
         if invite_token:
             self._claim_invite_quietly(tenant, user, invite_token)
 
+        # subscription: no `paywall` here; only `/tenants/me/` computes it; clients default to false.
         return Response(TenantSerializer(tenant).data, status=status.HTTP_201_CREATED)
 
     @staticmethod

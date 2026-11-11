@@ -36,12 +36,14 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.router.chat_gates import ios_paywall_refuses
 from apps.router.chat_views import (
     _get_or_create_main_thread,
     _no_store,
     _serialize_message,
     enqueue_tenant_turn,
 )
+from apps.router.models import AppChatMessage
 from apps.tenants.throttling import SiriRespondMinuteThrottle, SiriStatusMinuteThrottle
 
 logger = logging.getLogger(__name__)
@@ -189,6 +191,20 @@ class SiriRespondView(APIView):
       "turn": {...}}`` — routed to the full tenant agent (Tier 3). The client
       polls ``GET /api/v1/chat/messages/<client_msg_id>/`` for the reply (and may
       surface a budget error there if the tenant is over budget).
+    * ``{"answered": false, "escalated": false, "error": "subscription_required"}``
+      — the iOS paywall refused a paused tenant on a paywall>=2 build (dark
+      unless ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` opens the tenant).
+
+    Replay vs. refusal matches ``POST /chat/messages/``: a known
+    ``client_msg_id`` gets its stored turn back (the escalated shape above),
+    never ``subscription_required``. This view's only replay read normally sits
+    inside ``enqueue_tenant_turn`` at escalation, after the fast model, so the
+    refusal branch does that same read itself — only once the gate has already
+    decided to refuse, so no other request pays a query for it — and still
+    before any placeholder/PII work or model call. (The app sends a fresh id per
+    ask and polls the message endpoint, so this is a correctness backstop, not
+    a hot path. The gate's adoption log line for such a request still says
+    ``refused=True``: it records the gate's decision, not the response.)
     """
 
     permission_classes = [IsAuthenticated]
@@ -206,6 +222,15 @@ class SiriRespondView(APIView):
             return Response({"error": "empty_intent"}, status=status.HTTP_400_BAD_REQUEST)
         if len(intent) > _MAX_ASK_CHARS:
             return Response({"error": "intent_too_long"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # iOS paywall (dark by default): refuse a paused tenant on a paywall>=2
+        # build BEFORE the snapshot/intent redaction (PII work + writes), the fast
+        # model, and the escalation into enqueue_tenant_turn.
+        if ios_paywall_refuses(request, tenant, endpoint="siri_respond"):
+            replay = self._replay(request, tenant)
+            if replay is not None:
+                return replay
+            return _no_store(Response({"answered": False, "escalated": False, "error": "subscription_required"}))
 
         from apps.pii.provisional import PiiIngress
 
@@ -266,6 +291,33 @@ class SiriRespondView(APIView):
         cleaned = re.sub(re.escape(_ESCALATE_SENTINEL), "", reply, flags=re.IGNORECASE).strip()
         return cleaned or None
 
+    @staticmethod
+    def _escalated(turn) -> Response:
+        return _no_store(
+            Response(
+                {
+                    "answered": False,
+                    "escalated": True,
+                    "client_msg_id": turn.client_msg_id,
+                    "turn": _serialize_message(turn),
+                }
+            )
+        )
+
+    @classmethod
+    def _replay(cls, request, tenant) -> Response | None:
+        """The stored turn for a supplied ``client_msg_id`` (what ``enqueue_tenant_turn``
+        would return on escalation), or None. Only the paywall refusal branch calls it."""
+        client_msg_id = str(request.data.get("client_msg_id") or "").strip()
+        if not client_msg_id or len(client_msg_id) > 64:
+            return None
+        existing = AppChatMessage.objects.filter(tenant=tenant, client_msg_id=client_msg_id).first()
+        if existing is None:
+            return None
+        # Filtering by tenant= does not fill the FK cache; the serializer reads it.
+        existing.tenant = tenant
+        return cls._escalated(existing)
+
     def _escalate(self, request, tenant, intent: str) -> Response:
         client_msg_id = str(request.data.get("client_msg_id") or "").strip() or uuid.uuid4().hex
         if len(client_msg_id) > 64:
@@ -279,13 +331,4 @@ class SiriRespondView(APIView):
             client_msg_id=client_msg_id,
             ingress_origin="siri",
         )
-        return _no_store(
-            Response(
-                {
-                    "answered": False,
-                    "escalated": True,
-                    "client_msg_id": turn.client_msg_id,
-                    "turn": _serialize_message(turn),
-                }
-            )
-        )
+        return self._escalated(turn)

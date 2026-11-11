@@ -156,6 +156,12 @@ SEND_TEST_TENANT_IDS = env("SEND_TEST_TENANT_IDS", default="")
 ATTENTION_HOLD_TENANT_IDS = env("ATTENTION_HOLD_TENANT_IDS", default="")
 KEEP_CHATTING_TENANT_IDS = env("KEEP_CHATTING_TENANT_IDS", default="")
 
+# iOS paywall gate — mirror of the base.py name so the Container App env var is
+# documented here. Comma-separated tenant UUIDs or "*"; UNSET (the state at
+# deploy time) means nobody is refused. Only paused tenants on paywall>=2 iOS
+# builds are ever affected.
+IOS_PAYWALL_ENFORCE_TENANT_IDS = env("IOS_PAYWALL_ENFORCE_TENANT_IDS", default="")
+
 # Hourly Jev "worth a message?" SHADOW check — mirror of the base.py name so
 # the Container App env vars are documented here. Comma-separated tenant UUIDs
 # or "*"; empty/unset means nobody. Logs Jev's decision only — never sends.

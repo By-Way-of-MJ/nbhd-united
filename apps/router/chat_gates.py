@@ -6,9 +6,15 @@ else that merely contains ``*`` is ignored. ``CHAT_PANELS_TOOL_TENANT_IDS=*`` is
 only safe once EVERY running tenant image includes the #1638 plugin manifest.
 """
 
+import logging
+import re
 from uuid import UUID
 
 from django.conf import settings
+
+from apps.billing.entitlement import ai_paused
+
+logger = logging.getLogger(__name__)
 
 
 def _tenant_allowed(tenant, setting: str) -> bool:
@@ -72,3 +78,126 @@ def web_redesign_enabled(tenant) -> bool:
 def keep_chatting_enabled(tenant) -> bool:
     """Allow concurrent app conversation while a longer job runs."""
     return _tenant_allowed(tenant, "KEEP_CHATTING_TENANT_IDS")
+
+
+# ---------------------------------------------------------------------------
+# iOS paywall contract (Phase D free tier)
+# ---------------------------------------------------------------------------
+
+# ``X-NBHD-Client: ios/<version>/<build>; paywall=<n>``. Every shipped build since
+# 2.2.2 already sends ``paywall=1`` while its plan screen is compiled out of Release,
+# so refusing on ``1`` would strand those users. Only builds that carry the free-tier
+# flow send ``2``; the server refuses the assistant from that contract upward.
+IOS_PAYWALL_REFUSE_FROM = 2
+_IOS_CLIENT_HEADER_MAX = 256
+# No leading zeros ("02" is not a contract value), at most six digits.
+_PAYWALL_VALUE = re.compile(r"0|[1-9][0-9]{0,5}")
+# HTTP optional whitespace is space and tab only; ``str.strip()`` would also eat
+# NBSP, vertical tab and other Unicode spaces, which no real client sends.
+_OWS = " \t"
+# The whole header must be printable ASCII plus tab: the app builds it from its
+# version strings, so a control character or any non-ASCII byte anywhere (not
+# just around the paywall value) means it was not our client that wrote it.
+_HEADER_CHARS = re.compile(r"[\t\x20-\x7e]*")
+
+
+def ios_paywall_version(request) -> int:
+    """The paywall contract an iOS client declares, or 0. Never raises.
+
+    The header must be exactly ``ios/<product>; ...; paywall=<n>`` with a
+    non-empty product after the lowercase ``ios/`` prefix (the app sends
+    lowercase; ``iOS/`` reads as 0) and exactly one ``paywall`` param whose value
+    is ``0`` or a positive integer of at most six digits with no leading zero.
+    Everything else reads as 0, i.e. "an old client", served exactly as today:
+    missing, non-iOS, over 256 characters, any comma (a proxy can comma-join two
+    copies of the header, and ``ios/2.4.2/108, ios/2.4.4/110; paywall=2`` must not
+    read as 2), a repeated ``paywall`` param, signs, decimals, leading zeros,
+    any character outside printable ASCII and tab (non-ASCII digits, NBSP,
+    vertical tab, control characters), and whitespace other than ASCII space/tab
+    around tokens.
+
+    The real header (nbhd-ios ``ClientIdentity.headerValue``, stamped on every
+    backend request by ``BackendClient``) is ``ios/<CFBundleShortVersionString>/
+    <CFBundleVersion>; paywall=<n>``, e.g. ``ios/2.4.4/110; paywall=2``.
+    """
+    try:
+        raw = request.META.get("HTTP_X_NBHD_CLIENT", "")
+        if (
+            not isinstance(raw, str)
+            or len(raw) > _IOS_CLIENT_HEADER_MAX
+            or "," in raw
+            or not _HEADER_CHARS.fullmatch(raw)
+        ):
+            return 0
+        product, *params = raw.split(";")
+        product = product.strip(_OWS)
+        if not product.startswith("ios/") or not product[len("ios/") :]:
+            return 0
+        values = []
+        for param in params:
+            key, sep, value = param.partition("=")
+            key = key.strip(_OWS)
+            if key.lower() == "paywall":
+                values.append(value.strip(_OWS) if sep else "")
+        if len(values) != 1 or not _PAYWALL_VALUE.fullmatch(values[0]):
+            return 0
+        return int(values[0])
+    except Exception:  # noqa: BLE001 — a header must never break a request
+        return 0
+
+
+def ios_paywall_refuses(request, tenant, *, endpoint: str | None = None) -> bool:
+    """True when this iOS request must be refused the server assistant.
+
+    All three must hold: the client declares paywall contract >= 2, the tenant is
+    opened by ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` (dark by default), and the tenant
+    is ``ai_paused`` (the Telegram/LINE paused predicate, budget-exempt excluded).
+
+    The header is parsed FIRST, so web, Telegram/LINE and every shipped iOS build
+    (``paywall=1``) return False before any query or log line — old clients are
+    untouched, not merely served. The rest of the cost only falls on a request
+    that declares contract >= 2:
+
+    * ``endpoint=None`` (``/tenants/me/``): the flag is checked before
+      ``ai_paused``, so flag-off costs nothing and flag-on costs at most the one
+      Apple-subscription query ``ai_paused`` makes for a paused tenant.
+    * ``endpoint`` set (an AI turn endpoint): ``ai_paused`` runs whatever the flag
+      says, because a turn from a paused tenant is logged (ids and booleans only,
+      never message text) so adoption of the new client can be measured before the
+      flag flips. Flag-off therefore costs one Apple-subscription query for a
+      suspended, non-trial, non-exempt tenant without a Stripe id (none for an
+      active one) plus one INFO line when that tenant is paused.
+
+    Known gaps, same as the Telegram/LINE refusal sites: only SUSPENDED is ever
+    refused. A normal Stripe cancellation goes DEPROVISIONING then DELETED
+    (``apps/billing/services.py`` ``handle_subscription_deleted``,
+    ``apps/orchestrator/services.py`` ``deprovision_tenant``), so a churned Stripe
+    user is never refused here; neither is a SUSPENDED tenant whose ``is_trial`` is
+    still true.
+    """
+    if tenant is None:
+        return False
+    version = ios_paywall_version(request)
+    if version < IOS_PAYWALL_REFUSE_FROM:
+        return False
+    flag_allowed = _tenant_allowed(tenant, "IOS_PAYWALL_ENFORCE_TENANT_IDS")
+    if endpoint is None:
+        return flag_allowed and ai_paused(tenant)
+    if not ai_paused(tenant):
+        return False
+    logger.info(
+        "ios_paywall_turn tenant_id=%s endpoint=%s paywall=%d flag_allowed=%s refused=%s",
+        tenant.id,
+        endpoint,
+        version,
+        flag_allowed,
+        flag_allowed,
+        extra={
+            "tenant_id": str(tenant.id),
+            "endpoint": endpoint,
+            "paywall": version,
+            "flag_allowed": flag_allowed,
+            "refused": flag_allowed,
+        },
+    )
+    return flag_allowed
