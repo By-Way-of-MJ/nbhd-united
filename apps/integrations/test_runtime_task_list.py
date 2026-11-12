@@ -85,6 +85,7 @@ class RuntimeTaskListTests(TestCase):
                 "completed_at",
                 "parent_goal_id",
                 "related_ref",
+                "project",
                 "created_at",
                 "updated_at",
                 "date_passed",

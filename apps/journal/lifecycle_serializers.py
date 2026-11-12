@@ -130,6 +130,77 @@ class TaskCompactSerializer(serializers.ModelSerializer):
         return {"id": str(goal.id), "title": goal.title}
 
 
+def resolve_task_projects(tenant, tasks) -> dict[str, dict | None]:
+    """Resolve each task's ``related_ref`` project pointer to the owner-facing shape.
+
+    The pointer is written by ``apps.friends.services._mint_member_task`` as either
+    a ``SharedGoalStep`` id (the step's project) or a ``shared_goal`` id. Visibility
+    and title reuse the project chokepoint's membership helper: the project detail
+    endpoint (``apps.friends.services.get_mission_detail``) reads
+    ``access.mission_memberships()`` and the owner sees ``SharedGoal.title``
+    (``apps.friends.projection.build_mission_status``). Collect every id first so
+    this stays a fixed number of queries regardless of task count.
+    """
+    import uuid
+
+    out: dict[str, dict | None] = {}
+    step_ids: set[uuid.UUID] = set()
+    goal_ids: set[uuid.UUID] = set()
+    refs: list[tuple[str, str, uuid.UUID]] = []
+    for task in tasks:
+        task_id = str(task.id)
+        out[task_id] = None
+        ref = task.related_ref
+        if not isinstance(ref, dict):
+            continue
+        object_type = ref.get("object_type")
+        if object_type not in {"SharedGoalStep", "shared_goal"}:
+            continue
+        try:
+            object_id = uuid.UUID(str(ref.get("object_id")))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        refs.append((task_id, object_type, object_id))
+        if object_type == "SharedGoalStep":
+            step_ids.add(object_id)
+        else:
+            goal_ids.add(object_id)
+
+    if not refs:
+        return out
+
+    step_goals: dict[uuid.UUID, uuid.UUID] = {}
+    if step_ids:
+        from apps.friends.models import SharedGoalStep
+
+        step_goals = {
+            row["id"]: row["shared_goal_id"]
+            for row in SharedGoalStep.objects.filter(id__in=step_ids).values("id", "shared_goal_id")
+        }
+        goal_ids.update(step_goals.values())
+
+    titles: dict[uuid.UUID, str] = {}
+    if goal_ids:
+        from apps.friends import access
+
+        titles = {
+            row["shared_goal_id"]: row["shared_goal__title"]
+            for row in access.mission_memberships()
+            .filter(tenant=tenant, status="active", shared_goal_id__in=goal_ids)
+            .values("shared_goal_id", "shared_goal__title")
+        }
+
+    for task_id, object_type, object_id in refs:
+        if object_type == "SharedGoalStep":
+            goal_id = step_goals.get(object_id)
+            if goal_id is None or goal_id not in titles:
+                continue
+            out[task_id] = {"id": str(goal_id), "title": titles[goal_id], "step_id": str(object_id)}
+        elif object_id in titles:
+            out[task_id] = {"id": str(object_id), "title": titles[object_id], "step_id": None}
+    return out
+
+
 class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerializer):
     """Read/write shape for Task lifecycle."""
 
@@ -139,6 +210,7 @@ class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerialize
         required=False,
         allow_null=True,
     )
+    project = serializers.SerializerMethodField()
 
     class Meta:
         model = Task
@@ -152,10 +224,14 @@ class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerialize
             "completed_at",
             "parent_goal_id",
             "related_ref",
+            "project",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "completed_at", "created_at", "updated_at"]
+
+    def get_project(self, task):
+        return self.context.get("task_projects", {}).get(str(task.id))
 
     def validate(self, attrs):
         tenant = self.context.get("tenant")

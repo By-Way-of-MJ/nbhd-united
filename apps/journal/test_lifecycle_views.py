@@ -8,9 +8,12 @@ rejects (409) markdown writes to flag-on tasks/goal docs instead of losing them.
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import patch
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
 from apps.friends.models import SharedGoal, SharedGoalMembership, SharedGoalStep, SharedGoalStepAssignment
@@ -465,3 +468,119 @@ class TaskGoalListCreateTests(TestCase):
             Goal.objects.create(tenant=self.tenant, title=f"Milestone {i}")
         resp = self.client.get("/api/v1/journal/goals/?q=milestone")
         self.assertEqual(len(resp.data), 20)
+
+
+class TaskProjectResolutionTests(TestCase):
+    """Owner task responses carry the project a ``related_ref`` points at."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="projectuser", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.other_user = User.objects.create_user(username="projectother", password="x")
+        self.other_tenant = Tenant.objects.create(user=self.other_user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _project(self, title="Garden"):
+        goal = SharedGoal.objects.create(title=title, created_by=self.tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        return goal, step
+
+    def _step_ref(self, step):
+        return {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+
+    def _goal_ref(self, goal):
+        return {"pillar": "friends", "object_type": "shared_goal", "object_id": str(goal.id)}
+
+    def _listed(self, task):
+        resp = self.client.get("/api/v1/journal/tasks/")
+        self.assertEqual(resp.status_code, 200)
+        return next(row for row in resp.data if row["id"] == str(task.id))
+
+    def test_list_step_pointer_resolves_project_and_step(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        row = self._listed(task)
+
+        self.assertEqual(row["project"], {"id": str(goal.id), "title": "Garden", "step_id": str(step.id)})
+
+    def test_list_shared_goal_pointer_has_no_step_id(self):
+        goal, _ = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Plan the beds", related_ref=self._goal_ref(goal))
+
+        row = self._listed(task)
+
+        self.assertEqual(row["project"], {"id": str(goal.id), "title": "Garden", "step_id": None})
+
+    def test_list_plain_task_has_no_project(self):
+        task = Task.objects.create(tenant=self.tenant, title="Call the dentist")
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_list_missing_step_has_no_project(self):
+        task = Task.objects.create(
+            tenant=self.tenant,
+            title="Orphaned step",
+            related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(uuid.uuid4())},
+        )
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_list_project_without_membership_has_no_project(self):
+        goal = SharedGoal.objects.create(title="Not mine", created_by=self.other_tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.other_tenant,
+            user=self.other_user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.other_tenant)
+        task = Task.objects.create(tenant=self.tenant, title="Someone else's step", related_ref=self._step_ref(step))
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_detail_gets_same_project_as_list(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        listed = self._listed(task)
+        resp = self.client.get(f"/api/v1/journal/tasks/{task.id}/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["project"], listed["project"])
+
+    def _list_query_count(self, task_count):
+        Task.objects.filter(tenant=self.tenant).delete()
+        goal, _ = self._project()
+        for i in range(task_count):
+            step = SharedGoalStep.objects.create(shared_goal=goal, title=f"Step {i}", created_by=self.tenant)
+            Task.objects.create(tenant=self.tenant, title=f"Task {i}", related_ref=self._step_ref(step))
+
+        with CaptureQueriesContext(connection) as captured:
+            resp = self.client.get("/api/v1/journal/tasks/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), task_count)
+        self.assertTrue(all(row["project"] is not None for row in resp.data))
+        return len(captured)
+
+    def test_list_query_count_is_flat_across_project_linked_tasks(self):
+        one = self._list_query_count(1)
+        five = self._list_query_count(5)
+
+        self.assertEqual(one, five)
