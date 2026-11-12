@@ -1418,6 +1418,44 @@ def project_steps(goal):
     return SharedGoalStep.objects.filter(shared_goal=goal)
 
 
+def task_project_refs(tenant, step_ids, goal_ids) -> tuple[dict, dict]:
+    """Resolve task project pointers on a transaction-pinned tenant backend.
+
+    ``SharedGoalStep`` is FORCE RLS for ``app_user`` (friends 0015). Over the
+    transaction-mode pooler the request's session-scoped GUC is not present on
+    later statements, so the step read and the membership/title read must share
+    one transaction that re-asserts the tenant context — exactly what
+    ``RLSRequestTransactionMixin`` gives a tenant request. Returns
+    ``(step_goals, titles)`` keyed by step id and goal id respectively.
+    """
+    from apps.tenants.middleware import set_rls_context
+
+    from .models import SharedGoalStep
+
+    step_ids = set(step_ids)
+    goal_ids = set(goal_ids)
+    if not step_ids and not goal_ids:
+        return {}, {}
+    with transaction.atomic():
+        set_rls_context(tenant_id=_tenant_id(tenant), as_tenant=True)
+        step_goals: dict = {}
+        if step_ids:
+            step_goals = {
+                row["id"]: row["shared_goal_id"]
+                for row in SharedGoalStep.objects.filter(id__in=step_ids).values("id", "shared_goal_id")
+            }
+        all_goal_ids = goal_ids | set(step_goals.values())
+        titles: dict = {}
+        if all_goal_ids:
+            titles = {
+                row["shared_goal_id"]: row["shared_goal__title"]
+                for row in mission_memberships()
+                .filter(tenant=tenant, status="active", shared_goal_id__in=all_goal_ids)
+                .values("shared_goal_id", "shared_goal__title")
+            }
+    return step_goals, titles
+
+
 def project_notes(goal, *, viewer=None):
     """Live notes with redundant goal/step/author scoping as an application backstop."""
     from .models import SharedGoalStepNote

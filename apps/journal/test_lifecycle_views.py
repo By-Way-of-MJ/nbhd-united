@@ -9,18 +9,22 @@ rejects (409) markdown writes to flag-on tasks/goal docs instead of losing them.
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
+from datetime import date
 from unittest.mock import patch
 
-from django.db import connection
-from django.test import TestCase
+from django.db import connection, transaction
+from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
 from apps.friends.models import SharedGoal, SharedGoalMembership, SharedGoalStep, SharedGoalStepAssignment
 from apps.journal.lifecycle_views import _search_variants
-from apps.journal.models import Document, Goal, Task
+from apps.journal.models import Document, Goal, PendingTaskAction, Task
 from apps.pii.testsupport import neural_ran
+from apps.tenants.management.commands.disable_rls import RLS_KEEP_ENABLED
 from apps.tenants.models import Tenant, User
+from apps.tenants.test_utils import seed_internal_key
 
 
 class TypedWriteEndpointTests(TestCase):
@@ -157,6 +161,36 @@ class TaskDeleteTests(TestCase):
         self.assertEqual(resp.data["subtasks_kept"], 1)
         child.refresh_from_db()
         self.assertIsNone(child.parent_task_id)
+
+    def test_cross_tenant_subtask_refuses_the_delete_and_keeps_both_rows(self):
+        task = Task.objects.create(tenant=self.tenant, title="Mine")
+        foreign_child = Task.objects.create(
+            tenant=self.other_tenant,
+            title="Someone else's",
+            parent_task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.data["error"], "integrity_error")
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+        self.assertTrue(Task.objects.filter(id=foreign_child.id).exists())
+
+    def test_delete_reports_the_tasks_own_pending_actions(self):
+        task = Task.objects.create(tenant=self.tenant, title="Auto-completed")
+        PendingTaskAction.objects.create(
+            tenant=self.tenant,
+            kind=PendingTaskAction.Kind.TASK_COMPLETE,
+            task=task,
+            source_date=date(2026, 8, 8),
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_actions_deleted"], 1)
+        self.assertFalse(Task.objects.filter(id=task.id).exists())
 
     def test_shared_goal_step_assignment_survives_with_no_task(self):
         task = Task.objects.create(tenant=self.tenant, title="Hand off")
@@ -564,6 +598,25 @@ class TaskProjectResolutionTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["project"], listed["project"])
 
+    def test_runtime_list_omits_project_key_while_owner_list_keeps_it(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        owner_row = self._listed(task)
+        self.assertIn("project", owner_row)
+        self.assertEqual(owner_row["project"]["id"], str(goal.id))
+
+        seed_internal_key(self.tenant, key="runtime-project-key")
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/tasks/",
+            HTTP_X_NBHD_INTERNAL_KEY="runtime-project-key",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        runtime_row = next(row for row in resp.data["tasks"] if row["id"] == str(task.id))
+        self.assertNotIn("project", runtime_row)
+
     def _list_query_count(self, task_count):
         Task.objects.filter(tenant=self.tenant).delete()
         goal, _ = self._project()
@@ -584,3 +637,68 @@ class TaskProjectResolutionTests(TestCase):
         five = self._list_query_count(5)
 
         self.assertEqual(one, five)
+
+
+class TaskProjectRealRlsTests(TransactionTestCase):
+    """The owner task list resolves a project under production-like FORCE RLS.
+
+    Django connects as a BYPASSRLS superuser locally, so ``SET LOCAL ROLE
+    app_user`` recreates the bound runtime role. The request middleware's SET is
+    patched out because it is session-scoped in production: over the
+    transaction-mode pooler it is not visible to later statements, which is the
+    exact failure this accessor's transaction fixes.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="project_rls_user", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        goal = SharedGoal.objects.create(title="Garden", created_by=self.tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        self.task = Task.objects.create(
+            tenant=self.tenant,
+            title="Dig the beds",
+            related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)},
+        )
+        self.goal = goal
+        self.step = step
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    @contextmanager
+    def _app_user(self):
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                cursor.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND rowsecurity")
+                for (table,) in cursor.fetchall():
+                    if table not in RLS_KEEP_ENABLED:
+                        cursor.execute(f"ALTER TABLE {connection.ops.quote_name(table)} DISABLE ROW LEVEL SECURITY")
+                cursor.execute("GRANT USAGE ON SCHEMA public TO app_user")
+                cursor.execute("GRANT ALL ON ALL TABLES IN SCHEMA public TO app_user")
+                cursor.execute("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO app_user")
+                cursor.execute("SET LOCAL ROLE app_user")
+            try:
+                yield
+            finally:
+                transaction.set_rollback(True)
+
+    def test_list_resolves_project_under_real_app_user_rls(self):
+        with (
+            patch("apps.tenants.middleware.TenantContextMiddleware.process_request", return_value=None),
+            self._app_user(),
+        ):
+            resp = self.client.get("/api/v1/journal/tasks/")
+
+            self.assertEqual(resp.status_code, 200)
+            row = next(row for row in resp.data if row["id"] == str(self.task.id))
+            self.assertEqual(
+                row["project"],
+                {"id": str(self.goal.id), "title": "Garden", "step_id": str(self.step.id)},
+            )

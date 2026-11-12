@@ -43,8 +43,8 @@ def _owner_ctx(tenant, tasks=None):
     (``apps.integrations.runtime_views``) deliberately omit this flag so those
     fields stay in placeholder space for the model.
 
-    Pass ``tasks`` to attach the resolved ``project`` read-model; the runtime and
-    goal serializers omit it and therefore emit ``project: null``.
+    Pass ``tasks`` to attach the resolved ``project`` read-model; runtime callers
+    omit it, and ``TaskSerializer`` then omits the ``project`` key entirely.
     """
     context = {"tenant": tenant, "rehydrate": True}
     if tasks is not None:
@@ -230,6 +230,7 @@ class TaskDetailView(APIView):
         from django.db import transaction
 
         from apps.friends.access import backstop_service_context
+        from apps.integrations.runtime_views import _task_descendant_ids, _task_pending_action_count
 
         from .models import Task
 
@@ -239,15 +240,26 @@ class TaskDetailView(APIView):
             if task is None:
                 return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
 
+            # The ORM CASCADE ignores the tenant filter, so an unscoped walk is
+            # the only honest check that this delete cannot reach a stranger's row.
+            if _task_descendant_ids(task) != _task_descendant_ids(task, tenant=tenant):
+                return Response({"error": "integrity_error"}, status=status.HTTP_409_CONFLICT)
+
             # ``parent_task`` is CASCADE, so deleting without re-parenting would
             # destroy the direct children too. Move them up one level first.
             subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(parent_task=task.parent_task)
             deleted_id = str(task.id)
+            pending_actions_deleted = _task_pending_action_count({task.id})
             with backstop_service_context():
                 task.delete()
 
         return Response(
-            {"status": "deleted", "id": deleted_id, "subtasks_kept": subtasks_kept},
+            {
+                "status": "deleted",
+                "id": deleted_id,
+                "subtasks_kept": subtasks_kept,
+                "pending_actions_deleted": pending_actions_deleted,
+            },
             status=status.HTTP_200_OK,
         )
 

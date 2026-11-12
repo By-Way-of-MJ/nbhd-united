@@ -139,7 +139,9 @@ def resolve_task_projects(tenant, tasks) -> dict[str, dict | None]:
     endpoint (``apps.friends.services.get_mission_detail``) reads
     ``access.mission_memberships()`` and the owner sees ``SharedGoal.title``
     (``apps.friends.projection.build_mission_status``). Collect every id first so
-    this stays a fixed number of queries regardless of task count.
+    this stays a fixed number of queries regardless of task count. Both protected
+    reads go through ``access.task_project_refs``, inside one tenant-RLS
+    transaction (the tables are FORCE RLS and production uses a transaction pooler).
     """
     import uuid
 
@@ -169,26 +171,9 @@ def resolve_task_projects(tenant, tasks) -> dict[str, dict | None]:
     if not refs:
         return out
 
-    step_goals: dict[uuid.UUID, uuid.UUID] = {}
-    if step_ids:
-        from apps.friends.models import SharedGoalStep
+    from apps.friends import access
 
-        step_goals = {
-            row["id"]: row["shared_goal_id"]
-            for row in SharedGoalStep.objects.filter(id__in=step_ids).values("id", "shared_goal_id")
-        }
-        goal_ids.update(step_goals.values())
-
-    titles: dict[uuid.UUID, str] = {}
-    if goal_ids:
-        from apps.friends import access
-
-        titles = {
-            row["shared_goal_id"]: row["shared_goal__title"]
-            for row in access.mission_memberships()
-            .filter(tenant=tenant, status="active", shared_goal_id__in=goal_ids)
-            .values("shared_goal_id", "shared_goal__title")
-        }
+    step_goals, titles = access.task_project_refs(tenant, step_ids, goal_ids)
 
     for task_id, object_type, object_id in refs:
         if object_type == "SharedGoalStep":
@@ -232,6 +217,14 @@ class TaskSerializer(_RehydrateTitleDescriptionMixin, serializers.ModelSerialize
 
     def get_project(self, task):
         return self.context.get("task_projects", {}).get(str(task.id))
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Runtime callers do not resolve project refs. Emitting ``project: null``
+        # would claim a linked task has no project, so omit the key entirely.
+        if "task_projects" not in self.context:
+            data.pop("project", None)
+        return data
 
     def validate(self, attrs):
         tenant = self.context.get("tenant")
