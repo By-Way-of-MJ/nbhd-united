@@ -178,7 +178,7 @@ def _parse_uuid(raw, field_name):
 
 
 class TaskDetailView(APIView):
-    """GET/PATCH /api/v1/journal/tasks/<uuid>/ — read or update a task."""
+    """GET/PATCH/DELETE /api/v1/journal/tasks/<uuid>/ — read, update, or delete a task."""
 
     permission_classes = [IsAuthenticated]
 
@@ -217,6 +217,31 @@ class TaskDetailView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save(pii_receipts=receipts)
         return Response(TaskSerializer(task, context=_owner_ctx(tenant)).data)
+
+    def delete(self, request, task_id):
+        from django.db import transaction
+
+        from apps.friends.access import backstop_service_context
+
+        from .models import Task
+
+        tenant = _get_tenant(request.user)
+        with transaction.atomic():
+            task = Task.objects.select_for_update().filter(tenant=tenant, id=task_id).first()
+            if task is None:
+                return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+            # ``parent_task`` is CASCADE, so deleting without re-parenting would
+            # destroy the direct children too. Move them up one level first.
+            subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(parent_task=task.parent_task)
+            deleted_id = str(task.id)
+            with backstop_service_context():
+                task.delete()
+
+        return Response(
+            {"status": "deleted", "id": deleted_id, "subtasks_kept": subtasks_kept},
+            status=status.HTTP_200_OK,
+        )
 
 
 class TaskCompleteView(APIView):

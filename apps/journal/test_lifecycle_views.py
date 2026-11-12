@@ -13,6 +13,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from apps.friends.models import SharedGoal, SharedGoalMembership, SharedGoalStep, SharedGoalStepAssignment
 from apps.journal.lifecycle_views import _search_variants
 from apps.journal.models import Document, Goal, Task
 from apps.pii.testsupport import neural_ran
@@ -77,6 +78,108 @@ class TypedWriteEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 404)
         task.refresh_from_db()
         self.assertEqual(task.status, Task.Status.OPEN)  # untouched
+
+
+class TaskDeleteTests(TestCase):
+    """DELETE /tasks/<uuid>/ — the owner's irreversible endpoint.
+
+    ``Task.parent_task`` is CASCADE, so the delete must re-parent the direct
+    children up one level before removing the row. A task's shared-goal
+    assignment is SET_NULL and must survive with no task.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="deleteuser", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.other_user = User.objects.create_user(username="deleteother", password="x")
+        self.other_tenant = Tenant.objects.create(user=self.other_user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _delete(self, task_id):
+        return self.client.delete(f"/api/v1/journal/tasks/{task_id}/")
+
+    def test_owner_deletes_own_task(self):
+        task = Task.objects.create(tenant=self.tenant, title="Cancel the gym")
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "deleted")
+        self.assertEqual(resp.data["id"], str(task.id))
+        self.assertEqual(resp.data["subtasks_kept"], 0)
+        self.assertFalse(Task.objects.filter(id=task.id).exists())
+
+    def test_another_tenants_task_is_404_and_survives(self):
+        task = Task.objects.create(tenant=self.other_tenant, title="Not yours")
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.data["error"], "not_found")
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+
+    def test_delete_requires_auth(self):
+        task = Task.objects.create(tenant=self.tenant, title="Keep me")
+        anon = APIClient()
+
+        resp = anon.delete(f"/api/v1/journal/tasks/{task.id}/")
+
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+
+    def test_direct_subtasks_move_up_to_the_grandparent(self):
+        grandparent = Task.objects.create(tenant=self.tenant, title="Grandparent")
+        parent = Task.objects.create(tenant=self.tenant, title="Parent", parent_task=grandparent)
+        first = Task.objects.create(tenant=self.tenant, title="First", parent_task=parent)
+        second = Task.objects.create(tenant=self.tenant, title="Second", parent_task=parent)
+
+        resp = self._delete(parent.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["subtasks_kept"], 2)
+        self.assertFalse(Task.objects.filter(id=parent.id).exists())
+        for child in (first, second):
+            child.refresh_from_db()
+            self.assertEqual(child.parent_task_id, grandparent.id)
+        self.assertTrue(Task.objects.filter(id=grandparent.id).exists())
+
+    def test_top_level_task_subtask_becomes_top_level(self):
+        task = Task.objects.create(tenant=self.tenant, title="Top")
+        child = Task.objects.create(tenant=self.tenant, title="Child", parent_task=task)
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["subtasks_kept"], 1)
+        child.refresh_from_db()
+        self.assertIsNone(child.parent_task_id)
+
+    def test_shared_goal_step_assignment_survives_with_no_task(self):
+        task = Task.objects.create(tenant=self.tenant, title="Hand off")
+        goal = SharedGoal.objects.create(title="Garden", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+        self.assertTrue(SharedGoalStepAssignment.objects.filter(id=assignment.id).exists())
 
 
 class MarkdownPatchGuardTests(TestCase):
