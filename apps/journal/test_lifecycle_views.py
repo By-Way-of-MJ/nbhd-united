@@ -106,6 +106,46 @@ class TaskDeleteTests(TestCase):
     def _delete(self, task_id):
         return self.client.delete(f"/api/v1/journal/tasks/{task_id}/")
 
+    def _project_copy_with_twin(
+        self,
+        *,
+        step_created_by=None,
+        step_status="open",
+        task_status="open",
+        title="Book flights",
+    ):
+        """Fixtures shared by the hand-off tests: my private twin + a project copy."""
+        twin = Task.objects.create(tenant=self.tenant, title=title)
+        goal = SharedGoal.objects.create(title="Family visit", created_by=step_created_by or self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(
+            shared_goal=goal,
+            title=title,
+            created_by=step_created_by or self.tenant,
+            status=step_status,
+        )
+        related_ref = {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        minted = Task.objects.create(
+            tenant=self.tenant,
+            title=title,
+            status=task_status,
+            related_ref=related_ref,
+        )
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=minted,
+        )
+        return twin, step, minted, assignment
+
     def test_owner_deletes_own_task(self):
         task = Task.objects.create(tenant=self.tenant, title="Cancel the gym")
 
@@ -260,6 +300,58 @@ class TaskDeleteTests(TestCase):
         step.refresh_from_db()
         self.assertEqual(step.status, "done")
         self.assertEqual(step.completed_by_id, self.tenant.id)
+
+    def test_another_tenants_step_does_not_take_the_private_twin(self):
+        twin, step, minted, assignment = self._project_copy_with_twin(step_created_by=self.other_tenant)
+        self.assertNotEqual(step.created_by_id, self.tenant.id)
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_done_step_does_not_take_the_private_twin(self):
+        twin, step, minted, assignment = self._project_copy_with_twin(step_status="done")
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_done_project_copy_does_not_take_the_private_twin(self):
+        twin, _step, minted, assignment = self._project_copy_with_twin(task_status="done")
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_a_child_promoted_by_the_delete_never_becomes_the_twin(self):
+        other_twin, _step, minted, assignment = self._project_copy_with_twin()
+        other_twin.delete()
+        child = Task.objects.create(tenant=self.tenant, title="Book flights", parent_task=minted)
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        child.refresh_from_db()
+        self.assertIsNone(child.parent_task_id)
+        self.assertIsNone(child.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
 
     def test_deleting_project_copy_without_a_twin_leaves_the_step_unassigned(self):
         task = Task.objects.create(tenant=self.tenant, title="Book flights")

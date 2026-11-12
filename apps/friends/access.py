@@ -1437,6 +1437,12 @@ def task_project_refs(tenant, step_ids, goal_ids) -> tuple[dict, dict]:
     if not step_ids and not goal_ids:
         return {}, {}
     with transaction.atomic():
+        # Remember any context already set by an outer transaction: a nested
+        # atomic is a savepoint, so the SET LOCAL below would otherwise outlive
+        # this lookup and bleed the tenant/service GUC into the caller's work.
+        with connection.cursor() as cur:
+            cur.execute("SELECT current_setting('app.tenant_id', true), current_setting('app.service_role', true)")
+            previous_tenant, previous_service = cur.fetchone()
         set_rls_context(tenant_id=_tenant_id(tenant), as_tenant=True)
         step_goals: dict = {}
         if step_ids:
@@ -1453,6 +1459,14 @@ def task_project_refs(tenant, step_ids, goal_ids) -> tuple[dict, dict]:
                 .filter(tenant=tenant, status="active", shared_goal_id__in=all_goal_ids)
                 .values("shared_goal_id", "shared_goal__title")
             }
+        # Same restore discipline as backstop_service_context: rollback already
+        # undoes SET LOCAL, so never issue restoration SQL on a broken txn.
+        if not connection.needs_rollback:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('app.tenant_id', %s, true), set_config('app.service_role', %s, true)",
+                    [previous_tenant or "", previous_service or ""],
+                )
     return step_goals, titles
 
 

@@ -247,18 +247,32 @@ class TaskDetailView(APIView):
             if _task_descendant_ids(task) != _task_descendant_ids(task, tenant=tenant):
                 return Response({"error": "integrity_error"}, status=status.HTTP_409_CONFLICT)
 
-            # ``parent_task`` is CASCADE, so deleting without re-parenting would
-            # destroy the direct children too. Move them up one level first.
-            subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(parent_task=task.parent_task)
             deleted_id = str(task.id)
             pending_actions_deleted = _task_pending_action_count({task.id})
             step_moved_to = None
             # ``assignment_for_task`` reads the FORCE-RLS friends tables; widen the
             # service scope so the lookup and adoption see the same transaction
             # under the transaction-mode pooler, not just ``task.delete()``.
+            #
+            # The hand-off runs BEFORE the children are re-parented: a child
+            # promoted to top level by the UPDATE below must never become the
+            # twin that inherits the step.
             with backstop_service_context():
                 assignment = access.assignment_for_task(task)
-                if assignment is not None:
+                # Only hand the step to a private twin when the step is YOURS and
+                # both sides are still live. A friend's step (a separate copy was
+                # minted for it) and a done/skipped/in-review step or to-do must
+                # stay out of the project.
+                if (
+                    assignment is not None
+                    and assignment.step.created_by_id == tenant.id
+                    and task.status in ("open", "in_progress")
+                    and assignment.step.status in ("open", "in_progress")
+                ):
+                    # Every other assignment writer takes the project lock first.
+                    # The Task row lock above already precedes it, matching the
+                    # documented Task → project order.
+                    access.lock_project(tenant, assignment.step.shared_goal_id, allow_finished=True)
                     twin = friends_services._adopt_open_todo(
                         tenant,
                         task.title,
@@ -271,6 +285,13 @@ class TaskDetailView(APIView):
                         assignment.task = twin
                         assignment.save(update_fields=["task"])
                         step_moved_to = str(twin.id)
+                # ``parent_task`` is CASCADE, so deleting without re-parenting
+                # would destroy the direct children too. Move them up one level
+                # only AFTER the twin lookup above, so a promoted child can
+                # never become the hand-off target.
+                subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(
+                    parent_task=task.parent_task
+                )
                 task.delete()
 
         return Response(
