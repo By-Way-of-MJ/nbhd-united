@@ -62,16 +62,22 @@ class StepAdoptsExistingTodoTests(TestCase):
         assignment = SharedGoalStepAssignment.objects.get(step=step, membership=self.owner_row)
         self.assertEqual(assignment.task_id, existing.id)
 
-    def test_asked_step_answered_yes_adopts_open_todo(self):
+    def test_asked_step_answered_yes_keeps_private_todo_unlinked(self):
         existing = self.todo(tenant=self.member)
         step = projects.create_step(self.owner, self.owner.user, self.goal.id, {"title": TITLE})
+        self.assertEqual(step.created_by_id, self.owner.id)
         projects.ask(self.owner, self.owner.user, self.goal.id, step.id, [str(self.member_row.id)])
 
         assignment = projects.respond(self.member, self.member.user, self.goal.id, step.id, {"answer": "yes"})
 
-        self.assertEqual(self.open_with_title(tenant=self.member).count(), 1)
-        self.assertEqual(assignment.task_id, existing.id)
-        self.assertEqual(Task.objects.get(id=existing.id).related_ref, _step_ref(step))
+        self.assertEqual(self.open_with_title(tenant=self.member).count(), 2)
+        self.assertNotEqual(assignment.task_id, existing.id)
+        existing.refresh_from_db()
+        self.assertIsNone(existing.related_ref)
+        self.assertEqual(existing.description, NOTES)
+        minted = Task.objects.get(id=assignment.task_id)
+        self.assertEqual(minted.related_ref, _step_ref(step))
+        self.assertEqual(minted.description, "")
 
     def test_adopted_row_keeps_id_description_created_at_and_title(self):
         existing = self.todo()

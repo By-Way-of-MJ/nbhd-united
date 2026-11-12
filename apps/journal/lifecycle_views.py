@@ -229,6 +229,8 @@ class TaskDetailView(APIView):
     def delete(self, request, task_id):
         from django.db import transaction
 
+        from apps.friends import access
+        from apps.friends import services as friends_services
         from apps.friends.access import backstop_service_context
         from apps.integrations.runtime_views import _task_descendant_ids, _task_pending_action_count
 
@@ -250,7 +252,25 @@ class TaskDetailView(APIView):
             subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(parent_task=task.parent_task)
             deleted_id = str(task.id)
             pending_actions_deleted = _task_pending_action_count({task.id})
+            step_moved_to = None
+            # ``assignment_for_task`` reads the FORCE-RLS friends tables; widen the
+            # service scope so the lookup and adoption see the same transaction
+            # under the transaction-mode pooler, not just ``task.delete()``.
             with backstop_service_context():
+                assignment = access.assignment_for_task(task)
+                if assignment is not None:
+                    twin = friends_services._adopt_open_todo(
+                        tenant,
+                        task.title,
+                        related_ref=task.related_ref,
+                        due_date=task.due_date,
+                        parent_goal_id=task.parent_goal_id,
+                        exclude_id=task.id,
+                    )
+                    if twin is not None:
+                        assignment.task = twin
+                        assignment.save(update_fields=["task"])
+                        step_moved_to = str(twin.id)
                 task.delete()
 
         return Response(
@@ -259,6 +279,7 @@ class TaskDetailView(APIView):
                 "id": deleted_id,
                 "subtasks_kept": subtasks_kept,
                 "pending_actions_deleted": pending_actions_deleted,
+                "step_moved_to": step_moved_to,
             },
             status=status.HTTP_200_OK,
         )

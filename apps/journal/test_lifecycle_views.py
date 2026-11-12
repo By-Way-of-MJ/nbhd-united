@@ -218,6 +218,75 @@ class TaskDeleteTests(TestCase):
         self.assertIsNone(assignment.task_id)
         self.assertTrue(SharedGoalStepAssignment.objects.filter(id=assignment.id).exists())
 
+    def test_deleting_project_copy_hands_the_step_to_its_twin(self):
+        twin = Task.objects.create(
+            tenant=self.tenant,
+            title="Book flights",
+            description="Family trip — four seats, window preferred.",
+        )
+        goal = SharedGoal.objects.create(title="Family visit", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Book flights", created_by=self.tenant)
+        related_ref = {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        minted = Task.objects.create(tenant=self.tenant, title="Book flights", related_ref=related_ref)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=minted,
+        )
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["step_moved_to"], str(twin.id))
+        twin.refresh_from_db()
+        self.assertEqual(twin.related_ref, related_ref)
+        self.assertEqual(twin.description, "Family trip — four seats, window preferred.")
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.task_id, twin.id)
+        self.assertFalse(Task.objects.filter(id=minted.id).exists())
+
+        # Ticking the surviving private row still completes the shared step.
+        twin.complete()
+        twin.save()
+        step.refresh_from_db()
+        self.assertEqual(step.status, "done")
+        self.assertEqual(step.completed_by_id, self.tenant.id)
+
+    def test_deleting_project_copy_without_a_twin_leaves_the_step_unassigned(self):
+        task = Task.objects.create(tenant=self.tenant, title="Book flights")
+        goal = SharedGoal.objects.create(title="Family visit", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Book flights", created_by=self.tenant)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
 
 class MarkdownPatchGuardTests(TestCase):
     def setUp(self):
