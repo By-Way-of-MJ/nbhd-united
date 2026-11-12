@@ -181,13 +181,14 @@ class ApprovalPerformanceTests(TestCase):
             self.assertEqual(result["status"], "approved")
             # The best-effort crew refresh now has a savepoint so a DB
             # failure cannot abort the request transaction: two fixed queries.
-            self.assertLessEqual(queries, 22 + 7 * count)
+            # + one same-title to-do lookup per step (a step adopts your existing to-do instead of copying it).
+            self.assertLessEqual(queries, 22 + 8 * count)
             self.assertEqual(detector, count)
             self.assertEqual(pushes, 1)
             self.assertEqual(scheduled, 1)
             counts.append(queries)
             print(f"APPROVAL {count}: queries={queries} detector={detector} pushes={pushes} scheduled={scheduled}")
-        self.assertLessEqual(counts[-1] - counts[0], 7 * 7)
+        self.assertLessEqual(counts[-1] - counts[0], 7 * 8)
         self.assertEqual(Task.objects.filter(tenant=self.tenant).count(), 13)
 
     def test_duplicate_titles_reuse_inference_only_inside_this_approval(self):
@@ -214,7 +215,8 @@ class ApprovalPerformanceTests(TestCase):
         result, queries, detector, pushes, scheduled = self.measure(
             lambda: assistant.publish_draft(self.tenant, self.tenant.user, draft["draft_id"])
         )
-        self.assertLessEqual(queries, 90)
+        # + one same-title to-do lookup per step (a step adopts your existing to-do instead of copying it).
+        self.assertLessEqual(queries, 98)
         self.assertEqual((detector, pushes, scheduled), (8, 1, 1))
         goal = access.get_mission(result["mission_id"])
         self.assertEqual(access.project_assignments(goal).filter(status="accepted").count(), 8)
@@ -290,7 +292,8 @@ class ApprovalPerformanceTests(TestCase):
         self.assertEqual(snapshots[0], snapshots[1])
         self.assertIn("[PERSON_1]", str(snapshots[1]["tasks"]))
         self.assertTrue(all("Alice" not in row["title"] for row in snapshots[1]["tasks"]))
-        self.assertLessEqual(measurements[1][0], 90)
+        # + one same-title to-do lookup per step (a step adopts your existing to-do instead of copying it).
+        self.assertLessEqual(measurements[1][0], 95)
         self.assertEqual(measurements[1][2], 1)
         print(f"EQUIVALENCE with 8 dependencies: legacy={measurements[0]} batch={measurements[1]}")
 

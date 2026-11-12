@@ -8,15 +8,23 @@ rejects (409) markdown writes to flag-on tasks/goal docs instead of losing them.
 
 from __future__ import annotations
 
+import uuid
+from contextlib import contextmanager
+from datetime import date
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.db import connection, transaction
+from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
+from apps.friends.models import SharedGoal, SharedGoalMembership, SharedGoalStep, SharedGoalStepAssignment
 from apps.journal.lifecycle_views import _search_variants
-from apps.journal.models import Document, Goal, Task
+from apps.journal.models import Document, Goal, PendingTaskAction, Task
 from apps.pii.testsupport import neural_ran
+from apps.tenants.management.commands.disable_rls import RLS_KEEP_ENABLED
 from apps.tenants.models import Tenant, User
+from apps.tenants.test_utils import seed_internal_key
 
 
 class TypedWriteEndpointTests(TestCase):
@@ -77,6 +85,299 @@ class TypedWriteEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 404)
         task.refresh_from_db()
         self.assertEqual(task.status, Task.Status.OPEN)  # untouched
+
+
+class TaskDeleteTests(TestCase):
+    """DELETE /tasks/<uuid>/ — the owner's irreversible endpoint.
+
+    ``Task.parent_task`` is CASCADE, so the delete must re-parent the direct
+    children up one level before removing the row. A task's shared-goal
+    assignment is SET_NULL and must survive with no task.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="deleteuser", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.other_user = User.objects.create_user(username="deleteother", password="x")
+        self.other_tenant = Tenant.objects.create(user=self.other_user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _delete(self, task_id):
+        return self.client.delete(f"/api/v1/journal/tasks/{task_id}/")
+
+    def _project_copy_with_twin(
+        self,
+        *,
+        step_created_by=None,
+        step_status="open",
+        task_status="open",
+        title="Book flights",
+    ):
+        """Fixtures shared by the hand-off tests: my private twin + a project copy."""
+        twin = Task.objects.create(tenant=self.tenant, title=title)
+        goal = SharedGoal.objects.create(title="Family visit", created_by=step_created_by or self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(
+            shared_goal=goal,
+            title=title,
+            created_by=step_created_by or self.tenant,
+            status=step_status,
+        )
+        related_ref = {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        minted = Task.objects.create(
+            tenant=self.tenant,
+            title=title,
+            status=task_status,
+            related_ref=related_ref,
+        )
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=minted,
+        )
+        return twin, step, minted, assignment
+
+    def test_owner_deletes_own_task(self):
+        task = Task.objects.create(tenant=self.tenant, title="Cancel the gym")
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "deleted")
+        self.assertEqual(resp.data["id"], str(task.id))
+        self.assertEqual(resp.data["subtasks_kept"], 0)
+        self.assertFalse(Task.objects.filter(id=task.id).exists())
+
+    def test_another_tenants_task_is_404_and_survives(self):
+        task = Task.objects.create(tenant=self.other_tenant, title="Not yours")
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.data["error"], "not_found")
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+
+    def test_delete_requires_auth(self):
+        task = Task.objects.create(tenant=self.tenant, title="Keep me")
+        anon = APIClient()
+
+        resp = anon.delete(f"/api/v1/journal/tasks/{task.id}/")
+
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+
+    def test_direct_subtasks_move_up_to_the_grandparent(self):
+        grandparent = Task.objects.create(tenant=self.tenant, title="Grandparent")
+        parent = Task.objects.create(tenant=self.tenant, title="Parent", parent_task=grandparent)
+        first = Task.objects.create(tenant=self.tenant, title="First", parent_task=parent)
+        second = Task.objects.create(tenant=self.tenant, title="Second", parent_task=parent)
+
+        resp = self._delete(parent.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["subtasks_kept"], 2)
+        self.assertFalse(Task.objects.filter(id=parent.id).exists())
+        for child in (first, second):
+            child.refresh_from_db()
+            self.assertEqual(child.parent_task_id, grandparent.id)
+        self.assertTrue(Task.objects.filter(id=grandparent.id).exists())
+
+    def test_top_level_task_subtask_becomes_top_level(self):
+        task = Task.objects.create(tenant=self.tenant, title="Top")
+        child = Task.objects.create(tenant=self.tenant, title="Child", parent_task=task)
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["subtasks_kept"], 1)
+        child.refresh_from_db()
+        self.assertIsNone(child.parent_task_id)
+
+    def test_cross_tenant_subtask_refuses_the_delete_and_keeps_both_rows(self):
+        task = Task.objects.create(tenant=self.tenant, title="Mine")
+        foreign_child = Task.objects.create(
+            tenant=self.other_tenant,
+            title="Someone else's",
+            parent_task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.data["error"], "integrity_error")
+        self.assertTrue(Task.objects.filter(id=task.id).exists())
+        self.assertTrue(Task.objects.filter(id=foreign_child.id).exists())
+
+    def test_delete_reports_the_tasks_own_pending_actions(self):
+        task = Task.objects.create(tenant=self.tenant, title="Auto-completed")
+        PendingTaskAction.objects.create(
+            tenant=self.tenant,
+            kind=PendingTaskAction.Kind.TASK_COMPLETE,
+            task=task,
+            source_date=date(2026, 8, 8),
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_actions_deleted"], 1)
+        self.assertFalse(Task.objects.filter(id=task.id).exists())
+
+    def test_shared_goal_step_assignment_survives_with_no_task(self):
+        task = Task.objects.create(tenant=self.tenant, title="Hand off")
+        goal = SharedGoal.objects.create(title="Garden", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+        self.assertTrue(SharedGoalStepAssignment.objects.filter(id=assignment.id).exists())
+
+    def test_deleting_project_copy_hands_the_step_to_its_twin(self):
+        twin = Task.objects.create(
+            tenant=self.tenant,
+            title="Book flights",
+            description="Family trip — four seats, window preferred.",
+        )
+        goal = SharedGoal.objects.create(title="Family visit", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Book flights", created_by=self.tenant)
+        related_ref = {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        minted = Task.objects.create(tenant=self.tenant, title="Book flights", related_ref=related_ref)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=minted,
+        )
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["step_moved_to"], str(twin.id))
+        twin.refresh_from_db()
+        self.assertEqual(twin.related_ref, related_ref)
+        self.assertEqual(twin.description, "Family trip — four seats, window preferred.")
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.task_id, twin.id)
+        self.assertFalse(Task.objects.filter(id=minted.id).exists())
+
+        # Ticking the surviving private row still completes the shared step.
+        twin.complete()
+        twin.save()
+        step.refresh_from_db()
+        self.assertEqual(step.status, "done")
+        self.assertEqual(step.completed_by_id, self.tenant.id)
+
+    def test_another_tenants_step_does_not_take_the_private_twin(self):
+        twin, step, minted, assignment = self._project_copy_with_twin(step_created_by=self.other_tenant)
+        self.assertNotEqual(step.created_by_id, self.tenant.id)
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_done_step_does_not_take_the_private_twin(self):
+        twin, step, minted, assignment = self._project_copy_with_twin(step_status="done")
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_done_project_copy_does_not_take_the_private_twin(self):
+        twin, _step, minted, assignment = self._project_copy_with_twin(task_status="done")
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        twin.refresh_from_db()
+        self.assertIsNone(twin.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_a_child_promoted_by_the_delete_never_becomes_the_twin(self):
+        other_twin, _step, minted, assignment = self._project_copy_with_twin()
+        other_twin.delete()
+        child = Task.objects.create(tenant=self.tenant, title="Book flights", parent_task=minted)
+
+        resp = self._delete(minted.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        child.refresh_from_db()
+        self.assertIsNone(child.parent_task_id)
+        self.assertIsNone(child.related_ref)
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
+
+    def test_deleting_project_copy_without_a_twin_leaves_the_step_unassigned(self):
+        task = Task.objects.create(tenant=self.tenant, title="Book flights")
+        goal = SharedGoal.objects.create(title="Family visit", created_by=self.tenant)
+        membership = SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Book flights", created_by=self.tenant)
+        assignment = SharedGoalStepAssignment.objects.create(
+            step=step,
+            membership=membership,
+            asked_by=self.tenant,
+            status="accepted",
+            task=task,
+        )
+
+        resp = self._delete(task.id)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["step_moved_to"])
+        assignment.refresh_from_db()
+        self.assertIsNone(assignment.task_id)
 
 
 class MarkdownPatchGuardTests(TestCase):
@@ -362,3 +663,203 @@ class TaskGoalListCreateTests(TestCase):
             Goal.objects.create(tenant=self.tenant, title=f"Milestone {i}")
         resp = self.client.get("/api/v1/journal/goals/?q=milestone")
         self.assertEqual(len(resp.data), 20)
+
+
+class TaskProjectResolutionTests(TestCase):
+    """Owner task responses carry the project a ``related_ref`` points at."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="projectuser", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        self.other_user = User.objects.create_user(username="projectother", password="x")
+        self.other_tenant = Tenant.objects.create(user=self.other_user, status="active")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _project(self, title="Garden"):
+        goal = SharedGoal.objects.create(title=title, created_by=self.tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        return goal, step
+
+    def _step_ref(self, step):
+        return {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+
+    def _goal_ref(self, goal):
+        return {"pillar": "friends", "object_type": "shared_goal", "object_id": str(goal.id)}
+
+    def _listed(self, task):
+        resp = self.client.get("/api/v1/journal/tasks/")
+        self.assertEqual(resp.status_code, 200)
+        return next(row for row in resp.data if row["id"] == str(task.id))
+
+    def test_list_step_pointer_resolves_project_and_step(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        row = self._listed(task)
+
+        self.assertEqual(row["project"], {"id": str(goal.id), "title": "Garden", "step_id": str(step.id)})
+
+    def test_list_shared_goal_pointer_has_no_step_id(self):
+        goal, _ = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Plan the beds", related_ref=self._goal_ref(goal))
+
+        row = self._listed(task)
+
+        self.assertEqual(row["project"], {"id": str(goal.id), "title": "Garden", "step_id": None})
+
+    def test_list_plain_task_has_no_project(self):
+        task = Task.objects.create(tenant=self.tenant, title="Call the dentist")
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_list_missing_step_has_no_project(self):
+        task = Task.objects.create(
+            tenant=self.tenant,
+            title="Orphaned step",
+            related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(uuid.uuid4())},
+        )
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_list_project_without_membership_has_no_project(self):
+        goal = SharedGoal.objects.create(title="Not mine", created_by=self.other_tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.other_tenant,
+            user=self.other_user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.other_tenant)
+        task = Task.objects.create(tenant=self.tenant, title="Someone else's step", related_ref=self._step_ref(step))
+
+        row = self._listed(task)
+
+        self.assertIsNone(row["project"])
+
+    def test_detail_gets_same_project_as_list(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        listed = self._listed(task)
+        resp = self.client.get(f"/api/v1/journal/tasks/{task.id}/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["project"], listed["project"])
+
+    def test_runtime_list_omits_project_key_while_owner_list_keeps_it(self):
+        goal, step = self._project()
+        task = Task.objects.create(tenant=self.tenant, title="Dig the beds", related_ref=self._step_ref(step))
+
+        owner_row = self._listed(task)
+        self.assertIn("project", owner_row)
+        self.assertEqual(owner_row["project"]["id"], str(goal.id))
+
+        seed_internal_key(self.tenant, key="runtime-project-key")
+        resp = self.client.get(
+            f"/api/v1/integrations/runtime/{self.tenant.id}/tasks/",
+            HTTP_X_NBHD_INTERNAL_KEY="runtime-project-key",
+            HTTP_X_NBHD_TENANT_ID=str(self.tenant.id),
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        runtime_row = next(row for row in resp.data["tasks"] if row["id"] == str(task.id))
+        self.assertNotIn("project", runtime_row)
+
+    def _list_query_count(self, task_count):
+        Task.objects.filter(tenant=self.tenant).delete()
+        goal, _ = self._project()
+        for i in range(task_count):
+            step = SharedGoalStep.objects.create(shared_goal=goal, title=f"Step {i}", created_by=self.tenant)
+            Task.objects.create(tenant=self.tenant, title=f"Task {i}", related_ref=self._step_ref(step))
+
+        with CaptureQueriesContext(connection) as captured:
+            resp = self.client.get("/api/v1/journal/tasks/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data), task_count)
+        self.assertTrue(all(row["project"] is not None for row in resp.data))
+        return len(captured)
+
+    def test_list_query_count_is_flat_across_project_linked_tasks(self):
+        one = self._list_query_count(1)
+        five = self._list_query_count(5)
+
+        self.assertEqual(one, five)
+
+
+class TaskProjectRealRlsTests(TransactionTestCase):
+    """The owner task list resolves a project under production-like FORCE RLS.
+
+    Django connects as a BYPASSRLS superuser locally, so ``SET LOCAL ROLE
+    app_user`` recreates the bound runtime role. The request middleware's SET is
+    patched out because it is session-scoped in production: over the
+    transaction-mode pooler it is not visible to later statements, which is the
+    exact failure this accessor's transaction fixes.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="project_rls_user", password="x")
+        self.tenant = Tenant.objects.create(user=self.user, status="active")
+        goal = SharedGoal.objects.create(title="Garden", created_by=self.tenant)
+        SharedGoalMembership.objects.create(
+            shared_goal=goal,
+            tenant=self.tenant,
+            user=self.user,
+            role="owner",
+            status="active",
+        )
+        step = SharedGoalStep.objects.create(shared_goal=goal, title="Dig", created_by=self.tenant)
+        self.task = Task.objects.create(
+            tenant=self.tenant,
+            title="Dig the beds",
+            related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)},
+        )
+        self.goal = goal
+        self.step = step
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    @contextmanager
+    def _app_user(self):
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                cursor.execute("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND rowsecurity")
+                for (table,) in cursor.fetchall():
+                    if table not in RLS_KEEP_ENABLED:
+                        cursor.execute(f"ALTER TABLE {connection.ops.quote_name(table)} DISABLE ROW LEVEL SECURITY")
+                cursor.execute("GRANT USAGE ON SCHEMA public TO app_user")
+                cursor.execute("GRANT ALL ON ALL TABLES IN SCHEMA public TO app_user")
+                cursor.execute("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO app_user")
+                cursor.execute("SET LOCAL ROLE app_user")
+            try:
+                yield
+            finally:
+                transaction.set_rollback(True)
+
+    def test_list_resolves_project_under_real_app_user_rls(self):
+        with (
+            patch("apps.tenants.middleware.TenantContextMiddleware.process_request", return_value=None),
+            self._app_user(),
+        ):
+            resp = self.client.get("/api/v1/journal/tasks/")
+
+            self.assertEqual(resp.status_code, 200)
+            row = next(row for row in resp.data if row["id"] == str(self.task.id))
+            self.assertEqual(
+                row["project"],
+                {"id": str(self.goal.id), "title": "Garden", "step_id": str(self.step.id)},
+            )

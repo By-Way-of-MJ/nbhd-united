@@ -19,6 +19,7 @@ import re
 import secrets
 from collections import Counter
 from datetime import UTC, timedelta
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
@@ -48,6 +49,9 @@ from .models import (
 )
 from .project_hygiene import UNTRUSTED_RULE, clean_payload, clean_text, fence
 from .scrub import _content_hash
+
+if TYPE_CHECKING:
+    from apps.journal.models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -1737,18 +1741,91 @@ def _linked_goal_for(tenant, mission):
     return None
 
 
+def _adopt_open_todo(
+    tenant,
+    stored_title,
+    *,
+    related_ref,
+    due_date,
+    parent_goal_id,
+    exclude_id=None,
+) -> Task | None:
+    """Adopt the caller's own open, unlinked, top-level to-do with this exact title.
+
+    Only for a step the caller created: somebody else's step must not turn a
+    private to-do into crew work. Matching is the exact normalized title, never a
+    fuzzy match. The adopted row keeps its id, title, description and PII
+    receipts; only ``related_ref`` is linked, and ``due_date`` / ``parent_goal``
+    are filled only when they were empty. The description is never filled.
+    """
+    from apps.journal.models import Task
+
+    wanted = " ".join((stored_title or "").casefold().split())
+    candidate_filter = {
+        "tenant": tenant,
+        "status__in": ["open", "in_progress"],
+        "related_ref__isnull": True,
+        "parent_task__isnull": True,
+    }
+    candidates = Task.objects.filter(**candidate_filter)
+    locked = Task.objects.select_for_update().filter(**candidate_filter)
+    if exclude_id is not None:
+        candidates = candidates.exclude(id=exclude_id)
+        locked = locked.exclude(id=exclude_id)
+    for task_id, task_title in candidates.order_by("created_at", "id").values_list("id", "title"):
+        if " ".join((task_title or "").casefold().split()) != wanted:
+            continue
+        # Lock only the chosen row and re-check it: another writer may have
+        # linked or completed it since the candidate scan.
+        task = locked.filter(id=task_id).first()
+        if task is None or " ".join((task.title or "").casefold().split()) != wanted:
+            continue
+        task.related_ref = related_ref
+        update_fields = ["related_ref", "updated_at"]
+        if task.due_date is None and due_date is not None:
+            task.due_date = due_date
+            update_fields.append("due_date")
+        if task.parent_goal_id is None and parent_goal_id is not None:
+            task.parent_goal_id = parent_goal_id
+            update_fields.append("parent_goal_id")
+        task.save(update_fields=update_fields)
+        return task
+    return None
+
+
 def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None, linked_goal_id=...):
-    """Author outside transactions, then persist only the caller's private Task."""
+    """Author outside transactions, then persist only the caller's private Task.
+
+    Adopts YOUR open to-do with the same title only for a step YOU created — exact
+    normalized title only, never a fuzzy match — so a friend's step never turns
+    your private to-do into crew work. The adopted row keeps its id, title,
+    description and PII receipts; only ``due_date`` / ``parent_goal`` are filled
+    when empty, and the description is never filled.
+    """
     from apps.journal.models import Task
 
     values = prepared if prepared is not None else _prepare_member_task(tenant, title, description)
+    related_ref = (
+        {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        if step
+        else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)}
+    )
+    parent_goal_id = _linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id
+    if step is not None and step.created_by_id == tenant.id:
+        adopted = _adopt_open_todo(
+            tenant,
+            values.get("title"),
+            related_ref=related_ref,
+            due_date=due_date,
+            parent_goal_id=parent_goal_id,
+        )
+        if adopted is not None:
+            return adopted
     return Task.objects.create(
         **values,
         due_date=due_date,
-        parent_goal_id=_linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id,
-        related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
-        if step
-        else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
+        parent_goal_id=parent_goal_id,
+        related_ref=related_ref,
     )
 
 

@@ -34,7 +34,7 @@ _ENTITY_SEARCH_LIMIT = 20
 _SEARCH_VARIANT_LIMIT = 20
 
 
-def _owner_ctx(tenant):
+def _owner_ctx(tenant, tasks=None):
     """Serializer context for owner-facing responses.
 
     Sets ``rehydrate=True`` so ``TaskSerializer`` / ``GoalSerializer`` swap
@@ -42,8 +42,16 @@ def _owner_ctx(tenant):
     the logged-in owner. The agent/runtime serializer paths
     (``apps.integrations.runtime_views``) deliberately omit this flag so those
     fields stay in placeholder space for the model.
+
+    Pass ``tasks`` to attach the resolved ``project`` read-model; runtime callers
+    omit it, and ``TaskSerializer`` then omits the ``project`` key entirely.
     """
-    return {"tenant": tenant, "rehydrate": True}
+    context = {"tenant": tenant, "rehydrate": True}
+    if tasks is not None:
+        from .lifecycle_serializers import resolve_task_projects
+
+        context["task_projects"] = resolve_task_projects(tenant, tasks)
+    return context
 
 
 def _author_owner_input(tenant, data, *, seam, model_label, receipts=None, include_defaults=False):
@@ -178,7 +186,7 @@ def _parse_uuid(raw, field_name):
 
 
 class TaskDetailView(APIView):
-    """GET/PATCH /api/v1/journal/tasks/<uuid>/ — read or update a task."""
+    """GET/PATCH/DELETE /api/v1/journal/tasks/<uuid>/ — read, update, or delete a task."""
 
     permission_classes = [IsAuthenticated]
 
@@ -190,7 +198,7 @@ class TaskDetailView(APIView):
         task = Task.objects.filter(tenant=tenant, id=task_id).first()
         if task is None:
             return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response(TaskSerializer(task, context=_owner_ctx(tenant)).data)
+        return Response(TaskSerializer(task, context=_owner_ctx(tenant, [task])).data)
 
     def patch(self, request, task_id):
         from .lifecycle_serializers import TaskSerializer
@@ -216,7 +224,86 @@ class TaskDetailView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save(pii_receipts=receipts)
-        return Response(TaskSerializer(task, context=_owner_ctx(tenant)).data)
+        return Response(TaskSerializer(task, context=_owner_ctx(tenant, [task])).data)
+
+    def delete(self, request, task_id):
+        from django.db import transaction
+
+        from apps.friends import access
+        from apps.friends import services as friends_services
+        from apps.friends.access import backstop_service_context
+        from apps.integrations.runtime_views import _task_descendant_ids, _task_pending_action_count
+
+        from .models import Task
+
+        tenant = _get_tenant(request.user)
+        with transaction.atomic():
+            task = Task.objects.select_for_update().filter(tenant=tenant, id=task_id).first()
+            if task is None:
+                return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+            # The ORM CASCADE ignores the tenant filter, so an unscoped walk is
+            # the only honest check that this delete cannot reach a stranger's row.
+            if _task_descendant_ids(task) != _task_descendant_ids(task, tenant=tenant):
+                return Response({"error": "integrity_error"}, status=status.HTTP_409_CONFLICT)
+
+            deleted_id = str(task.id)
+            pending_actions_deleted = _task_pending_action_count({task.id})
+            step_moved_to = None
+            # ``assignment_for_task`` reads the FORCE-RLS friends tables; widen the
+            # service scope so the lookup and adoption see the same transaction
+            # under the transaction-mode pooler, not just ``task.delete()``.
+            #
+            # The hand-off runs BEFORE the children are re-parented: a child
+            # promoted to top level by the UPDATE below must never become the
+            # twin that inherits the step.
+            with backstop_service_context():
+                assignment = access.assignment_for_task(task)
+                # Only hand the step to a private twin when the step is YOURS and
+                # both sides are still live. A friend's step (a separate copy was
+                # minted for it) and a done/skipped/in-review step or to-do must
+                # stay out of the project.
+                if (
+                    assignment is not None
+                    and assignment.step.created_by_id == tenant.id
+                    and task.status in ("open", "in_progress")
+                    and assignment.step.status in ("open", "in_progress")
+                ):
+                    # Every other assignment writer takes the project lock first.
+                    # The Task row lock above already precedes it, matching the
+                    # documented Task → project order.
+                    access.lock_project(tenant, assignment.step.shared_goal_id, allow_finished=True)
+                    twin = friends_services._adopt_open_todo(
+                        tenant,
+                        task.title,
+                        related_ref=task.related_ref,
+                        due_date=task.due_date,
+                        parent_goal_id=task.parent_goal_id,
+                        exclude_id=task.id,
+                    )
+                    if twin is not None:
+                        assignment.task = twin
+                        assignment.save(update_fields=["task"])
+                        step_moved_to = str(twin.id)
+                # ``parent_task`` is CASCADE, so deleting without re-parenting
+                # would destroy the direct children too. Move them up one level
+                # only AFTER the twin lookup above, so a promoted child can
+                # never become the hand-off target.
+                subtasks_kept = Task.objects.filter(tenant=tenant, parent_task=task).update(
+                    parent_task=task.parent_task
+                )
+                task.delete()
+
+        return Response(
+            {
+                "status": "deleted",
+                "id": deleted_id,
+                "subtasks_kept": subtasks_kept,
+                "pending_actions_deleted": pending_actions_deleted,
+                "step_moved_to": step_moved_to,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class TaskCompleteView(APIView):
@@ -234,7 +321,7 @@ class TaskCompleteView(APIView):
             return Response({"error": "not_found"}, status=status.HTTP_404_NOT_FOUND)
 
         task.complete()
-        return Response(TaskSerializer(task, context=_owner_ctx(tenant)).data)
+        return Response(TaskSerializer(task, context=_owner_ctx(tenant, [task])).data)
 
 
 class TaskReopenView(APIView):
@@ -254,7 +341,7 @@ class TaskReopenView(APIView):
         task.status = Task.Status.OPEN
         task.completed_at = None
         task.save(update_fields=["status", "completed_at", "updated_at"])
-        return Response(TaskSerializer(task, context=_owner_ctx(tenant)).data)
+        return Response(TaskSerializer(task, context=_owner_ctx(tenant, [task])).data)
 
 
 class GoalDetailView(APIView):
@@ -380,7 +467,7 @@ class TaskListCreateView(APIView):
         q = (params.get("q") or "").strip()
         if q:
             qs = _filter_title_variants(qs, _search_variants(tenant, q))[:_ENTITY_SEARCH_LIMIT]
-        return Response(TaskSerializer(qs, many=True, context=_owner_ctx(tenant)).data)
+        return Response(TaskSerializer(qs, many=True, context=_owner_ctx(tenant, qs)).data)
 
     def post(self, request):
         from .lifecycle_serializers import TaskSerializer
@@ -395,8 +482,11 @@ class TaskListCreateView(APIView):
         )
         serializer = TaskSerializer(data=authored_data, context=_owner_ctx(tenant))
         serializer.is_valid(raise_exception=True)
-        serializer.save(pii_receipts=receipts)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        task = serializer.save(pii_receipts=receipts)
+        return Response(
+            TaskSerializer(task, context=_owner_ctx(tenant, [task])).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class GoalListCreateView(APIView):
