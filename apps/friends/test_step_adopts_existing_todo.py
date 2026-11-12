@@ -47,15 +47,25 @@ class StepAdoptsExistingTodoTests(TestCase):
         values = {"tenant": tenant or self.owner, "title": TITLE, "description": NOTES, **overrides}
         return Task.objects.create(**values)
 
+    def tasks_with_title(self, *, tenant=None):
+        """Rows whose title matches TITLE — compared in Python, never in the DB.
+
+        Task.title is registered for phase-3 encryption-at-rest, so a raw
+        ``title=`` predicate would silently stop matching once it is
+        ciphertext (see scripts/check_encrypted_column_predicates.py).
+        """
+        rows = Task.objects.filter(tenant=tenant or self.owner)
+        return [row for row in rows if row.title == TITLE]
+
     def open_with_title(self, *, tenant=None):
-        return Task.objects.filter(tenant=tenant or self.owner, title=TITLE, status__in=["open", "in_progress"])
+        return [row for row in self.tasks_with_title(tenant=tenant) if row.status in ("open", "in_progress")]
 
     def test_add_owned_step_adopts_open_todo_with_same_title(self):
         existing = self.todo()
 
         step, task = projects.add_owned_step(self.owner, self.owner.user, self.goal.id, title=TITLE)
 
-        self.assertEqual(self.open_with_title().count(), 1)
+        self.assertEqual(len(self.open_with_title()), 1)
         self.assertEqual(task.id, existing.id)
         self.assertEqual(task.related_ref, _step_ref(step))
         self.assertEqual(task.description, NOTES)
@@ -70,7 +80,7 @@ class StepAdoptsExistingTodoTests(TestCase):
 
         assignment = projects.respond(self.member, self.member.user, self.goal.id, step.id, {"answer": "yes"})
 
-        self.assertEqual(self.open_with_title(tenant=self.member).count(), 2)
+        self.assertEqual(len(self.open_with_title(tenant=self.member)), 2)
         self.assertNotEqual(assignment.task_id, existing.id)
         existing.refresh_from_db()
         self.assertIsNone(existing.related_ref)
@@ -99,7 +109,7 @@ class StepAdoptsExistingTodoTests(TestCase):
         step, task = projects.add_owned_step(self.owner, self.owner.user, self.goal.id, title=TITLE)
 
         self.assertNotEqual(task.id, done.id)
-        self.assertEqual(Task.objects.filter(tenant=self.owner, title=TITLE).count(), 2)
+        self.assertEqual(len(self.tasks_with_title()), 2)
         done.refresh_from_db()
         self.assertEqual((done.status, done.related_ref), ("done", None))
         self.assertEqual(task.related_ref, _step_ref(step))
@@ -114,7 +124,7 @@ class StepAdoptsExistingTodoTests(TestCase):
         self.assertNotEqual(task.id, linked.id)
         linked.refresh_from_db()
         self.assertEqual(linked.related_ref["object_type"], "FinanceAccount")
-        self.assertEqual(Task.objects.filter(tenant=self.owner, title=TITLE).count(), 2)
+        self.assertEqual(len(self.tasks_with_title()), 2)
         self.assertEqual(task.related_ref, _step_ref(step))
 
     def test_different_title_is_not_adopted(self):
@@ -137,7 +147,7 @@ class StepAdoptsExistingTodoTests(TestCase):
         self.assertNotEqual(task.id, sub.id)
         sub.refresh_from_db()
         self.assertIsNone(sub.related_ref)
-        self.assertEqual(Task.objects.filter(tenant=self.owner, title=TITLE).count(), 2)
+        self.assertEqual(len(self.tasks_with_title()), 2)
         self.assertEqual(task.related_ref, _step_ref(step))
 
     def test_title_match_normalises_case_and_whitespace(self):
