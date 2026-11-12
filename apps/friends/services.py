@@ -1738,17 +1738,66 @@ def _linked_goal_for(tenant, mission):
 
 
 def _mint_member_task(tenant, mission, title, description, due_date, *, step=None, prepared=None, linked_goal_id=...):
-    """Author outside transactions, then persist only the caller's private Task."""
+    """Author outside transactions, then persist only the caller's private Task.
+
+    A step that becomes yours adopts YOUR open to-do with the same title instead
+    of making a second copy — exact normalized title only, never a fuzzy match —
+    and only fills fields that were empty. The adopted row keeps its id, title,
+    description and PII receipts, so a later release cannot destroy the notes.
+    """
     from apps.journal.models import Task
 
     values = prepared if prepared is not None else _prepare_member_task(tenant, title, description)
+    related_ref = (
+        {"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
+        if step
+        else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)}
+    )
+    parent_goal_id = _linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id
+    wanted = " ".join((values.get("title") or "").casefold().split())
+    candidates = (
+        Task.objects.filter(
+            tenant=tenant,
+            status__in=["open", "in_progress"],
+            related_ref__isnull=True,
+            parent_task__isnull=True,
+        )
+        .order_by("created_at", "id")
+        .values_list("id", "title")
+    )
+    for task_id, task_title in candidates:
+        if " ".join((task_title or "").casefold().split()) != wanted:
+            continue
+        # Lock only the chosen row and re-check it: another writer may have
+        # linked or completed it since the candidate scan.
+        task = (
+            Task.objects.select_for_update()
+            .filter(
+                id=task_id,
+                tenant=tenant,
+                status__in=["open", "in_progress"],
+                related_ref__isnull=True,
+                parent_task__isnull=True,
+            )
+            .first()
+        )
+        if task is None or " ".join((task.title or "").casefold().split()) != wanted:
+            continue
+        task.related_ref = related_ref
+        update_fields = ["related_ref", "updated_at"]
+        if task.due_date is None and due_date is not None:
+            task.due_date = due_date
+            update_fields.append("due_date")
+        if task.parent_goal_id is None and parent_goal_id is not None:
+            task.parent_goal_id = parent_goal_id
+            update_fields.append("parent_goal_id")
+        task.save(update_fields=update_fields)
+        return task
     return Task.objects.create(
         **values,
         due_date=due_date,
-        parent_goal_id=_linked_goal_for(tenant, mission) if linked_goal_id is ... else linked_goal_id,
-        related_ref={"pillar": "neighborhood", "object_type": "SharedGoalStep", "object_id": str(step.id)}
-        if step
-        else {"pillar": "friends", "object_type": "shared_goal", "object_id": str(mission.id)},
+        parent_goal_id=parent_goal_id,
+        related_ref=related_ref,
     )
 
 
