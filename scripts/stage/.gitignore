@@ -1,0 +1,4 @@
+.state/
+.acceptance/
+.*.log
+__pycache__/

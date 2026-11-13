@@ -1,0 +1,12 @@
+# Development image: no production ACR access or baked detector weights.
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata wamerican \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/requirements.txt
+# No neural detector weights/sidecar in stage. Keep the other application pins;
+# omit torch/transformers and their explicit CUDA/triton requirements.
+RUN sed -E '/^(cuda-|nvidia-|triton==|torch==|transformers==)/d' /tmp/requirements.txt > /tmp/stage-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/stage-requirements.txt
+COPY . /app
