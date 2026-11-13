@@ -1834,6 +1834,81 @@ class WakeBootGraceTest(TestCase):
         msg.refresh_from_db()
         self.assertEqual(msg.delivery_attempts, 1)
 
+    def _ios_provisioned_batch(self, provisioned_seconds_ago: int):
+        # A freshly provisioned tenant: ACTIVE, FQDN set, never hibernated,
+        # never woken (provisioning does not stamp last_wake_at).
+        user = _make_user()
+        tenant = _make_tenant(user)
+        Tenant.objects.filter(id=tenant.id).update(
+            hibernated_at=None,
+            last_wake_at=None,
+            provisioned_at=timezone.now() - timedelta(seconds=provisioned_seconds_ago),
+        )
+        thread = ChatThread.objects.create(tenant=tenant, user=user, title="", is_main=True)
+        turn = AppChatMessage.objects.create(
+            tenant=tenant,
+            user=user,
+            thread=thread,
+            client_msg_id=f"cmid-prov-{provisioned_seconds_ago}",
+            user_text="hi there",
+        )
+        row = PendingMessage.objects.create(
+            tenant=tenant,
+            channel=PendingMessage.Channel.IOS,
+            channel_user_id=str(thread.id),
+            payload={
+                "message_text": "hi there",
+                "user_param": f"thread:{thread.id}",
+                "user_timezone": "UTC",
+                "client_msg_id": turn.client_msg_id,
+            },
+            user_text="hi there",
+        )
+        return tenant, turn, row
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.hibernation.wake_hibernated_tenant")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_just_provisioned_container_down_defers_without_attempt_burn(
+        self, mock_post, _mock_credit, mock_wake, mock_publish
+    ):
+        mock_post.side_effect = self._container_404
+        tenant, turn, row = self._ios_provisioned_batch(provisioned_seconds_ago=30)
+
+        result = drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+
+        self.assertTrue(result.get("booting"))
+        mock_wake.assert_not_called()
+        row.refresh_from_db()
+        self.assertEqual(row.delivery_status, PendingMessage.Status.PENDING)
+        self.assertEqual(row.delivery_attempts, 0)
+        self.assertIsNone(row.delivery_in_flight_until)
+        turn.refresh_from_db()
+        self.assertEqual(turn.status, AppChatMessage.Status.PENDING)
+        # The app's "Waking your assistant..." pill reads this stamp.
+        self.assertIsNotNone(turn.waking_at)
+        drain_calls = [
+            c for c in mock_publish.call_args_list if c.args and c.args[0] == "drain_pending_messages_for_tenant"
+        ]
+        self.assertTrue(drain_calls, "expected a deferred drain reschedule")
+        self.assertEqual(drain_calls[-1].kwargs.get("delay_seconds"), _WAKE_DEFER_SECONDS)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
+    @patch("apps.router.pending_queue.httpx.post")
+    def test_provisioned_long_ago_container_down_still_burns_attempt(self, mock_post, _mock_credit, _mock_publish):
+        mock_post.side_effect = self._container_404
+        tenant, turn, row = self._ios_provisioned_batch(provisioned_seconds_ago=_WAKE_BOOT_GRACE_SECONDS + 60)
+
+        with self.assertRaises(RuntimeError):
+            drain_pending_messages_for_tenant_task(str(tenant.id), "ios", row.channel_user_id)
+
+        row.refresh_from_db()
+        self.assertEqual(row.delivery_attempts, 1)
+        turn.refresh_from_db()
+        self.assertIsNone(turn.waking_at)
+
     @patch("apps.cron.publish.publish_task")
     @patch("apps.router.pending_queue._looks_like_openrouter_credit_limit", return_value=False)
     @patch("apps.router.pending_queue.httpx.post")

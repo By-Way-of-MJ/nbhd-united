@@ -13,6 +13,7 @@ import secrets
 from datetime import timedelta
 from unittest.mock import patch
 
+import httpx
 from django.core.cache import cache
 from django.db import connection
 from django.test import RequestFactory, SimpleTestCase, TestCase, override_settings
@@ -1123,5 +1124,91 @@ class FreeTierAccountEndpointsTest(_PaywallClientMixin, TestCase):
     def test_prewarm_is_a_no_op_for_a_paused_tenant(self, wake, _pii):
         Tenant.objects.filter(pk=self.paused.pk).update(hibernated_at=timezone.now() - timedelta(hours=1))
         resp = self.client_for(self.paused).post("/api/v1/chat/prewarm/")
-        self.assertEqual((resp.status_code, resp.data), (200, {"state": "unavailable"}))
+        self.assertEqual((resp.status_code, resp.data), (200, {"state": "paused"}))
+        wake.assert_not_called()
+
+
+def _health(status_code: int):
+    resp = httpx.Response(status_code, request=httpx.Request("GET", "https://oc-paywall.example.com/health"))
+    return resp
+
+
+@patch("apps.router.chat_views.httpx.get")
+@patch("apps.cron.publish.publish_task")
+class PrewarmPausedOnlyWhenRefusedTest(_PaywallClientMixin, TestCase):
+    """Prewarm says ``paused`` only when ``ios_paywall_refuses`` is true (the
+    ``/tenants/me/`` predicate). Every other SUSPENDED tenant is still served by
+    chat, so it reports its real box state instead. Opening Chat never wakes a
+    hibernated SUSPENDED tenant nobody pays for."""
+
+    def setUp(self):
+        cache.clear()
+
+    def prewarm(self, tenant, header=PAYWALL_2):
+        return self.client_for(tenant, header).post("/api/v1/chat/prewarm/")
+
+    def hibernate(self, tenant):
+        Tenant.objects.filter(pk=tenant.pk).update(hibernated_at=timezone.now() - timedelta(hours=1))
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_refused_tenant_is_paused_without_probe_or_wake(self, wake, get):
+        tenant = _make_tenant()
+        resp = self.prewarm(tenant)
+        self.assertEqual((resp.status_code, resp.data), (200, {"state": "paused"}))
+        get.assert_not_called()
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="")
+    def test_flag_dark_paused_tenant_serving_box_is_awake_not_paused(self, wake, get):
+        get.return_value = _health(200)
+        tenant = _make_tenant()
+        resp = self.prewarm(tenant)
+        self.assertEqual(resp.data, {"state": "awake"})
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_old_client_billing_paused_scaled_to_zero_is_unavailable_not_paused(self, wake, get):
+        # Billing pause: SUSPENDED, hibernated_at cleared, scaled to zero, so the
+        # probe finds no replica. Its messages would not deliver either.
+        get.return_value = _health(404)
+        tenant = _make_tenant()
+        resp = self.prewarm(tenant, header="ios/2.4.2/108; paywall=1")
+        self.assertEqual(resp.data, {"state": "unavailable"})
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="")
+    def test_flag_dark_paused_hibernated_tenant_is_not_woken_by_opening_chat(self, wake, get):
+        tenant = _make_tenant()
+        self.hibernate(tenant)
+        resp = self.prewarm(tenant)
+        self.assertEqual(resp.data, {"state": "unavailable"})
+        get.assert_not_called()
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_suspended_but_entitled_hibernated_tenants_wake_like_active_ones(self, wake, get):
+        for label, tenant in (
+            ("trial", _make_tenant(is_trial=True)),
+            ("budget_exempt", _make_tenant(budget_exempt=True)),
+            ("stripe_paying", _make_tenant(stripe="sub_live")),
+        ):
+            with self.subTest(label):
+                cache.clear()
+                wake.reset_mock()
+                self.hibernate(tenant)
+                resp = self.prewarm(tenant)
+                self.assertEqual((resp.status_code, resp.data), (202, {"state": "waking"}))
+                wake.assert_called_once_with("wake_tenant_for_app_message", str(tenant.id), retries=1)
+        get.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_suspended_but_entitled_awake_tenant_reports_probe_state(self, wake, get):
+        tenant = _make_tenant(is_trial=True)
+        for code, state in ((200, "awake"), (502, "unavailable")):
+            with self.subTest(code=code):
+                cache.clear()
+                get.return_value = _health(code)
+                resp = self.prewarm(tenant)
+                self.assertEqual(resp.data, {"state": state})
+                self.assertNotEqual(resp.data, {"state": "paused"})
         wake.assert_not_called()
