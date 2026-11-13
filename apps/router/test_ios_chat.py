@@ -2587,12 +2587,77 @@ class ChatPrewarmEndpointTest(TestCase):
         self.assertEqual(second.data, {"state": "recent"})
         self.assertEqual(mock_publish.call_count, 1)
 
+    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
     @patch("apps.cron.publish.publish_task")
-    def test_awake_tenant_is_awake_and_does_not_publish(self, mock_publish):
+    def test_awake_tenant_is_awake_and_does_not_publish(self, mock_publish, mock_live):
         resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
 
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.data, {"state": "awake"})
+        mock_publish.assert_not_called()
+        mock_live.assert_called_once()
+        self.assertEqual(str(mock_live.call_args.args[0].id), str(self.tenant.id))
+
+    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=False)
+    @patch("apps.cron.publish.publish_task")
+    def test_not_hibernated_but_not_serving_is_starting(self, mock_publish, mock_live):
+        # A just-provisioned box: ACTIVE, never hibernated, still booting.
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data, {"state": "starting"})
+        mock_live.assert_called_once()
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
+    @patch("apps.cron.publish.publish_task")
+    def test_not_hibernated_without_fqdn_is_starting_without_probe(self, mock_publish, mock_live):
+        Tenant.objects.filter(pk=self.tenant.pk).update(container_fqdn="")
+        self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
+        self.client.force_authenticate(user=self.user)
+
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.data, {"state": "starting"})
+        mock_live.assert_not_called()
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
+    @patch("apps.cron.publish.publish_task")
+    def test_non_active_statuses_report_their_true_state(self, mock_publish, mock_live):
+        expected = {
+            Tenant.Status.PENDING: "provisioning",
+            Tenant.Status.PROVISIONING: "provisioning",
+            Tenant.Status.SUSPENDED: "paused",
+            Tenant.Status.DEPROVISIONING: "unavailable",
+            Tenant.Status.DELETED: "unavailable",
+        }
+        for tenant_status, state in expected.items():
+            with self.subTest(status=tenant_status):
+                from django.core.cache import cache
+
+                cache.clear()
+                Tenant.objects.filter(pk=self.tenant.pk).update(status=tenant_status)
+                self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
+                self.client.force_authenticate(user=self.user)
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual(resp.data, {"state": state})
+        mock_live.assert_not_called()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    def test_user_without_tenant_is_unavailable(self, mock_publish):
+        user = _make_user()
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        resp = client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.data, {"state": "unavailable"})
         mock_publish.assert_not_called()
 
     @patch("apps.cron.publish.publish_task")

@@ -1983,7 +1983,7 @@ def drain_pending_messages_for_tenant_task(
             # after the failed POST so container-down and proxy-gateway failures
             # see the current wake/hibernate state.
             try:
-                tenant.refresh_from_db(fields=["hibernated_at", "last_wake_at"])
+                tenant.refresh_from_db(fields=["hibernated_at", "last_wake_at", "provisioned_at"])
             except Exception:
                 logger.exception(
                     "drain_pending: failed to refresh container recovery state for tenant %s",
@@ -2075,11 +2075,12 @@ def drain_pending_messages_for_tenant_task(
         # the attempt counters, retry soon.
         # Without this, the shorter _WAKE_DEFER_SECONDS would burn all
         # _MAX_DELIVERY_ATTEMPTS during a slow cold boot.
-        if (
-            recoverable_boot_failure
-            and tenant.last_wake_at is not None
-            and (timezone.now() - tenant.last_wake_at).total_seconds() < _WAKE_BOOT_GRACE_SECONDS
-        ):
+        #
+        # A just-provisioned tenant is ACTIVE and not hibernated, but
+        # provisioning never stamps last_wake_at; its first container is
+        # still booting. provisioned_at inside the same window gets the same
+        # free deferral, so an early first message is not dropped.
+        if recoverable_boot_failure and _within_boot_grace(tenant):
             try:
                 for row in batch:
                     row.delivery_in_flight_until = None
@@ -2240,6 +2241,17 @@ def _reschedule_drain(
             channel,
             (channel_user_id or "")[:24],
         )
+
+
+def _within_boot_grace(tenant: Tenant) -> bool:
+    """True while the container is plausibly still booting: a wake
+    (``last_wake_at``) or the first provision (``provisioned_at``) happened
+    less than ``_WAKE_BOOT_GRACE_SECONDS`` ago."""
+    now = timezone.now()
+    for started in (tenant.last_wake_at, tenant.provisioned_at):
+        if started is not None and (now - started).total_seconds() < _WAKE_BOOT_GRACE_SECONDS:
+            return True
+    return False
 
 
 def _mark_ios_waking(channel: str, batch: list[PendingMessage]) -> None:

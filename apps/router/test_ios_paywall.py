@@ -1123,5 +1123,5 @@ class FreeTierAccountEndpointsTest(_PaywallClientMixin, TestCase):
     def test_prewarm_is_a_no_op_for_a_paused_tenant(self, wake, _pii):
         Tenant.objects.filter(pk=self.paused.pk).update(hibernated_at=timezone.now() - timedelta(hours=1))
         resp = self.client_for(self.paused).post("/api/v1/chat/prewarm/")
-        self.assertEqual((resp.status_code, resp.data), (200, {"state": "unavailable"}))
+        self.assertEqual((resp.status_code, resp.data), (200, {"state": "paused"}))
         wake.assert_not_called()

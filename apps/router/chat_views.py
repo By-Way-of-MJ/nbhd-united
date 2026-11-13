@@ -1368,6 +1368,22 @@ class ChatPrewarmView(APIView):
     the box. A cache cap (one wake per tenant per 10 minutes) bounds the
     worst-case cold-start spend; repeated opens inside the window are cheap
     no-ops.
+
+    The reply tells the app the assistant's TRUE state so the empty chat never
+    claims "ready" when it isn't:
+
+    - ``provisioning``: the tenant is still being set up (PENDING/PROVISIONING);
+    - ``paused``: the tenant is SUSPENDED;
+    - ``unavailable``: no tenant, or any other non-ACTIVE status;
+    - ``awake``: ACTIVE, not hibernated, and the container answers its health
+      probe;
+    - ``starting``: ACTIVE and not hibernated, but the container does not
+      answer yet (a just-provisioned box still booting);
+    - ``waking`` / ``recent``: hibernated, a wake was just published / was
+      published in the last 10 minutes.
+
+    Old app builds treat unknown state strings as unknown, so the new strings
+    are backward compatible.
     """
 
     permission_classes = [IsAuthenticated]
@@ -1375,11 +1391,24 @@ class ChatPrewarmView(APIView):
 
     def post(self, request):
         tenant = getattr(request.user, "tenant", None)
-        if not tenant or tenant.status != Tenant.Status.ACTIVE:
+        if not tenant:
+            return Response({"state": "unavailable"}, status=status.HTTP_200_OK)
+        if tenant.status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
+            return Response({"state": "provisioning"}, status=status.HTTP_200_OK)
+        if tenant.status == Tenant.Status.SUSPENDED:
+            return Response({"state": "paused"}, status=status.HTTP_200_OK)
+        if tenant.status != Tenant.Status.ACTIVE:
             return Response({"state": "unavailable"}, status=status.HTTP_200_OK)
 
         if tenant.hibernated_at is None:
-            return Response({"state": "awake"}, status=status.HTTP_200_OK)
+            # Not hibernated is not proof of serving: a just-provisioned
+            # container can still be booting. The drain's short (3 s) health
+            # probe decides; it treats ambiguous local errors as live.
+            from apps.router.pending_queue import _is_tenant_container_live
+
+            if tenant.container_fqdn and _is_tenant_container_live(tenant):
+                return Response({"state": "awake"}, status=status.HTTP_200_OK)
+            return Response({"state": "starting"}, status=status.HTTP_200_OK)
 
         # Atomic add is the cap: only the first caller in a 10-minute window
         # wins the publish. The key deliberately outlives this request; that
