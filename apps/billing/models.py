@@ -387,3 +387,41 @@ class AppStoreNotification(models.Model):
 
     def __str__(self) -> str:
         return f"{self.notification_type}/{self.subtype} {self.notification_uuid}"
+
+
+class AdAttribution(models.Model):
+    """Apple Ads attribution for one tenant account.
+
+    The iOS app reports the opaque token it gets from ``AAAttribution``; Apple's
+    AdServices API resolves it to the campaign that brought the account in. The
+    first token reported for a tenant wins, so a reinstall/relaunch cannot
+    rewrite history. ``token`` is cleared as soon as the row reaches a terminal
+    state (or expires) and is only retained while a retry is still useful.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        ATTRIBUTED = "attributed", "Attributed"
+        ORGANIC = "organic", "Organic"
+        ERROR = "error", "Error"
+
+    tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name="ad_attribution")
+    token = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    attempts = models.IntegerField(default=0)
+    org_id = models.BigIntegerField(null=True, blank=True)
+    campaign_id = models.BigIntegerField(null=True, blank=True)
+    ad_group_id = models.BigIntegerField(null=True, blank=True)
+    keyword_id = models.BigIntegerField(null=True, blank=True)
+    ad_id = models.BigIntegerField(null=True, blank=True)
+    country_or_region = models.CharField(max_length=16, blank=True, default="")
+    click_date = models.DateTimeField(null=True, blank=True)
+    raw = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "ad_attributions"
+
+    def __str__(self) -> str:
+        return f"{self.tenant_id}: {self.status}"

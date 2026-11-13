@@ -2,6 +2,7 @@ from django.urls import path
 
 from .usage_views import DailyUsageView, DonationPreferenceView, TransparencyView, UsageSummaryView
 from .views import (
+    AdAttributionView,
     AppleSyncView,
     CreditBalanceView,
     CreditCheckoutView,
@@ -16,6 +17,7 @@ urlpatterns = [
     # Apple in-app subscriptions
     path("apple/notifications/", apple_notifications, name="apple-notifications"),
     path("apple/sync/", AppleSyncView.as_view(), name="apple-sync"),
+    path("ad-attribution/", AdAttributionView.as_view(), name="ad-attribution"),
     path("portal/", StripePortalView.as_view(), name="stripe-portal"),
     path("checkout/", StripeCheckoutView.as_view(), name="stripe-checkout"),
     # Prepaid credit top-ups
