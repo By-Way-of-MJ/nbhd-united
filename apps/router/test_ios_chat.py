@@ -2534,12 +2534,17 @@ class IOSChatWakeAtIngressTest(TestCase):
 
 @override_settings(NBHD_INTERNAL_API_KEY="test-key")
 class ChatPrewarmEndpointTest(TestCase):
-    """POST /chat/prewarm/ wakes a hibernated tenant when Chat opens.
+    """POST /chat/prewarm/ reports the assistant's true state and wakes a
+    hibernated tenant when Chat opens.
 
     The wake is capped per tenant (cache add, 10-minute window) and must stay
     purely a wake: no ``last_message_at`` stamp (so the idle sweep can still
     hibernate an unanswered box) and no inline Azure call. The QStash publish
-    is mocked here; a publish failure is still an accepted 202.
+    is mocked here; a publish failure is still an accepted 202. A tenant that
+    is not hibernated is ``awake`` only when its gateway answers /health with
+    a 2xx (``httpx.get`` is mocked); otherwise ``starting`` inside the boot
+    grace window and ``unavailable`` past it. SUSPENDED cases live in
+    ``test_ios_paywall.PrewarmPausedOnlyWhenRefusedTest``.
     """
 
     def setUp(self):
@@ -2587,48 +2592,153 @@ class ChatPrewarmEndpointTest(TestCase):
         self.assertEqual(second.data, {"state": "recent"})
         self.assertEqual(mock_publish.call_count, 1)
 
-    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
+    def _reload(self):
+        self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
+        self.client.force_authenticate(user=self.user)
+        self.tenant = self.user.tenant
+
+    def _just_provisioned(self, seconds_ago: int = 30):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(provisioned_at=timezone.now() - timedelta(seconds=seconds_ago))
+        self._reload()
+
+    @staticmethod
+    def _health(status_code: int):
+        import httpx
+
+        return httpx.Response(status_code, request=httpx.Request("GET", "https://oc-ios.example.com/health"))
+
+    @patch("apps.router.chat_views.httpx.get")
     @patch("apps.cron.publish.publish_task")
-    def test_awake_tenant_is_awake_and_does_not_publish(self, mock_publish, mock_live):
+    def test_awake_tenant_is_awake_and_does_not_publish(self, mock_publish, mock_get):
+        mock_get.return_value = self._health(200)
+
         resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
 
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.data, {"state": "awake"})
         mock_publish.assert_not_called()
-        mock_live.assert_called_once()
-        self.assertEqual(str(mock_live.call_args.args[0].id), str(self.tenant.id))
+        mock_get.assert_called_once_with("https://oc-ios.example.com/health", timeout=3.0)
 
-    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=False)
+    @patch("apps.router.chat_views.httpx.get")
     @patch("apps.cron.publish.publish_task")
-    def test_not_hibernated_but_not_serving_is_starting(self, mock_publish, mock_live):
-        # A just-provisioned box: ACTIVE, never hibernated, still booting.
-        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+    def test_strict_probe_in_boot_grace_only_2xx_is_awake(self, mock_publish, mock_get):
+        import httpx
 
-        self.assertEqual(resp.status_code, 200, resp.content)
-        self.assertEqual(resp.data, {"state": "starting"})
-        mock_live.assert_called_once()
+        # A just-provisioned box: ACTIVE, never hibernated, possibly booting.
+        # The proxy answers 502 bad_gateway until the gateway is up.
+        self._just_provisioned()
+        cases = (
+            ("200", self._health(200), "awake"),
+            ("502", self._health(502), "starting"),
+            ("503", self._health(503), "starting"),
+            ("timeout", httpx.ReadTimeout("slow"), "starting"),
+            ("connect", httpx.ConnectError("refused"), "starting"),
+            ("unexpected", RuntimeError("boom"), "starting"),
+        )
+        for label, outcome, state in cases:
+            with self.subTest(label):
+                from django.core.cache import cache
+
+                cache.clear()
+                mock_get.reset_mock()
+                if isinstance(outcome, Exception):
+                    mock_get.side_effect = outcome
+                else:
+                    mock_get.side_effect = None
+                    mock_get.return_value = outcome
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertEqual(resp.data, {"state": state})
+                mock_get.assert_called_once()
         mock_publish.assert_not_called()
 
-    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
+    @patch("apps.router.chat_views.httpx.get")
     @patch("apps.cron.publish.publish_task")
-    def test_not_hibernated_without_fqdn_is_starting_without_probe(self, mock_publish, mock_live):
+    def test_not_serving_past_boot_grace_is_unavailable(self, mock_publish, mock_get):
+        from apps.router.pending_queue import _WAKE_BOOT_GRACE_SECONDS
+
+        mock_get.return_value = self._health(502)
+        for label, seconds_ago in (("provisioned long ago", _WAKE_BOOT_GRACE_SECONDS + 60), ("never stamped", None)):
+            with self.subTest(label):
+                from django.core.cache import cache
+
+                cache.clear()
+                if seconds_ago is None:
+                    Tenant.objects.filter(pk=self.tenant.pk).update(provisioned_at=None, last_wake_at=None)
+                    self._reload()
+                else:
+                    self._just_provisioned(seconds_ago)
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.data, {"state": "unavailable"})
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_recent_wake_not_serving_is_starting(self, mock_publish, mock_get):
+        from django.utils import timezone
+
+        mock_get.return_value = self._health(502)
+        Tenant.objects.filter(pk=self.tenant.pk).update(last_wake_at=timezone.now())
+        self._reload()
+
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual(resp.data, {"state": "starting"})
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_serving_answer_is_cached_briefly(self, mock_publish, mock_get):
+        mock_get.return_value = self._health(200)
+
+        first = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+        second = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual((first.data, second.data), ({"state": "awake"}, {"state": "awake"}))
+        mock_get.assert_called_once()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_not_serving_answer_is_not_cached(self, mock_publish, mock_get):
+        self._just_provisioned()
+        mock_get.return_value = self._health(502)
+        first = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+        mock_get.return_value = self._health(200)
+        second = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+        self.assertEqual((first.data, second.data), ({"state": "starting"}, {"state": "awake"}))
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_no_fqdn_skips_probe_and_is_bounded_by_boot_grace(self, mock_publish, mock_get):
         Tenant.objects.filter(pk=self.tenant.pk).update(container_fqdn="")
-        self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
-        self.client.force_authenticate(user=self.user)
+        self._just_provisioned()
 
         resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
-
         self.assertEqual(resp.data, {"state": "starting"})
-        mock_live.assert_not_called()
+
+        self._just_provisioned(seconds_ago=3600)
+        resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+        self.assertEqual(resp.data, {"state": "unavailable"})
+
+        mock_get.assert_not_called()
         mock_publish.assert_not_called()
 
-    @patch("apps.router.pending_queue._is_tenant_container_live", return_value=True)
+    @patch("apps.router.chat_views.httpx.get")
     @patch("apps.cron.publish.publish_task")
-    def test_non_active_statuses_report_their_true_state(self, mock_publish, mock_live):
+    def test_non_active_statuses_report_their_true_state(self, mock_publish, mock_get):
         expected = {
             Tenant.Status.PENDING: "provisioning",
             Tenant.Status.PROVISIONING: "provisioning",
-            Tenant.Status.SUSPENDED: "paused",
             Tenant.Status.DEPROVISIONING: "unavailable",
             Tenant.Status.DELETED: "unavailable",
         }
@@ -2638,14 +2748,38 @@ class ChatPrewarmEndpointTest(TestCase):
 
                 cache.clear()
                 Tenant.objects.filter(pk=self.tenant.pk).update(status=tenant_status)
-                self.user = User.objects.select_related("tenant").get(pk=self.user.pk)
-                self.client.force_authenticate(user=self.user)
+                self._reload()
 
                 resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
 
                 self.assertEqual(resp.status_code, 200, resp.content)
                 self.assertEqual(resp.data, {"state": state})
-        mock_live.assert_not_called()
+        mock_get.assert_not_called()
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_pending_left_after_a_failed_run_is_unavailable(self, mock_publish, mock_get):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        # A failed provisioning run resets the tenant to PENDING and nothing
+        # retries on its own; PROVISIONING is still "provisioning" (the
+        # repair cron owns stuck leases).
+        stale = timezone.now() - timedelta(minutes=10)
+        for tenant_status, state in (
+            (Tenant.Status.PENDING, "unavailable"),
+            (Tenant.Status.PROVISIONING, "provisioning"),
+        ):
+            with self.subTest(status=tenant_status):
+                Tenant.objects.filter(pk=self.tenant.pk).update(status=tenant_status, updated_at=stale)
+                self._reload()
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.data, {"state": state})
+        mock_get.assert_not_called()
         mock_publish.assert_not_called()
 
     @patch("apps.cron.publish.publish_task")

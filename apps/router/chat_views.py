@@ -24,6 +24,7 @@ import logging
 import uuid
 from datetime import timedelta
 
+import httpx
 from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
@@ -35,8 +36,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.billing.entitlement import ai_paused
 from apps.billing.services import check_budget
 from apps.crypto.nolog import RedactedStr
+from apps.orchestrator.gateway_url import gateway_base_url
 from apps.router import enc_columns, enc_read
 from apps.router.chat_gates import ios_paywall_refuses
 from apps.router.conversation_capture import scrub_chat_thread_title
@@ -50,7 +53,7 @@ from apps.router.inbound_media import (
 )
 from apps.router.models import AppChatMessage, ChatThread, PendingMessage
 from apps.router.panels import rehydrate_panels
-from apps.router.pending_queue import enqueue_message_for_tenant, placeholder_redactions
+from apps.router.pending_queue import _within_boot_grace, enqueue_message_for_tenant, placeholder_redactions
 from apps.router.reply_text import clamp_reply_text
 from apps.router.services import build_chat_context_marker, build_datetime_context
 from apps.tenants.models import Tenant
@@ -1359,6 +1362,53 @@ class ChatMessageDetailView(APIView):
         return _no_store(Response(_serialize_message(turn)))
 
 
+# Prewarm's strict serving probe. Only a 2xx from the gateway's own /health
+# counts as serving. The tenant proxy binds before the gateway starts
+# (runtime/openclaw/entrypoint.sh) and answers 502 bad_gateway for proxied
+# paths until it is up (runtime/openclaw/proxy.js proxyRequest), so the
+# drain's lenient "anything but 404 is live" reading would say "awake" for a
+# box that is still booting. /proxy-health is not used: it only probes the
+# gateway on images built after 2026-08-18 (0eb30633); older images answer it
+# 200 from the proxy alone. /health 200 unauthenticated is what the tenant
+# health check already requires (apps/orchestrator/services.py).
+_PREWARM_PROBE_TIMEOUT_SECONDS = 3.0
+# A positive answer is reused briefly so repeated Chat opens don't each pay
+# a probe. Only "serving" is cached; a hibernation in the meantime takes the
+# hibernated branch before the probe, so the cache can't hide it.
+_PREWARM_SERVING_CACHE_SECONDS = 30
+# A tenant left PENDING this long (a failed provisioning run resets it to
+# PENDING) is not being set up any more; the drain gives up on buffered
+# messages after the same wait.
+_PREWARM_PENDING_STALE_SECONDS = 300
+
+
+def _prewarm_gateway_serving(tenant) -> bool:
+    """True only when the tenant gateway answers /health with a 2xx.
+
+    Fails closed: 5xx (proxy 502 while the gateway boots), 404 (no replica),
+    timeouts and unexpected errors all read as "not serving". Network I/O;
+    never call inside ``transaction.atomic()``.
+    """
+    if not tenant.container_fqdn:
+        return False
+    cache_key = f"chat_prewarm_serving:{tenant.id}"
+    if cache.get(cache_key):
+        return True
+    try:
+        response = httpx.get(f"{gateway_base_url(tenant)}/health", timeout=_PREWARM_PROBE_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 — any failure means "not serving"
+        logger.info(
+            "chat_prewarm: health probe failed for tenant %s (%s)",
+            str(tenant.id)[:8],
+            type(exc).__name__,
+        )
+        return False
+    serving = 200 <= response.status_code < 300
+    if serving:
+        cache.set(cache_key, 1, timeout=_PREWARM_SERVING_CACHE_SECONDS)
+    return serving
+
+
 class ChatPrewarmView(APIView):
     """POST: opportunistically wake a hibernated tenant when Chat opens.
 
@@ -1372,18 +1422,27 @@ class ChatPrewarmView(APIView):
     The reply tells the app the assistant's TRUE state so the empty chat never
     claims "ready" when it isn't:
 
-    - ``provisioning``: the tenant is still being set up (PENDING/PROVISIONING);
-    - ``paused``: the tenant is SUSPENDED;
-    - ``unavailable``: no tenant, or any other non-ACTIVE status;
-    - ``awake``: ACTIVE, not hibernated, and the container answers its health
-      probe;
-    - ``starting``: ACTIVE and not hibernated, but the container does not
-      answer yet (a just-provisioned box still booting);
+    - ``provisioning``: PENDING/PROVISIONING (a PENDING tenant untouched for
+      ``_PREWARM_PENDING_STALE_SECONDS`` is ``unavailable`` instead);
+    - ``paused``: the iOS paywall refuses this tenant (``ios_paywall_refuses``,
+      the same predicate ``/tenants/me/`` reports);
+    - ``awake``: not hibernated and the gateway answers /health with a 2xx;
+    - ``starting``: not hibernated, not serving yet, and inside the boot grace
+      window after a wake or the first provision;
     - ``waking`` / ``recent``: hibernated, a wake was just published / was
-      published in the last 10 minutes.
+      published in the last 10 minutes;
+    - ``unavailable``: no tenant, DEPROVISIONING/DELETED, not serving past the
+      boot grace window, or a hibernated SUSPENDED tenant that opening Chat
+      must not wake (see below).
 
-    Old app builds treat unknown state strings as unknown, so the new strings
-    are backward compatible.
+    SUSPENDED tenants the paywall does not refuse are still served by chat, so
+    they take the same awake/starting probe. Opening Chat never wakes a
+    SUSPENDED tenant that is ``ai_paused`` (nobody paying): that would turn
+    app opens into cold-start spend for non-payers. A real message still
+    wakes it through the ingress.
+
+    Old app builds treat unknown state strings as unknown (the same as
+    ``unavailable``), so the new strings are backward compatible.
     """
 
     permission_classes = [IsAuthenticated]
@@ -1392,29 +1451,39 @@ class ChatPrewarmView(APIView):
     def post(self, request):
         tenant = getattr(request.user, "tenant", None)
         if not tenant:
-            return Response({"state": "unavailable"}, status=status.HTTP_200_OK)
+            return _prewarm_state("unavailable")
         if tenant.status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
-            return Response({"state": "provisioning"}, status=status.HTTP_200_OK)
+            if (
+                tenant.status == Tenant.Status.PENDING
+                and tenant.updated_at is not None
+                and (timezone.now() - tenant.updated_at).total_seconds() > _PREWARM_PENDING_STALE_SECONDS
+            ):
+                return _prewarm_state("unavailable")
+            return _prewarm_state("provisioning")
         if tenant.status == Tenant.Status.SUSPENDED:
-            return Response({"state": "paused"}, status=status.HTTP_200_OK)
-        if tenant.status != Tenant.Status.ACTIVE:
-            return Response({"state": "unavailable"}, status=status.HTTP_200_OK)
+            if ios_paywall_refuses(request, tenant):
+                return _prewarm_state("paused")
+        elif tenant.status != Tenant.Status.ACTIVE:
+            return _prewarm_state("unavailable")
 
         if tenant.hibernated_at is None:
-            # Not hibernated is not proof of serving: a just-provisioned
-            # container can still be booting. The drain's short (3 s) health
-            # probe decides; it treats ambiguous local errors as live.
-            from apps.router.pending_queue import _is_tenant_container_live
+            # Not hibernated is not proof of serving: a just-provisioned or
+            # just-woken container can still be booting, and a billing-paused
+            # one is scaled to zero with hibernated_at cleared.
+            if _prewarm_gateway_serving(tenant):
+                return _prewarm_state("awake")
+            if _within_boot_grace(tenant):
+                return _prewarm_state("starting")
+            return _prewarm_state("unavailable")
 
-            if tenant.container_fqdn and _is_tenant_container_live(tenant):
-                return Response({"state": "awake"}, status=status.HTTP_200_OK)
-            return Response({"state": "starting"}, status=status.HTTP_200_OK)
+        if tenant.status == Tenant.Status.SUSPENDED and ai_paused(tenant):
+            return _prewarm_state("unavailable")
 
         # Atomic add is the cap: only the first caller in a 10-minute window
         # wins the publish. The key deliberately outlives this request; that
         # is what keeps repeated Chat opens from paying for repeat cold starts.
         if not cache.add(f"chat_prewarm:{tenant.id}", 1, timeout=600):
-            return Response({"state": "recent"}, status=status.HTTP_200_OK)
+            return _prewarm_state("recent")
 
         try:
             from apps.cron.publish import publish_task
@@ -1434,6 +1503,10 @@ class ChatPrewarmView(APIView):
             )
 
         return Response({"state": "waking"}, status=status.HTTP_202_ACCEPTED)
+
+
+def _prewarm_state(state: str) -> Response:
+    return Response({"state": state}, status=status.HTTP_200_OK)
 
 
 class ChatReadView(APIView):

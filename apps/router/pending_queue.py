@@ -1979,9 +1979,10 @@ def drain_pending_messages_for_tenant_task(
         recoverable_boot_failure = container_down or proxy_gateway_down
         if recoverable_boot_failure:
             # Idle hibernation can race a drain that loaded the tenant just
-            # before hibernated_at was stamped. Refresh the two recovery fields
-            # after the failed POST so container-down and proxy-gateway failures
-            # see the current wake/hibernate state.
+            # before hibernated_at was stamped. Refresh the recovery fields
+            # (hibernated_at, last_wake_at, provisioned_at) after the failed POST
+            # so container-down and proxy-gateway failures see the current
+            # wake/hibernate/boot-grace state.
             try:
                 tenant.refresh_from_db(fields=["hibernated_at", "last_wake_at", "provisioned_at"])
             except Exception:
