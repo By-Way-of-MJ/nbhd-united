@@ -2696,6 +2696,69 @@ class ChatPrewarmEndpointTest(TestCase):
 
     @patch("apps.router.chat_views.httpx.get")
     @patch("apps.cron.publish.publish_task")
+    def test_wake_in_flight_is_starting_not_unavailable(self, mock_publish, mock_get):
+        from datetime import timedelta
+
+        from django.core.cache import cache
+        from django.utils import timezone
+
+        from apps.orchestrator.hibernation import mark_wake_in_progress
+        from apps.router.pending_queue import _WAKE_BOOT_GRACE_SECONDS
+
+        # wake_hibernated_tenant has cleared hibernated_at but its Azure call
+        # hasn't returned, so last_wake_at is still the previous (old) wake.
+        mock_get.return_value = self._health(404)
+        Tenant.objects.filter(pk=self.tenant.pk).update(
+            hibernated_at=None,
+            last_wake_at=timezone.now() - timedelta(seconds=_WAKE_BOOT_GRACE_SECONDS + 3600),
+            provisioned_at=timezone.now() - timedelta(days=30),
+        )
+        self._reload()
+
+        for in_flight, state in ((True, "starting"), (False, "unavailable")):
+            with self.subTest(in_flight=in_flight):
+                cache.clear()
+                if in_flight:
+                    mark_wake_in_progress(self.tenant.id)
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.data, {"state": state})
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
+    def test_past_grace_only_a_read_timeout_reads_as_busy_awake(self, mock_publish, mock_get):
+        import httpx
+        from django.core.cache import cache
+
+        # Past any boot: a slow /health from a box that accepted the
+        # connection is a busy gateway mid-turn. 5xx/404/connect failures
+        # stay strict.
+        cases = (
+            ("read timeout", httpx.ReadTimeout("slow"), "awake"),
+            ("connect timeout", httpx.ConnectTimeout("no route"), "unavailable"),
+            ("connect error", httpx.ConnectError("refused"), "unavailable"),
+            ("404", self._health(404), "unavailable"),
+            ("502", self._health(502), "unavailable"),
+            ("503", self._health(503), "unavailable"),
+        )
+        for label, outcome, state in cases:
+            with self.subTest(label):
+                cache.clear()
+                if isinstance(outcome, Exception):
+                    mock_get.side_effect = outcome
+                else:
+                    mock_get.side_effect = None
+                    mock_get.return_value = outcome
+
+                resp = self.client.post("/api/v1/chat/prewarm/", {}, format="json")
+
+                self.assertEqual(resp.data, {"state": state})
+        mock_publish.assert_not_called()
+
+    @patch("apps.router.chat_views.httpx.get")
+    @patch("apps.cron.publish.publish_task")
     def test_serving_answer_is_cached_briefly(self, mock_publish, mock_get):
         mock_get.return_value = self._health(200)
 

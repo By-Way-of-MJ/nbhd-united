@@ -1382,31 +1382,41 @@ _PREWARM_SERVING_CACHE_SECONDS = 30
 _PREWARM_PENDING_STALE_SECONDS = 300
 
 
-def _prewarm_gateway_serving(tenant) -> bool:
-    """True only when the tenant gateway answers /health with a 2xx.
+_PROBE_SERVING = "serving"
+_PROBE_DOWN = "down"
+_PROBE_SLOW = "slow"
 
-    Fails closed: 5xx (proxy 502 while the gateway boots), 404 (no replica),
-    timeouts and unexpected errors all read as "not serving". Network I/O;
-    never call inside ``transaction.atomic()``.
+
+def _prewarm_probe(tenant) -> str:
+    """Strict serving probe: ``serving`` only on a 2xx from the gateway /health.
+
+    ``slow`` is a ReadTimeout: the connection to the box was accepted but the
+    answer didn't arrive in time, which is what a busy, healthy gateway
+    mid-turn looks like. Everything else is ``down``: 5xx (the proxy's 502
+    while the gateway boots), 404 (no replica), connect/other timeouts and
+    unexpected errors. Network I/O; never call inside ``transaction.atomic()``.
     """
     if not tenant.container_fqdn:
-        return False
+        return _PROBE_DOWN
     cache_key = f"chat_prewarm_serving:{tenant.id}"
     if cache.get(cache_key):
-        return True
+        return _PROBE_SERVING
     try:
         response = httpx.get(f"{gateway_base_url(tenant)}/health", timeout=_PREWARM_PROBE_TIMEOUT_SECONDS)
-    except Exception as exc:  # noqa: BLE001 — any failure means "not serving"
+    except httpx.ReadTimeout:
+        logger.info("chat_prewarm: health probe read timeout for tenant %s", str(tenant.id)[:8])
+        return _PROBE_SLOW
+    except Exception as exc:  # noqa: BLE001 — any other failure means "not serving"
         logger.info(
             "chat_prewarm: health probe failed for tenant %s (%s)",
             str(tenant.id)[:8],
             type(exc).__name__,
         )
-        return False
-    serving = 200 <= response.status_code < 300
-    if serving:
+        return _PROBE_DOWN
+    if 200 <= response.status_code < 300:
         cache.set(cache_key, 1, timeout=_PREWARM_SERVING_CACHE_SECONDS)
-    return serving
+        return _PROBE_SERVING
+    return _PROBE_DOWN
 
 
 class ChatPrewarmView(APIView):
@@ -1428,7 +1438,9 @@ class ChatPrewarmView(APIView):
       the same predicate ``/tenants/me/`` reports);
     - ``awake``: not hibernated and the gateway answers /health with a 2xx;
     - ``starting``: not hibernated, not serving yet, and inside the boot grace
-      window after a wake or the first provision;
+      window after a wake or the first provision, or a wake is in flight
+      (``is_wake_in_progress``); past that, a /health read timeout counts as
+      ``awake`` (busy mid-turn), anything else as ``unavailable``;
     - ``waking`` / ``recent``: hibernated, a wake was just published / was
       published in the last 10 minutes;
     - ``unavailable``: no tenant, DEPROVISIONING/DELETED, not serving past the
@@ -1470,10 +1482,21 @@ class ChatPrewarmView(APIView):
             # Not hibernated is not proof of serving: a just-provisioned or
             # just-woken container can still be booting, and a billing-paused
             # one is scaled to zero with hibernated_at cleared.
-            if _prewarm_gateway_serving(tenant):
+            from apps.orchestrator.hibernation import is_wake_in_progress
+
+            probe = _prewarm_probe(tenant)
+            if probe == _PROBE_SERVING:
                 return _prewarm_state("awake")
-            if _within_boot_grace(tenant):
+            # A wake in flight clears hibernated_at before the Azure call but
+            # stamps last_wake_at only after it returns; the in-progress
+            # marker covers that gap.
+            if _within_boot_grace(tenant) or is_wake_in_progress(tenant.id):
                 return _prewarm_state("starting")
+            # Past any boot, a box that accepted the connection but answered
+            # slowly is busy, not gone (no replica is a fast 404, a dead
+            # gateway a fast 502).
+            if probe == _PROBE_SLOW:
+                return _prewarm_state("awake")
             return _prewarm_state("unavailable")
 
         if tenant.status == Tenant.Status.SUSPENDED and ai_paused(tenant):
