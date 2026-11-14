@@ -2,7 +2,8 @@
 
 The server refuses the assistant only when ALL hold: the flag opens the tenant,
 the iOS client declares ``X-NBHD-Client: ios/<v>/<b>; paywall=2`` (or higher),
-and the tenant is paused (suspended, no trial, not paying, not budget-exempt).
+and the tenant is lapsed and unpaid (SUSPENDED, DEPROVISIONING or DELETED, with no
+unexpired trial, no Stripe or Apple payment, not budget-exempt).
 Everyone else — web, Telegram/LINE, every shipped iOS build (``paywall=1``) — is
 served exactly as before.
 """
@@ -21,7 +22,7 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.billing.entitlement import ai_paused
+from apps.billing.entitlement import ai_paused, lapsed_unpaid
 from apps.billing.models import AppStoreSubscription
 from apps.router import chat_shape_views, siri_views, talk_route_views
 from apps.router.chat_gates import _tenant_allowed, ios_paywall_version
@@ -137,7 +138,12 @@ class IOSPaywallVersionParseTest(SimpleTestCase):
         self.assertEqual(ios_paywall_version(NoMeta()), 0)
 
 
-def _make_tenant(*, status=Tenant.Status.SUSPENDED, is_trial=False, budget_exempt=False, stripe="") -> Tenant:
+_UNSET = object()
+
+
+def _make_tenant(
+    *, status=Tenant.Status.SUSPENDED, is_trial=False, budget_exempt=False, stripe="", trial_ends_at=_UNSET
+) -> Tenant:
     user = User.objects.create_user(
         username=f"paywall_{secrets.token_hex(4)}",
         email=f"{secrets.token_hex(4)}@example.com",
@@ -147,7 +153,9 @@ def _make_tenant(*, status=Tenant.Status.SUSPENDED, is_trial=False, budget_exemp
         user=user,
         status=status,
         is_trial=is_trial,
-        trial_ends_at=timezone.now() + timedelta(days=7) if is_trial else None,
+        trial_ends_at=(timezone.now() + timedelta(days=7) if is_trial else None)
+        if trial_ends_at is _UNSET
+        else trial_ends_at,
         is_budget_exempt=budget_exempt,
         stripe_subscription_id=stripe,
         container_fqdn="oc-paywall.example.com",
@@ -178,8 +186,8 @@ class AiPausedTest(TestCase):
         _apple(lapsed_apple, entitles=False)
         self.assertTrue(ai_paused(lapsed_apple))
         self.assertFalse(ai_paused(None))
-        # Only SUSPENDED is paused. In particular a normal Stripe cancellation goes
-        # DEPROVISIONING -> DELETED, so a churned Stripe user is never refused (known gap).
+        # ai_paused stays the narrow Telegram/LINE predicate: only SUSPENDED. The iOS
+        # paywall reads the wider lapsed_unpaid (LapsedUnpaidTest).
         for status in (
             Tenant.Status.PENDING,
             Tenant.Status.PROVISIONING,
@@ -200,6 +208,70 @@ class AiPausedTest(TestCase):
         tenant = _make_tenant(status=Tenant.Status.ACTIVE)
         with self.assertNumQueries(0):
             self.assertFalse(ai_paused(tenant))
+
+
+class LapsedUnpaidTest(TestCase):
+    """The iOS paywall predicate: lapsed (SUSPENDED/DEPROVISIONING/DELETED) and nothing
+    entitles the account. Exactly ``not has_entitlement`` within those statuses."""
+
+    LAPSED = (Tenant.Status.SUSPENDED, Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED)
+    NEVER = (Tenant.Status.PENDING, Tenant.Status.PROVISIONING, Tenant.Status.ACTIVE)
+
+    def test_unpaid_lapsed_statuses_are_true(self):
+        expired = timezone.now() - timedelta(days=1)
+        for tenant_status in self.LAPSED:
+            with self.subTest(status=tenant_status):
+                self.assertTrue(lapsed_unpaid(_make_tenant(status=tenant_status)))
+                # Trial ended but is_trial never cleared (the old ai_paused gap).
+                self.assertTrue(lapsed_unpaid(_make_tenant(status=tenant_status, is_trial=True, trial_ends_at=expired)))
+                # Same as has_entitlement: a trial with no end date does not entitle.
+                self.assertTrue(lapsed_unpaid(_make_tenant(status=tenant_status, is_trial=True, trial_ends_at=None)))
+                lapsed_apple = _make_tenant(status=tenant_status)
+                _apple(lapsed_apple, entitles=False)
+                self.assertTrue(lapsed_unpaid(lapsed_apple))
+
+    def test_entitled_lapsed_statuses_are_false(self):
+        for tenant_status in self.LAPSED:
+            apple = _make_tenant(status=tenant_status)
+            _apple(apple, entitles=True)
+            for label, tenant in (
+                ("trial", _make_tenant(status=tenant_status, is_trial=True)),
+                ("stripe", _make_tenant(status=tenant_status, stripe="sub_live")),
+                ("apple", apple),
+                ("budget_exempt", _make_tenant(status=tenant_status, budget_exempt=True)),
+            ):
+                with self.subTest(status=tenant_status, who=label):
+                    self.assertFalse(lapsed_unpaid(tenant))
+                    self.assertTrue(Tenant.objects.get(pk=tenant.pk).has_entitlement)
+
+    def test_new_signup_and_active_never_lapsed_even_unpaid(self):
+        for tenant_status in self.NEVER:
+            with self.subTest(status=tenant_status):
+                tenant = _make_tenant(status=tenant_status)
+                self.assertFalse(Tenant.objects.get(pk=tenant.pk).has_entitlement)  # unpaid ...
+                self.assertFalse(lapsed_unpaid(tenant))  # ... and still never lapsed
+        self.assertFalse(lapsed_unpaid(None))
+
+    def test_matches_not_has_entitlement_within_lapsed_statuses(self):
+        expired = timezone.now() - timedelta(days=1)
+        for tenant_status in self.LAPSED:
+            for kwargs in ({}, {"is_trial": True}, {"is_trial": True, "trial_ends_at": expired}, {"stripe": "sub_x"}):
+                with self.subTest(status=tenant_status, **kwargs):
+                    tenant = _make_tenant(status=tenant_status, **kwargs)
+                    self.assertEqual(lapsed_unpaid(tenant), not Tenant.objects.get(pk=tenant.pk).has_entitlement)
+
+    def test_query_cost(self):
+        lapsed = _make_tenant(status=Tenant.Status.DELETED)
+        with self.assertNumQueries(1):
+            self.assertTrue(lapsed_unpaid(lapsed))
+        for tenant in (
+            _make_tenant(status=Tenant.Status.ACTIVE),
+            _make_tenant(status=Tenant.Status.DELETED, is_trial=True),
+            _make_tenant(status=Tenant.Status.DELETED, budget_exempt=True),
+            _make_tenant(status=Tenant.Status.DELETED, stripe="sub_live"),
+        ):
+            with self.subTest(tenant=tenant.status), self.assertNumQueries(0):
+                self.assertFalse(lapsed_unpaid(tenant))
 
 
 class _PaywallClientMixin:
@@ -377,7 +449,7 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
         with (
             self.subTest(flag=flag, client=label),
             override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=flag),
-            patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+            patch("apps.router.chat_gates.lapsed_unpaid", wraps=lapsed_unpaid) as paused_check,
             patch("apps.router.chat_gates._tenant_allowed", wraps=_tenant_allowed) as flag_check,
         ):
             enqueue.reset_mock()
@@ -403,29 +475,77 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
         enqueue.assert_not_called()
         wake.assert_not_called()
 
-    def test_non_suspended_statuses_served_as_today(self, enqueue, wake, _pii):
-        # Known gap pinned: only SUSPENDED is refused. A churned Stripe user goes
-        # DEPROVISIONING -> DELETED and keeps today's response, whatever that is.
-        for tenant_status in (
-            Tenant.Status.PENDING,
-            Tenant.Status.PROVISIONING,
-            Tenant.Status.DEPROVISIONING,
-            Tenant.Status.DELETED,
-        ):
+    def test_new_signup_statuses_served_as_today(self, enqueue, wake, _pii):
+        # A new signup (PENDING/PROVISIONING) is never refused, whatever today's
+        # response for it is, and the gate adds no log line.
+        for tenant_status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
             with self.subTest(status=tenant_status), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
-                baseline_tenant, gated_tenant = _make_tenant(status=tenant_status), _make_tenant(status=tenant_status)
-                with patch("apps.router.chat_views.ios_paywall_refuses", return_value=False):
-                    baseline = self.post(baseline_tenant, client_msg_id=f"base-{tenant_status}")
-                with self.assertNoLogs("apps.router.chat_gates", level="DEBUG"):
-                    gated = self.post(gated_tenant, client_msg_id=f"gated-{tenant_status}")
-                self.assertEqual(gated.status_code, baseline.status_code, gated.content)
-                self.assertEqual(gated.data.get("status"), baseline.data.get("status"))
-                self.assertEqual(gated.data.get("error"), baseline.data.get("error"))
-                self.assertNotEqual(gated.data.get("error"), "subscription_required")
-                self.assertEqual(
-                    AppChatMessage.objects.filter(tenant=gated_tenant).count(),
-                    AppChatMessage.objects.filter(tenant=baseline_tenant).count(),
+                self._assert_same_as_ungated(tenant_status, PAYWALL_2, expect_logs=False)
+
+    def test_churned_statuses_refused_like_suspended(self, enqueue, wake, _pii):
+        # A normal Stripe cancellation goes DEPROVISIONING -> DELETED: a paywall=2
+        # build gets subscription_required (free tier + Subscribe), nothing persisted.
+        for tenant_status in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            with self.subTest(status=tenant_status), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+                enqueue.reset_mock()
+                tenant = _make_tenant(status=tenant_status)
+                self.assert_refused(
+                    self.post(tenant, client_msg_id=f"churn-{tenant_status}"),
+                    tenant,
+                    enqueue,
+                    wake,
+                    client_msg_id=f"churn-{tenant_status}",
                 )
+
+    def test_expired_trial_still_flagged_is_refused(self, enqueue, wake, _pii):
+        tenant = _make_tenant(is_trial=True, trial_ends_at=timezone.now() - timedelta(days=1))
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+            self.assert_refused(self.post(tenant), tenant, enqueue, wake)
+
+    def test_churned_statuses_old_clients_served_as_today(self, enqueue, wake, _pii):
+        # Every client that does not declare paywall>=2 gets exactly today's
+        # response for a churned tenant, with no gate query or log.
+        for tenant_status in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            for label, header in (("web", None), ("paywall1", PAYWALL_1), ("dup", DUPLICATED)):
+                with (
+                    self.subTest(status=tenant_status, client=label),
+                    override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+                    patch("apps.router.chat_gates.lapsed_unpaid", wraps=lapsed_unpaid) as paused_check,
+                ):
+                    self._assert_same_as_ungated(tenant_status, header, expect_logs=False)
+                    paused_check.assert_not_called()
+
+    def test_churned_but_paying_or_entitled_not_refused(self, enqueue, wake, _pii):
+        for tenant_status in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            apple = _make_tenant(status=tenant_status)
+            _apple(apple, entitles=True)
+            for label, tenant in (
+                ("apple", apple),
+                ("trial", _make_tenant(status=tenant_status, is_trial=True)),
+                ("budget_exempt", _make_tenant(status=tenant_status, budget_exempt=True)),
+                ("stripe", _make_tenant(status=tenant_status, stripe="sub_live")),
+            ):
+                with (
+                    self.subTest(status=tenant_status, who=label),
+                    override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
+                ):
+                    resp = self.post(tenant, client_msg_id=f"ent-{tenant_status}-{label}")
+                    self.assertNotEqual(resp.data.get("error"), "subscription_required", resp.content)
+
+    def _assert_same_as_ungated(self, tenant_status, header, *, expect_logs):
+        baseline_tenant, gated_tenant = _make_tenant(status=tenant_status), _make_tenant(status=tenant_status)
+        with patch("apps.router.chat_views.ios_paywall_refuses", return_value=False):
+            baseline = self.post(baseline_tenant, header=header, client_msg_id=f"base-{tenant_status}")
+        with self.assertNoLogs("apps.router.chat_gates", level="DEBUG"):
+            gated = self.post(gated_tenant, header=header, client_msg_id=f"gated-{tenant_status}")
+        self.assertEqual(gated.status_code, baseline.status_code, gated.content)
+        self.assertEqual(gated.data.get("status"), baseline.data.get("status"))
+        self.assertEqual(gated.data.get("error"), baseline.data.get("error"))
+        self.assertNotEqual(gated.data.get("error"), "subscription_required")
+        self.assertEqual(
+            AppChatMessage.objects.filter(tenant=gated_tenant).count(),
+            AppChatMessage.objects.filter(tenant=baseline_tenant).count(),
+        )
 
     def test_duplicated_header_served_as_today(self, enqueue, wake, _pii):
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
@@ -768,6 +888,44 @@ class TenantMePaywallFieldTest(_PaywallClientMixin, TestCase):
             with self.subTest(tenant=tenant.pk), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
                 self.assertIs(self.paywall(tenant), False)
 
+    def test_true_for_churned_and_expired_trial_tenants(self):
+        expired = timezone.now() - timedelta(days=1)
+        lapsed_apple = _make_tenant(status=Tenant.Status.DELETED)
+        _apple(lapsed_apple, entitles=False)
+        for label, tenant in (
+            ("deprovisioning", _make_tenant(status=Tenant.Status.DEPROVISIONING)),
+            ("deleted", _make_tenant(status=Tenant.Status.DELETED)),
+            ("deleted_lapsed_apple", lapsed_apple),
+            ("suspended_trial_expired", _make_tenant(is_trial=True, trial_ends_at=expired)),
+            ("deleted_trial_expired", _make_tenant(status=Tenant.Status.DELETED, is_trial=True, trial_ends_at=expired)),
+        ):
+            with self.subTest(label), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+                subscription = self.me(tenant).data["subscription"]
+                self.assertIs(subscription["paywall"], True)
+                self.assertIs(subscription["active"], False)  # never paywall beside active
+                # Old clients: unchanged (false), with the same body.
+                for header in (None, PAYWALL_1, DUPLICATED):
+                    self.assertIs(self.paywall(tenant, header), False)
+        with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""):
+            self.assertIs(self.paywall(_make_tenant(status=Tenant.Status.DELETED)), False)
+
+    def test_false_for_paying_trial_exempt_apple_and_new_signups(self):
+        tenants = {
+            "pending": _make_tenant(status=Tenant.Status.PENDING),
+            "provisioning": _make_tenant(status=Tenant.Status.PROVISIONING),
+            "active_unpaid": _make_tenant(status=Tenant.Status.ACTIVE),
+        }
+        for tenant_status in (Tenant.Status.SUSPENDED, Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            apple = _make_tenant(status=tenant_status)
+            _apple(apple, entitles=True)
+            tenants[f"{tenant_status}_apple"] = apple
+            tenants[f"{tenant_status}_trial"] = _make_tenant(status=tenant_status, is_trial=True)
+            tenants[f"{tenant_status}_exempt"] = _make_tenant(status=tenant_status, budget_exempt=True)
+            tenants[f"{tenant_status}_stripe"] = _make_tenant(status=tenant_status, stripe="sub_live")
+        for label, tenant in tenants.items():
+            with self.subTest(label), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
+                self.assertIs(self.paywall(tenant), False)
+
     def test_other_subscription_fields_unchanged(self):
         with override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
             subscription = self.client_for(self.paused).get("/api/v1/tenants/me/").data["subscription"]
@@ -825,7 +983,7 @@ class TenantMePaywallFieldTest(_PaywallClientMixin, TestCase):
         baseline_tenant, gated_tenant = _make_tenant(), _make_tenant()
         with (
             override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=""),
-            patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+            patch("apps.router.chat_gates.lapsed_unpaid", wraps=lapsed_unpaid) as paused_check,
         ):
             with CaptureQueriesContext(connection) as baseline_queries:
                 baseline = self.me(baseline_tenant, header=None)
@@ -911,7 +1069,7 @@ class HeaderFirstPerViewTest(_PaywallClientMixin, TestCase):
                 with (
                     self.subTest(endpoint=endpoint, header=header),
                     override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=str(self.paused.id)),
-                    patch("apps.router.chat_gates.ai_paused", wraps=ai_paused) as paused_check,
+                    patch("apps.router.chat_gates.lapsed_unpaid", wraps=lapsed_unpaid) as paused_check,
                     patch("apps.router.chat_gates._tenant_allowed", wraps=_tenant_allowed) as flag_check,
                     self.assertNoLogs("apps.router.chat_gates", level="DEBUG"),
                 ):
@@ -1212,3 +1370,94 @@ class PrewarmPausedOnlyWhenRefusedTest(_PaywallClientMixin, TestCase):
                 self.assertEqual(resp.data, {"state": state})
                 self.assertNotEqual(resp.data, {"state": "paused"})
         wake.assert_not_called()
+
+
+class FreeTierChurnedAccountEndpointsTest(FreeTierAccountEndpointsTest):
+    """The same free-tier tool endpoints (and the paused prewarm) for a churned Stripe
+    user whose assistant was deleted (DELETED, no container): still served, so free
+    chat is not a dead end. The flag and patches are inherited from the base class."""
+
+    def setUp(self):
+        cache.clear()
+        self.paused = _make_tenant(status=Tenant.Status.DELETED)
+        Tenant.objects.filter(pk=self.paused.pk).update(container_id="", container_fqdn="")
+        self.paused.refresh_from_db()
+        self.client = self.client_for(self.paused)
+        self.today = timezone.localdate().isoformat()
+
+
+@patch("apps.router.chat_views.httpx.get")
+@patch("apps.cron.publish.publish_task")
+class PrewarmChurnedTest(_PaywallClientMixin, TestCase):
+    """Prewarm for DEPROVISIONING/DELETED and an expired-but-flagged trial: ``paused``
+    exactly when the paywall refuses; otherwise today's ``unavailable``."""
+
+    def setUp(self):
+        cache.clear()
+
+    def prewarm(self, tenant, header=PAYWALL_2):
+        return self.client_for(tenant, header).post("/api/v1/chat/prewarm/")
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_churned_unpaid_is_paused_without_probe_or_wake(self, wake, get):
+        for label, tenant in (
+            ("deprovisioning", _make_tenant(status=Tenant.Status.DEPROVISIONING)),
+            ("deleted", _make_tenant(status=Tenant.Status.DELETED)),
+            ("trial_expired", _make_tenant(is_trial=True, trial_ends_at=timezone.now() - timedelta(days=1))),
+        ):
+            with self.subTest(label):
+                resp = self.prewarm(tenant)
+                self.assertEqual((resp.status_code, resp.data), (200, {"state": "paused"}))
+        get.assert_not_called()
+        wake.assert_not_called()
+
+    def test_churned_old_client_or_flag_off_is_unavailable_as_today(self, wake, get):
+        for tenant_status in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            tenant = _make_tenant(status=tenant_status)
+            for flag, header in (("*", None), ("*", PAYWALL_1), ("*", DUPLICATED), ("", PAYWALL_2)):
+                with (
+                    self.subTest(status=tenant_status, flag=flag, header=header),
+                    override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS=flag),
+                ):
+                    cache.clear()
+                    resp = self.prewarm(tenant, header)
+                    self.assertEqual((resp.status_code, resp.data), (200, {"state": "unavailable"}))
+        get.assert_not_called()
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_churned_but_entitled_is_unavailable_not_paused(self, wake, get):
+        apple = _make_tenant(status=Tenant.Status.DELETED)
+        _apple(apple, entitles=True)
+        for label, tenant in (
+            ("apple", apple),
+            ("trial", _make_tenant(status=Tenant.Status.DEPROVISIONING, is_trial=True)),
+            ("exempt", _make_tenant(status=Tenant.Status.DELETED, budget_exempt=True)),
+        ):
+            with self.subTest(label):
+                cache.clear()
+                self.assertEqual(self.prewarm(tenant).data, {"state": "unavailable"})
+        wake.assert_not_called()
+
+    @override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_new_signup_still_provisioning(self, wake, get):
+        for tenant_status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
+            with self.subTest(status=tenant_status):
+                self.assertEqual(self.prewarm(_make_tenant(status=tenant_status)).data, {"state": "provisioning"})
+        wake.assert_not_called()
+
+
+@patch("apps.pii.redactor._detect_pii", return_value=[])
+@patch("apps.router.chat_views.enqueue_message_for_tenant")
+@patch("apps.common.openrouter.chat_completion", return_value=_completion("Two tasks are due."))
+class SiriChurnedPaywallTest(_PaywallClientMixin, TestCase):
+    def setUp(self):
+        cache.clear()
+
+    @override_settings(OPENROUTER_API_KEY="test-only", TEST_MODE=True, IOS_PAYWALL_ENFORCE_TENANT_IDS="*")
+    def test_deleted_tenant_refused_without_any_model_call(self, completion, enqueue, _pii):
+        tenant = _make_tenant(status=Tenant.Status.DELETED)
+        resp = self.client_for(tenant).post("/api/v1/siri/respond/", {"intent": "what's due?"}, format="json")
+        self.assertEqual(resp.data, {"answered": False, "escalated": False, "error": "subscription_required"})
+        completion.assert_not_called()
+        enqueue.assert_not_called()

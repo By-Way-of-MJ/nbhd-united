@@ -12,7 +12,7 @@ from uuid import UUID
 
 from django.conf import settings
 
-from apps.billing.entitlement import ai_paused
+from apps.billing.entitlement import lapsed_unpaid
 
 logger = logging.getLogger(__name__)
 
@@ -150,30 +150,30 @@ def ios_paywall_refuses(request, tenant, *, endpoint: str | None = None) -> bool
     """True when this iOS request must be refused the server assistant.
 
     All three must hold: the client declares paywall contract >= 2, the tenant is
-    opened by ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` (dark by default), and the tenant
-    is ``ai_paused`` (the Telegram/LINE paused predicate, budget-exempt excluded).
+    opened by ``IOS_PAYWALL_ENFORCE_TENANT_IDS``, and the tenant is ``lapsed_unpaid``
+    (SUSPENDED, DEPROVISIONING or DELETED with nothing entitling it: not paying on
+    Stripe or Apple, no unexpired trial, not budget-exempt). A refused client runs
+    the free tier (Apple's models) and offers Subscribe, so every unpaid user on a
+    current build gets that instead of a dead end: a billing-paused tenant, a
+    churned Stripe user whose assistant is being or has been deleted, and a
+    SUSPENDED tenant whose trial ended while ``is_trial`` stayed true. PENDING,
+    PROVISIONING and ACTIVE are never refused.
 
     The header is parsed FIRST, so web, Telegram/LINE and every shipped iOS build
     (``paywall=1``) return False before any query or log line — old clients are
-    untouched, not merely served. The rest of the cost only falls on a request
+    untouched, not merely served. Telegram/LINE never call this; they keep their own
+    inline SUSPENDED-only predicate. The rest of the cost only falls on a request
     that declares contract >= 2:
 
-    * ``endpoint=None`` (``/tenants/me/``): the flag is checked before
-      ``ai_paused``, so flag-off costs nothing and flag-on costs at most the one
-      Apple-subscription query ``ai_paused`` makes for a paused tenant.
-    * ``endpoint`` set (an AI turn endpoint): ``ai_paused`` runs whatever the flag
-      says, because a turn from a paused tenant is logged (ids and booleans only,
-      never message text) so adoption of the new client can be measured before the
-      flag flips. Flag-off therefore costs one Apple-subscription query for a
-      suspended, non-trial, non-exempt tenant without a Stripe id (none for an
-      active one) plus one INFO line when that tenant is paused.
-
-    Known gaps, same as the Telegram/LINE refusal sites: only SUSPENDED is ever
-    refused. A normal Stripe cancellation goes DEPROVISIONING then DELETED
-    (``apps/billing/services.py`` ``handle_subscription_deleted``,
-    ``apps/orchestrator/services.py`` ``deprovision_tenant``), so a churned Stripe
-    user is never refused here; neither is a SUSPENDED tenant whose ``is_trial`` is
-    still true.
+    * ``endpoint=None`` (``/tenants/me/``, prewarm): the flag is checked before
+      ``lapsed_unpaid``, so flag-off costs nothing and flag-on costs at most the one
+      Apple-subscription query ``lapsed_unpaid`` makes for a lapsed tenant.
+    * ``endpoint`` set (an AI turn endpoint): ``lapsed_unpaid`` runs whatever the
+      flag says, because a turn from a lapsed tenant is logged (ids and booleans
+      only, never message text) so adoption of the new client can be measured.
+      Flag-off therefore costs one Apple-subscription query for a lapsed,
+      non-trial, non-exempt tenant without a Stripe id (none for an active one)
+      plus one INFO line when that tenant is lapsed.
     """
     if tenant is None:
         return False
@@ -182,8 +182,8 @@ def ios_paywall_refuses(request, tenant, *, endpoint: str | None = None) -> bool
         return False
     flag_allowed = _tenant_allowed(tenant, "IOS_PAYWALL_ENFORCE_TENANT_IDS")
     if endpoint is None:
-        return flag_allowed and ai_paused(tenant)
-    if not ai_paused(tenant):
+        return flag_allowed and lapsed_unpaid(tenant)
+    if not lapsed_unpaid(tenant):
         return False
     logger.info(
         "ios_paywall_turn tenant_id=%s endpoint=%s paywall=%d flag_allowed=%s refused=%s",
