@@ -1078,9 +1078,10 @@ class ChatMessageView(APIView):
             existing.tenant = tenant
             return Response(_serialize_message(existing), status=status.HTTP_200_OK)
 
-        # iOS paywall (dark unless IOS_PAYWALL_ENFORCE_TENANT_IDS opens this
-        # tenant): a paused tenant on a paywall>=2 build is refused BEFORE any
-        # row, share write, enqueue, wake or last_message_at stamp. Nothing is
+        # iOS paywall (only for tenants IOS_PAYWALL_ENFORCE_TENANT_IDS opens): a
+        # lapsed, unpaid tenant (``lapsed_unpaid``: SUSPENDED, DEPROVISIONING or
+        # DELETED with nothing entitling it) on a paywall>=2 build is refused
+        # BEFORE any row, share write, enqueue, wake or last_message_at stamp. Nothing is
         # persisted, so the client's later /chat/turns/ record of the free-tier
         # reply under this same client_msg_id is a fresh insert, not a replay.
         # Placed after the replay so a retry of an already-accepted turn still
@@ -1325,10 +1326,13 @@ class ChatLocalTurnView(APIView):
 
         # Same debounced USER.md push a captured Telegram/LINE turn triggers,
         # so the conversation digest reflects on-device chats before the next
-        # cron fires.
-        from apps.router.conversation_capture import schedule_user_md_refresh
+        # cron fires. Not for a DEPROVISIONING/DELETED tenant (a churned user on
+        # the free tier): its file share is gone, so the push could only fail,
+        # log a traceback and clear the debounce on every turn.
+        if tenant.status not in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            from apps.router.conversation_capture import schedule_user_md_refresh
 
-        schedule_user_md_refresh(tenant)
+            schedule_user_md_refresh(tenant)
 
         # Which Apple model produced a free-tier reply (Phase D). Log-only, for
         # measuring adoption; anything but the two known engines is ignored.

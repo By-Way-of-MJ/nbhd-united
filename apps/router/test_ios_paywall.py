@@ -480,7 +480,7 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
         # response for it is, and the gate adds no log line.
         for tenant_status in (Tenant.Status.PENDING, Tenant.Status.PROVISIONING):
             with self.subTest(status=tenant_status), override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"):
-                self._assert_same_as_ungated(tenant_status, PAYWALL_2, expect_logs=False)
+                self._assert_same_as_ungated(tenant_status, PAYWALL_2)
 
     def test_churned_statuses_refused_like_suspended(self, enqueue, wake, _pii):
         # A normal Stripe cancellation goes DEPROVISIONING -> DELETED: a paywall=2
@@ -512,7 +512,7 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
                     override_settings(IOS_PAYWALL_ENFORCE_TENANT_IDS="*"),
                     patch("apps.router.chat_gates.lapsed_unpaid", wraps=lapsed_unpaid) as paused_check,
                 ):
-                    self._assert_same_as_ungated(tenant_status, header, expect_logs=False)
+                    self._assert_same_as_ungated(tenant_status, header)
                     paused_check.assert_not_called()
 
     def test_churned_but_paying_or_entitled_not_refused(self, enqueue, wake, _pii):
@@ -532,7 +532,7 @@ class ChatMessagePaywallTest(_PaywallClientMixin, TestCase):
                     resp = self.post(tenant, client_msg_id=f"ent-{tenant_status}-{label}")
                     self.assertNotEqual(resp.data.get("error"), "subscription_required", resp.content)
 
-    def _assert_same_as_ungated(self, tenant_status, header, *, expect_logs):
+    def _assert_same_as_ungated(self, tenant_status, header):
         baseline_tenant, gated_tenant = _make_tenant(status=tenant_status), _make_tenant(status=tenant_status)
         with patch("apps.router.chat_views.ios_paywall_refuses", return_value=False):
             baseline = self.post(baseline_tenant, header=header, client_msg_id=f"base-{tenant_status}")
@@ -1384,6 +1384,38 @@ class FreeTierChurnedAccountEndpointsTest(FreeTierAccountEndpointsTest):
         self.paused.refresh_from_db()
         self.client = self.client_for(self.paused)
         self.today = timezone.localdate().isoformat()
+
+    # Defined here, so the base class's patch decorators do not reach it: it
+    # patches what it needs itself. The USER.md scheduler is wrapped (it runs for
+    # real if called), not stubbed, and a SUSPENDED control proves the patch
+    # target is the one the view calls.
+    @patch("apps.cron.publish.publish_task")
+    def test_local_turn_recorded_without_user_md_push(self, wake):
+        from apps.router import conversation_capture
+
+        real = conversation_capture.schedule_user_md_refresh
+        with patch.object(conversation_capture, "schedule_user_md_refresh", wraps=real) as refresh:
+            resp = self.client.post(
+                "/api/v1/chat/turns/",
+                {"text": "hi", "reply_text": "Hello.", "client_msg_id": "churn-lt-1", "engine": "apple_cloud"},
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 201, resp.content)
+            row = AppChatMessage.objects.get(tenant=self.paused, client_msg_id="churn-lt-1")
+            self.assertEqual((row.user_text, row.reply_text), ("hi", "Hello."))
+            self.assertEqual(row.status, AppChatMessage.Status.READY)
+            refresh.assert_not_called()
+
+            suspended = _make_tenant()
+            resp = self.client_for(suspended).post(
+                "/api/v1/chat/turns/",
+                {"text": "hi", "reply_text": "Hello.", "client_msg_id": "susp-lt-1"},
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 201, resp.content)
+            refresh.assert_called_once()
+            self.assertEqual(refresh.call_args.args[0].pk, suspended.pk)
+        wake.assert_not_called()
 
 
 @patch("apps.router.chat_views.httpx.get")
