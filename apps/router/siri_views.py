@@ -192,8 +192,9 @@ class SiriRespondView(APIView):
       polls ``GET /api/v1/chat/messages/<client_msg_id>/`` for the reply (and may
       surface a budget error there if the tenant is over budget).
     * ``{"answered": false, "escalated": false, "error": "subscription_required"}``
-      — the iOS paywall refused a paused tenant on a paywall>=2 build (dark
-      unless ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` opens the tenant).
+      — the iOS paywall refused a lapsed, unpaid tenant (``lapsed_unpaid``:
+      SUSPENDED, DEPROVISIONING or DELETED with nothing entitling it) on a
+      paywall>=2 build, for tenants ``IOS_PAYWALL_ENFORCE_TENANT_IDS`` opens.
 
     Replay vs. refusal matches ``POST /chat/messages/``: a known
     ``client_msg_id`` gets its stored turn back (the escalated shape above),
@@ -223,8 +224,8 @@ class SiriRespondView(APIView):
         if len(intent) > _MAX_ASK_CHARS:
             return Response({"error": "intent_too_long"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # iOS paywall (dark by default): refuse a paused tenant on a paywall>=2
-        # build BEFORE the snapshot/intent redaction (PII work + writes), the fast
+        # iOS paywall (IOS_PAYWALL_ENFORCE_TENANT_IDS): refuse a lapsed, unpaid
+        # tenant on a paywall>=2 build BEFORE the snapshot/intent redaction (PII work + writes), the fast
         # model, and the escalation into enqueue_tenant_turn.
         if ios_paywall_refuses(request, tenant, endpoint="siri_respond"):
             replay = self._replay(request, tenant)

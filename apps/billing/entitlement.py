@@ -54,6 +54,47 @@ def ai_paused(tenant) -> bool:
     return not is_paying(tenant)
 
 
+def lapsed_unpaid(tenant) -> bool:
+    """The account's paid assistant has lapsed and nothing entitles it now.
+
+    Status SUSPENDED, DEPROVISIONING or DELETED, and none of: paying (Stripe or an
+    entitling Apple subscription), an unexpired trial, budget-exempt. That is the
+    negation of ``Tenant.has_entitlement`` (what ``subscription.active`` reports),
+    limited to those three statuses, so on ``/tenants/me/`` ``paywall`` is never true
+    beside a fresh ``active`` true.
+
+    Wider than ``ai_paused`` on purpose; only the iOS paywall reads it. It covers a
+    churned Stripe user (cancellation goes DEPROVISIONING then DELETED) and a
+    SUSPENDED tenant whose ``is_trial`` is still true but whose trial has ended.
+    ``ai_paused`` stays the narrower Telegram/LINE predicate.
+
+    Never lapsed: PENDING/PROVISIONING (a new signup or a re-provision under way) and
+    ACTIVE (an ACTIVE tenant whose trial ran out is served until the daily
+    ``expire_trials`` sweep suspends it). Exemption and trial are checked before the
+    one query (the entitling Apple-subscription ``exists()``), so only a lapsed
+    tenant without a Stripe id costs it.
+    """
+    if tenant is None:
+        return False
+    from django.utils import timezone
+
+    from apps.tenants.models import Tenant
+
+    if getattr(tenant, "status", None) not in (
+        Tenant.Status.SUSPENDED,
+        Tenant.Status.DEPROVISIONING,
+        Tenant.Status.DELETED,
+    ):
+        return False
+    if getattr(tenant, "is_budget_exempt", False):
+        return False
+    if getattr(tenant, "is_trial", False):
+        trial_ends_at = getattr(tenant, "trial_ends_at", None)
+        if trial_ends_at is not None and trial_ends_at > timezone.now():
+            return False
+    return not is_paying(tenant)
+
+
 def paying_q(prefix: str = "") -> Q:
     """``is_paying`` as a queryset filter on Tenant (``prefix`` for related lookups,
     e.g. ``"tenant__"``). ``Exists`` rather than a join, so a tenant with several App

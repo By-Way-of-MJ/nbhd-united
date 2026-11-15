@@ -1078,9 +1078,10 @@ class ChatMessageView(APIView):
             existing.tenant = tenant
             return Response(_serialize_message(existing), status=status.HTTP_200_OK)
 
-        # iOS paywall (dark unless IOS_PAYWALL_ENFORCE_TENANT_IDS opens this
-        # tenant): a paused tenant on a paywall>=2 build is refused BEFORE any
-        # row, share write, enqueue, wake or last_message_at stamp. Nothing is
+        # iOS paywall (only for tenants IOS_PAYWALL_ENFORCE_TENANT_IDS opens): a
+        # lapsed, unpaid tenant (``lapsed_unpaid``: SUSPENDED, DEPROVISIONING or
+        # DELETED with nothing entitling it) on a paywall>=2 build is refused
+        # BEFORE any row, share write, enqueue, wake or last_message_at stamp. Nothing is
         # persisted, so the client's later /chat/turns/ record of the free-tier
         # reply under this same client_msg_id is a fresh insert, not a replay.
         # Placed after the replay so a retry of an already-accepted turn still
@@ -1325,10 +1326,13 @@ class ChatLocalTurnView(APIView):
 
         # Same debounced USER.md push a captured Telegram/LINE turn triggers,
         # so the conversation digest reflects on-device chats before the next
-        # cron fires.
-        from apps.router.conversation_capture import schedule_user_md_refresh
+        # cron fires. Not for a DEPROVISIONING/DELETED tenant (a churned user on
+        # the free tier): its file share is gone, so the push could only fail,
+        # log a traceback and clear the debounce on every turn.
+        if tenant.status not in (Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED):
+            from apps.router.conversation_capture import schedule_user_md_refresh
 
-        schedule_user_md_refresh(tenant)
+            schedule_user_md_refresh(tenant)
 
         # Which Apple model produced a free-tier reply (Phase D). Log-only, for
         # measuring adoption; anything but the two known engines is ignored.
@@ -1419,6 +1423,10 @@ def _prewarm_probe(tenant) -> str:
     return _PROBE_DOWN
 
 
+# Statuses whose prewarm can answer ``paused``: the ones ``lapsed_unpaid`` admits.
+_PREWARM_PAYWALL_STATUSES = (Tenant.Status.SUSPENDED, Tenant.Status.DEPROVISIONING, Tenant.Status.DELETED)
+
+
 class ChatPrewarmView(APIView):
     """POST: opportunistically wake a hibernated tenant when Chat opens.
 
@@ -1435,7 +1443,8 @@ class ChatPrewarmView(APIView):
     - ``provisioning``: PENDING/PROVISIONING (a PENDING tenant untouched for
       ``_PREWARM_PENDING_STALE_SECONDS`` is ``unavailable`` instead);
     - ``paused``: the iOS paywall refuses this tenant (``ios_paywall_refuses``,
-      the same predicate ``/tenants/me/`` reports);
+      the same predicate ``/tenants/me/`` reports): SUSPENDED, DEPROVISIONING or
+      DELETED with nothing entitling it, on a paywall>=2 build;
     - ``awake``: not hibernated and the gateway answers /health with a 2xx;
     - ``starting``: not hibernated, not serving yet, and inside the boot grace
       window after a wake or the first provision, or a wake is in flight
@@ -1443,7 +1452,8 @@ class ChatPrewarmView(APIView):
       ``awake`` (busy mid-turn), anything else as ``unavailable``;
     - ``waking`` / ``recent``: hibernated, a wake was just published / was
       published in the last 10 minutes;
-    - ``unavailable``: no tenant, DEPROVISIONING/DELETED, not serving past the
+    - ``unavailable``: no tenant, DEPROVISIONING/DELETED the paywall does not
+      refuse (old builds, flag off, or still entitled), not serving past the
       boot grace window, or a hibernated SUSPENDED tenant that opening Chat
       must not wake (see below).
 
@@ -1472,10 +1482,9 @@ class ChatPrewarmView(APIView):
             ):
                 return _prewarm_state("unavailable")
             return _prewarm_state("provisioning")
-        if tenant.status == Tenant.Status.SUSPENDED:
-            if ios_paywall_refuses(request, tenant):
-                return _prewarm_state("paused")
-        elif tenant.status != Tenant.Status.ACTIVE:
+        if tenant.status in _PREWARM_PAYWALL_STATUSES and ios_paywall_refuses(request, tenant):
+            return _prewarm_state("paused")
+        if tenant.status not in (Tenant.Status.ACTIVE, Tenant.Status.SUSPENDED):
             return _prewarm_state("unavailable")
 
         if tenant.hibernated_at is None:
