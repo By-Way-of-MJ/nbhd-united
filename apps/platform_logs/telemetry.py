@@ -81,6 +81,12 @@ DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
             "intentional_repeat",
             "rotation_compiler_expansions",
             "searched_before_write",
+            # Content-free facts about a successful assistant workout write, so
+            # "on the calendar but missing from the week list" needs no row read.
+            "op",  # create | update
+            "has_plan",  # bool
+            "date_offset_days",  # int, relative to tenant-local today
+            "status_changed",  # bool, update only
         }
     ),
     # "pattern" is the typed cron pattern (pure_reminder, ...) — it separates
