@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, timedelta
 
 from django.test import SimpleTestCase, TestCase, override_settings
@@ -12,7 +13,15 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from apps.dashboard.views import _clean_markdown_preview, _derive_week_bounds
 from apps.insights.models import AssistantInsight, TopicRegistry
 from apps.insights.pillars import Pillar
-from apps.journal.models import Document, Goal, JournalEntry, PendingExtraction, Purpose, WeeklyReview
+from apps.journal.models import (
+    Document,
+    Goal,
+    JournalAppendOp,
+    JournalEntry,
+    PendingExtraction,
+    Purpose,
+    WeeklyReview,
+)
 from apps.journal.services import STARTER_DOCUMENT_TEMPLATES
 from apps.journal.templates_md import GOALS_TEMPLATE
 from apps.tenants.services import create_tenant
@@ -724,3 +733,78 @@ class HorizonsViewTopicSignalsTests(TestCase):
         )
         slugs = [r["topic_slug"] for r in self._signals()]
         self.assertEqual(slugs, ["debt", "dining"])
+
+
+@override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
+class HorizonsJournalDaysTests(TestCase):
+    """``journal_days`` — content-free days the USER appended from the app.
+
+    Sourced only from ``JournalAppendOp``, which ``DocumentAppendView`` writes
+    for app/console appends; the assistant's runtime daily-note endpoint never
+    creates one, so these dates mean "the user wrote here".
+    """
+
+    url = "/api/v1/dashboard/horizons/"
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Journal days", telegram_chat_id=901820)
+        self.other_tenant = create_tenant(display_name="Journal days other", telegram_chat_id=901821)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.tenant.user)
+
+    def _append_op(self, slug, *, tenant=None, age=timedelta(0)):
+        op = JournalAppendOp.objects.create(
+            tenant=tenant or self.tenant,
+            op_id=uuid.uuid4(),
+            document_slug=slug,
+            entry_heading="### 09:00",
+        )
+        if age:
+            # created_at is auto_now_add — stamp the age with an UPDATE.
+            JournalAppendOp.objects.filter(pk=op.pk).update(created_at=timezone.now() - age)
+        return op
+
+    def _journal_days(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        return response.json()["journal_days"]
+
+    def test_recent_daily_slugs_are_sorted_unique_and_older_ops_pruned(self):
+        self._append_op("2026-03-02")
+        self._append_op("2026-03-01")
+        self._append_op("2026-03-01")  # a second append on the same day
+        self._append_op("2026-02-20", age=timedelta(days=15))
+
+        self.assertEqual(self._journal_days(), ["2026-03-01", "2026-03-02"])
+
+    def test_non_date_slugs_are_ignored(self):
+        self._append_op("2026-03-05")
+        self._append_op("notes")
+        self._append_op("2026-W09")
+        self._append_op("2026-02-30")  # matches the shape, not a real day
+
+        self.assertEqual(self._journal_days(), ["2026-03-05"])
+
+    def test_other_tenants_ops_are_excluded(self):
+        self._append_op("2026-03-04")
+        self._append_op("2026-03-05", tenant=self.other_tenant)
+
+        self.assertEqual(self._journal_days(), ["2026-03-04"])
+
+    def test_no_ops_is_empty_list(self):
+        self.assertEqual(self._journal_days(), [])
+
+    def test_app_append_invalidates_cached_horizons(self):
+        self.assertEqual(self.client.get(self.url)["X-Cache"], "MISS")
+        self.assertEqual(self.client.get(self.url)["X-Cache"], "HIT")
+
+        response = self.client.post(
+            "/api/v1/journal/documents/daily/2026-03-06/append/",
+            {"op_id": str(uuid.uuid4()), "content": "Wrote this from the app", "time": "09:00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+        refreshed = self.client.get(self.url)
+        self.assertEqual(refreshed["X-Cache"], "MISS")
+        self.assertEqual(refreshed.json()["journal_days"], ["2026-03-06"])
