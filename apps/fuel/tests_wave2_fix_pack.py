@@ -647,7 +647,7 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
                 "detail_json": _strength_detail(),
             }
         )
-        create_event = self.written_events().get()
+        create_event = self.written_events().get(detail__op="create")
         self.assertEqual(
             set(create_event.detail),
             {"op", "status", "has_plan", "category", "date_offset_days"},
@@ -655,7 +655,7 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
 
         w = Workout.objects.get(tenant=self.tenant)
         self.client.patch(self.base(f"workouts/{w.id}/"), {"status": "done"}, format="json", **self.headers)
-        update_event = self.written_events().get(op="update")
+        update_event = self.written_events().get(detail__op="update")
         self.assertEqual(
             set(update_event.detail),
             {"op", "status", "has_plan", "category", "date_offset_days", "status_changed"},
