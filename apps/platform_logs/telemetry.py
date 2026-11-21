@@ -87,6 +87,7 @@ DETAIL_ALLOWLIST: dict[str, frozenset[str]] = {
             "has_plan",  # bool
             "date_offset_days",  # int, relative to tenant-local today
             "status_changed",  # bool, update only
+            "workout_status",  # WorkoutStatus value (distinct from HTTP "status")
         }
     ),
     # "pattern" is the typed cron pattern (pure_reminder, ...) — it separates

@@ -393,29 +393,32 @@ def _emit_workout_written(tenant, *, tool_name, workout, op, status_changed=None
     was saved, and how far from today it landed. Never an id, activity, note,
     exercise name, or any other user text.
     """
-    workout_date = workout.date
-    if isinstance(workout_date, str):
-        # The create path stores the resolved date as an ISO string in-memory
-        # until the row is reloaded; the instance attr is not coerced by save().
-        workout_date = date.fromisoformat(workout_date)
+    try:
+        workout_date = workout.date
+        if isinstance(workout_date, str):
+            # The create path stores the resolved date as an ISO string in-memory
+            # until the row is reloaded; the instance attr is not coerced by save().
+            workout_date = date.fromisoformat(workout_date)
 
-    detail = {
-        "op": op,
-        "status": workout.status,
-        "has_plan": workout.plan_id is not None,
-        "category": workout.category,
-        "date_offset_days": (workout_date - today_in_tenant_tz(tenant)).days,
-    }
-    if status_changed is not None:
-        detail["status_changed"] = status_changed
+        detail = {
+            "op": op,
+            "workout_status": workout.status,
+            "has_plan": workout.plan_id is not None,
+            "category": workout.category,
+            "date_offset_days": (workout_date - today_in_tenant_tz(tenant)).days,
+        }
+        if status_changed is not None:
+            detail["status_changed"] = status_changed
 
-    _emit_fuel_event(
-        tenant,
-        tool_name=tool_name,
-        outcome="accepted",
-        reason_code="workout_written",
-        detail=detail,
-    )
+        _emit_fuel_event(
+            tenant,
+            tool_name=tool_name,
+            outcome="accepted",
+            reason_code="workout_written",
+            detail=detail,
+        )
+    except Exception:
+        logger.exception("Failed to emit workout_written telemetry")
 
 
 def _emit_fuel_event(tenant, *, tool_name, outcome, reason_code="", detail=None):

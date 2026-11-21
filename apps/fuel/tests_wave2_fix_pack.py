@@ -19,7 +19,8 @@ The shared shape of the bug is that nothing complained at the time:
      a number that is not on the row.
 """
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
@@ -606,12 +607,33 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
             event.detail,
             {
                 "op": "create",
-                "status": "planned",
+                "workout_status": "planned",
                 "has_plan": False,
                 "category": "strength",
                 "date_offset_days": 3,
             },
         )
+
+    def test_create_date_offset_uses_tenant_local_day(self):
+        self.tenant.user.timezone = "Asia/Tokyo"
+        self.tenant.user.save(update_fields=["timezone"])
+        # 2026-05-01T16:30Z is already 2026-05-02 01:30 in Tokyo. A UTC-anchored
+        # offset would report 1 for a workout dated the tenant's local today.
+        frozen = datetime(2026, 5, 1, 16, 30, tzinfo=UTC)
+        with patch("django.utils.timezone.now", return_value=frozen):
+            resp = self.log(
+                {
+                    "category": "strength",
+                    "status": "planned",
+                    "date": "2026-05-02",
+                    "activity": "Push Day",
+                    "detail_json": _strength_detail(),
+                }
+            )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        event = self.written_events().get(detail__op="create")
+        self.assertEqual(event.detail["workout_status"], "planned")
+        self.assertEqual(event.detail["date_offset_days"], 0)
 
     def test_rejected_create_emits_no_workout_written_event(self):
         resp = self.log({"category": "strength", "activity": "Push Day"})
@@ -633,7 +655,7 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
         self.assertEqual(event.outcome, "accepted")
         self.assertEqual(event.tool_name, "runtime-fuel-workout-detail")
         self.assertEqual(event.detail["op"], "update")
-        self.assertEqual(event.detail["status"], "done")
+        self.assertEqual(event.detail["workout_status"], "done")
         self.assertTrue(event.detail["status_changed"])
         self.assertFalse(event.detail["has_plan"])
         self.assertEqual(event.detail["category"], "cardio")
@@ -650,7 +672,7 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
         create_event = self.written_events().get(detail__op="create")
         self.assertEqual(
             set(create_event.detail),
-            {"op", "status", "has_plan", "category", "date_offset_days"},
+            {"op", "workout_status", "has_plan", "category", "date_offset_days"},
         )
 
         w = Workout.objects.get(tenant=self.tenant)
@@ -658,5 +680,5 @@ class WorkoutWrittenTelemetryTests(_RuntimeFuelCase):
         update_event = self.written_events().get(detail__op="update")
         self.assertEqual(
             set(update_event.detail),
-            {"op", "status", "has_plan", "category", "date_offset_days", "status_changed"},
+            {"op", "workout_status", "has_plan", "category", "date_offset_days", "status_changed"},
         )
