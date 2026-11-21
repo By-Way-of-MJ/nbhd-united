@@ -14,26 +14,16 @@ from rest_framework.views import APIView
 
 from apps.billing.models import UsageRecord
 from apps.common.cache import tenant_cache
+from apps.common.llm_contracts import today_in_tenant_tz
 from apps.insights.models import AssistantInsight
 from apps.integrations.models import Integration
-from apps.journal.models import Document, JournalAppendOp, JournalEntry, PendingExtraction, WeeklyReview
+from apps.journal.document_views import owner_written_days
+from apps.journal.models import Document, JournalEntry, PendingExtraction, WeeklyReview
 from apps.journal.services import is_pristine_goals_scaffold
 from apps.tenants.models import Tenant
 
 _WEEKLY_SLUG_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _ISO_WEEKLY_SLUG_RE = re.compile(r"^(\d{4})-W(\d{2})$")
-_ISO_DAY_SLUG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
-def _is_iso_day_slug(value) -> bool:
-    """True only for a plain ``YYYY-MM-DD`` string naming a real calendar day."""
-    if not isinstance(value, str) or not _ISO_DAY_SLUG_RE.fullmatch(value):
-        return False
-    try:
-        date.fromisoformat(value)
-    except ValueError:
-        return False
-    return True
 
 
 def _clean_markdown_preview(markdown: str, max_chars: int = 180) -> str:
@@ -395,23 +385,20 @@ class HorizonsView(APIView):
             .values("date", "mood", "energy", "energy_score", "pii_receipts")
         )
 
-        # 4b. Journal days (14 days) — days the USER appended to their daily
-        # note from the app/console. JournalAppendOp rows are written only by
-        # DocumentAppendView; the assistant's runtime daily-note endpoint never
-        # creates them. Content-free by design (slugs only), so the app can
-        # light the Reflect star from the server without reading entries.
-        journal_days = sorted(
-            {
-                slug
-                for slug in JournalAppendOp.objects.filter(
-                    tenant=tenant,
-                    created_at__gte=timezone.now() - timedelta(days=14),
-                )
-                .values_list("document_slug", flat=True)
-                .distinct()
-                if _is_iso_day_slug(slug)
-            }
+        # 4b. Journal days (14 days) — days the owner wrote on, decided by the
+        # journal's own rule (a timed heading not authored by the assistant in
+        # the daily note). Reading content rather than write-path bookkeeping
+        # means quick-log appends, block edits and full PATCH saves all count.
+        # The response stays content-free (slugs only) so the app can light the
+        # Reflect star from the server; Document saves bump the dashboard cache
+        # tag, so a new entry refreshes this immediately.
+        journal_today = today_in_tenant_tz(tenant)
+        _, _, wrote_slugs = owner_written_days(
+            tenant,
+            since=str(journal_today - timedelta(days=13)),
+            until=str(journal_today),
         )
+        journal_days = sorted(wrote_slugs)
 
         # 5. Momentum (30 days) — message counts + journal dates
         message_counts = dict(

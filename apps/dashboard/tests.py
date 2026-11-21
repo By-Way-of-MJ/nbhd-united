@@ -10,6 +10,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from apps.common.llm_contracts import today_in_tenant_tz
 from apps.dashboard.views import _clean_markdown_preview, _derive_week_bounds
 from apps.insights.models import AssistantInsight, TopicRegistry
 from apps.insights.pillars import Pillar
@@ -22,7 +23,7 @@ from apps.journal.models import (
     Purpose,
     WeeklyReview,
 )
-from apps.journal.services import STARTER_DOCUMENT_TEMPLATES
+from apps.journal.services import STARTER_DOCUMENT_TEMPLATES, _get_persona_name
 from apps.journal.templates_md import GOALS_TEMPLATE
 from apps.tenants.services import create_tenant
 
@@ -737,11 +738,12 @@ class HorizonsViewTopicSignalsTests(TestCase):
 
 @override_settings(NBHD_DISABLE_BACKGROUND_THREADS=True)
 class HorizonsJournalDaysTests(TestCase):
-    """``journal_days`` — content-free days the USER appended from the app.
+    """``journal_days`` — content-free days the OWNER wrote on.
 
-    Sourced only from ``JournalAppendOp``, which ``DocumentAppendView`` writes
-    for app/console appends; the assistant's runtime daily-note endpoint never
-    creates one, so these dates mean "the user wrote here".
+    Decided by the journal's own rule (``owner_written_days``): a daily note
+    with a timed heading whose author is not the assistant. Content is the
+    evidence, so every way the owner writes counts — quick-log appends, block
+    edits, full PATCH saves — and no ``JournalAppendOp`` row is required.
     """
 
     url = "/api/v1/dashboard/horizons/"
@@ -751,55 +753,65 @@ class HorizonsJournalDaysTests(TestCase):
         self.other_tenant = create_tenant(display_name="Journal days other", telegram_chat_id=901821)
         self.client = APIClient()
         self.client.force_authenticate(user=self.tenant.user)
+        self.today = today_in_tenant_tz(self.tenant)
+        self.assistant = _get_persona_name(self.tenant)
 
-    def _append_op(self, slug, *, tenant=None, age=timedelta(0)):
-        op = JournalAppendOp.objects.create(
+    def _daily_note(self, day, markdown, *, tenant=None):
+        return Document.objects.create(
             tenant=tenant or self.tenant,
-            op_id=uuid.uuid4(),
-            document_slug=slug,
-            entry_heading="### 09:00",
+            kind=Document.Kind.DAILY,
+            slug=str(day),
+            title=str(day),
+            markdown=markdown,
         )
-        if age:
-            # created_at is auto_now_add — stamp the age with an UPDATE.
-            JournalAppendOp.objects.filter(pk=op.pk).update(created_at=timezone.now() - age)
-        return op
+
+    def _owner_heading(self, author="Casey Park"):
+        """A timed heading shaped like the one ``DocumentAppendView`` writes."""
+        return f"### 09:00 — {author}\nWrote this myself\n"
 
     def _journal_days(self):
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
         return response.json()["journal_days"]
 
-    def test_recent_daily_slugs_are_sorted_unique_and_older_ops_pruned(self):
-        self._append_op("2026-03-02")
-        self._append_op("2026-03-01")
-        self._append_op("2026-03-01")  # a second append on the same day
-        self._append_op("2026-02-20", age=timedelta(days=15))
+    def test_owner_heading_in_todays_note_counts_without_an_append_op(self):
+        self._daily_note(self.today, self._owner_heading())
 
-        self.assertEqual(self._journal_days(), ["2026-03-01", "2026-03-02"])
+        self.assertEqual(self._journal_days(), [str(self.today)])
+        self.assertFalse(JournalAppendOp.objects.exists())
 
-    def test_non_date_slugs_are_ignored(self):
-        self._append_op("2026-03-05")
-        self._append_op("notes")
-        self._append_op("2026-W09")
-        self._append_op("2026-02-30")  # matches the shape, not a real day
+    def test_assistant_authored_note_does_not_count(self):
+        self._daily_note(self.today, f"### 09:00 — {self.assistant}\nMorning briefing\n")
+        self._daily_note(self.today - timedelta(days=1), "### Overnight Summary\n- All quiet\n")
 
-        self.assertEqual(self._journal_days(), ["2026-03-05"])
-
-    def test_other_tenants_ops_are_excluded(self):
-        self._append_op("2026-03-04")
-        self._append_op("2026-03-05", tenant=self.other_tenant)
-
-        self.assertEqual(self._journal_days(), ["2026-03-04"])
-
-    def test_no_ops_is_empty_list(self):
         self.assertEqual(self._journal_days(), [])
 
-    def test_app_append_invalidates_cached_horizons(self):
+    def test_note_older_than_the_window_does_not_count(self):
+        self._daily_note(self.today - timedelta(days=20), self._owner_heading())
+
+        self.assertEqual(self._journal_days(), [])
+
+    def test_window_edges_are_inclusive_for_13_days_back(self):
+        inside = self.today - timedelta(days=13)
+        outside = self.today - timedelta(days=14)
+        self._daily_note(inside, self._owner_heading())
+        self._daily_note(outside, self._owner_heading())
+
+        self.assertEqual(self._journal_days(), [str(inside)])
+
+    def test_other_tenants_notes_are_excluded(self):
+        self._daily_note(self.today - timedelta(days=1), self._owner_heading(), tenant=self.other_tenant)
+
+        self.assertEqual(self._journal_days(), [])
+
+    def test_new_owner_entry_invalidates_cached_horizons(self):
+        self._daily_note(self.today, "## Today\n")
         self.assertEqual(self.client.get(self.url)["X-Cache"], "MISS")
         self.assertEqual(self.client.get(self.url)["X-Cache"], "HIT")
+        self.assertEqual(self._journal_days(), [])
 
         response = self.client.post(
-            "/api/v1/journal/documents/daily/2026-03-06/append/",
+            f"/api/v1/journal/documents/daily/{self.today}/append/",
             {"op_id": str(uuid.uuid4()), "content": "Wrote this from the app", "time": "09:00"},
             format="json",
         )
@@ -807,4 +819,4 @@ class HorizonsJournalDaysTests(TestCase):
 
         refreshed = self.client.get(self.url)
         self.assertEqual(refreshed["X-Cache"], "MISS")
-        self.assertEqual(refreshed.json()["journal_days"], ["2026-03-06"])
+        self.assertEqual(refreshed.json()["journal_days"], [str(self.today)])
