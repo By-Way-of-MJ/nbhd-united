@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.db.models import F
 from django.utils.translation import gettext_lazy as _
 
-from .models import MonthlyBudget, UsageRecord
+from .models import AdAttribution, MonthlyBudget, UsageRecord
 
 
 @admin.register(UsageRecord)
@@ -48,3 +48,32 @@ class MonthlyBudgetAdmin(admin.ModelAdmin):
     @admin.display(boolean=True, description="capped")
     def capped(self, obj):
         return obj.is_over_budget
+
+
+@admin.register(AdAttribution)
+class AdAttributionAdmin(admin.ModelAdmin):
+    """Read-only audit view: attribution rows are written by the app and resolver."""
+
+    list_display = (
+        "tenant",
+        "status",
+        "campaign_id",
+        "ad_group_id",
+        "keyword_id",
+        "attempts",
+        "created_at",
+        "resolved_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("tenant__user__email", "tenant__user__username")
+    date_hierarchy = "created_at"
+    readonly_fields = tuple(field.name for field in AdAttribution._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

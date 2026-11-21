@@ -271,6 +271,15 @@ def republish_apple_revocation_outbox_task() -> dict:
     return {"status": "completed"}
 
 
+def resolve_ad_attributions_task() -> dict:
+    """Zero-argument TASK_MAP wrapper for the Apple Ads retry command."""
+
+    from django.core.management import call_command
+
+    call_command("resolve_ad_attributions")
+    return {"status": "completed"}
+
+
 # How long past its fire time a one-shot cron is left alone before being retired.
 # The container owns firing; this row is bookkeeping. A tenant hibernated across
 # the fire time may run the job late on wake, so a generous grace keeps a
