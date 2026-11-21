@@ -707,50 +707,70 @@ class TodayView(APIView):
         return Response(DocumentSerializer(doc, context={"tenant": tenant}).data)
 
 
-class JournalDaysView(APIView):
-    """GET /api/v1/journal/days/ — every day and whether the owner wrote.
+def owner_written_days(tenant: Tenant, *, since: str | None = None, until: str) -> tuple[str, list[str], set[str]]:
+    """Daily-note days and which of them the owner wrote on.
+
+    Returns ``(assistant_name, day_slugs_newest_first, owner_wrote_slugs)``.
+    A day counts as owner-written when its daily note holds at least one timed
+    heading (``### HH:MM — Author``) whose author is anything but the assistant
+    — the same rule the journal calendar uses, so every way the owner writes
+    (quick-log appends, block edits, full PATCH saves) is covered by content
+    rather than by which write path produced it.
 
     Read daily documents once through model instances, like memory sync, and
     find owner-written headings in Python without database text predicates.
     Tenant filtering follows the sidebar's RLS-scoped read path; no external
-    calls or document creation are needed.
+    calls or document creation are needed. ``since``/``until`` are inclusive
+    ``YYYY-MM-DD`` bounds on the day slug; ``until`` caps future notes.
+    """
+    assistant_name = rehydrate_for_tenant(tenant, _get_persona_name(tenant)).strip()
+    documents = Document.objects.filter(tenant=tenant, kind=Document.Kind.DAILY, slug__lte=until)
+    if since is not None:
+        documents = documents.filter(slug__gte=since)
+    days: list[str] = []
+    wrote: set[str] = set()
+    for document in documents.order_by("-slug"):
+        slug = document.slug
+        if not _DATE_RE.fullmatch(slug):
+            continue
+        try:
+            datetime.date.fromisoformat(slug)
+        except ValueError:
+            continue
+        days.append(slug)
+        markdown = document.markdown
+        if "### " not in markdown:
+            continue
+        # Reuse the editor's fence-aware splitter. Only a block's leading
+        # heading is evidence; headings inside fenced code stay in its body.
+        for block in split_markdown_blocks(markdown):
+            heading = _TIMED_HEADING_RE.fullmatch(block.split("\n", 1)[0])
+            if heading is None:
+                continue
+            author = rehydrate_for_tenant(tenant, heading["author"] or "").strip()
+            if not assistant_name or not author or author != assistant_name:
+                wrote.add(slug)
+                break
+    return assistant_name, days, wrote
+
+
+class JournalDaysView(APIView):
+    """GET /api/v1/journal/days/ — every day and whether the owner wrote.
+
+    The rule lives in :func:`owner_written_days` so Horizons can reuse it.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         tenant = _get_tenant(request.user)
-        assistant_name = rehydrate_for_tenant(tenant, _get_persona_name(tenant)).strip()
-        documents = Document.objects.filter(
-            tenant=tenant, kind=Document.Kind.DAILY, slug__lte=str(today_in_tenant_tz(tenant))
+        assistant_name, day_slugs, wrote = owner_written_days(tenant, until=str(today_in_tenant_tz(tenant)))
+        return Response(
+            {
+                "assistant_name": assistant_name,
+                "days": [{"date": slug, "wrote": slug in wrote} for slug in day_slugs],
+            }
         )
-        days = []
-        wrote = set()
-        for document in documents.order_by("-slug"):
-            slug = document.slug
-            if not _DATE_RE.fullmatch(slug):
-                continue
-            try:
-                datetime.date.fromisoformat(slug)
-            except ValueError:
-                continue
-            days.append({"date": slug, "wrote": False})
-            markdown = document.markdown
-            if "### " not in markdown:
-                continue
-            # Reuse the editor's fence-aware splitter. Only a block's leading
-            # heading is evidence; headings inside fenced code stay in its body.
-            for block in split_markdown_blocks(markdown):
-                heading = _TIMED_HEADING_RE.fullmatch(block.split("\n", 1)[0])
-                if heading is None:
-                    continue
-                author = rehydrate_for_tenant(tenant, heading["author"] or "").strip()
-                if not assistant_name or not author or author != assistant_name:
-                    wrote.add(slug)
-                    break
-        for day in days:
-            day["wrote"] = day["date"] in wrote
-        return Response({"assistant_name": assistant_name, "days": days})
 
 
 class SidebarTreeView(APIView):

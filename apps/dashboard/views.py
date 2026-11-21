@@ -14,8 +14,10 @@ from rest_framework.views import APIView
 
 from apps.billing.models import UsageRecord
 from apps.common.cache import tenant_cache
+from apps.common.llm_contracts import today_in_tenant_tz
 from apps.insights.models import AssistantInsight
 from apps.integrations.models import Integration
+from apps.journal.document_views import owner_written_days
 from apps.journal.models import Document, JournalEntry, PendingExtraction, WeeklyReview
 from apps.journal.services import is_pristine_goals_scaffold
 from apps.tenants.models import Tenant
@@ -383,6 +385,21 @@ class HorizonsView(APIView):
             .values("date", "mood", "energy", "energy_score", "pii_receipts")
         )
 
+        # 4b. Journal days (14 days) — days the owner wrote on, decided by the
+        # journal's own rule (a timed heading not authored by the assistant in
+        # the daily note). Reading content rather than write-path bookkeeping
+        # means quick-log appends, block edits and full PATCH saves all count.
+        # The response stays content-free (slugs only) so the app can light the
+        # Reflect star from the server; Document saves bump the dashboard cache
+        # tag, so a new entry refreshes this immediately.
+        journal_today = today_in_tenant_tz(tenant)
+        _, _, wrote_slugs = owner_written_days(
+            tenant,
+            since=str(journal_today - timedelta(days=13)),
+            until=str(journal_today),
+        )
+        journal_days = sorted(wrote_slugs)
+
         # 5. Momentum (30 days) — message counts + journal dates
         message_counts = dict(
             UsageRecord.objects.filter(
@@ -555,6 +572,7 @@ class HorizonsView(APIView):
                     }
                     for m in moods
                 ],
+                "journal_days": journal_days,
                 "momentum": momentum,
                 "current_streak": streak,
                 "assistant_insights": [
