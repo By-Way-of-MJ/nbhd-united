@@ -386,6 +386,41 @@ def _mapped_override_paths(raw_overrides) -> list[IncomingPath]:
     return paths
 
 
+def _emit_workout_written(tenant, *, tool_name, workout, op, status_changed=None):
+    """Content-free facts about a successful assistant workout write.
+
+    Answers the telemetry questions a row read used to: what status/plan/category
+    was saved, and how far from today it landed. Never an id, activity, note,
+    exercise name, or any other user text.
+    """
+    try:
+        workout_date = workout.date
+        if isinstance(workout_date, str):
+            # The create path stores the resolved date as an ISO string in-memory
+            # until the row is reloaded; the instance attr is not coerced by save().
+            workout_date = date.fromisoformat(workout_date)
+
+        detail = {
+            "op": op,
+            "workout_status": workout.status,
+            "has_plan": workout.plan_id is not None,
+            "category": workout.category,
+            "date_offset_days": (workout_date - today_in_tenant_tz(tenant)).days,
+        }
+        if status_changed is not None:
+            detail["status_changed"] = status_changed
+
+        _emit_fuel_event(
+            tenant,
+            tool_name=tool_name,
+            outcome="accepted",
+            reason_code="workout_written",
+            detail=detail,
+        )
+    except Exception:
+        logger.exception("Failed to emit workout_written telemetry")
+
+
 def _emit_fuel_event(tenant, *, tool_name, outcome, reason_code="", detail=None):
     """Call-site telemetry for the fuel tool contract (namespace ``fuel``).
 
@@ -680,6 +715,7 @@ class RuntimeLogWorkoutView(_FuelResponseGuard, APIView):
             )
 
         record_runtime_write_event(tenant, kind="fuel", ref={"workout_id": workout.id}, verb="created")
+        _emit_workout_written(tenant, tool_name="runtime-fuel-log", workout=workout, op="create")
 
         # PR detection is best-effort — don't let it break workout logging
         try:
@@ -768,6 +804,7 @@ class RuntimeWorkoutDetailView(_FuelResponseGuard, APIView):
 
         data, searched_before_write = _strip_search_marker(request.data)
         original_date = workout.date
+        original_status = workout.status
         stored_detail = workout.detail_json
         stored_duration = workout.duration_minutes
         updated_fields = []
@@ -967,6 +1004,13 @@ class RuntimeWorkoutDetailView(_FuelResponseGuard, APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             record_runtime_write_event(tenant, kind="fuel", ref={"workout_id": workout.id})
+            _emit_workout_written(
+                tenant,
+                tool_name="runtime-fuel-workout-detail",
+                workout=workout,
+                op="update",
+                status_changed=workout.status != original_status,
+            )
 
             # Re-run PR detection if exercise data changed
             if "detail_json" in updated_fields:
