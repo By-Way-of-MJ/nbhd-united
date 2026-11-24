@@ -121,7 +121,12 @@ def _backfill_one(tenant: Tenant, dry_run: bool, stdout) -> bool:
             assign_key_vault_role(mi.principal_id, secret_names=[secret_name])
         except Exception as exc:
             stdout.write(f"[FAIL] tenant={tid} KV role grant for {secret_name}: {exc}")
-            logger.warning("KV role grant failed for tenant=%s secret=%s", tid, secret_name)
+            logger.warning(
+                "Orphan OR sub-key hash=%s for tenant=%s (KV role grant failed for %s)",
+                key_hash,
+                tid,
+                secret_name,
+            )
             return False
 
     tenant.openrouter_key_secret_name = secret_name
@@ -160,6 +165,25 @@ def _backfill_one(tenant: Tenant, dry_run: bool, stdout) -> bool:
             )
             logger.error("Container rebind failed for tenant=%s; manual retry needed", tid)
             return False
+
+        # The rebind creates a new, active revision. A hibernated tenant
+        # (status ACTIVE + hibernated_at set) would then run and bill
+        # indefinitely: the idle sweep skips rows already marked hibernated.
+        # Put it back to sleep; the next wake activates the latest revision,
+        # which carries the new binding.
+        if tenant.hibernated_at:
+            from apps.orchestrator.azure_client import hibernate_container_app
+
+            try:
+                hibernate_container_app(tenant.container_id)
+            except Exception as exc:
+                stdout.write(
+                    f"[FAIL] tenant={tid} rebound OK but RE-HIBERNATE FAILED — "
+                    f"{tenant.container_id} is awake while marked hibernated: {exc}"
+                )
+                logger.error("Re-hibernate after OR rebind failed for tenant=%s", tid)
+                return False
+            stdout.write(f"[OK]   tenant={tid} re-hibernated after rebind")
 
     stdout.write(f"[OK]   tenant={tid} hash={key_hash} secret={secret_name}")
     return True

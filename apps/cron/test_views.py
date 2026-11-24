@@ -652,6 +652,126 @@ class CronOpsTriggerTest(TestCase):
         self.assertTrue(CronJob.objects.filter(tenant=self.tenant, name="Unmanaged").exists())
 
 
+@override_settings(DEPLOY_SECRET="test-deploy-secret", OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+class BackfillOpenRouterKeyTriggerTest(TestCase):
+    URL = "/api/cron/backfill-openrouter-key/"
+
+    def setUp(self):
+        self.client = APIClient()
+        user = User.objects.create_user(username="or-backfill-trigger")
+        self.tenant = Tenant.objects.create(
+            user=user,
+            status=Tenant.Status.ACTIVE,
+            container_id="oc-or-backfill",
+            managed_identity_id="/subscriptions/x/resourceGroups/rg/providers/mi/mi-nbhd-or-backfill",
+            key_vault_prefix=f"tenants-{user.id}",
+        )
+
+    def _post(self, body: dict, *, authenticated: bool = True):
+        headers = {"HTTP_X_DEPLOY_SECRET": "test-deploy-secret"} if authenticated else {}
+        return self.client.post(self.URL, data=json.dumps(body), content_type="application/json", **headers)
+
+    @patch("apps.cron.views.verify_qstash_signature", return_value=False)
+    def test_requires_auth(self, _mock_verify):
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": True}, authenticated=False)
+        self.assertEqual(response.status_code, 401)
+
+    @patch("apps.cron.views.verify_qstash_signature", return_value=True)
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_qstash_signature_is_accepted(self, mock_create, _mock_verify):
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": True}, authenticated=False)
+        self.assertEqual(response.status_code, 200, response.content)
+        mock_create.assert_not_called()
+
+    def test_rejects_bad_body(self):
+        self.assertEqual(self._post({"tenant_id": "not-a-uuid", "dry_run": True}).status_code, 400)
+        self.assertEqual(self._post({"tenant_id": str(self.tenant.id), "dry_run": "yes"}).status_code, 400)
+        self.assertEqual(self._post({"tenant_id": str(self.tenant.id)}).status_code, 400)
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=False)
+    def test_refuses_when_flag_off(self):
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": True})
+        self.assertEqual(response.status_code, 409)
+
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_dry_run_mints_nothing(self, mock_create):
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(response.json()["ok"])
+        self.assertTrue(response.json()["eligible"])
+        self.assertTrue(any("DRY-RUN" in line for line in response.json()["lines"]))
+        mock_create.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_secret_name, "")
+
+    @patch("apps.orchestrator.azure_client.update_container_openrouter_key_secret")
+    @patch("apps.orchestrator.azure_client.assign_key_vault_role")
+    @patch("apps.orchestrator.azure_client.get_identity_client")
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key", return_value=("sk-or-test", "hash-xyz"))
+    def test_real_run_keys_tenant_and_rebinds_container(
+        self, mock_create, mock_kv_write, mock_identity, mock_grant, mock_rebind
+    ):
+        mock_identity.return_value.user_assigned_identities.get.return_value.principal_id = "pid-1"
+        expected_secret = f"{self.tenant.key_vault_prefix}-openrouter-key"
+
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": False})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(response.json()["ok"])
+        self.assertNotIn("sk-or-test", response.content.decode())
+        mock_create.assert_called_once()
+        mock_kv_write.assert_called_once_with(expected_secret, "sk-or-test")
+        mock_grant.assert_called_once_with("pid-1", secret_names=[expected_secret])
+        mock_rebind.assert_called_once_with(
+            container_name="oc-or-backfill",
+            identity_id=self.tenant.managed_identity_id,
+            kv_secret_name=expected_secret,
+        )
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_secret_name, expected_secret)
+        self.assertEqual(self.tenant.openrouter_key_hash, "hash-xyz")
+
+    @patch("apps.orchestrator.azure_client.hibernate_container_app")
+    @patch("apps.orchestrator.azure_client.update_container_openrouter_key_secret")
+    @patch("apps.orchestrator.azure_client.assign_key_vault_role")
+    @patch("apps.orchestrator.azure_client.get_identity_client")
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key", return_value=("sk-or-test", "hash-xyz"))
+    def test_hibernated_tenant_is_put_back_to_sleep_after_rebind(
+        self, _mock_create, _mock_kv_write, _mock_identity, _mock_grant, mock_rebind, mock_hibernate
+    ):
+        Tenant.objects.filter(id=self.tenant.id).update(hibernated_at=timezone.now())
+
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": False})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        mock_rebind.assert_called_once()
+        mock_hibernate.assert_called_once_with("oc-or-backfill")
+
+    @patch("apps.orchestrator.azure_client.hibernate_container_app")
+    @patch("apps.orchestrator.azure_client.update_container_openrouter_key_secret")
+    @patch("apps.orchestrator.azure_client.assign_key_vault_role")
+    @patch("apps.orchestrator.azure_client.get_identity_client")
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key", return_value=("sk-or-test", "hash-xyz"))
+    def test_awake_tenant_is_not_hibernated(
+        self, _mock_create, _mock_kv_write, _mock_identity, _mock_grant, _mock_rebind, mock_hibernate
+    ):
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": False})
+
+        self.assertEqual(response.status_code, 200, response.content)
+        mock_hibernate.assert_not_called()
+
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_already_keyed_tenant_is_skipped(self, mock_create):
+        Tenant.objects.filter(id=self.tenant.id).update(openrouter_key_secret_name="already-keyed")
+        response = self._post({"tenant_id": str(self.tenant.id), "dry_run": False})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(response.json()["eligible"])
+        mock_create.assert_not_called()
+
+
 class ExpireTrialsCronTest(TestCase):
     def setUp(self):
         self.client = APIClient()
