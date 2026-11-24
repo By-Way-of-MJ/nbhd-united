@@ -832,6 +832,57 @@ class DeliveryDedupTest(TestCase):
         self.assertEqual(DeliveryAttempt.objects.filter(tenant=self.tenant).count(), 1)
         self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 3)
 
+    def _post_raw(self, message, *, job_name="", cron_job_id=""):
+        headers = self._headers(job_name)
+        if not job_name:
+            headers.pop("HTTP_X_NBHD_JOB_NAME")
+        if cron_job_id:
+            headers["HTTP_X_NBHD_CRON_JOB_ID"] = cron_job_id
+        with patch("apps.router.cron_delivery.timezone.now", return_value=self.fired_at):
+            return self.client.post(self.url, {"message": message}, format="json", **headers)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_unnamed_sends_are_never_degraded_deduped(self, mock_client_cls):
+        """Regression: two DIFFERENT in-chat proactive sends in one hour have no
+        job name; the hourly claim must not swallow the second one."""
+        mock_http = self._successful_http(mock_client_cls)
+
+        first = self._post_raw("Here is the summary you asked for.")
+        second = self._post_raw("And the follow-up link.")
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(second.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+        self.assertEqual(DeliveryAttempt.objects.filter(tenant=self.tenant).count(), 0)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_cron_job_id_alone_identifies_the_job(self, mock_client_cls):
+        mock_http = self._successful_http(mock_client_cls)
+
+        first = self._post_raw("Passport photo reminder", cron_job_id="d0be28b7")
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING"):
+            retry = self._post_raw("Passport photo reminder", cron_job_id="d0be28b7")
+        other_job = self._post_raw("Water the plants", cron_job_id="aa11bb22")
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(retry.json()["status"], "duplicate_suppressed")
+        self.assertEqual(other_job.json()["status"], "sent")
+        self.assertEqual(mock_http.post.call_count, 2)
+
+    @patch("apps.router.cron_delivery.httpx.Client")
+    def test_retry_with_different_job_name_is_still_deduped_by_cron_id(self, mock_client_cls):
+        """Passport ×3 shape: the timed-out attempt named the job, the retry
+        didn't (job_name is model-supplied) — the runtime cron id is the same."""
+        mock_http = self._successful_http(mock_client_cls)
+
+        first = self._post_raw("Passport photo reminder", job_name="Passport reminder", cron_job_id="d0be28b7")
+        with self.assertLogs("apps.router.cron_delivery", level="WARNING"):
+            retry = self._post_raw("Passport photo reminder", cron_job_id="d0be28b7")
+
+        self.assertEqual(first.json()["status"], "sent")
+        self.assertEqual(retry.json()["status"], "duplicate_suppressed")
+        self.assertEqual(mock_http.post.call_count, 1)
+
     @override_settings(NBHD_DELIVERY_DEDUP_TENANTS="*")
     @patch("apps.router.cron_delivery.httpx.Client")
     def test_star_gate_enables_dedup_for_all_tenants(self, mock_client_cls):

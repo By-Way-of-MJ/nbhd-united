@@ -17,7 +17,7 @@ from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from django.core.cache import cache
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from apps.cron.models import CronJob
@@ -457,3 +457,124 @@ class HibernatedCronWakesTest(TestCase):
 
         self.assertEqual(result["hibernated_scheduled"], 1)
         self.assertEqual(mock_publish.call_count, 1)
+
+
+class LostCronWakeRebookTest(TestCase):
+    """A hibernated tenant whose sleep-time wake booking was lost gets one
+    from its canonical rows — even rows that existed before it fell asleep
+    (2026-11-24: QStash publish failed at sleep, 13fa39df slept through crons)."""
+
+    def setUp(self):
+        cache.clear()
+        self.tenant = _make_active_tenant(name="Lost Wake", chat_id=444444444)
+        self.cron_target = timezone.now() + timedelta(minutes=10)
+        expr = f"{self.cron_target.minute} {self.cron_target.hour} * * *"
+        self.row = CronJob.objects.create(
+            tenant=self.tenant,
+            name="Morning Briefing",
+            data={"schedule": {"kind": "cron", "expr": expr, "tz": "UTC"}},
+            enabled=True,
+        )
+        # Fell asleep AFTER the row existed, and the booking never landed.
+        Tenant.objects.filter(pk=self.tenant.pk).update(
+            hibernated_at=timezone.now() + timedelta(seconds=1),
+            cron_wake_armed_for=None,
+        )
+        self.tid = str(self.tenant.id)
+        self.expected_ms = int(self.cron_target.replace(second=0, microsecond=0).timestamp() * 1000)
+
+    def _run(self):
+        from apps.orchestrator.tasks import ensure_at_cron_wakes_task
+
+        return ensure_at_cron_wakes_task()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_gate_off_does_not_rebook_lost_wakes(self, _mock_invoke, mock_publish):
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS=""):
+            result = self._run()
+        mock_publish.assert_not_called()
+        self.assertEqual(result["lost_wakes_rebooked"], 0)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_missing_booking_is_rebooked_from_canonical_rows(self, mock_invoke, mock_publish):
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS=self.tid):
+            result = self._run()
+
+        self.assertEqual(result["lost_wakes_rebooked"], 1)
+        mock_publish.assert_called_once()
+        self.assertEqual(mock_publish.call_args.args, ("wake_for_cron", self.tid))
+        self.assertEqual(mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{self.tid}-{self.expected_ms}")
+        mock_invoke.assert_not_called()
+        self.tenant.refresh_from_db()
+        self.assertGreater(self.tenant.cron_wake_armed_for, timezone.now())
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_overdue_booking_is_rebooked(self, _mock_invoke, mock_publish):
+        Tenant.objects.filter(pk=self.tenant.pk).update(cron_wake_armed_for=timezone.now() - timedelta(minutes=30))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            result = self._run()
+        mock_publish.assert_called_once()
+        self.assertEqual(result["lost_wakes_rebooked"], 1)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_live_booking_is_trusted(self, _mock_invoke, mock_publish):
+        Tenant.objects.filter(pk=self.tenant.pk).update(cron_wake_armed_for=timezone.now() + timedelta(minutes=6))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            self._run()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_recently_due_booking_gets_grace(self, _mock_invoke, mock_publish):
+        Tenant.objects.filter(pk=self.tenant.pk).update(cron_wake_armed_for=timezone.now() - timedelta(minutes=5))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            self._run()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_tenant_with_no_enabled_rows_is_never_woken(self, _mock_invoke, mock_publish):
+        """Regression guard: no fallback to default seed crons."""
+        CronJob.objects.filter(pk=self.row.pk).update(enabled=False)
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            result = self._run()
+        mock_publish.assert_not_called()
+        self.assertEqual(result["lost_wakes_rebooked"], 0)
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_over_budget_tenant_is_left_asleep(self, _mock_invoke, mock_publish):
+        Tenant.objects.filter(pk=self.tenant.pk).update(
+            estimated_cost_this_month=1000, monthly_cost_budget=5, is_budget_exempt=False, purchased_credit=0
+        )
+        self.tenant.refresh_from_db()
+        self.assertFalse(self.tenant.has_spendable_budget)
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            self._run()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_cron_outside_window_waits_for_a_later_sweep(self, _mock_invoke, mock_publish):
+        later = timezone.now() + timedelta(hours=3)
+        CronJob.objects.filter(pk=self.row.pk).update(
+            data={"schedule": {"kind": "cron", "expr": f"{later.minute} {later.hour} * * *", "tz": "UTC"}}
+        )
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            self._run()
+        mock_publish.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    @patch("apps.cron.gateway_client.invoke_gateway_tool")
+    def test_failed_rebook_records_nothing_and_retries_next_sweep(self, _mock_invoke, mock_publish):
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            first = self._run()
+            second = self._run()
+        self.assertEqual(first["lost_wakes_rebooked"], 0)
+        self.assertEqual(mock_publish.call_count, 2)
+        self.tenant.refresh_from_db()
+        self.assertIsNone(self.tenant.cron_wake_armed_for)

@@ -1843,9 +1843,11 @@ def ensure_at_cron_wakes_task() -> dict:
     """
     import logging
     import time as _time
+    from datetime import timedelta
 
     from django.core.cache import cache
     from django.db.models import Q
+    from django.utils import timezone
 
     from apps.cron.gateway_client import GatewayError, list_tenant_crons
     from apps.cron.models import CronJob
@@ -1866,6 +1868,7 @@ def ensure_at_cron_wakes_task() -> dict:
         "skipped": 0,
         "hibernated_tenants": 0,
         "hibernated_scheduled": 0,
+        "lost_wakes_rebooked": 0,
     }
 
     tenants = (
@@ -1919,17 +1922,28 @@ def ensure_at_cron_wakes_task() -> dict:
     # one from the DB and use the same idempotency key as the snapshot path.
     hibernated_cutoff_ms = now_ms + _HIBERNATED_WAKE_LOOKAHEAD_SECONDS * 1000
     hibernated_tenants = Tenant.objects.filter(status="active", hibernated_at__isnull=False).exclude(container_fqdn="")
+    from apps.orchestrator.hibernation import _CRON_WAKE_OVERDUE_GRACE, cron_wake_rearm_allowed
+
+    overdue_before = timezone.now() - _CRON_WAKE_OVERDUE_GRACE
     for tenant in hibernated_tenants:
         totals["hibernated_tenants"] += 1
         try:
             earliest_ms = None
-            # Only rows changed after the hibernation snapshot: rows that
-            # existed then already got their wake from that snapshot.
-            rows = CronJob.objects.filter(
-                Q(created_at__gt=tenant.hibernated_at) | Q(updated_at__gt=tenant.hibernated_at),
-                tenant=tenant,
-                enabled=True,
+            # Normally only rows changed after the hibernation snapshot: rows
+            # that existed then already got their wake at sleep time. But that
+            # sleep-time publish can fail (2026-11-24, 13fa39df) or the wake can
+            # fail — then ``cron_wake_armed_for`` is missing or long overdue and
+            # nothing else re-books, so the tenant sleeps through every
+            # reminder. For those, consider ALL enabled rows. Over-budget
+            # tenants are left asleep: a wake can't run their crons anyway.
+            lost_booking = (
+                (tenant.cron_wake_armed_for is None or tenant.cron_wake_armed_for < overdue_before)
+                and cron_wake_rearm_allowed(tenant.id)
+                and tenant.has_spendable_budget
             )
+            rows = CronJob.objects.filter(tenant=tenant, enabled=True)
+            if not lost_booking:
+                rows = rows.filter(Q(created_at__gt=tenant.hibernated_at) | Q(updated_at__gt=tenant.hibernated_at))
             for row in rows:
                 try:
                     fire_ms = _next_fire_ms_from_row_data(row.data, now_ms)
@@ -1972,6 +1986,16 @@ def ensure_at_cron_wakes_task() -> dict:
                     idempotency_key=idempotency_key,
                 )
                 totals["hibernated_scheduled"] += 1
+                Tenant.objects.filter(id=tenant.id).update(
+                    cron_wake_armed_for=timezone.now() + timedelta(seconds=delay),
+                )
+                if lost_booking:
+                    totals["lost_wakes_rebooked"] += 1
+                    logger.warning(
+                        "ensure_at_cron_wakes: tenant %s was asleep with no booked wake (armed_for=%s) — re-booked",
+                        str(tenant.id)[:8],
+                        tenant.cron_wake_armed_for.isoformat() if tenant.cron_wake_armed_for else None,
+                    )
             except Exception:
                 try:
                     cache.delete(cache_key)

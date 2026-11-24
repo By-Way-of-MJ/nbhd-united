@@ -15,6 +15,7 @@ Two regression guards:
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
@@ -187,3 +188,71 @@ class WakeForCronAlreadyAwakeTests(TestCase):
             wake_for_cron_task(str(self.tenant.id))
 
         self.assertEqual(mock_publish.call_args.kwargs["delay_seconds"], 7 * 60)
+
+
+class CronWakeBookingRecordTests(TestCase):
+    """``_schedule_next_cron_wake`` records a booked wake and only a booked one."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="ArmRecord", telegram_chat_id=950300)
+        self.tenant.container_id = "oc-armrecord"
+        self.tenant.save(update_fields=["container_id"])
+
+    @patch("apps.cron.publish.publish_task")
+    @patch.object(hibernation, "_find_earliest_next_run")
+    def test_successful_publish_records_due_time(self, mock_earliest, _mock_publish):
+        now_ms = int(timezone.now().timestamp() * 1000)
+        mock_earliest.return_value = now_ms + 3_600_000
+
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, [{"placeholder": True}]))
+
+        self.tenant.refresh_from_db()
+        expected = timezone.now() + timedelta(seconds=3600 - _CRON_WAKE_LEAD_SECONDS)
+        self.assertAlmostEqual(self.tenant.cron_wake_armed_for.timestamp(), expected.timestamp(), delta=5)
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    @patch.object(hibernation, "_find_earliest_next_run")
+    def test_failed_publish_records_nothing(self, mock_earliest, _mock_publish):
+        mock_earliest.return_value = int(timezone.now().timestamp() * 1000) + 3_600_000
+
+        self.assertFalse(_schedule_next_cron_wake(self.tenant, [{"placeholder": True}]))
+
+        self.tenant.refresh_from_db()
+        self.assertIsNone(self.tenant.cron_wake_armed_for)
+
+
+class HibernateClearsBookingTests(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="ClearBooking", telegram_chat_id=950400)
+        Tenant.objects.filter(id=self.tenant.id).update(
+            status=Tenant.Status.ACTIVE,
+            container_id="oc-clearbooking",
+            container_fqdn="",
+            hibernated_at=None,
+            cron_wake_armed_for=timezone.now() + timedelta(hours=5),
+        )
+        self.tenant.refresh_from_db()
+
+    @patch("apps.orchestrator.azure_client.hibernate_container_app")
+    @patch("apps.cron.publish.publish_task")
+    @patch.object(hibernation, "_capture_tenant_cron_schedules", return_value=[])
+    def test_hibernate_clears_previous_booking(self, _mock_capture, _mock_publish, _mock_hib):
+        """A stale future booking must not mask a lost wake after the next sleep."""
+        self.assertTrue(hibernation.hibernate_idle_tenant(self.tenant))
+
+        self.tenant.refresh_from_db()
+        self.assertIsNotNone(self.tenant.hibernated_at)
+        self.assertIsNone(self.tenant.cron_wake_armed_for)
+
+
+class CronWakeRearmGateTests(TestCase):
+    def test_gate(self):
+        tid = "AAAAAAAA-0000-0000-0000-000000000001"
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS=""):
+            self.assertFalse(hibernation.cron_wake_rearm_allowed(tid))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="*"):
+            self.assertTrue(hibernation.cron_wake_rearm_allowed(tid))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS=f" other , {tid.lower()} "):
+            self.assertTrue(hibernation.cron_wake_rearm_allowed(tid))
+        with override_settings(CRON_WAKE_REARM_TENANT_IDS="other"):
+            self.assertFalse(hibernation.cron_wake_rearm_allowed(tid))
