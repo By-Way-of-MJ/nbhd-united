@@ -729,11 +729,22 @@ class CronDeliveryView(APIView):
 
             if _tenant_allowed(tenant, "HEARTBEAT_NUDGE_DEDUP_TENANT_IDS"):
                 about_occurrence_key = _about_occurrence_key(tenant=tenant, ref=about_ref)
-        if explicit_occurrence_key or about_occurrence_key or _delivery_dedup_enabled(tenant):
+        # The hourly degraded claim is only safe for sends that come from an
+        # identified scheduled job: everything else (in-chat proactive sends,
+        # follow-ups) arrives with no job name, and keying those on
+        # (tenant, "", hour) silently dropped every second distinct message in
+        # an hour (canary: 3 such hours in 14 days, all different texts).
+        # The cron job id comes from the runtime's own cron session key and is
+        # identical on every retry of a run, so it wins; job_name is
+        # model-supplied and can differ between attempts.
+        cron_job_id = request.headers.get("X-NBHD-Cron-Job-Id", "").strip()[:64]
+        dedup_identity = f"cron:{cron_job_id}" if cron_job_id else job_name.strip()
+        degraded_dedup = bool(dedup_identity) and _delivery_dedup_enabled(tenant)
+        if explicit_occurrence_key or about_occurrence_key or degraded_dedup:
             occurrence_key = (
                 explicit_occurrence_key
                 or about_occurrence_key
-                or degraded_occurrence_key(tenant_id=tenant.id, job_name=job_name, fired_at=received_at)
+                or degraded_occurrence_key(tenant_id=tenant.id, job_name=dedup_identity, fired_at=received_at)
             )
             delivery_attempt, duplicate_response = _claim_delivery_attempt(
                 tenant=tenant,

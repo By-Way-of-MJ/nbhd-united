@@ -1068,6 +1068,12 @@ class Tenant(models.Model):
         help_text="When the container was woken for a scheduled cron job. "
         "Null = not a cron wake. Used to apply the shorter 30-min idle window.",
     )
+    cron_wake_armed_for = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the booked QStash cron wake is due to fire. Null = no wake booked. "
+        "ensure_at_cron_wakes re-books hibernated tenants whose wake is missing or overdue.",
+    )
     last_wake_at = models.DateTimeField(
         null=True,
         blank=True,

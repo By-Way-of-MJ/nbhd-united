@@ -257,6 +257,10 @@ REHIBERNATE_DRIFT_BUDGET_SECONDS = env.float("REHIBERNATE_DRIFT_BUDGET_SECONDS",
 TENANT_IDLE_HIBERNATE_MINUTES = env.int("TENANT_IDLE_HIBERNATE_MINUTES", default=30)
 TENANT_CRON_HOLD_MINUTES = env.int("TENANT_CRON_HOLD_MINUTES", default=20)
 TENANT_CRON_WAKE_IDLE_MINUTES = env.int("TENANT_CRON_WAKE_IDLE_MINUTES", default=10)
+# Re-book lost cron wakes for hibernated tenants (5-min ensure_at_cron_wakes). A failed
+# QStash publish at sleep time otherwise leaves the tenant asleep through every
+# scheduled reminder. Comma-separated tenant UUIDs or "*"; EMPTY = nobody.
+CRON_WAKE_REARM_TENANT_IDS = env("CRON_WAKE_REARM_TENANT_IDS", default="")
 
 # Steward Phase 1 — portfolio-scoped deterministic evidence ingestion,
 # direct urgent delivery, and the external dead-man. Every value is optional

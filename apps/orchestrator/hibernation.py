@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from django.conf import settings
 from django.core.cache import cache
@@ -268,10 +268,27 @@ def _load_fallback_cron_jobs(tenant: Tenant) -> list[dict]:
     return []
 
 
-def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> None:
-    """Schedule a QStash task to wake the tenant before their next cron fires."""
+def _record_cron_wake_booking(tenant: Tenant, due) -> None:
+    """Persist the outcome of a cron-wake booking attempt (never raises)."""
+    try:
+        Tenant.objects.filter(id=tenant.id).update(cron_wake_armed_for=due)
+    except Exception:
+        logger.warning("cron wake booking record failed for tenant %s", str(tenant.id)[:8], exc_info=True)
+
+
+def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> bool:
+    """Schedule a QStash task to wake the tenant before their next cron fires.
+
+    On a successful publish, records the due time in ``cron_wake_armed_for``
+    so ``ensure_at_cron_wakes_task`` can tell a booked wake from a lost one.
+    Every attempt overwrites the record: the due time when a wake was booked,
+    ``None`` otherwise (no jobs, no upcoming run, publish failed) — so a stale
+    future value from an earlier booking can never mask a lost wake.
+    Returns True only when a wake was booked.
+    """
     if not cron_jobs:
-        return
+        _record_cron_wake_booking(tenant, None)
+        return False
 
     now_ms = int(timezone.now().timestamp() * 1000)
     earliest_ms = _find_earliest_next_run(cron_jobs, now_ms)
@@ -281,7 +298,8 @@ def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> None:
             "idle_hibernate: no upcoming crons for tenant %s, skipping cron wake",
             str(tenant.id)[:8],
         )
-        return
+        _record_cron_wake_booking(tenant, None)
+        return False
 
     delay_seconds = max(60, (earliest_ms - now_ms) // 1000 - _CRON_WAKE_LEAD_SECONDS)
 
@@ -294,17 +312,41 @@ def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> None:
             delay_seconds=delay_seconds,
             idempotency_key=f"wake-cron-{tenant.id}-{earliest_ms}",
         )
+        _record_cron_wake_booking(tenant, timezone.now() + timedelta(seconds=delay_seconds))
         logger.info(
             "idle_hibernate: scheduled cron wake for tenant %s in %ds (next cron ~%s)",
             str(tenant.id)[:8],
             delay_seconds,
             datetime.fromtimestamp(earliest_ms / 1000, tz=UTC).isoformat(),
         )
+        return True
     except Exception:
         logger.exception(
             "idle_hibernate: failed to schedule cron wake for %s",
             str(tenant.id)[:8],
         )
+        _record_cron_wake_booking(tenant, None)
+        return False
+
+
+# A booked wake fires ~4 min before the cron and clears ``hibernated_at``.
+# A tenant still asleep this long past its booking lost the wake (or the
+# wake failed) and needs a new one.
+_CRON_WAKE_OVERDUE_GRACE = timedelta(minutes=15)
+
+
+def cron_wake_rearm_allowed(tenant_id) -> bool:
+    """Tenant gate for re-booking lost wakes in ``ensure_at_cron_wakes_task``.
+
+    Empty ``CRON_WAKE_REARM_TENANT_IDS`` -> nobody (safe default), ``*`` -> all,
+    otherwise only the listed tenant UUIDs.
+    """
+    raw = str(getattr(settings, "CRON_WAKE_REARM_TENANT_IDS", "") or "").strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return True
+    return str(tenant_id).lower() in {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
 def _find_earliest_next_run(cron_jobs: list[dict], now_ms: int) -> int | None:

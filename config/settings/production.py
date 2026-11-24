@@ -144,6 +144,10 @@ STEWARD_OPENROUTER_CANARY_TENANT_ID = env(
 # add the canary's id to the Container App to open it for that tenant only.
 TASK_HYGIENE_TENANT_IDS = env("TASK_HYGIENE_TENANT_IDS", default="")
 
+# Lost cron-wake re-booking gate — mirror of the base.py name (must match the
+# Azure Container App env var). Comma-separated tenant UUIDs or "*"; unset = nobody.
+CRON_WAKE_REARM_TENANT_IDS = env("CRON_WAKE_REARM_TENANT_IDS", default="")
+
 # Evening Check-in tomorrow-prep step — mirror of the base.py name so the
 # deploy's Azure Container App env vars are documented here. Comma-separated
 # tenant UUIDs or "*"; empty/unset means nobody.
