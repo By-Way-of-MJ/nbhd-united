@@ -1686,6 +1686,70 @@ def repair_fuel_rows(request):
 
 
 @csrf_exempt
+def backfill_openrouter_key(request):
+    """Give ONE tenant its own capped OpenRouter sub-key (ops trigger).
+
+    Runs ``backfill_openrouter_keys`` for a single tenant: mint sub-key →
+    KV write → MI grant → persist → rebind the container secret (new
+    revision, so the tenant's container restarts once). Skips tenants that
+    already have a sub-key. Prod has no shell, so this is how the command runs.
+
+    Auth: X-Deploy-Secret header, or a QStash signature.
+    URL: /api/cron/backfill-openrouter-key/
+    Body: {"tenant_id": "<uuid>", "dry_run": true}
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    import hmac
+
+    deploy_secret = getattr(settings, "DEPLOY_SECRET", None)
+    provided = request.headers.get("X-Deploy-Secret", "")
+    deploy_ok = bool(deploy_secret and provided and hmac.compare_digest(provided, deploy_secret))
+    if not deploy_ok and not verify_qstash_signature(request):
+        return JsonResponse({"error": "Unauthorized"}, status=401)
+
+    from apps.tenants.middleware import set_rls_context
+
+    set_rls_context(service_role=True)
+
+    body, error = _parse_internal_ops_body(request, {"tenant_id", "dry_run"})
+    if error:
+        return error
+    if not isinstance(body["dry_run"], bool):
+        return JsonResponse({"error": "dry_run must be a boolean"}, status=400)
+    try:
+        tenant_id = str(uuid.UUID(str(body["tenant_id"])))
+    except ValueError:
+        return JsonResponse({"error": "tenant_id must be a UUID"}, status=400)
+
+    if not getattr(settings, "OPENROUTER_PER_TENANT_KEYS_ENABLED", False):
+        return JsonResponse({"error": "OPENROUTER_PER_TENANT_KEYS_ENABLED is off"}, status=409)
+
+    import io
+
+    from apps.billing.management.commands.backfill_openrouter_keys import _backfill_one, _eligible_tenants
+
+    tenants = _eligible_tenants(tenant_id)
+    if not tenants:
+        return JsonResponse({"ok": True, "tenant_id": tenant_id, "eligible": False, "lines": []})
+
+    out = io.StringIO()
+    ok = _backfill_one(tenants[0], body["dry_run"], out)
+    lines = [line for line in out.getvalue().splitlines() if line.strip()]
+    logger.info(
+        "backfill_openrouter_key: tenant_id=%s dry_run=%s ok=%s",
+        tenant_id,
+        body["dry_run"],
+        ok,
+    )
+    return JsonResponse(
+        {"ok": ok, "tenant_id": tenant_id, "eligible": True, "dry_run": body["dry_run"], "lines": lines},
+        status=200 if ok else 500,
+    )
+
+
+@csrf_exempt
 def retire_quarantined_rows(request):
     """Remove share-observed cron jobs by exact gateway ID.
 

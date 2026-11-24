@@ -504,13 +504,22 @@ def provision_tenant(tenant_id: str, *, send_first_session_welcome: bool = True)
                 limit = float(TIER_COST_BUDGETS.get(tier, 5.00))
                 label = f"tenant-{str(tenant.id)[:8]}"
 
+                if not (tenant.key_vault_prefix or "").strip():
+                    # Self-heal: any tenant-creation path that forgets the
+                    # prefix would otherwise fall back to the shared key.
+                    tenant.key_vault_prefix = f"tenants-{tenant.user_id}"
+                    _retry_provision_db_write(tenant, lambda: tenant.save(update_fields=["key_vault_prefix"]))
+
+                # Resolve the KV name BEFORE minting so a naming failure can
+                # never leave an orphan sub-key on OpenRouter.
+                secret_name = secret_name_for_tenant(tenant)
                 _log_provisioning_event(
                     tenant_id=str(tenant.id),
                     user_id=user_id,
                     stage="create_openrouter_subkey",
                 )
                 api_key, key_hash = create_sub_key(label, limit_dollars=limit, limit_reset="monthly")
-                openrouter_kv_secret_name = secret_name_for_tenant(tenant)
+                openrouter_kv_secret_name = secret_name
                 _write_secret_to_kv(openrouter_kv_secret_name, api_key)
                 _renew_provision_lease(tenant)
                 tenant.openrouter_key_secret_name = openrouter_kv_secret_name
@@ -528,14 +537,18 @@ def provision_tenant(tenant_id: str, *, send_first_session_welcome: bool = True)
             except _ProvisionLeaseLost:
                 raise
             except OpenRouterAdminError as exc:
-                logger.warning(
+                # ERROR (not WARNING) so Sentry raises an issue: a tenant on
+                # the shared key has no per-user spend cap. Provisioning still
+                # continues so sign-up never breaks; backfill_openrouter_keys
+                # (or POST /api/cron/backfill-openrouter-key/) repairs it.
+                logger.error(
                     "OpenRouter sub-key creation failed for tenant %s; falling back to shared key: %s",
                     tenant_id,
                     exc,
                 )
                 openrouter_kv_secret_name = None
             except Exception:
-                logger.warning(
+                logger.error(
                     "Unexpected error creating OpenRouter sub-key for tenant %s; falling back to shared key",
                     tenant_id,
                     exc_info=True,

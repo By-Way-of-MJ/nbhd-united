@@ -1333,6 +1333,78 @@ class ProvisioningTest(TestCase):
         # But provisioning succeeded.
         self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
 
+    def test_app_signup_tenant_gets_key_vault_prefix(self):
+        """The iOS/web sign-up path must set the prefix every per-tenant
+        KV secret name is built from (it used to leave it empty)."""
+        from apps.tenants.models import User
+        from apps.tenants.services import prepare_tenant_provisioning
+
+        user = User.objects.create_user(username="app-signup-prefix")
+        tenant, created = prepare_tenant_provisioning(user)
+        self.assertTrue(created)
+        self.assertEqual(tenant.key_vault_prefix, f"tenants-{user.id}")
+        tenant.refresh_from_db()
+        self.assertEqual(tenant.key_vault_prefix, f"tenants-{user.id}")
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+    @patch("apps.byo_models.services._write_secret_to_kv")
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_provision_self_heals_empty_prefix_and_keys_tenant(self, mock_create, mock_kv_write):
+        """Regression (2026-10-30, 2026-11-09 sign-ups): an empty prefix made
+        the tenant fall back to the shared key after minting an orphan."""
+        Tenant.objects.filter(id=self.tenant.id).update(key_vault_prefix="")
+        mock_create.return_value = ("mock-or-key-xyz", "hash-abc123")
+
+        provision_tenant(str(self.tenant.id))
+
+        self.tenant.refresh_from_db()
+        expected_prefix = f"tenants-{self.tenant.user_id}"
+        self.assertEqual(self.tenant.key_vault_prefix, expected_prefix)
+        self.assertEqual(self.tenant.openrouter_key_secret_name, f"{expected_prefix}-openrouter-key")
+        self.assertEqual(self.tenant.openrouter_key_hash, "hash-abc123")
+        mock_create.assert_called_once()
+        self.assertEqual(mock_kv_write.call_args.args[0], f"{expected_prefix}-openrouter-key")
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+    @patch("apps.billing.openrouter_admin.secret_name_for_tenant")
+    @patch("apps.billing.openrouter_admin.create_sub_key")
+    def test_provision_naming_failure_mints_nothing_and_logs_error(self, mock_create, mock_name):
+        """A naming failure must not leave an orphan OpenRouter key, and the
+        shared-key fallback must log at ERROR so Sentry raises an issue."""
+        from apps.billing.openrouter_admin import OpenRouterAdminError
+
+        mock_name.side_effect = OpenRouterAdminError("no prefix")
+
+        with self.assertLogs("apps.orchestrator.services", level="ERROR") as logs:
+            provision_tenant(str(self.tenant.id))
+
+        mock_create.assert_not_called()
+        self.assertTrue(any("falling back to shared key" in line for line in logs.output))
+        self.tenant.refresh_from_db()
+        self.assertEqual(self.tenant.openrouter_key_secret_name, "")
+        self.assertEqual(self.tenant.status, Tenant.Status.ACTIVE)
+
+    def test_backfill_migration_fills_only_empty_prefixes(self):
+        from importlib import import_module
+
+        from django.apps import apps as django_apps
+
+        from apps.tenants.models import User
+
+        migration = import_module("apps.tenants.migrations.0191_backfill_key_vault_prefix_app_signups")
+        empty_user = User.objects.create_user(username="prefix-empty")
+        empty = Tenant.objects.create(user=empty_user, key_vault_prefix="")
+        kept_prefix = self.tenant.key_vault_prefix
+        self.assertTrue(kept_prefix)
+
+        migration.backfill(django_apps, None)
+
+        empty.refresh_from_db()
+        self.tenant.refresh_from_db()
+        self.assertEqual(empty.key_vault_prefix, f"tenants-{empty_user.id}")
+        self.assertEqual(self.tenant.key_vault_prefix, kept_prefix)
+
     @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
     @patch("apps.byo_models.services._delete_secret_from_kv")
     @patch("apps.billing.openrouter_admin.delete_sub_key")

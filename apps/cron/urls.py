@@ -33,6 +33,11 @@ urlpatterns = [
     path("scrub-thread-titles/", views.scrub_thread_titles, name="cron-scrub-thread-titles"),
     path("repair-fuel-rows/", views.repair_fuel_rows, name="cron-repair-fuel-rows"),
     path(
+        "backfill-openrouter-key/",
+        views.backfill_openrouter_key,
+        name="cron-backfill-openrouter-key",
+    ),
+    path(
         "retire-quarantined/",
         views.retire_quarantined_rows,
         name="cron-retire-quarantined",

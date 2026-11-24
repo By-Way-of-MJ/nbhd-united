@@ -43,6 +43,11 @@ def prepare_tenant_provisioning(user: User) -> tuple[Tenant, bool]:
                 trial_ends_at=now + timedelta(days=TRIAL_DAYS),
                 model_tier=Tenant.ModelTier.STARTER,
                 status=Tenant.Status.PROVISIONING,
+                # Every per-tenant Key Vault secret name is built from this
+                # (OpenRouter sub-key, integration tokens, BYO keys, recall
+                # key). Leaving it empty silently put every app sign-up on
+                # the shared OpenRouter key.
+                key_vault_prefix=f"tenants-{user.id}",
                 # New sign-ups switch on their own scheduled messages during
                 # onboarding; nothing generic is seeded for them.
                 scheduled_messages_opt_in=True,
