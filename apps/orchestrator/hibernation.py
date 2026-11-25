@@ -1004,7 +1004,10 @@ def wake_for_cron_task(tenant_id: str) -> dict:
         try:
             cron_jobs = _capture_tenant_cron_schedules(tenant)
             # Skip the run that is about to fire: the awake container owns it.
-            skip_until_ms = int(timezone.now().timestamp() * 1000) + _CRON_WAKE_LEAD_SECONDS * 1000
+            # +60s margin: a wake can land up to ~1s before T-lead (the booking
+            # delay is floored to whole seconds), which would otherwise miss
+            # the skip once and cost one extra 60s re-arm.
+            skip_until_ms = int(timezone.now().timestamp() * 1000) + (_CRON_WAKE_LEAD_SECONDS + 60) * 1000
             _schedule_next_cron_wake(tenant, cron_jobs, after_ms=skip_until_ms)
         except Exception:
             logger.warning(
