@@ -268,6 +268,11 @@ def _load_fallback_cron_jobs(tenant: Tenant) -> list[dict]:
     return []
 
 
+# Two bookings for the same run land within ~1s of each other (whole-second
+# delay arithmetic); anything further apart is a different run.
+_SAME_BOOKING_TOLERANCE_S = 5
+
+
 def _record_cron_wake_booking(tenant: Tenant, due) -> None:
     """Persist the outcome of a cron-wake booking attempt (never raises)."""
     try:
@@ -311,6 +316,30 @@ def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict], *, after_ms:
         return False
 
     delay_seconds = max(60, (earliest_ms - now_ms) // 1000 - _CRON_WAKE_LEAD_SECONDS)
+    due = timezone.now() + timedelta(seconds=delay_seconds)
+
+    # Already booked? Every sleep (and every awake re-arm) books the next run,
+    # and earlier bookings for the same run are never cancelled; QStash's
+    # dedup id does not hold across hours, so N sleeps before a run meant N
+    # wakes at T-lead (canary 2026-11-25: 5 bookings for one 17:00 run). A
+    # future ``cron_wake_armed_for`` only ever follows a publish that landed,
+    # so a match means that wake is still pending — don't book it again.
+    try:
+        booked = Tenant.objects.filter(id=tenant.id).values_list("cron_wake_armed_for", flat=True).first()
+    except Exception:
+        booked = None
+    if (
+        booked is not None
+        and booked > timezone.now()
+        and abs((booked - due).total_seconds()) <= _SAME_BOOKING_TOLERANCE_S
+    ):
+        logger.info(
+            "idle_hibernate: cron wake for tenant %s already booked for %s (next cron ~%s), not re-booking",
+            str(tenant.id)[:8],
+            booked.isoformat(),
+            datetime.fromtimestamp(earliest_ms / 1000, tz=UTC).isoformat(),
+        )
+        return True
 
     try:
         from apps.cron.publish import publish_task
@@ -321,7 +350,7 @@ def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict], *, after_ms:
             delay_seconds=delay_seconds,
             idempotency_key=f"wake-cron-{tenant.id}-{earliest_ms}",
         )
-        _record_cron_wake_booking(tenant, timezone.now() + timedelta(seconds=delay_seconds))
+        _record_cron_wake_booking(tenant, due)
         logger.info(
             "idle_hibernate: scheduled cron wake for tenant %s in %ds (next cron ~%s)",
             str(tenant.id)[:8],
