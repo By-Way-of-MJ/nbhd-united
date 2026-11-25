@@ -277,3 +277,31 @@ class EnsureSubkeyOnReactivationTest(TestCase):
         Tenant.objects.filter(pk=self.tenant.pk).update(openrouter_key_secret_name="already")
         restore_tenant_runtime(self.tenant)
         self.assertFalse([c for c in mock_publish.call_args_list if c.args and c.args[0] == "ensure_openrouter_subkey"])
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.scale_container_app", side_effect=RuntimeError("azure down"))
+    def test_restore_queues_subkey_even_when_scale_up_fails(self, _mock_scale, mock_publish):
+        from apps.billing.services import restore_tenant_runtime
+
+        self.assertFalse(restore_tenant_runtime(self.tenant))
+        self.assertTrue([c for c in mock_publish.call_args_list if c.args and c.args[0] == "ensure_openrouter_subkey"])
+
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.billing.management.commands.backfill_openrouter_keys._backfill_one")
+    @patch("apps.orchestrator.openclaw_auto_upgrade.in_flight", return_value=True)
+    def test_task_defers_while_an_upgrade_is_in_flight(self, _mock_in_flight, mock_backfill, mock_publish):
+        from apps.billing.tasks import _ENSURE_SUBKEY_MAX_ATTEMPTS, ensure_openrouter_subkey_task
+
+        result = ensure_openrouter_subkey_task(str(self.tenant.id))
+        self.assertEqual(result["status"], "deferred_upgrade_in_flight")
+        mock_backfill.assert_not_called()
+        mock_publish.assert_called_once()
+        self.assertEqual(mock_publish.call_args.args, ("ensure_openrouter_subkey", str(self.tenant.id)))
+        self.assertEqual(mock_publish.call_args.kwargs["attempt"], 2)
+        self.assertEqual(mock_publish.call_args.kwargs["retries"], 0)
+
+        mock_publish.reset_mock()
+        result = ensure_openrouter_subkey_task(str(self.tenant.id), attempt=_ENSURE_SUBKEY_MAX_ATTEMPTS)
+        self.assertEqual(result["status"], "gave_up_upgrade_in_flight")
+        mock_publish.assert_not_called()
+        mock_backfill.assert_not_called()

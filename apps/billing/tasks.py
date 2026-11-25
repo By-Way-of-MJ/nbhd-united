@@ -37,7 +37,11 @@ def model_health_check_task():
     return model_health_check()
 
 
-def ensure_openrouter_subkey_task(tenant_id: str) -> dict:
+_ENSURE_SUBKEY_UPGRADE_RETRY_SECONDS = 15 * 60
+_ENSURE_SUBKEY_MAX_ATTEMPTS = 4
+
+
+def ensure_openrouter_subkey_task(tenant_id: str, attempt: int = 1) -> dict:
     """Give a reactivated tenant its own capped OpenRouter sub-key.
 
     Queued by ``restore_tenant_runtime``: tenants that went inactive before
@@ -62,6 +66,32 @@ def ensure_openrouter_subkey_task(tenant_id: str) -> dict:
     eligible = [t for t in _eligible_tenants(tenant_id) if t.status == Tenant.Status.ACTIVE]
     if not eligible:
         return {"status": "not_eligible"}
+
+    # The rebind rewrites the whole container app spec. Racing an OpenClaw
+    # auto-upgrade (which also rewrites it — likely for long-inactive tenants
+    # on an old runtime) could put the old image back. Wait it out.
+    from apps.orchestrator import openclaw_auto_upgrade
+
+    if openclaw_auto_upgrade.in_flight(eligible[0].id):
+        attempt = int(attempt or 1)
+        if attempt >= _ENSURE_SUBKEY_MAX_ATTEMPTS:
+            logger.error(
+                "ensure_openrouter_subkey: tenant %s still mid-upgrade after %d attempts — left on shared key",
+                str(tenant_id)[:8],
+                attempt,
+            )
+            return {"status": "gave_up_upgrade_in_flight"}
+        from apps.cron.publish import publish_task
+
+        publish_task(
+            "ensure_openrouter_subkey",
+            str(tenant_id),
+            attempt=attempt + 1,
+            idempotency_key=f"ensure-or-subkey-{tenant_id}-a{attempt + 1}",
+            delay_seconds=_ENSURE_SUBKEY_UPGRADE_RETRY_SECONDS,
+            retries=0,
+        )
+        return {"status": "deferred_upgrade_in_flight", "attempt": attempt}
     out = io.StringIO()
     try:
         ok = _backfill_one(eligible[0], False, out)
