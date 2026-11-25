@@ -119,6 +119,8 @@ TASK_MAP = {
     "replay_cron_dispatches": "apps.actions.tasks.replay_stale_cron_dispatches",
     # PR #1.6: hourly OR-spend truing-up (per-tenant + platform).
     "reconcile_openrouter_spend": "apps.billing.tasks.reconcile_openrouter_spend_task",
+    "ensure_openrouter_subkey": "apps.billing.tasks.ensure_openrouter_subkey_task",
+    "sweep_orphan_openrouter_keys": "apps.billing.tasks.sweep_orphan_openrouter_keys_task",
     # Journal memory sync (on-demand via signal or QStash publish)
     "sync_documents_to_workspace": "apps.journal.tasks.sync_documents_to_workspace",
     # Provisioning (on-demand via QStash publish)

@@ -360,6 +360,28 @@ def restore_tenant_runtime(tenant: Tenant) -> bool:
     if not tenant.container_id:
         return False
 
+    # Tenants that went inactive on the shared, uncapped OpenRouter key
+    # (pre per-tenant keys, or a provisioning fallback) get their own
+    # capped sub-key. Queued BEFORE the scale-up so a failed scale-up (the
+    # callers then mark the tenant hibernated) still gets keyed; the task
+    # re-hibernates a sleeping tenant after its rebind. Delayed so the
+    # scale-up revision settles before the rebind creates the next one.
+    try:
+        from django.conf import settings
+
+        tenant.refresh_from_db(fields=["openrouter_key_secret_name"])
+        if not tenant.openrouter_key_secret_name and getattr(settings, "OPENROUTER_PER_TENANT_KEYS_ENABLED", False):
+            publish_task(
+                "ensure_openrouter_subkey",
+                str(tenant.id),
+                idempotency_key=f"ensure-or-subkey-{tenant.id}",
+                delay_seconds=120,
+                retries=0,
+            )
+            logger.info("Queued ensure_openrouter_subkey for reactivated tenant %s", tenant.id)
+    except Exception:
+        logger.exception("Failed to queue ensure_openrouter_subkey for tenant %s", tenant.id)
+
     try:
         from apps.orchestrator.azure_client import scale_container_app
 
