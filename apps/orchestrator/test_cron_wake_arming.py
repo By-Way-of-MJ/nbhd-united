@@ -256,3 +256,55 @@ class CronWakeRearmGateTests(TestCase):
             self.assertTrue(hibernation.cron_wake_rearm_allowed(tid))
         with override_settings(CRON_WAKE_REARM_TENANT_IDS="other"):
             self.assertFalse(hibernation.cron_wake_rearm_allowed(tid))
+
+
+class AwakeRearmSkipsImminentRunTests(TestCase):
+    """Regression (canary 2026-11-24 16:56–16:57): an already-awake tenant whose
+    next cron was <lead away re-armed a wake for THAT run, floored at 60s, which
+    found it awake and re-armed again every minute until the run fired."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="AwakeRearm", telegram_chat_id=950500)
+        Tenant.objects.filter(id=self.tenant.id).update(
+            status=Tenant.Status.ACTIVE, container_id="oc-awake-rearm", hibernated_at=None
+        )
+        self.tenant.refresh_from_db()
+        now = timezone.now()
+        self.imminent = (now + timedelta(minutes=2)).replace(second=0, microsecond=0) + timedelta(minutes=1)
+        self.imminent_ms = int(self.imminent.timestamp() * 1000)
+        self.daily_job = {
+            "name": "Daily",
+            "enabled": True,
+            "schedule": {
+                "kind": "cron",
+                "expr": f"{self.imminent.minute} {self.imminent.hour} * * *",
+                "tz": "UTC",
+            },
+            "state": {"nextRunAtMs": self.imminent_ms},
+        }
+
+    @patch("apps.cron.publish.publish_task")
+    def test_awake_rearm_books_the_run_after_the_imminent_one(self, mock_publish):
+        with patch.object(hibernation, "_capture_tenant_cron_schedules", return_value=[self.daily_job]):
+            result = wake_for_cron_task(str(self.tenant.id))
+
+        self.assertEqual(result["status"], "already_awake")
+        mock_publish.assert_called_once()
+        next_day_ms = self.imminent_ms + 24 * 3600 * 1000
+        self.assertEqual(mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{self.tenant.id}-{next_day_ms}")
+        self.assertGreater(mock_publish.call_args.kwargs["delay_seconds"], 23 * 3600)
+
+    @patch("apps.cron.publish.publish_task")
+    def test_sleep_path_still_wakes_for_the_imminent_run(self, mock_publish):
+        """Unchanged for a hibernating tenant: it is asleep, so the imminent run needs the wake."""
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, [self.daily_job]))
+
+        self.assertEqual(
+            mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{self.tenant.id}-{self.imminent_ms}"
+        )
+        self.assertEqual(mock_publish.call_args.kwargs["delay_seconds"], 60)
+
+    def test_next_run_from_expr_counts_from_after_ms(self):
+        base = timezone.now().replace(hour=10, minute=0, second=0, microsecond=0)
+        nxt = hibernation._next_run_from_expr("0 11 * * *", "UTC", after_ms=int(base.timestamp() * 1000))
+        self.assertEqual(nxt, int((base + timedelta(hours=1)).timestamp() * 1000))

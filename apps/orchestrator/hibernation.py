@@ -276,7 +276,7 @@ def _record_cron_wake_booking(tenant: Tenant, due) -> None:
         logger.warning("cron wake booking record failed for tenant %s", str(tenant.id)[:8], exc_info=True)
 
 
-def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> bool:
+def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict], *, after_ms: int | None = None) -> bool:
     """Schedule a QStash task to wake the tenant before their next cron fires.
 
     On a successful publish, records the due time in ``cron_wake_armed_for``
@@ -285,13 +285,22 @@ def _schedule_next_cron_wake(tenant: Tenant, cron_jobs: list[dict]) -> bool:
     ``None`` otherwise (no jobs, no upcoming run, publish failed) — so a stale
     future value from an earlier booking can never mask a lost wake.
     Returns True only when a wake was booked.
+
+    ``after_ms`` books the first run strictly after that instant instead of
+    after now. The already-awake re-arm passes now + lead: the run that is
+    about to fire belongs to the awake container, and booking a wake for it
+    floored the delay at 60s and chained wake → "already awake" → re-arm
+    every minute until it fired (canary 2026-11-24 16:56–16:57).
     """
     if not cron_jobs:
         _record_cron_wake_booking(tenant, None)
         return False
 
     now_ms = int(timezone.now().timestamp() * 1000)
-    earliest_ms = _find_earliest_next_run(cron_jobs, now_ms)
+    if after_ms is not None and after_ms > now_ms:
+        earliest_ms = _find_earliest_next_run(cron_jobs, after_ms, cron_base_ms=after_ms)
+    else:
+        earliest_ms = _find_earliest_next_run(cron_jobs, now_ms)
 
     if not earliest_ms:
         logger.info(
@@ -349,7 +358,7 @@ def cron_wake_rearm_allowed(tenant_id) -> bool:
     return str(tenant_id).lower() in {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
-def _find_earliest_next_run(cron_jobs: list[dict], now_ms: int) -> int | None:
+def _find_earliest_next_run(cron_jobs: list[dict], now_ms: int, *, cron_base_ms: int | None = None) -> int | None:
     """Return the earliest ``nextRunAtMs`` from the job list.
 
     OpenClaw's ``cron.list`` returns each job with its mutable runtime
@@ -384,21 +393,25 @@ def _find_earliest_next_run(cron_jobs: list[dict], now_ms: int) -> int | None:
         expr = schedule.get("expr")
         tz_name = schedule.get("tz", "UTC")
         if expr:
-            computed = _next_run_from_expr(expr, tz_name)
+            computed = _next_run_from_expr(expr, tz_name, after_ms=cron_base_ms)
             if computed and computed > now_ms:
                 candidates.append(computed)
 
     return min(candidates) if candidates else None
 
 
-def _next_run_from_expr(expr: str, tz_name: str) -> int | None:
-    """Compute next run time in epoch ms from a cron expression + timezone."""
+def _next_run_from_expr(expr: str, tz_name: str, *, after_ms: int | None = None) -> int | None:
+    """Compute next run time in epoch ms from a cron expression + timezone.
+
+    Counts from now, or from ``after_ms`` when given.
+    """
     try:
         from zoneinfo import ZoneInfo
 
         from croniter import croniter
 
-        now = datetime.now(ZoneInfo(tz_name))
+        tz = ZoneInfo(tz_name)
+        now = datetime.fromtimestamp(after_ms / 1000, tz) if after_ms is not None else datetime.now(tz)
         cron = croniter(expr, now)
         next_dt = cron.get_next(datetime)
         return int(next_dt.timestamp() * 1000)
@@ -990,7 +1003,9 @@ def wake_for_cron_task(tenant_id: str) -> dict:
         )
         try:
             cron_jobs = _capture_tenant_cron_schedules(tenant)
-            _schedule_next_cron_wake(tenant, cron_jobs)
+            # Skip the run that is about to fire: the awake container owns it.
+            skip_until_ms = int(timezone.now().timestamp() * 1000) + _CRON_WAKE_LEAD_SECONDS * 1000
+            _schedule_next_cron_wake(tenant, cron_jobs, after_ms=skip_until_ms)
         except Exception:
             logger.warning(
                 "wake_for_cron: re-arm failed for awake tenant %s — relying on next idle-hibernation",
