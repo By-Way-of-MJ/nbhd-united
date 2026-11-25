@@ -308,3 +308,49 @@ class AwakeRearmSkipsImminentRunTests(TestCase):
         base = timezone.now().replace(hour=10, minute=0, second=0, microsecond=0)
         nxt = hibernation._next_run_from_expr("0 11 * * *", "UTC", after_ms=int(base.timestamp() * 1000))
         self.assertEqual(nxt, int((base + timedelta(hours=1)).timestamp() * 1000))
+
+
+class DuplicateBookingTests(TestCase):
+    """Regression (canary 2026-11-25): five sleeps before one 17:00 run each
+    booked a wake for it; all five fired at 16:56."""
+
+    def setUp(self):
+        self.tenant = create_tenant(display_name="DupBooking", telegram_chat_id=950600)
+        Tenant.objects.filter(id=self.tenant.id).update(status=Tenant.Status.ACTIVE, container_id="oc-dup")
+        self.tenant.refresh_from_db()
+        self.run_ms = int(timezone.now().timestamp() * 1000) + 3 * 3600 * 1000
+
+    def _jobs(self, run_ms):
+        return [{"name": "Daily", "enabled": True, "state": {"nextRunAtMs": run_ms}, "schedule": {"kind": "every"}}]
+
+    @patch("apps.cron.publish.publish_task")
+    def test_same_run_is_booked_once(self, mock_publish):
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms)))
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms)))
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms)))
+        self.assertEqual(mock_publish.call_count, 1)
+
+    @patch("apps.cron.publish.publish_task")
+    def test_an_earlier_run_still_gets_its_own_wake(self, mock_publish):
+        _schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms))
+        earlier = self.run_ms - 3600 * 1000
+        _schedule_next_cron_wake(self.tenant, self._jobs(earlier))
+        self.assertEqual(mock_publish.call_count, 2)
+        self.assertEqual(mock_publish.call_args.kwargs["idempotency_key"], f"wake-cron-{self.tenant.id}-{earlier}")
+        self.tenant.refresh_from_db()
+        expected_due = (earlier - int(timezone.now().timestamp() * 1000)) / 1000 - _CRON_WAKE_LEAD_SECONDS
+        self.assertAlmostEqual(
+            (self.tenant.cron_wake_armed_for - timezone.now()).total_seconds(), expected_due, delta=5
+        )
+
+    @patch("apps.cron.publish.publish_task")
+    def test_a_past_booking_does_not_block(self, mock_publish):
+        Tenant.objects.filter(id=self.tenant.id).update(cron_wake_armed_for=timezone.now() - timedelta(minutes=1))
+        _schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms))
+        mock_publish.assert_called_once()
+
+    @patch("apps.cron.publish.publish_task", side_effect=[RuntimeError("qstash down"), None])
+    def test_a_failed_booking_is_retried_next_time(self, mock_publish):
+        self.assertFalse(_schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms)))
+        self.assertTrue(_schedule_next_cron_wake(self.tenant, self._jobs(self.run_ms)))
+        self.assertEqual(mock_publish.call_count, 2)
