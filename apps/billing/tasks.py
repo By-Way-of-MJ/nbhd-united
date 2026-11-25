@@ -83,14 +83,21 @@ def ensure_openrouter_subkey_task(tenant_id: str, attempt: int = 1) -> dict:
             return {"status": "gave_up_upgrade_in_flight"}
         from apps.cron.publish import publish_task
 
-        publish_task(
-            "ensure_openrouter_subkey",
-            str(tenant_id),
-            attempt=attempt + 1,
-            idempotency_key=f"ensure-or-subkey-{tenant_id}-a{attempt + 1}",
-            delay_seconds=_ENSURE_SUBKEY_UPGRADE_RETRY_SECONDS,
-            retries=0,
-        )
+        try:
+            publish_task(
+                "ensure_openrouter_subkey",
+                str(tenant_id),
+                attempt=attempt + 1,
+                idempotency_key=f"ensure-or-subkey-{tenant_id}-a{attempt + 1}",
+                delay_seconds=_ENSURE_SUBKEY_UPGRADE_RETRY_SECONDS,
+                retries=0,
+            )
+        except Exception:
+            logger.exception(
+                "ensure_openrouter_subkey: could not re-queue tenant %s (mid-upgrade) — left on shared key",
+                str(tenant_id)[:8],
+            )
+            return {"status": "error_requeue_failed", "attempt": attempt}
         return {"status": "deferred_upgrade_in_flight", "attempt": attempt}
     out = io.StringIO()
     try:

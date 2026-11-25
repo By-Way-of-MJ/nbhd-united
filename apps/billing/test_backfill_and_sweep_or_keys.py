@@ -305,3 +305,10 @@ class EnsureSubkeyOnReactivationTest(TestCase):
         self.assertEqual(result["status"], "gave_up_upgrade_in_flight")
         mock_publish.assert_not_called()
         mock_backfill.assert_not_called()
+
+    @patch("apps.cron.publish.publish_task", side_effect=RuntimeError("qstash down"))
+    @patch("apps.orchestrator.openclaw_auto_upgrade.in_flight", return_value=True)
+    def test_deferral_requeue_failure_does_not_raise(self, _mock_in_flight, _mock_publish):
+        from apps.billing.tasks import ensure_openrouter_subkey_task
+
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "error_requeue_failed")
