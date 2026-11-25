@@ -366,6 +366,26 @@ def restore_tenant_runtime(tenant: Tenant) -> bool:
         scale_container_app(tenant.container_id, min_replicas=1, max_replicas=1)
         logger.info("Woke container %s for reactivated tenant %s", tenant.container_id, tenant.id)
 
+        # Tenants that went inactive on the shared, uncapped OpenRouter key
+        # (pre per-tenant keys, or a provisioning fallback) get their own
+        # capped sub-key. Delayed so the scale-up revision settles before the
+        # rebind creates the next one.
+        try:
+            from django.conf import settings
+
+            tenant.refresh_from_db(fields=["openrouter_key_secret_name"])
+            if not tenant.openrouter_key_secret_name and getattr(settings, "OPENROUTER_PER_TENANT_KEYS_ENABLED", False):
+                publish_task(
+                    "ensure_openrouter_subkey",
+                    str(tenant.id),
+                    idempotency_key=f"ensure-or-subkey-{tenant.id}",
+                    delay_seconds=120,
+                    retries=0,
+                )
+                logger.info("Queued ensure_openrouter_subkey for reactivated tenant %s", tenant.id)
+        except Exception:
+            logger.exception("Failed to queue ensure_openrouter_subkey for tenant %s", tenant.id)
+
         # Apply pending config updates missed during hibernation
         try:
             tenant.refresh_from_db(fields=["config_version", "pending_config_version"])

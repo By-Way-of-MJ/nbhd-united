@@ -142,9 +142,24 @@ class SweepTest(TestCase):
     def test_deletes_old_orphans_keeps_known_keys(self, mock_list, mock_delete):
         # Three OR keys: one tied to our tenant, one orphan + old, one orphan + young.
         mock_list.return_value = [
-            {"hash": "known-hash", "label": "tenant-1", "created_at": "2026-04-01T00:00:00Z"},
-            {"hash": "orphan-old", "label": "tenant-old", "created_at": "2026-04-01T00:00:00Z"},
-            {"hash": "orphan-young", "label": "tenant-young", "created_at": "2099-01-01T00:00:00Z"},
+            {
+                "hash": "known-hash",
+                "name": "tenant-00000001",
+                "label": "sk-or-v1-a...1",
+                "created_at": "2026-04-01T00:00:00Z",
+            },
+            {
+                "hash": "orphan-old",
+                "name": "tenant-00000002",
+                "label": "sk-or-v1-b...2",
+                "created_at": "2026-04-01T00:00:00Z",
+            },
+            {
+                "hash": "orphan-young",
+                "name": "tenant-00000003",
+                "label": "sk-or-v1-c...3",
+                "created_at": "2099-01-01T00:00:00Z",
+            },
         ]
         out = StringIO()
         call_command("sweep_orphan_openrouter_keys", stdout=out)
@@ -156,7 +171,7 @@ class SweepTest(TestCase):
     @patch("apps.billing.openrouter_admin.list_sub_keys")
     def test_dry_run_does_not_delete(self, mock_list, mock_delete):
         mock_list.return_value = [
-            {"hash": "orphan-old", "label": "x", "created_at": "2026-01-01T00:00:00Z"},
+            {"hash": "orphan-old", "name": "tenant-0000000a", "created_at": "2026-01-01T00:00:00Z"},
         ]
         out = StringIO()
         call_command("sweep_orphan_openrouter_keys", "--dry-run", stdout=out)
@@ -166,7 +181,99 @@ class SweepTest(TestCase):
     @patch("apps.billing.openrouter_admin.list_sub_keys")
     def test_skips_when_no_created_at(self, mock_list, mock_delete):
         # Missing created_at → treated as young (conservative).
-        mock_list.return_value = [{"hash": "orphan-no-ts", "label": "x"}]
+        mock_list.return_value = [{"hash": "orphan-no-ts", "name": "tenant-0000000b"}]
         out = StringIO()
         call_command("sweep_orphan_openrouter_keys", stdout=out)
         mock_delete.assert_not_called()
+
+
+class SweepSafetyTest(TestCase):
+    """list_sub_keys returns EVERY key on the account (prod 2026-11-25: 59
+    tenant keys + 4 platform keys). Only ``tenant-<8 hex>`` keys may go."""
+
+    @patch("apps.billing.openrouter_admin.delete_sub_key")
+    @patch("apps.billing.openrouter_admin.list_sub_keys")
+    def test_platform_keys_are_never_deleted(self, mock_list, mock_delete):
+        old = "2026-01-01T00:00:00Z"
+        mock_list.return_value = [
+            {"hash": "p1", "name": "nbhd-openrouter-platform-key", "created_at": old},
+            {"hash": "p2", "name": "nbhd-functionality", "created_at": old},
+            {"hash": "p3", "name": "TheClaw", "created_at": old},
+            {"hash": "p4", "name": None, "label": "tenant-deadbeef", "created_at": old},
+            {"hash": "p5", "name": "tenant-DEADBEEF", "created_at": old},
+            {"hash": "p6", "name": "tenant-deadbeef-extra", "created_at": old},
+            {"hash": "t1", "name": "tenant-deadbeef", "created_at": old},
+        ]
+        call_command("sweep_orphan_openrouter_keys", stdout=StringIO())
+        mock_delete.assert_called_once_with("t1")
+
+    @patch("apps.billing.openrouter_admin.delete_sub_key")
+    @patch("apps.billing.openrouter_admin.list_sub_keys")
+    def test_task_defaults_to_dry_run(self, mock_list, mock_delete):
+        from apps.billing.tasks import sweep_orphan_openrouter_keys_task
+
+        mock_list.return_value = [{"hash": "t1", "name": "tenant-deadbeef", "created_at": "2026-01-01T00:00:00Z"}]
+        result = sweep_orphan_openrouter_keys_task()
+        mock_delete.assert_not_called()
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["orphans"], 1)
+
+        sweep_orphan_openrouter_keys_task(dry_run=False)
+        mock_delete.assert_called_once_with("t1")
+
+
+@override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=True)
+class EnsureSubkeyOnReactivationTest(TestCase):
+    def setUp(self):
+        self.tenant = create_tenant(display_name="Comeback", telegram_chat_id=906)
+        Tenant.objects.filter(pk=self.tenant.pk).update(status=Tenant.Status.ACTIVE, container_id="oc-comeback")
+        self.tenant.refresh_from_db()
+
+    @patch("apps.billing.management.commands.backfill_openrouter_keys._backfill_one", return_value=True)
+    def test_task_keys_an_unkeyed_active_tenant(self, mock_backfill):
+        from apps.billing.tasks import ensure_openrouter_subkey_task
+
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "ok")
+        mock_backfill.assert_called_once()
+        self.assertEqual(mock_backfill.call_args.args[0].pk, self.tenant.pk)
+        self.assertFalse(mock_backfill.call_args.args[1])  # not a dry run
+
+    @patch("apps.billing.management.commands.backfill_openrouter_keys._backfill_one")
+    def test_task_skips_keyed_and_suspended_tenants(self, mock_backfill):
+        from apps.billing.tasks import ensure_openrouter_subkey_task
+
+        Tenant.objects.filter(pk=self.tenant.pk).update(openrouter_key_secret_name="already")
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "not_eligible")
+        Tenant.objects.filter(pk=self.tenant.pk).update(openrouter_key_secret_name="", status=Tenant.Status.SUSPENDED)
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "not_eligible")
+        mock_backfill.assert_not_called()
+
+    @patch("apps.billing.management.commands.backfill_openrouter_keys._backfill_one", side_effect=RuntimeError("boom"))
+    def test_task_never_raises(self, _mock_backfill):
+        from apps.billing.tasks import ensure_openrouter_subkey_task
+
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "error")
+
+    @override_settings(OPENROUTER_PER_TENANT_KEYS_ENABLED=False)
+    def test_task_respects_flag(self):
+        from apps.billing.tasks import ensure_openrouter_subkey_task
+
+        self.assertEqual(ensure_openrouter_subkey_task(str(self.tenant.id))["status"], "flag_off")
+
+    @patch("apps.orchestrator.services.refresh_system_cron_rows_from_seed", return_value={})
+    @patch("apps.cron.publish.publish_task")
+    @patch("apps.orchestrator.azure_client.scale_container_app")
+    def test_restore_queues_subkey_for_unkeyed_tenant_only(self, _mock_scale, mock_publish, _mock_refresh):
+        from apps.billing.services import restore_tenant_runtime
+
+        self.assertTrue(restore_tenant_runtime(self.tenant))
+        calls = [c for c in mock_publish.call_args_list if c.args and c.args[0] == "ensure_openrouter_subkey"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].args[1], str(self.tenant.id))
+        self.assertEqual(calls[0].kwargs["retries"], 0)
+        self.assertGreaterEqual(calls[0].kwargs["delay_seconds"], 60)
+
+        mock_publish.reset_mock()
+        Tenant.objects.filter(pk=self.tenant.pk).update(openrouter_key_secret_name="already")
+        restore_tenant_runtime(self.tenant)
+        self.assertFalse([c for c in mock_publish.call_args_list if c.args and c.args[0] == "ensure_openrouter_subkey"])
