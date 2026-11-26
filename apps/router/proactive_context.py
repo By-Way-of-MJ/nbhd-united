@@ -104,6 +104,7 @@ def record_proactive_outbound(
     journal_link: dict | None = None,
     quick_replies: list[str] | None = None,
     panels: list[dict] | None = None,
+    a2ui: list[dict] | None = None,
     artifact_dedup_key: str | None = None,
     thread_id=None,
     defer_push: bool = False,
@@ -192,6 +193,7 @@ def record_proactive_outbound(
                 # deterministic model-facing offer set below.
                 quick_replies=quick_replies,
                 panels=panels or None,
+                a2ui=a2ui,
             )
             if transcript_redaction is not None or transcript_quarantine is not None:
                 try:
