@@ -174,7 +174,7 @@ CARD_INSTRUCTION = (
     "match " + COMPONENT_ID_PATTERN + " lowercase.\n"
     "Components: " + _component_docs() + ". Bindings: "
     '{"@path":"/abs"}; in a List template, relative {"@path":"field"}.\n'
-    'Any component may take "when":{"@path":...}; it is hidden unless that value is non-empty. '
+    'Any component may take "when":{"@path":...}; it is hidden when that value is missing, null, false, "" or empty; 0 shows. '
     "Use it on headings, panels and buttons that depend on data.\n"
     "Panels " + PANEL_VOCABULARY + ".\n"
     "Data: dataModel = refs, never copied: "

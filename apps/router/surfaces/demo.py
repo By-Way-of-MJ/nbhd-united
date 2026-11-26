@@ -185,6 +185,7 @@ def _stuck_components(mission_id: str) -> tuple[list[dict], dict]:
             "id": "root",
             "component": "Card",
             "children": ["mission-title", "next-label", "next-title", "project-panel", "when", "actions"],
+            "when": {"@path": "/mission"},
         },
         {
             "id": "mission-title",
