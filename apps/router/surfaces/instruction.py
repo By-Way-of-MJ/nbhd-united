@@ -97,5 +97,5 @@ CARD_INSTRUCTION = (
     f"Limits: <= {MAX_COMPONENTS} components, depth <= {MAX_DEPTH}, envelope <= "
     f"{MAX_SURFACE_BYTES} bytes, <= {MAX_DATA_REFS} data refs, text <= "
     f"{MAX_TEXT_LENGTH} chars, no URLs.\n"
-    "Example:\n```nbhd-card\n" + _EXAMPLE + "\n```"
+    "Example:\n```nbhd-card\n" + _EXAMPLE + "\n```\n"
 )

@@ -14,6 +14,7 @@ stored.
 
 from __future__ import annotations
 
+import json
 import secrets
 from unittest.mock import MagicMock, patch
 
@@ -238,6 +239,28 @@ class ExtractInboundDocumentTaskTest(TestCase):
         self.assertEqual(row.channel, "app")
         self.assertEqual(row.job_name, "_document_extraction")
         self.assertIn("4200", row.message_text)
+
+    def test_reply_fences_are_stripped_before_proactive_storage(self):
+        card = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "invoice",
+                "catalogId": "nbhd/v1",
+                "components": [{"id": "root", "component": "Divider"}],
+            },
+        }
+        panels = [{"kind": "log_table", "params": {"range": "this_month"}}]
+        reply = (
+            "The invoice is 4200 USD.\n"
+            "```nbhd-panels\n" + json.dumps(panels) + "\n```\n"
+            "```nbhd-card\n" + json.dumps(card) + "\n```"
+        )
+        self._run(post=MagicMock(return_value=_ok_turn_response(reply)))
+
+        row = ProactiveOutbound.objects.get(tenant=self.tenant)
+        self.assertEqual(row.message_text, "The invoice is 4200 USD.")
+        self.assertNotIn("nbhd-panels", row.message_text)
+        self.assertNotIn("nbhd-card", row.message_text)
 
     def test_already_delivered_document_is_a_clean_no_op(self):
         # Done-marker present → QStash redelivery must not re-post the turn or

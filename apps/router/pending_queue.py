@@ -3220,11 +3220,12 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
     from apps.router.chat_gates import chat_surfaces_enabled
     from apps.router.panels import extract_panels, prepare_panels
     from apps.router.surfaces.extract import extract_card
-    from apps.router.surfaces.store import clean_surfaces
+    from apps.router.surfaces.store import clean_surfaces, redact_surfaces
 
     ai_text, panels = extract_panels(ai_text or "")
     ai_text, a2ui = extract_card(ai_text)
     a2ui = clean_surfaces(a2ui) if chat_surfaces_enabled(tenant) else []
+    a2ui = redact_surfaces(a2ui, tenant)
     # A panel-only reply has no prose: pass user_text=None so prepare_panels does
     # not filter timers and turn a legitimate timer-only turn into an error.
     joined_user_text = " ".join(getattr(m, "user_text", None) or "" for m in batch) if ai_text.strip() else None

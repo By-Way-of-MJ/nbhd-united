@@ -1,13 +1,15 @@
-"""A2UI surface storage helpers: cleaning, cap and rehydration (no database)."""
+"""A2UI surface storage helpers: cleaning, cap, redaction and rehydration."""
 
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
-from apps.router.surfaces.store import clean_surfaces, rehydrate_surfaces
+from apps.router.surfaces.store import clean_surfaces, redact_surfaces, rehydrate_surfaces
 from apps.router.surfaces.validate import validate_surface
 
 SENTINEL = "private-sentinel"
@@ -185,3 +187,116 @@ class RehydrateSurfacesTests(SimpleTestCase):
             self.assertEqual(rehydrate_surfaces("nope", {}, tenant_id=None), [])
             with self.assertLogs("apps.router.surfaces.store", level="INFO"):
                 self.assertEqual(rehydrate_surfaces([{SENTINEL: "x"}], {}, tenant_id=None), [])
+
+
+def known_value_tenant():
+    return SimpleNamespace(id=uuid4(), pii_entity_map={"[PERSON_1]": "Alice"})
+
+
+class RedactSurfacesTests(SimpleTestCase):
+    def test_every_user_visible_string_is_redacted_but_code_entries_survive(self):
+        tenant = known_value_tenant()
+        payload = surface(
+            text="Call Alice",
+            options=("Alice", "Hard"),
+            data_model={"title": "Call Alice", "tasks": {"$ref": "tasks:due_today"}},
+        )
+        body = payload["createSurface"]
+        root = body["components"][0]
+        root["children"].append("panel")
+        body["components"].append({"id": "panel", "component": "Panel", "kind": "tasks", "ref": "Alice"})
+        go = next(component for component in body["components"] if component["id"] == "go")
+        go["label"] = "Call Alice"
+        go["action"] = {
+            "event": {
+                "name": "task.create",
+                "context": {"title": "Call Alice", "when": "tomorrow", "who": {"@path": "/title"}},
+            }
+        }
+
+        [result] = redact_surfaces([payload], tenant)
+        body = result["createSurface"]
+        by_id = {component["id"]: component for component in body["components"]}
+
+        self.assertEqual(by_id["title"]["text"], "Call [PERSON_1]")
+        self.assertEqual(by_id["go"]["label"], "Call [PERSON_1]")
+        self.assertEqual(by_id["pick"]["options"], ["[PERSON_1]", "Hard"])
+        self.assertEqual(
+            by_id["go"]["action"]["event"]["context"],
+            {"title": "Call [PERSON_1]", "when": "tomorrow", "who": {"@path": "/title"}},
+        )
+        self.assertEqual(by_id["panel"]["ref"], "[PERSON_1]")
+        self.assertEqual(body["dataModel"]["title"], "Call [PERSON_1]")
+        self.assertEqual(body["dataModel"]["tasks"], {"$ref": "tasks:due_today"})
+        self.assertEqual(payload["createSurface"]["components"][1]["text"], "Call Alice")
+
+
+class StoredSurfaceRedactionTests(SimpleTestCase):
+    def test_text_and_data_model_rest_placeholder_and_serialize_rehydrated(self):
+        from django.utils import timezone
+
+        from apps.router.chat_views import _serialize_message
+        from apps.router.models import AppChatMessage
+        from apps.tenants.models import Tenant
+
+        tenant = Tenant(id=uuid4(), pii_entity_map={"[PERSON_1]": "Alice"})
+        card = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "call-alice",
+                "catalogId": "nbhd/v1",
+                "components": [
+                    {"id": "root", "component": "Column", "children": ["title", "go", "panel"]},
+                    {"id": "title", "component": "Text", "text": "Call Alice"},
+                    {
+                        "id": "go",
+                        "component": "Button",
+                        "label": "Call Alice",
+                        "action": {"event": {"name": "task.create", "context": {"title": "Call Alice"}}},
+                    },
+                    {"id": "panel", "component": "Panel", "kind": "tasks", "ref": "Alice"},
+                ],
+                "dataModel": {"title": "Call Alice"},
+            },
+        }
+        [stored] = redact_surfaces([card], tenant)
+        body = stored["createSurface"]
+        by_id = {component["id"]: component for component in body["components"]}
+        self.assertEqual(by_id["title"]["text"], "Call [PERSON_1]")
+        self.assertEqual(by_id["go"]["action"]["event"]["context"]["title"], "Call [PERSON_1]")
+        self.assertEqual(by_id["panel"]["ref"], "[PERSON_1]")
+        self.assertEqual(body["dataModel"]["title"], "Call [PERSON_1]")
+
+        message = AppChatMessage(
+            tenant=tenant,
+            client_msg_id=uuid4().hex,
+            thread_id=uuid4(),
+            user_text="Show me",
+            reply_text="Here",
+            status=AppChatMessage.Status.READY,
+            source=AppChatMessage.Source.TENANT,
+            created_at=timezone.now(),
+            a2ui=[stored],
+            panels=None,
+            quick_replies=None,
+            journal_link=None,
+            user_redactions=None,
+            reply_redactions=None,
+            attachment_paths=[],
+            attachment_path="",
+            phase="",
+            phase_detail="",
+            partial_text="",
+            partial_seq=0,
+            retried_at=None,
+            waking_at=None,
+        )
+        with override_settings(CHAT_SURFACES_TENANT_IDS=str(tenant.id)):
+            serialized = _serialize_message(message)
+
+        body = serialized["a2ui"][0]["createSurface"]
+        by_id = {component["id"]: component for component in body["components"]}
+        self.assertEqual(by_id["title"]["text"], "Call Alice")
+        self.assertEqual(by_id["go"]["action"]["event"]["context"]["title"], "Call Alice")
+        self.assertEqual(by_id["panel"]["ref"], "Alice")
+        self.assertEqual(body["dataModel"]["title"], "Call Alice")

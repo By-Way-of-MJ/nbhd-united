@@ -60,6 +60,9 @@ class CardInstructionTests(SimpleTestCase):
     def test_instruction_fits_prompt_budget(self):
         self.assertLessEqual(len(CARD_INSTRUCTION), MAX_INSTRUCTION_CHARS)
 
+    def test_instruction_ends_with_a_newline(self):
+        self.assertTrue(CARD_INSTRUCTION.endswith("\n"))
+
 
 class CardInstructionGateTests(SimpleTestCase):
     def setUp(self):

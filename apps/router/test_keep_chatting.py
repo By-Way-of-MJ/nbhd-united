@@ -389,6 +389,33 @@ class KeepChattingTests(TestCase):
         self.assertEqual(reply.reply_text, "Noted.")
         self.assertEqual(reply.user_text, "")
 
+    def test_handoff_reply_strips_panel_and_card_fences_before_storage(self):
+        from apps.router.side_lane import store_handoff_reply
+
+        row = self.row()
+        row.payload = {"side_handoff": True, "side_client_msg_ids": []}
+        row.save(update_fields=["payload"])
+        card = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "handoff",
+                "catalogId": "nbhd/v1",
+                "components": [{"id": "root", "component": "Divider"}],
+            },
+        }
+        panels = [{"kind": "tasks", "params": {"filter": "open"}}]
+        store_handoff_reply(
+            self.tenant,
+            [row],
+            "Top three?\n```nbhd-panels\n" + json.dumps(panels) + "\n```\n```nbhd-card\n" + json.dumps(card) + "\n```",
+        )
+        reply = AppChatMessage.objects.get(client_msg_id__startswith="side-resume-")
+        self.assertEqual(reply.reply_text, "Top three?")
+        self.assertNotIn("nbhd-panels", reply.reply_text)
+        self.assertNotIn("nbhd-card", reply.reply_text)
+        self.assertIsNone(reply.panels)
+        self.assertIsNone(reply.a2ui)
+
     def test_exhausted_handoff_writes_one_assistant_only_resend_notice(self):
         main = self.main()
         self.row("cancel that job")

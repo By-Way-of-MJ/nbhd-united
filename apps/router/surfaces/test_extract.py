@@ -131,3 +131,73 @@ class ExtractCardTests(SimpleTestCase):
         for partial in ("```nbhd-", "```nbhd-ca", "```nbhd-card"):
             with self.subTest(partial=partial):
                 self.assertEqual(strip_streaming_panels("Before\n" + partial), "Before")
+
+    def test_tolerant_openers_and_backtick_closers(self):
+        variants = (
+            ("```nbhd-card", "```"),
+            ("``` nbhd-card", "```"),
+            ("```json nbhd-card", "```"),
+            ("````nbhd-card", "````"),
+            ("```NBHD-CARD", "```"),
+        )
+        for opener, closer in variants:
+            with self.subTest(opener=opener):
+                source = "Before\n" + opener + "\n" + json.dumps(CARD) + "\n" + closer + "\nAfter"
+                text, surfaces = extract_card(source)
+                self.assertEqual(text, "Before\nAfter")
+                self.assertEqual(len(surfaces), 1)
+
+    def test_json_on_opener_line_is_first_payload_line(self):
+        source = "Before\n```nbhd-card " + json.dumps(CARD) + "\n```\nAfter"
+
+        text, surfaces = extract_card(source)
+
+        self.assertEqual(text, "Before\nAfter")
+        self.assertEqual(len(surfaces), 1)
+
+    def test_prose_before_opener_is_kept(self):
+        source = "Before ```nbhd-card\n" + json.dumps(CARD) + "\n```\nAfter"
+
+        text, surfaces = extract_card(source)
+
+        self.assertEqual(text, "Before\nAfter")
+        self.assertEqual(len(surfaces), 1)
+
+    def test_closing_fence_glued_after_json_keeps_following_text(self):
+        source = "Before\n```nbhd-card\n" + json.dumps(CARD) + "``` After\nNext"
+
+        text, surfaces = extract_card(source)
+
+        self.assertEqual(text, "Before\nAfter\nNext")
+        self.assertEqual(len(surfaces), 1)
+
+    def test_streaming_matches_tolerant_openers_and_closers(self):
+        variants = (
+            ("```nbhd-card", "```"),
+            ("``` nbhd-card", "```"),
+            ("```json nbhd-card", "```"),
+            ("````nbhd-card", "````"),
+            ("```NBHD-CARD", "```"),
+        )
+        for opener, closer in variants:
+            with self.subTest(opener=opener):
+                source = "Before\n" + opener + "\n" + json.dumps(CARD) + "\n" + closer + "\nAfter"
+                self.assertEqual(strip_streaming_panels(source), "Before\nAfter")
+
+        self.assertEqual(
+            strip_streaming_panels("Before\n```nbhd-card " + json.dumps(CARD) + "\n```\nAfter"),
+            "Before\nAfter",
+        )
+        self.assertEqual(
+            strip_streaming_panels("Before\n```nbhd-card\n" + json.dumps(CARD) + "``` After\nNext"),
+            "Before\nAfter\nNext",
+        )
+        self.assertEqual(
+            strip_streaming_panels("Before ```nbhd-card\n" + json.dumps(CARD) + "\n```\nAfter"),
+            "Before\nAfter",
+        )
+
+    def test_streaming_hides_tolerant_partial_openers(self):
+        for partial in ("```json nbhd-ca", "``` nbhd-ca", "````nbhd-ca", "```NBHD-CA"):
+            with self.subTest(partial=partial):
+                self.assertEqual(strip_streaming_panels("Before\n" + partial), "Before")

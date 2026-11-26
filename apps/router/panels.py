@@ -209,29 +209,55 @@ def extract_panels(text: str) -> tuple[str, list[dict]]:
 
 def strip_streaming_panels(text: str) -> str:
     """Hide fences, markers and trailing openers until cumulative text disambiguates."""
+    from .surfaces.extract import _append_after, find_card_fence_opener, split_card_fence_close
+
     kept = []
-    inside = found = False
-    ordinary_fence = False
+    inside = found = inside_card = ordinary_fence = False
     lines = text.splitlines(keepends=True)
-    openers = ("```nbhd-panels", "```nbhd-card")
     for index, line in enumerate(lines):
         marker = line.strip()
-        trailing_prefix = (
-            index == len(lines) - 1
-            and not line.endswith(("\n", "\r"))
-            and bool(marker)
-            and any(opener.startswith(marker) for opener in openers)
-        )
-        if not inside and not ordinary_fence and (marker in openers or trailing_prefix):
-            inside = found = True
-        elif inside and marker == "```":
-            inside = False
-        elif not inside:
+        trailing_prefix = index == len(lines) - 1 and not line.endswith(("\n", "\r")) and bool(marker)
+        if inside:
+            if inside_card:
+                close = split_card_fence_close(line)
+                if close is not None:
+                    inside = False
+                    _append_after(close[1], kept)
+            elif marker == "```":
+                inside = False
+            continue
+        if ordinary_fence:
             kept.append(line)
             if marker == "```":
-                ordinary_fence = not ordinary_fence
-            elif marker.startswith("```") and not ordinary_fence:
-                ordinary_fence = True
+                ordinary_fence = False
+            continue
+        if marker == "```nbhd-panels":
+            inside = found = True
+            inside_card = False
+            continue
+        opener = find_card_fence_opener(line)
+        if opener is None and trailing_prefix:
+            opener = find_card_fence_opener(line, partial=True)
+        if opener is not None:
+            start, token_end = opener
+            prefix = line[:start]
+            if prefix.strip():
+                kept.append(prefix.rstrip(" \t") + "\n")
+            found = True
+            rest = line[token_end:]
+            close = split_card_fence_close(rest) if rest else None
+            if close is None:
+                inside = inside_card = True
+            else:
+                _append_after(close[1], kept)
+            continue
+        if trailing_prefix and "```nbhd-panels".startswith(marker):
+            inside = found = True
+            inside_card = False
+            continue
+        kept.append(line)
+        if marker.startswith("```"):
+            ordinary_fence = True
     clean, _payloads = _strip_bracket_panels("".join(kept).rstrip() if found else text)
     # Withhold split prefixes, releasing them when they become ordinary text.
     opener = "[[panel:"

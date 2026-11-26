@@ -63,7 +63,7 @@ for tenants in `CHAT_SURFACES_TENANT_IDS`; non-gated tenants get no stored
 card, while the fence is still removed. Card-only replies remain READY and
 visible, mirroring panel-only replies. App partial text hides in-progress
 `nbhd-card` blocks and trailing partial openers with the same streaming logic
-as `nbhd-panels`.
+as `nbhd-panels`. Openers tolerate case, 3+ backticks, optional spaces/`json`, JSON after the token, and prose before the fence; closing fences may be a bare backtick line or glued after the JSON, with trailing prose preserved.
 
 To repair existing rows, run the following (dry-run by default), then add
 `--apply` to write:
