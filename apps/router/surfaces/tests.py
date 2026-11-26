@@ -210,3 +210,98 @@ class SurfaceValidationTests(SimpleTestCase):
                     result["createSurface"]["components"][0]["action"]["event"]["name"],
                     name,
                 )
+
+
+REF_ID = "123e4567-e89b-42d3-a456-426614174000"
+VALID_REFS = (
+    "tasks:due_today",
+    "tasks:overdue",
+    "tasks:this_week",
+    "tasks:open",
+    f"task:{REF_ID}",
+    "workout:today",
+    f"workout:{REF_ID}",
+    "sleep:last_night",
+    "weight:latest",
+    f"mission:{REF_ID}",
+)
+
+
+def ref_surface(data_model):
+    return surface([{"id": "root", "component": "Divider"}], data_model=data_model)
+
+
+class SurfaceDataModelTests(SimpleTestCase):
+    def assert_code(self, payload, code):
+        with self.assertRaises(SurfaceError) as caught:
+            validate_surface(payload)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_every_ref_kind_is_accepted_and_preserved(self):
+        for ref in VALID_REFS:
+            with self.subTest(ref=ref):
+                data_model = {"items": {"$ref": ref}}
+                self.assertEqual(validate_surface(ref_surface(data_model))["createSurface"]["dataModel"], data_model)
+
+    def test_ref_and_plain_values_round_trip(self):
+        data_model = {"title": "Today", "tasks": {"$ref": "tasks:due_today"}, "count": 2, "flag": True}
+        self.assertEqual(validate_surface(ref_surface(data_model))["createSurface"]["dataModel"], data_model)
+
+    def test_data_model_must_be_a_dict(self):
+        self.assert_code(ref_surface(["not", "a", "dict"]), "bad_data")
+
+    def test_ref_dict_must_have_only_ref(self):
+        self.assert_code(ref_surface({"x": {"$ref": "tasks:open", "fallback": "none"}}), "bad_data")
+
+    def test_ref_value_must_be_a_string(self):
+        self.assert_code(ref_surface({"x": {"$ref": 1}}), "bad_data")
+
+    def test_ref_must_match_the_pattern(self):
+        for ref in (
+            "tasks:someday",
+            "tasks:",
+            "tasks",
+            "task:not-a-uuid",
+            "task:" + REF_ID.upper(),
+            "task:" + REF_ID.replace("-", ""),
+            "workout:tomorrow",
+            "sleep:last_night ",
+            "weight:latest\n",
+            "mission:",
+            "unknown:latest",
+            "https://evil.example",
+        ):
+            with self.subTest(ref=ref):
+                self.assert_code(ref_surface({"x": {"$ref": ref}}), "bad_data")
+
+    def test_six_levels_of_nesting_are_allowed_seven_are_not(self):
+        def nested(depth):
+            node = "leaf"
+            for _ in range(depth):
+                node = {"a": node}
+            return node
+
+        self.assertEqual(validate_surface(ref_surface(nested(6)))["createSurface"]["dataModel"], nested(6))
+        self.assert_code(ref_surface(nested(7)), "bad_data")
+
+    def test_nesting_limit_applies_to_lists(self):
+        node = "leaf"
+        for _ in range(7):
+            node = [node]
+        self.assert_code(ref_surface({"a": node}), "bad_data")
+
+    def test_at_most_200_leaves(self):
+        self.assertEqual(
+            len(validate_surface(ref_surface({"items": [0] * 200}))["createSurface"]["dataModel"]["items"]), 200
+        )
+        self.assert_code(ref_surface({"items": [0] * 201}), "bad_data")
+
+    def test_refs_count_as_leaves(self):
+        self.assert_code(ref_surface({"items": [{"$ref": "tasks:open"}] * 201}), "bad_data")
+
+    def test_plain_string_leaf_length(self):
+        validate_surface(ref_surface({"text": "a" * 500}))
+        self.assert_code(ref_surface({"text": "a" * 501}), "bad_data")
+
+    def test_plain_string_leaf_must_not_be_a_url(self):
+        self.assert_code(ref_surface({"text": "see https://evil.example"}), "bad_data")

@@ -517,13 +517,15 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
     # A2UI surfaces are a gated rollout: only tenants on CHAT_SURFACES_TENANT_IDS
     # ever see them, and the key is always present (``[]`` when empty or gated
     # off). Stored surfaces rest placeholder-space, so rehydrate here via the
-    # SAME shared helper the ?since= feed calls.
+    # SAME shared helper the ?since= feed calls; passing the tenant lets that
+    # helper resolve live dataModel refs fresh for this request.
     from apps.router.chat_gates import chat_surfaces_enabled
     from apps.router.surfaces.store import rehydrate_surfaces
 
     surfaces = []
-    if msg.a2ui and chat_surfaces_enabled(getattr(msg, "tenant", None)):
-        surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id)
+    tenant = getattr(msg, "tenant", None)
+    if msg.a2ui and chat_surfaces_enabled(tenant):
+        surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id, tenant=tenant)
     return {
         "client_msg_id": msg.client_msg_id,
         "thread_id": str(msg.thread_id),

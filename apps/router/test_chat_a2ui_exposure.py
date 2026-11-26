@@ -128,6 +128,31 @@ class ChatA2UIExposureTests(TestCase):
         self.assertEqual(assistant[0]["id"], f"cron:{send.id}")
         self.assertEqual(assistant[0]["a2ui"], [self.expected])
 
+    def test_feed_resolves_live_task_ref_for_gated_tenant(self):
+        from apps.common.tenant_tz import tenant_today
+        from apps.journal.models import Task
+
+        today = tenant_today(self.tenant)
+        task = Task.objects.create(tenant=self.tenant, title="Water the plants", due_date=today, status="open")
+        payload = surface()
+        payload["createSurface"]["dataModel"] = {"tasks": {"$ref": "tasks:due_today"}}
+        self._app_message(a2ui=[payload])
+        with self._gate_on():
+            assistant = self._assistant_rows(self._feed())
+        self.assertEqual(len(assistant), 1)
+        self.assertEqual(
+            assistant[0]["a2ui"][0]["createSurface"]["dataModel"]["tasks"],
+            [
+                {
+                    "id": str(task.id),
+                    "title": "Water the plants",
+                    "due_date": today.isoformat(),
+                    "status": "open",
+                    "done": False,
+                }
+            ],
+        )
+
     def test_invalid_stored_surface_is_dropped_from_output(self):
         row = self._app_message(reply_text=SENTINEL, a2ui=[self.surface, INVALID])
         with self._gate_on(), self.assertLogs("apps.router.surfaces.store", level="INFO") as logs:

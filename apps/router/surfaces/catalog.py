@@ -8,6 +8,7 @@ to send to the iOS renderer. Graph checks (ids, root, cycles, depth) live in
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
@@ -41,6 +42,28 @@ POINTER_PATTERN = rf"^/(?:{_POINTER_TOKEN})(?:/{_POINTER_TOKEN})*$"
 BINDING_POINTER_PATTERN = rf"^/?{_POINTER_TOKEN}(?:/{_POINTER_TOKEN})*$"
 COMPONENT_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,47}$"
 MAX_TEXT_LENGTH = 500
+
+# A ``dataModel`` never carries a snapshot of the user's data. Instead it may
+# hold live references that the owner-facing read seams resolve per request
+# (``resolve.py``); the reference string itself is code, not content.
+REF_KINDS = ("tasks", "task", "workout", "sleep", "weight", "mission")
+TASK_LISTS = ("due_today", "overdue", "this_week", "open")
+
+_UUID4 = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}"
+    r"-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+REF_PATTERN = re.compile(
+    rf"^(?:"
+    rf"tasks:(?:{'|'.join(TASK_LISTS)})"
+    rf"|task:{_UUID4}"
+    rf"|workout:today"
+    rf"|workout:{_UUID4}"
+    rf"|sleep:last_night"
+    rf"|weight:latest"
+    rf"|mission:{_UUID4}"
+    rf")$"
+)
 
 
 def _no_url(value: str) -> str:

@@ -15,11 +15,13 @@ from typing import Any
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from .catalog import CATALOG_ID, Binding, Card, Column, Component, List, Row
+from .catalog import CATALOG_ID, MAX_TEXT_LENGTH, REF_PATTERN, Binding, Card, Column, Component, List, Row
 
 MAX_SURFACE_BYTES = 32768
 MAX_COMPONENTS = 60
 MAX_DEPTH = 8
+MAX_DATA_DEPTH = 6
+MAX_DATA_LEAVES = 200
 SURFACE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 _COMPONENTS = TypeAdapter(list[Component])
@@ -126,6 +128,48 @@ def _check_graph(components: list[BaseModel]) -> None:
             raise SurfaceError("bad_template")
 
 
+def _check_data_model(data_model: Any) -> None:
+    """Bound the ``dataModel`` tree and allow only live-ref dicts.
+
+    A surface stores references (``{"$ref": "tasks:due_today"}``), never a
+    snapshot: values are resolved fresh at the owner-facing read seam. The tree
+    itself is bounded so a payload cannot smuggle in a large document.
+    """
+    if not isinstance(data_model, dict):
+        raise SurfaceError("bad_data")
+    leaves = 0
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal leaves
+        if isinstance(node, dict):
+            if depth > MAX_DATA_DEPTH:
+                raise SurfaceError("bad_data")
+            if "$ref" in node:
+                leaves += 1
+                if leaves > MAX_DATA_LEAVES:
+                    raise SurfaceError("bad_data")
+                ref = node.get("$ref")
+                if len(node) != 1 or not isinstance(ref, str) or not REF_PATTERN.fullmatch(ref):
+                    raise SurfaceError("bad_data")
+                return
+            for item in node.values():
+                walk(item, depth + 1)
+            return
+        if isinstance(node, list):
+            if depth > MAX_DATA_DEPTH:
+                raise SurfaceError("bad_data")
+            for item in node:
+                walk(item, depth + 1)
+            return
+        leaves += 1
+        if leaves > MAX_DATA_LEAVES:
+            raise SurfaceError("bad_data")
+        if isinstance(node, str) and (len(node) > MAX_TEXT_LENGTH or "://" in node):
+            raise SurfaceError("bad_data")
+
+    walk(data_model, 1)
+
+
 def validate_surface(payload: dict) -> dict:
     """Return the normalized surface dict or raise ``SurfaceError(code)``.
 
@@ -167,8 +211,8 @@ def validate_surface(payload: dict) -> dict:
         raise SurfaceError("schema") from None
 
     data_model = surface.get("dataModel")
-    if "dataModel" in surface and not isinstance(data_model, dict):
-        raise SurfaceError("schema")
+    if "dataModel" in surface:
+        _check_data_model(data_model)
 
     _check_graph(components)
 

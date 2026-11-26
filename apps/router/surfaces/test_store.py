@@ -161,6 +161,15 @@ class RehydrateSurfacesTests(SimpleTestCase):
         # Only the dataModel leaves (heading + two options) go through the seam.
         self.assertEqual(finalize.call_count, 3)
 
+    def test_ref_dicts_survive_rehydration_untouched(self):
+        payload = surface(data_model={"tasks": {"$ref": "tasks:due_today"}, "heading": "today"})
+        with patch("apps.router.reply_text.finalize_outbound_text", side_effect=_upper):
+            result = rehydrate_surfaces([payload], {}, tenant_id=None)
+        self.assertEqual(
+            result[0]["createSurface"]["dataModel"],
+            {"tasks": {"$ref": "tasks:due_today"}, "heading": "TODAY"},
+        )
+
     def test_input_is_not_mutated(self):
         payload = surface(data_model={"sleep": {"summary": "you slept"}})
         payloads = [payload]

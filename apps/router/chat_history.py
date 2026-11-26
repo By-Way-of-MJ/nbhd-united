@@ -238,7 +238,7 @@ def _row(
     return {"_sort": (created_at, row_id), "msg": msg}
 
 
-def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None, surfaces_enabled=False):
+def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None, surfaces_enabled=False, tenant=None):
     """An ``AppChatMessage`` → a user row (if there's text or attachments) and an
     assistant row (only once the reply has actually landed).
 
@@ -247,7 +247,9 @@ def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None, surfaces_en
     ``build_since_page`` pre-decrypts the page's user_text once (one bulk read,
     owner_request) and passes each ``RedactedStr`` in; we ``.reveal()`` it at the
     row-build egress. The emptiness check runs on the decrypted value so a
-    ``b""``-sealed empty turn is dropped exactly like a legacy empty one."""
+    ``b""``-sealed empty turn is dropped exactly like a legacy empty one.
+    ``tenant`` (threaded from ``build_since_page`` like ``surfaces_enabled``)
+    lets stored A2UI ``$ref`` entries resolve live for the owner."""
     from apps.crypto.nolog import RedactedStr
     from apps.router.journal_link import rehydrate_journal_link
     from apps.router.models import AppChatMessage
@@ -287,7 +289,7 @@ def _app_rows(m, main_thread_id, entity_map=None, *, user_text=None, surfaces_en
     # A2UI rollout gate (``surfaces_enabled``).
     surfaces = []
     if surfaces_enabled and m.status == AppChatMessage.Status.READY:
-        surfaces = rehydrate_surfaces(m.a2ui, entity_map, tenant_id=m.tenant_id)
+        surfaces = rehydrate_surfaces(m.a2ui, entity_map, tenant_id=m.tenant_id, tenant=tenant)
     if m.status == AppChatMessage.Status.READY and (
         (m.reply_text or "").strip() or m.quick_replies or m.journal_link or m.panels or surfaces
     ):
@@ -375,19 +377,20 @@ def _conv_rows(t, main_thread_id, entity_map=None):
     return out
 
 
-def _proactive_rows(p, main_thread_id, entity_map=None, *, surfaces_enabled=False):
+def _proactive_rows(p, main_thread_id, entity_map=None, *, surfaces_enabled=False, tenant=None):
     """A ``ProactiveOutbound`` (cron / proactive send) → one assistant row.
 
     ``message_text`` is stored placeholder-space and rehydrated here (owner-facing).
     ``quick_replies`` and a ``journal_link`` ride the row too — rehydrated via
     the same shared helpers the app-message seams use so proactive and app-reply
     affordances resolve stored placeholder text identically. A2UI surfaces are
-    emitted only for tenants on the rollout gate (``surfaces_enabled``)."""
+    emitted only for tenants on the rollout gate (``surfaces_enabled``);
+    ``tenant`` lets their live ``$ref`` entries resolve for the owner."""
     from apps.router.journal_link import rehydrate_journal_link
     from apps.router.quick_replies import rehydrate_quick_replies
     from apps.router.surfaces.store import rehydrate_surfaces
 
-    surfaces = rehydrate_surfaces(p.a2ui, entity_map, tenant_id=p.tenant_id) if surfaces_enabled else []
+    surfaces = rehydrate_surfaces(p.a2ui, entity_map, tenant_id=p.tenant_id, tenant=tenant) if surfaces_enabled else []
     # Keep a marker-only row: stripping can legitimately leave no prose, but
     # the pills/chip are still the proactive payload the app needs to render.
     # A surface-only send counts the same way (gated tenants only).
@@ -511,7 +514,16 @@ def build_since_page(tenant, main_thread_id: str, *, cursor: str | None, limit: 
         [(m.user_text_enc, m.user_text) for m in app_slice],
     )
     for m, ut in zip(app_slice, app_user_texts):
-        candidates.extend(_app_rows(m, main_thread_id, entity_map, user_text=ut, surfaces_enabled=surfaces_enabled))
+        candidates.extend(
+            _app_rows(
+                m,
+                main_thread_id,
+                entity_map,
+                user_text=ut,
+                surfaces_enabled=surfaces_enabled,
+                tenant=tenant,
+            )
+        )
 
     conv_qs = ConversationTurn.objects.filter(tenant=tenant)
     for t in _page_slice(conv_qs, after_dt, fetch):
@@ -526,7 +538,9 @@ def build_since_page(tenant, main_thread_id: str, *, cursor: str | None, limit: 
         .exclude(job_name=FIRST_SESSION_WELCOME_JOB_NAME)
     )
     for p in _page_slice(pro_qs, after_dt, fetch):
-        candidates.extend(_proactive_rows(p, main_thread_id, entity_map, surfaces_enabled=surfaces_enabled))
+        candidates.extend(
+            _proactive_rows(p, main_thread_id, entity_map, surfaces_enabled=surfaces_enabled, tenant=tenant)
+        )
 
     # Keyset filter: strictly after the watermark (so the cursor's own row isn't
     # re-served, and same-timestamp rows with a greater id are not skipped).
