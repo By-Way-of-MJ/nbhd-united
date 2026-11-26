@@ -13,7 +13,7 @@ Resolution is fail-soft: an unknown, foreign or broken reference becomes
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import timedelta
 from typing import Any
 
 from apps.common.tenant_tz import tenant_today, tenant_tz_name
@@ -24,7 +24,6 @@ from .catalog import REF_KINDS, TASK_LISTS
 logger = logging.getLogger(__name__)
 
 MAX_TASKS = 10
-_MISSION_OPEN_STEP_STATUSES = ("open", "in_progress")
 
 
 class _Unresolved(Exception):
@@ -35,15 +34,20 @@ class _Unresolved(Exception):
         super().__init__(reason)
 
 
-def resolve_refs(data_model: dict, *, tenant) -> dict:
+def resolve_refs(data_model: dict, *, tenant, cache: dict | None = None) -> dict:
     """Return a new ``data_model`` with every ``{"$ref": ...}`` substituted.
 
-    The same ref string is resolved at most once per call. Unknown refs, rows
-    owned by another tenant and resolution errors all become ``None``.
+    The same ref string is resolved at most once per ``cache``. Callers that
+    build one feed page pass the same dict to every row, so a ref shared by
+    several surfaces costs one resolution per page; the detail seam leaves it
+    ``None`` and gets a fresh dict. Unknown refs, rows owned by another tenant
+    and resolution errors all become ``None``.
     """
     if not isinstance(data_model, dict):
         return {}
-    return _walk(data_model, tenant, {})
+    if cache is None:
+        cache = {}
+    return _walk(data_model, tenant, cache)
 
 
 def _walk(node: Any, tenant, cache: dict[str, Any]) -> Any:
@@ -79,8 +83,9 @@ def _resolve_ref(ref: str, tenant) -> Any:
     except _Unresolved as exc:
         logger.info("a2ui_ref_unresolved kind=%s reason=%s", log_kind, exc.reason)
         return None
-    except Exception:
-        logger.info("a2ui_ref_unresolved kind=%s reason=%s", log_kind, "error")
+    except Exception as exc:
+        # Exception class only: a message can carry a title, id or other content.
+        logger.info("a2ui_ref_unresolved kind=%s reason=error type=%s", log_kind, type(exc).__name__)
         return None
 
 
@@ -244,6 +249,10 @@ def _sleep(tenant, target: str) -> dict:
     log = SleepLog.objects.filter(tenant=tenant).order_by("-date").first()
     if log is None:
         raise _Unresolved("missing")
+    # "Last night" means today's or yesterday's tenant-local log. An older log
+    # is not last night's sleep, however recent it is in the table.
+    if log.date < tenant_today(tenant) - timedelta(days=1):
+        raise _Unresolved("stale")
     data = SleepLogSerializer(log, context={"tenant": tenant, "rehydrate": True}).data
     return {
         "date": data["date"],
@@ -283,34 +292,7 @@ def _weight(tenant, target: str) -> dict:
 def _mission(tenant, mission_id: str) -> dict:
     from apps.friends import access
 
-    goal = access.get_mission(mission_id)
-    if goal is None:
+    summary = access.mission_summary(tenant, mission_id)
+    if summary is None:
         raise _Unresolved("missing")
-    membership = access.mission_memberships().filter(shared_goal=goal, tenant=tenant, status="active").first()
-    if membership is None:
-        raise _Unresolved("not_owned")
-
-    steps = list(access.project_steps(goal).values("id", "title", "status", "due_date", "order"))
-    open_steps = [step for step in steps if step["status"] in _MISSION_OPEN_STEP_STATUSES]
-    open_steps.sort(
-        key=lambda step: (
-            step["due_date"] is None,
-            step["due_date"] or date.max,
-            step["order"],
-            step["title"],
-        )
-    )
-    next_step = None
-    if open_steps:
-        step = open_steps[0]
-        next_step = {
-            "id": str(step["id"]),
-            "title": step["title"],
-            "due_date": step["due_date"].isoformat() if step["due_date"] else None,
-        }
-    return {
-        "id": str(goal.id),
-        "title": goal.title,
-        "next_step": next_step,
-        "steps_open": len(open_steps),
-    }
+    return summary

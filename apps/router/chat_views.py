@@ -523,9 +523,14 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
     from apps.router.surfaces.store import rehydrate_surfaces
 
     surfaces = []
-    tenant = getattr(msg, "tenant", None)
-    if msg.a2ui and chat_surfaces_enabled(tenant):
-        surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id, tenant=tenant)
+    if msg.a2ui:
+        # Only touch the tenant FK for rows that actually carry surfaces: thread
+        # views load plain rows (no select_related), so an unconditional
+        # getattr(msg, "tenant") is one extra SELECT tenants for every message
+        # of every tenant. The gate is irrelevant when there is nothing to gate.
+        tenant = getattr(msg, "tenant", None)
+        if chat_surfaces_enabled(tenant):
+            surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id, tenant=tenant)
     return {
         "client_msg_id": msg.client_msg_id,
         "thread_id": str(msg.thread_id),

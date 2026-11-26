@@ -7,6 +7,9 @@ A surface-only assistant row counts as worth showing only when gated on.
 
 from __future__ import annotations
 
+import uuid
+from unittest.mock import patch
+
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -60,7 +63,7 @@ class ChatA2UIExposureTests(TestCase):
             tenant=self.tenant,
             user=self.user,
             thread=self.thread,
-            client_msg_id=f"a2ui-{timezone.now().timestamp()}",
+            client_msg_id=f"a2ui-{uuid.uuid4().hex}",
             user_text="Hi",
             status=AppChatMessage.Status.READY,
             reply_text=reply_text,
@@ -101,6 +104,21 @@ class ChatA2UIExposureTests(TestCase):
             self.assertEqual(_serialize_message(row)["a2ui"], [])
         with self._gate_off():
             self.assertEqual(_serialize_message(row)["a2ui"], [])
+
+    def test_serializing_non_a2ui_rows_does_not_query_tenant(self):
+        # Thread views load plain rows (no select_related) and pass the page's
+        # entity_map/user_text. Only rows that actually carry a2ui may touch the
+        # tenant FK; otherwise every message of every tenant costs one
+        # SELECT tenants.
+        from apps.crypto.nolog import RedactedStr
+
+        for index in range(3):
+            self._app_message(reply_text=f"Reply {index}")
+        rows = list(AppChatMessage.objects.filter(thread=self.thread).order_by("created_at"))
+        entity_map = self.tenant.pii_entity_map
+        with self.assertNumQueries(0):
+            for row in rows:
+                _serialize_message(row, entity_map=entity_map, user_text=RedactedStr("Hi"))
 
     def test_surface_only_app_reply_appears_in_feed_only_when_gated_on(self):
         row = self._app_message(reply_text="", a2ui=[self.surface])
@@ -152,6 +170,19 @@ class ChatA2UIExposureTests(TestCase):
                 }
             ],
         )
+
+    def test_feed_resolves_shared_ref_once_per_page(self):
+        from apps.router.surfaces import resolve as resolve_module
+
+        payload = surface()
+        payload["createSurface"]["dataModel"] = {"tasks": {"$ref": "tasks:due_today"}}
+        self._app_message(a2ui=[payload])
+        self._app_message(a2ui=[payload])
+        with self._gate_on(), patch.object(resolve_module, "_tasks", wraps=resolve_module._tasks) as tasks:
+            assistant = self._assistant_rows(self._feed())
+        self.assertEqual(len(assistant), 2)
+        # Both rows bind the same ref; one page-level cache means one lookup.
+        self.assertEqual(tasks.call_count, 1)
 
     def test_invalid_stored_surface_is_dropped_from_output(self):
         row = self._app_message(reply_text=SENTINEL, a2ui=[self.surface, INVALID])

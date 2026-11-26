@@ -191,6 +191,16 @@ class ResolveRefsTests(TestCase):
             },
         )
 
+    def test_sleep_today_is_last_night(self):
+        SleepLog.objects.create(tenant=self.tenant, date=self.today, duration_hours="6.00")
+        self.assertEqual(self._resolve("sleep:last_night")["date"], self.today.isoformat())
+
+    def test_sleep_older_than_yesterday_is_stale(self):
+        SleepLog.objects.create(tenant=self.tenant, date=self.today - timedelta(days=2), duration_hours="7.00")
+        with self.assertLogs("apps.router.surfaces.resolve", level="INFO") as logs:
+            self.assertIsNone(self._resolve("sleep:last_night"))
+        self.assertIn("a2ui_ref_unresolved kind=sleep reason=stale", logs.output[0])
+
     def test_sleep_summary_never_prints_sixty_minutes(self):
         self.assertEqual(_sleep_summary(7.996), "8h 0m")
         self.assertEqual(_sleep_summary(7.995), "8h 0m")
@@ -259,7 +269,8 @@ class ResolveRefsTests(TestCase):
         goal = self._mission(members=[self.other, _tenant("refs-third")])
         with self.assertLogs("apps.router.surfaces.resolve", level="INFO") as logs:
             self.assertIsNone(self._resolve(f"mission:{goal.id}"))
-        self.assertIn("a2ui_ref_unresolved kind=mission reason=not_owned", logs.output[0])
+        # The pinned accessor collapses "missing" and "not a member" into None.
+        self.assertIn("a2ui_ref_unresolved kind=mission reason=missing", logs.output[0])
         self.assertNotIn(str(goal.id), logs.output[0])
 
     # ── failure + caching ──────────────────────────────────────────────
@@ -275,6 +286,15 @@ class ResolveRefsTests(TestCase):
         with self.assertLogs("apps.router.surfaces.resolve", level="INFO") as logs:
             self.assertIsNone(self._resolve("weight:latest"))
         self.assertIn("a2ui_ref_unresolved kind=weight reason=missing", logs.output[0])
+
+    def test_unexpected_error_logs_exception_class_only(self):
+        with (
+            patch.object(resolve_module, "_weight", side_effect=RuntimeError("private title")),
+            self.assertLogs("apps.router.surfaces.resolve", level="INFO") as logs,
+        ):
+            self.assertIsNone(self._resolve("weight:latest"))
+        self.assertIn("a2ui_ref_unresolved kind=weight reason=error type=RuntimeError", logs.output[0])
+        self.assertNotIn("private title", logs.output[0])
 
     def test_same_ref_resolves_once_per_call(self):
         SleepLog.objects.create(tenant=self.tenant, date=self.today, duration_hours="8.00")

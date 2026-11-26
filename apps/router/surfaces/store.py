@@ -87,7 +87,7 @@ def clean_surfaces(value) -> list[dict]:
     return surfaces
 
 
-def rehydrate_surfaces(value, entity_map, *, tenant_id, tenant=None) -> list[dict]:
+def rehydrate_surfaces(value, entity_map, *, tenant_id, tenant=None, cache: dict | None = None) -> list[dict]:
     """Rehydrate every user-visible string for an owner-facing read seam.
 
     Mirrors ``apps.router.panels.rehydrate_panels``: stored surfaces rest in
@@ -96,7 +96,8 @@ def rehydrate_surfaces(value, entity_map, *, tenant_id, tenant=None) -> list[dic
     way out. When ``tenant`` is given, live ``$ref`` entries in the
     ``dataModel`` are then resolved fresh, per request. Resolved values are
     already owner-facing and are deliberately NOT passed through rehydration
-    again. The input is never mutated.
+    again. The input is never mutated. ``cache`` is shared across one feed
+    page's rows so a ref used by several surfaces resolves once per page.
     """
     from apps.router.reply_text import finalize_outbound_text
 
@@ -118,5 +119,5 @@ def rehydrate_surfaces(value, entity_map, *, tenant_id, tenant=None) -> list[dic
         for envelope in surfaces:
             body = envelope.get("createSurface") or {}
             if isinstance(body.get("dataModel"), dict):
-                body["dataModel"] = resolve_refs(body["dataModel"], tenant=tenant)
+                body["dataModel"] = resolve_refs(body["dataModel"], tenant=tenant, cache=cache)
     return surfaces
