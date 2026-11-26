@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 from apps.router.panels import PANEL_KINDS
 
@@ -97,7 +97,8 @@ class ActionEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: ALLOWED_ACTIONS
-    context: dict[SafeStr, SafeStr | int | bool | Binding] = Field(default_factory=dict, max_length=10)
+    # ``weight.log`` sends a float (72.5); FiniteFloat keeps NaN/inf out.
+    context: dict[SafeStr, SafeStr | int | bool | FiniteFloat | Binding] = Field(default_factory=dict, max_length=10)
 
 
 class Action(BaseModel):

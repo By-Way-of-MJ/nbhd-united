@@ -11,6 +11,7 @@ from django.utils.dateparse import parse_datetime
 from apps.router.models import AppChatMessage, ProactiveOutbound
 from apps.router.panels import extract_panels, prepare_panels
 from apps.router.proactive_context import parse_markdown_items
+from apps.router.surfaces.extract import extract_card
 from apps.tenants.middleware import set_rls_context
 from apps.tenants.models import Tenant
 
@@ -50,6 +51,7 @@ class Command(BaseCommand):
                         continue
                     counts["matched"] += 1
                     text, fallback = extract_panels(original)
+                    text, _a2ui = extract_card(text)
                     updates = {}
                     if text != original:
                         updates[field] = text

@@ -41,9 +41,22 @@ MORNING_PANELS = [
     {"kind": "log_table", "params": {"metric": "body_weight", "range": "this_month"}},
 ]
 
+CARD = {
+    "version": "1.0",
+    "createSurface": {
+        "surfaceId": "card",
+        "catalogId": "nbhd/v1",
+        "components": [{"id": "root", "component": "Divider"}],
+    },
+}
+
 
 def block(panels=PANELS):
     return "```nbhd-panels\n" + json.dumps(panels) + "\n```"
+
+
+def card_block(card=CARD):
+    return "```nbhd-card\n" + json.dumps(card) + "\n```"
 
 
 @override_settings(CHAT_SHAPE_TENANT_IDS="", CHAT_PANELS_TOOL_TENANT_IDS="")
@@ -448,6 +461,79 @@ class PanelPersistenceTests(TestCase):
             self.assertIsNone(rows[0].panels)
             self.assertEqual(rows[1].reply_text, "Before\nAfter")
             self.assertEqual(rows[1].panels or [], MORNING_PANELS if enabled else [])
+
+    def test_gated_reply_stores_card_on_representative_row_only(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        rows = [
+            AppChatMessage.objects.create(
+                tenant=self.tenant,
+                user=self.user,
+                thread=self.thread,
+                client_msg_id=str(uuid4()),
+                user_text="Hello",
+            )
+            for _ in range(2)
+        ]
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id}) for row in rows]
+        with (
+            override_settings(CHAT_SURFACES_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "Before\n" + card_block() + "\nAfter")
+        for row in rows:
+            row.refresh_from_db()
+        self.assertEqual(rows[0].reply_text, "")
+        self.assertIsNone(rows[0].a2ui)
+        self.assertEqual(rows[1].reply_text, "Before\nAfter")
+        self.assertNotIn("nbhd-card", rows[1].reply_text)
+        self.assertEqual([surface["createSurface"]["surfaceId"] for surface in rows[1].a2ui], ["card"])
+
+    def test_non_gated_reply_strips_card_without_storing(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text="Hello",
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id})]
+        with (
+            override_settings(CHAT_SURFACES_TENANT_IDS=""),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, "Before\n" + card_block() + "\nAfter")
+        row.refresh_from_db()
+        self.assertIsNone(row.a2ui)
+        self.assertEqual(row.reply_text, "Before\nAfter")
+        self.assertNotIn("nbhd-card", row.reply_text)
+
+    def test_card_only_reply_is_ready_and_keeps_surface(self):
+        from apps.router.models import AppChatMessage
+        from apps.router.pending_queue import _store_ios_turn_reply
+
+        row = AppChatMessage.objects.create(
+            tenant=self.tenant,
+            user=self.user,
+            thread=self.thread,
+            client_msg_id=str(uuid4()),
+            user_text="Show me",
+        )
+        batch = [SimpleNamespace(payload={"client_msg_id": row.client_msg_id})]
+        with (
+            override_settings(CHAT_SURFACES_TENANT_IDS=str(self.tenant.id)),
+            patch("apps.router.pending_queue._dispatch_push"),
+        ):
+            _store_ios_turn_reply(self.tenant, batch, card_block())
+        row.refresh_from_db()
+        self.assertEqual(row.reply_text, "")
+        self.assertEqual(row.status, AppChatMessage.Status.READY)
+        self.assertEqual(row.error, "")
+        self.assertEqual([surface["createSurface"]["surfaceId"] for surface in row.a2ui], ["card"])
 
     def test_ordinary_reply_drops_timer_panel_user_did_not_request(self):
         from apps.router.models import AppChatMessage

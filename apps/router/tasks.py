@@ -201,6 +201,20 @@ def _deliver_extraction_turn(tenant: Tenant, thread_id: str, turn_text: str) -> 
         )
         return
 
+    # This path delivers prose only (no panels/cards are attached), so strip
+    # both fallback fences before the reply reaches the feed or a push.
+    from apps.router.panels import extract_panels
+    from apps.router.surfaces.extract import extract_card
+
+    reply, _ = extract_panels(reply)
+    reply, _ = extract_card(reply)
+    if not reply.strip():
+        logger.warning(
+            "pdf_extract: delivery turn for tenant %s returned only fences",
+            str(tenant.id)[:8],
+        )
+        return
+
     record_proactive_outbound(
         tenant=tenant,
         channel="app",

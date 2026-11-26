@@ -374,6 +374,11 @@ def store_handoff_reply(tenant, batch, ai_text, *, user_text_enc=_UNPREPARED_ENC
         raise RuntimeError("side_handoff_empty_response")
     client_id = f"side-resume-{batch[0].id.hex}"
     visible = (ai_text or "").replace("[[side-recap-no-action]]", "").strip()
+    from apps.router.panels import extract_panels
+    from apps.router.surfaces.extract import extract_card
+
+    visible, _ = extract_panels(visible)
+    visible, _ = extract_card(visible)
     text, push_text, redactions, quick, link = _clean_assistant_text_for_app(
         tenant, visible, artifact_dedup_key=client_id
     )

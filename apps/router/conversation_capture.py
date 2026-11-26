@@ -96,8 +96,10 @@ def clean_reply_for_capture(tenant, ai_text: str | None) -> str:
     if not text:
         return ""
     from apps.router.panels import extract_panels
+    from apps.router.surfaces.extract import extract_card
 
     text, _panels = extract_panels(text)
+    text, _a2ui = extract_card(text)
     text = _MARKER_RE.sub("", text)
     text = _MEDIA_LINE_RE.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()

@@ -72,12 +72,20 @@ def _channel_via(channel: str | None) -> str:
 
 
 def _panel_chat_context(channel, tenant) -> str:
-    from apps.router.chat_gates import chat_shape_enabled
-    from apps.router.panels import CHAT_PANEL_INSTRUCTION
+    from apps.router.chat_gates import chat_shape_enabled, chat_surfaces_enabled
 
-    if (channel or "").strip().lower() in {"ios", "app"} and chat_shape_enabled(tenant):
-        return CHAT_PANEL_INSTRUCTION
-    return ""
+    if (channel or "").strip().lower() not in {"ios", "app"}:
+        return ""
+    parts = []
+    if chat_shape_enabled(tenant):
+        from apps.router.panels import CHAT_PANEL_INSTRUCTION
+
+        parts.append(CHAT_PANEL_INSTRUCTION)
+    if chat_surfaces_enabled(tenant):
+        from apps.router.surfaces.instruction import CARD_INSTRUCTION
+
+        parts.append(CARD_INSTRUCTION)
+    return "".join(parts)
 
 
 def build_chat_context_marker(channel: str | None = None, *, tenant=None) -> str:

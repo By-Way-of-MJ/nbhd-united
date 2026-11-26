@@ -357,6 +357,19 @@ def _button_context(context):
     )
 
 
+def _weight_context(context):
+    return surface(
+        [
+            {
+                "id": "root",
+                "component": "Button",
+                "label": "Log weight",
+                "action": {"event": {"name": "weight.log", "context": context}},
+            }
+        ]
+    )
+
+
 def _panel(kind="tasks", params=None):
     body = {"id": "root", "component": "Panel", "kind": kind}
     if params is not None:
@@ -378,6 +391,20 @@ class SurfaceStringBoundTests(SimpleTestCase):
     def test_action_context_values_are_bounded(self):
         validate_surface(_button_context({"to": "a" * 500}))
         self.assert_code(_button_context({"to": "a" * 501}), "schema")
+
+    def test_weight_log_context_accepts_a_finite_number(self):
+        for kg in (72.5, 72, 0.0):
+            with self.subTest(kg=kg):
+                result = validate_surface(_weight_context({"kg": kg}))
+                self.assertEqual(
+                    result["createSurface"]["components"][0]["action"]["event"]["context"],
+                    {"kg": kg},
+                )
+
+    def test_weight_log_context_rejects_non_finite_numbers(self):
+        for kg in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(kg=kg):
+                self.assert_code(_weight_context({"kg": kg}), "schema")
 
     def test_panel_params_values_are_url_free(self):
         self.assert_code(_panel(params={"filter": "https://evil.example"}), "schema")
