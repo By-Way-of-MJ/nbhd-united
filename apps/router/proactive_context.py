@@ -70,6 +70,11 @@ UNCONSUMED_WINDOW_HOURS = 168  # 7 days
 # crons fired before the user replied" tail.
 DEFAULT_LIMIT = 3
 
+# Operator demo surfaces are app-feed fixtures, not assistant memory. The demo
+# module imports this name so the row label and the recall-capture skip cannot
+# drift apart.
+A2UI_DEMO_JOB_NAME = "a2ui_demo"
+
 # Markdown list-item patterns. Order matters — numbered first so a line
 # like "1. foo" isn't matched as a sub-item of an outer bullet.
 _NUMBERED_PATTERN = re.compile(r"^\s*\d+[.)]\s+(.+)$")
@@ -134,7 +139,8 @@ def record_proactive_outbound(
         panels = prepare_panels(tenant, panels, tool=True)
         transcript_redaction = None
         transcript_quarantine = None
-        if getattr(tenant, "recall_capture_enabled", False):
+        capture_recall = getattr(tenant, "recall_capture_enabled", False) and job_name != A2UI_DEMO_JOB_NAME
+        if capture_recall:
             try:
                 from apps.pii.redactor import RedactionOutcome, confirm_assistant_output
                 from apps.transcripts.capture import encrypt_transcript_text

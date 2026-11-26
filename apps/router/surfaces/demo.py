@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from apps.router.chat_gates import chat_surfaces_enabled
-from apps.router.proactive_context import record_proactive_outbound
+from apps.router.proactive_context import A2UI_DEMO_JOB_NAME, record_proactive_outbound
 from apps.tenants.models import Tenant
 
 from .catalog import CATALOG_ID
@@ -19,7 +19,7 @@ from .validate import validate_surface
 logger = logging.getLogger(__name__)
 
 SCENARIOS = ("gym", "review", "stuck", "rough")
-JOB_NAME = "a2ui_demo"
+JOB_NAME = A2UI_DEMO_JOB_NAME
 
 
 def _gym() -> tuple[str, list[dict], dict]:

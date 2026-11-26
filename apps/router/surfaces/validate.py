@@ -116,7 +116,7 @@ def _check_panels(components: list[BaseModel]) -> None:
     for component in components:
         if not isinstance(component, Panel):
             continue
-        if len(validate_panels([{"kind": component.kind, "params": component.params}])) != 1:
+        if len(validate_panels([{"kind": component.kind, "params": component.params}], log=False)) != 1:
             raise SurfaceError("schema")
 
 

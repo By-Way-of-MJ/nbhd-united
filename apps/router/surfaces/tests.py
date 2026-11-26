@@ -411,6 +411,10 @@ class SurfacePanelParamsTests(SimpleTestCase):
     def test_param_scoped_to_another_kind_is_rejected(self):
         self.assert_code(_panel(kind="workout", params={"filter": "open"}), "schema")
 
+    def test_rejected_surface_panel_does_not_log_panel_dropped(self):
+        with self.assertNoLogs("apps.router.panels", level="WARNING"):
+            self.assert_code(_panel(params={"bogus": "x"}), "schema")
+
 
 class SurfaceGraphScopeTests(SimpleTestCase):
     """Relative bindings are template-only; the graph under root is closed."""

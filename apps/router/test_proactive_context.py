@@ -23,15 +23,20 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.crypto.keys import mint_and_wrap_dek
+from apps.orchestrator.azure_client import _MOCK_KEK_REGISTRY
+from apps.pii.redactor import RedactionOutcome, as_confirmed
 from apps.router.cron_delivery import _rate_counts
 from apps.router.models import ProactiveOutbound
 from apps.router.proactive_context import (
+    A2UI_DEMO_JOB_NAME,
     parse_markdown_items,
     record_proactive_outbound,
     surface_proactive_context,
 )
 from apps.tenants.models import Tenant
 from apps.tenants.test_utils import seed_internal_key
+from apps.transcripts.models import TranscriptEvent
 
 
 def _large_table(rows: int = 26) -> str:
@@ -223,6 +228,49 @@ class RecordProactiveOutboundTest(_TenantFixture):
             {"kind": "daily", "slug": "2026-07-15", "title": "Original"},
         )
         self.assertFalse(Document.objects.filter(tenant=self.tenant).exists())
+
+
+class ProactiveRecallCaptureTest(_TenantFixture):
+    """Recall capture follows assistant memory, not operator demo fixtures."""
+
+    def setUp(self):
+        super().setUp()
+        mock_patcher = patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+        mock_patcher.start()
+        self.addCleanup(mock_patcher.stop)
+        self.addCleanup(_MOCK_KEK_REGISTRY.clear)
+        self.tenant.recall_capture_enabled = True
+        self.tenant.save(update_fields=["recall_capture_enabled"])
+        mint_and_wrap_dek(self.tenant)
+
+    def test_a2ui_demo_row_skips_capture_while_normal_row_still_captures(self):
+        confirmed = as_confirmed(RedactionOutcome("captured assistant text", True, "redacted"))
+        assert confirmed is not None
+
+        with patch("apps.pii.redactor.confirm_assistant_output", return_value=confirmed) as confirm:
+            demo = record_proactive_outbound(
+                tenant=self.tenant,
+                channel="app",
+                channel_user_id="u-app",
+                message_text="operator demo card",
+                job_name=A2UI_DEMO_JOB_NAME,
+            )
+            assert demo is not None
+            confirm.assert_not_called()
+            self.assertFalse(TranscriptEvent.objects.filter(tenant=self.tenant).exists())
+
+            normal = record_proactive_outbound(
+                tenant=self.tenant,
+                channel="app",
+                channel_user_id="u-app",
+                message_text="real proactive nudge",
+            )
+            assert normal is not None
+
+        event = TranscriptEvent.objects.get(tenant=self.tenant)
+        self.assertEqual(event.source_type, TranscriptEvent.SourceType.PROACTIVE)
+        self.assertEqual(event.source_event_id, str(normal.id))
+        self.assertEqual(event.role, TranscriptEvent.Role.ASSISTANT)
 
 
 class SurfaceProactiveContextTest(_TenantFixture):
