@@ -213,13 +213,16 @@ def strip_streaming_panels(text: str) -> str:
     inside = found = False
     ordinary_fence = False
     lines = text.splitlines(keepends=True)
-    opener = "```nbhd-panels"
+    openers = ("```nbhd-panels", "```nbhd-card")
     for index, line in enumerate(lines):
         marker = line.strip()
         trailing_prefix = (
-            index == len(lines) - 1 and not line.endswith(("\n", "\r")) and bool(marker) and opener.startswith(marker)
+            index == len(lines) - 1
+            and not line.endswith(("\n", "\r"))
+            and bool(marker)
+            and any(opener.startswith(marker) for opener in openers)
         )
-        if not inside and not ordinary_fence and (marker == opener or trailing_prefix):
+        if not inside and not ordinary_fence and (marker in openers or trailing_prefix):
             inside = found = True
         elif inside and marker == "```":
             inside = False

@@ -391,8 +391,10 @@ class TelegramPoller:
         from apps.router.journal_link import extract_journal_link
         from apps.router.panels import extract_panels
         from apps.router.quick_replies import extract_quick_replies
+        from apps.router.surfaces.extract import extract_card
 
         text, _panels = extract_panels(text)
+        text, _a2ui = extract_card(text)
         text, _quick_replies = extract_quick_replies(text, tenant_id=tenant.id, channel="telegram_poller")
         text, _journal_link = extract_journal_link(text, tenant_id=tenant.id, channel="telegram_poller")
 

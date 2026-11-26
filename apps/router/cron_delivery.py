@@ -419,10 +419,12 @@ class SendToUserSerializer(serializers.Serializer):
     def validate(self, data):
         from apps.router.chat_gates import chat_panels_tool_enabled
         from apps.router.panels import extract_panels
+        from apps.router.surfaces.extract import extract_card
 
         # Strip on every channel and outside the rollout gate. Explicit panels
         # (even empty/null/invalid) take precedence over the fallback block.
         data["message"], fallback = extract_panels(data["message"])
+        data["message"], _a2ui = extract_card(data["message"])
         if "panels" not in data:
             if chat_panels_tool_enabled(self.context.get("tenant")):
                 data["panels"] = fallback

@@ -3217,9 +3217,14 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
         return None
     write_started = time.monotonic()
     now = timezone.now()
+    from apps.router.chat_gates import chat_surfaces_enabled
     from apps.router.panels import extract_panels, prepare_panels
+    from apps.router.surfaces.extract import extract_card
+    from apps.router.surfaces.store import clean_surfaces
 
     ai_text, panels = extract_panels(ai_text or "")
+    ai_text, a2ui = extract_card(ai_text)
+    a2ui = clean_surfaces(a2ui) if chat_surfaces_enabled(tenant) else []
     # A panel-only reply has no prose: pass user_text=None so prepare_panels does
     # not filter timers and turn a legitimate timer-only turn into an error.
     joined_user_text = " ".join(getattr(m, "user_text", None) or "" for m in batch) if ai_text.strip() else None
@@ -3229,7 +3234,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
     if has_character_drawing(ai_text):
         # Measure-only: AGENTS.md bans character drawings; count how often it slips.
         logger.info("chat_reply_character_drawing tenant=%s chars=%d", tenant.id, len(ai_text))
-    if ai_text or panels:
+    if ai_text or panels or a2ui:
         # A coalesced batch (N>1) yields ONE combined reply. Attach it to a single
         # representative row (the last message in the batch) so the since-feed,
         # thread history, and the USER.md digest each emit exactly one assistant
@@ -3274,6 +3279,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 # the same reason. null when the reply carried no marker.
                 quick_replies=quick_replies or None,
                 panels=panels or None,
+                a2ui=a2ui or None,
                 # The "View in Journal" deep-link rides the same representative row,
                 # for the same reason. null when the reply carried no marker.
                 journal_link=journal_link or None,
@@ -3287,6 +3293,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
                 AppChatMessage.objects.filter(tenant=tenant, client_msg_id__in=other_ids).update(
                     reply_text="",
                     panels=None,
+                    a2ui=None,
                     quick_replies=None,
                     journal_link=None,
                     reply_redactions=None,
@@ -3305,7 +3312,7 @@ def _store_ios_turn_reply(tenant: Tenant, batch: list[PendingMessage], ai_text: 
         # body uses the REHYDRATED copy (``push_text``) — ``reply_text`` is stored
         # placeholder-space, so pushing ``text`` would leak a raw ``[PERSON_1]``.
         reply_write_ms = (time.monotonic() - write_started) * 1000
-        if text or panels or quick_replies or journal_link:
+        if text or panels or a2ui or quick_replies or journal_link:
             _dispatch_push(notify_app_reply_ready, tenant, [rep_id], push_text)
         # Only feeds the retry_succeeded log line, so it runs AFTER the reply is
         # committed (the client can already read it) instead of in front of the
@@ -3525,8 +3532,10 @@ def relay_ai_response_to_telegram(tenant: Tenant, chat_id: int, ai_text: str) ->
     from apps.router.journal_link import extract_journal_link
     from apps.router.panels import extract_panels
     from apps.router.quick_replies import extract_quick_replies
+    from apps.router.surfaces.extract import extract_card
 
     ai_text, _panels = extract_panels(ai_text)
+    ai_text, _a2ui = extract_card(ai_text)
     ai_text, _quick_replies = extract_quick_replies(ai_text, tenant_id=tenant.id, channel="telegram_drain")
     ai_text, _journal_link = extract_journal_link(ai_text, tenant_id=tenant.id, channel="telegram_drain")
 

@@ -49,6 +49,22 @@ Unclosed trailing `[[panel:` markers are removed from final text and withheld
 from partial text; split bracket opener prefixes are also withheld. All stripping is unconditional, independent of channel or tenant gate.
 Prompts require the `panels` tool argument or the chat fence, never textual markers.
 
+## A2UI cards (`nbhd-card`)
+
+Normal iOS replies may end with one fenced `nbhd-card` block whose body is a
+single A2UI envelope (`{"version":"1.0","createSurface":{...}}`). The server
+strips every such block on every channel (Telegram poller/queue, LINE, cron
+send-to-user, conversation capture, and panel repair) so fences never reach a
+recipient. Only the first block is a candidate; it is parsed as JSON and run
+through `validate_surface`. Malformed JSON, schema-invalid envelopes, extra
+blocks, and unclosed blocks are stripped and dropped with content-free
+`card_dropped` logs. A card is persisted as `a2ui` on the app reply row only
+for tenants in `CHAT_SURFACES_TENANT_IDS`; non-gated tenants get no stored
+card, while the fence is still removed. Card-only replies remain READY and
+visible, mirroring panel-only replies. App partial text hides in-progress
+`nbhd-card` blocks and trailing partial openers with the same streaming logic
+as `nbhd-panels`.
+
 To repair existing rows, run the following (dry-run by default), then add
 `--apply` to write:
 
