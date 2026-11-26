@@ -424,6 +424,31 @@ class ConversationCaptureTest(TestCase):
         rendered = [ln for ln in digest.splitlines() if "heartbeat_checkin" in ln]
         self.assertEqual(len(rendered), DEFAULT_LIMIT)
 
+    def test_digest_excludes_a2ui_demo_rows(self):
+        """Operator demo cards are app-feed test rows, not conversation. The
+        USER.md digest must never replay them into a composed turn, while real
+        proactive sends stay in the dedup block."""
+        from apps.router.models import ProactiveOutbound
+
+        ProactiveOutbound.objects.create(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="1",
+            message_text="real proactive nudge",
+            job_name="morning_briefing",
+        )
+        ProactiveOutbound.objects.create(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="1",
+            message_text="operator demo card",
+            job_name="a2ui_demo",
+        )
+        digest = build_conversation_digest(self.tenant)
+        self.assertIn("real proactive nudge", digest)
+        self.assertNotIn("operator demo card", digest)
+        self.assertNotIn("a2ui_demo", digest)
+
     def test_digest_omits_proactive_block_when_none(self):
         record_conversation_turn(
             tenant=self.tenant,

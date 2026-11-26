@@ -387,6 +387,32 @@ class SurfaceProactiveContextTest(_TenantFixture):
         row.refresh_from_db()
         self.assertIsNone(row.consumed_at)
 
+    def test_a2ui_demo_rows_are_not_resurfaced_into_context(self):
+        # Operator demo cards are app-feed test rows (job_name="a2ui_demo"),
+        # not real assistant context. Push/feed rendering is untouched; only the
+        # model-facing [earlier-from-you] block must ignore them.
+        real = record_proactive_outbound(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="u-app",
+            message_text="real proactive nudge",
+        )
+        demo = record_proactive_outbound(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="u-app",
+            message_text="operator demo card",
+            job_name="a2ui_demo",
+        )
+        assert real is not None
+        assert demo is not None
+
+        block = surface_proactive_context(tenant=self.tenant)
+        self.assertIn("real proactive nudge", block)
+        self.assertNotIn("operator demo card", block)
+        demo.refresh_from_db()
+        self.assertIsNone(demo.consumed_at)
+
     def test_other_tenant_rows_not_surfaced(self):
         # Tenant-wide scoping stops at the tenant boundary — a different
         # tenant's proactive rows must never leak into this tenant's turn.

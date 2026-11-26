@@ -49,19 +49,21 @@ MAX_TEXT_LENGTH = 500
 REF_KINDS = ("tasks", "task", "workout", "sleep", "weight", "mission")
 TASK_LISTS = ("due_today", "overdue", "this_week", "open")
 
-_UUID4 = (
-    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}"
-    r"-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+# Any lowercase canonical UUID, not just v4: missions and tasks may carry
+# UUIDv1/6/7 ids minted elsewhere, and the ref only needs to be a stable id.
+_UUID = (
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+    r"-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 REF_PATTERN = re.compile(
     rf"^(?:"
     rf"tasks:(?:{'|'.join(TASK_LISTS)})"
-    rf"|task:{_UUID4}"
+    rf"|task:{_UUID}"
     rf"|workout:today"
-    rf"|workout:{_UUID4}"
+    rf"|workout:{_UUID}"
     rf"|sleep:last_night"
     rf"|weight:latest"
-    rf"|mission:{_UUID4}"
+    rf"|mission:{_UUID}"
     rf")$"
 )
 
@@ -95,7 +97,7 @@ class ActionEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: ALLOWED_ACTIONS
-    context: dict[SafeStr, str | int | bool | Binding] = Field(default_factory=dict, max_length=10)
+    context: dict[SafeStr, SafeStr | int | bool | Binding] = Field(default_factory=dict, max_length=10)
 
 
 class Action(BaseModel):
@@ -196,7 +198,7 @@ class Panel(_Component):
     component: Literal["Panel"]
     kind: PanelKind
     ref: SafeStr | Binding | None = None
-    params: dict[SafeStr, str | int] = Field(default_factory=dict, max_length=6)
+    params: dict[SafeStr, SafeStr | int] = Field(default_factory=dict, max_length=6)
 
 
 Component = Annotated[

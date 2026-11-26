@@ -477,12 +477,14 @@ def surface_proactive_context(
     # Tenant-scoped — the (tenant, created_at) index (proactive_tenant_created_idx)
     # backs the range scan below. User-delivery channels are not distinguished: one
     # tenant = one human, and switching transports must not break continuity.
-    # Internal eval evidence and thread-targeted sub-agent results are excluded;
-    # the latter already landed in their authoritative app thread.
+    # Internal eval evidence, thread-targeted sub-agent results, and operator A2UI
+    # demo cards are excluded; the latter are test rows, never real assistant
+    # context, even though they still render in the app feed.
     base = (
         ProactiveOutbound.objects.filter(tenant=tenant)
         .exclude(channel=ProactiveOutbound.Channel.EVAL)
         .exclude(job_name="_subagent_result")
+        .exclude(job_name="a2ui_demo")
     )
 
     # ONE query over both consumption states (was two sequential SELECTs — a

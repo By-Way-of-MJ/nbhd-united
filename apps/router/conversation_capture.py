@@ -391,7 +391,8 @@ def _recent_proactive_lines(tenant, tz) -> list[str]:
     so two routines firing the same morning each speak into apparent silence and
     can re-ask the same question. ``ProactiveOutbound`` records proactive
     delivery events and is read both on inbound replies and here for cron-to-cron
-    dedup (internal eval evidence rows are excluded). By
+    dedup (internal eval evidence rows and operator ``a2ui_demo`` test cards are
+    excluded). By
     rendering "what you/a sibling routine already sent in the last 24h" into the
     same USER.md digest the isolated session already reads, a composing cron can
     see the heartbeat/briefing already asked it and not repeat.
@@ -409,6 +410,7 @@ def _recent_proactive_lines(tenant, tz) -> list[str]:
     rows = list(
         ProactiveOutbound.objects.filter(tenant=tenant, created_at__gte=since)
         .exclude(channel=ProactiveOutbound.Channel.EVAL)
+        .exclude(job_name="a2ui_demo")
         .only("created_at", "message_text", "job_name")
         .order_by("-created_at")[:DEFAULT_LIMIT]
     )

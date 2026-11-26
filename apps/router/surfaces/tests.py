@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import get_args
+from unittest.mock import patch
 
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase
 
 from apps.router.panels import PANEL_KINDS
@@ -305,3 +309,195 @@ class SurfaceDataModelTests(SimpleTestCase):
 
     def test_plain_string_leaf_must_not_be_a_url(self):
         self.assert_code(ref_surface({"text": "see https://evil.example"}), "bad_data")
+
+    def test_data_model_keys_must_be_bounded_token_names(self):
+        # Keys are rendered/looked up by the app; they get the same token
+        # discipline as component ids, not arbitrary JSON object names.
+        validate_surface(ref_surface({"a": 1, "A-b_9": 2, "x" * 64: 3}))
+        for key in ("bad key", "", "x" * 65, "$refx", "café", "a/b"):
+            with self.subTest(key=key):
+                self.assert_code(ref_surface({key: 1}), "bad_data")
+        self.assert_code(ref_surface({1: "int keys are not model keys"}), "bad_data")
+
+    def test_nested_data_model_keys_are_checked(self):
+        self.assert_code(ref_surface({"outer": {"bad key": 1}}), "bad_data")
+
+    def test_at_most_20_refs(self):
+        refs = {f"k{i}": {"$ref": "tasks:open"} for i in range(20)}
+        validate_surface(ref_surface(refs))
+        refs["k20"] = {"$ref": "tasks:open"}
+        self.assert_code(ref_surface(refs), "bad_data")
+
+    def test_non_v4_canonical_uuid_refs_are_accepted(self):
+        # UUIDs minted elsewhere (v1/v6/v7) are still canonical lowercase ids;
+        # only "not a UUID at all" should be rejected.
+        for value in (
+            "123e4567-e89b-12d3-a456-426614174000",  # v1
+            "1e0a1d6e-3b7c-6d4a-9f2b-0a1c2d3e4f50",  # v6
+            "018f4c6e-7b1a-7c3d-8e2f-9a0b1c2d3e4f",  # v7
+        ):
+            with self.subTest(value=value):
+                for prefix in ("task", "workout", "mission"):
+                    data_model = {"x": {"$ref": f"{prefix}:{value}"}}
+                    self.assertEqual(
+                        validate_surface(ref_surface(data_model))["createSurface"]["dataModel"], data_model
+                    )
+
+
+def _button_context(context):
+    return surface(
+        [
+            {
+                "id": "root",
+                "component": "Button",
+                "label": "Go",
+                "action": {"event": {"name": "task.move", "context": context}},
+            }
+        ]
+    )
+
+
+def _panel(kind="tasks", params=None):
+    body = {"id": "root", "component": "Panel", "kind": kind}
+    if params is not None:
+        body["params"] = params
+    return surface([body])
+
+
+class SurfaceStringBoundTests(SimpleTestCase):
+    """Every plain string in action context and panel params is a SafeStr."""
+
+    def assert_code(self, payload, code):
+        with self.assertRaises(SurfaceError) as caught:
+            validate_surface(payload)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_action_context_values_are_url_free(self):
+        self.assert_code(_button_context({"to": "https://evil.example"}), "schema")
+
+    def test_action_context_values_are_bounded(self):
+        validate_surface(_button_context({"to": "a" * 500}))
+        self.assert_code(_button_context({"to": "a" * 501}), "schema")
+
+    def test_panel_params_values_are_url_free(self):
+        self.assert_code(_panel(params={"filter": "https://evil.example"}), "schema")
+
+    def test_panel_params_values_are_bounded(self):
+        validate_surface(_panel(params={"filter": "open"}))
+        self.assert_code(_panel(params={"filter": "a" * 501}), "schema")
+
+
+class SurfacePanelParamsTests(SimpleTestCase):
+    """Panel kind+params reuse the panels.py vocabulary, not an open dict."""
+
+    def assert_code(self, payload, code):
+        with self.assertRaises(SurfaceError) as caught:
+            validate_surface(payload)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_valid_panel_params_pass_and_round_trip(self):
+        result = validate_surface(_panel(params={"filter": "open"}))
+        component = result["createSurface"]["components"][0]
+        self.assertEqual(component["kind"], "tasks")
+        self.assertEqual(component["params"], {"filter": "open"})
+        validate_surface(_panel(kind="timer", params={"duration_seconds": 600}))
+
+    def test_unknown_param_key_is_rejected(self):
+        self.assert_code(_panel(params={"bogus": "x"}), "schema")
+
+    def test_param_value_must_match_the_panel_vocabulary(self):
+        self.assert_code(_panel(params={"filter": "someday"}), "schema")
+
+    def test_param_scoped_to_another_kind_is_rejected(self):
+        self.assert_code(_panel(kind="workout", params={"filter": "open"}), "schema")
+
+
+class SurfaceGraphScopeTests(SimpleTestCase):
+    """Relative bindings are template-only; the graph under root is closed."""
+
+    def assert_code(self, payload, code):
+        with self.assertRaises(SurfaceError) as caught:
+            validate_surface(payload)
+        self.assertEqual(caught.exception.code, code)
+
+    def test_orphan_list_with_template_root_cannot_unlock_relative_bindings(self):
+        # Exact bypass: an unreachable List used to add root (and everything
+        # under it) to the template set, so a relative pointer on a normal node
+        # passed. The List-template edge must never point into the direct graph.
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["title"]},
+                {"id": "title", "component": "Text", "text": {"@path": "title"}},
+                {"id": "ghost-list", "component": "List", "children": {"template": "root", "path": "/x"}},
+            ]
+        )
+        self.assert_code(payload, "bad_template")
+
+    def test_list_template_must_not_be_in_the_direct_graph(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["lst", "title"]},
+                {"id": "lst", "component": "List", "children": {"template": "title", "path": "/x"}},
+                {"id": "title", "component": "Text", "text": "Hi"},
+            ]
+        )
+        self.assert_code(payload, "bad_template")
+
+    def test_relative_binding_on_a_direct_node_is_rejected(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["title"]},
+                {"id": "title", "component": "Text", "text": {"@path": "title"}},
+            ]
+        )
+        self.assert_code(payload, "bad_template")
+
+    def test_unreachable_component_is_an_orphan(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["title"]},
+                {"id": "title", "component": "Divider"},
+                {"id": "extra", "component": "Text", "text": "never rendered"},
+            ]
+        )
+        self.assert_code(payload, "orphan")
+
+    def test_duplicate_child_id_is_rejected(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["item", "item"]},
+                {"id": "item", "component": "Divider"},
+            ]
+        )
+        self.assert_code(payload, "duplicate_child")
+
+
+class PostDemoSurfaceCommandTests(SimpleTestCase):
+    """The operator command reports expected failures without a traceback."""
+
+    def _call(self):
+        return call_command(
+            "post_demo_surface",
+            tenant=str(uuid.uuid4()),
+            scenario="gym",
+        )
+
+    def test_surface_error_is_a_clean_command_error(self):
+        with (
+            patch(
+                "apps.router.management.commands.post_demo_surface.post_demo_surface",
+                side_effect=SurfaceError("schema"),
+            ),
+            self.assertRaisesMessage(CommandError, "post_demo_surface failed: schema"),
+        ):
+            self._call()
+
+    def test_value_error_is_a_clean_command_error(self):
+        with (
+            patch(
+                "apps.router.management.commands.post_demo_surface.post_demo_surface",
+                side_effect=ValueError("mission_id required"),
+            ),
+            self.assertRaisesMessage(CommandError, "post_demo_surface failed: mission_id required"),
+        ):
+            self._call()

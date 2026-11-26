@@ -15,14 +15,29 @@ from typing import Any
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from .catalog import CATALOG_ID, MAX_TEXT_LENGTH, REF_PATTERN, Binding, Card, Column, Component, List, Row
+from apps.router.panels import validate_panels
+
+from .catalog import (
+    CATALOG_ID,
+    MAX_TEXT_LENGTH,
+    REF_PATTERN,
+    Binding,
+    Card,
+    Column,
+    Component,
+    List,
+    Panel,
+    Row,
+)
 
 MAX_SURFACE_BYTES = 32768
 MAX_COMPONENTS = 60
 MAX_DEPTH = 8
 MAX_DATA_DEPTH = 6
 MAX_DATA_LEAVES = 200
+MAX_DATA_REFS = 20
 SURFACE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+DATA_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _COMPONENTS = TypeAdapter(list[Component])
 _SURFACE_KEYS = frozenset({"surfaceId", "catalogId", "components", "dataModel"})
@@ -38,13 +53,30 @@ class SurfaceError(ValueError):
         super().__init__(code)
 
 
+def _children_ids(component: BaseModel) -> list[str]:
+    """Normal child edges only; a List's template edge is deliberately absent."""
+    if isinstance(component, (Column, Row, Card)):
+        return list(component.children)
+    return []
+
+
 def _component_targets(component: BaseModel) -> list[str]:
     """Graph edges: children for containers, the template id for a List."""
     if isinstance(component, List):
         return [component.children.template]
-    if isinstance(component, (Column, Row, Card)):
-        return list(component.children)
-    return []
+    return _children_ids(component)
+
+
+def _reachable(edges: dict[str, list[str]], start: str) -> set[str]:
+    seen: set[str] = set()
+    pending = [start]
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        pending.extend(edges.get(node, ()))
+    return seen
 
 
 def _bindings(value: Any) -> Iterator[Binding]:
@@ -74,6 +106,20 @@ def _template_ids(components: list[BaseModel], edges: dict[str, list[str]]) -> s
     return inside
 
 
+def _check_panels(components: list[BaseModel]) -> None:
+    """A Panel's kind+params must pass the same rules as ``panels.py``.
+
+    Reusing ``validate_panels`` keeps the surface panel vocabulary and the
+    assistant-attached panel vocabulary from drifting: one item in, exactly one
+    item out, otherwise the payload is a schema failure.
+    """
+    for component in components:
+        if not isinstance(component, Panel):
+            continue
+        if len(validate_panels([{"kind": component.kind, "params": component.params}])) != 1:
+            raise SurfaceError("schema")
+
+
 def _check_graph(components: list[BaseModel]) -> None:
     ids = [component.id for component in components]
     if len(set(ids)) != len(ids):
@@ -86,6 +132,13 @@ def _check_graph(components: list[BaseModel]) -> None:
     for targets in edges.values():
         if any(target not in known for target in targets):
             raise SurfaceError("dangling_child")
+
+    for component in components:
+        if not isinstance(component, (Column, Row, Card)):
+            continue
+        children = component.children
+        if len(set(children)) != len(children):
+            raise SurfaceError("duplicate_child")
 
     # Iterative three-color DFS over every component, so a cycle in a
     # disconnected island is rejected just like one under root.
@@ -107,6 +160,33 @@ def _check_graph(components: list[BaseModel]) -> None:
                 state[target] = 1
                 stack.append((target, iter(edges.get(target, ()))))
 
+    # "direct" is what the renderer reaches from root WITHOUT following a
+    # List's template edge. A node in direct is a normal node, not a per-item
+    # array element, so relative bindings there are unsafe; a List template
+    # pointing back into direct (especially at root) would let an item-only
+    # relative pointer masquerade as a normal node binding.
+    direct = _reachable({component.id: _children_ids(component) for component in components}, "root")
+    for component in components:
+        if isinstance(component, List) and (
+            component.children.template == "root" or component.children.template in direct
+        ):
+            raise SurfaceError("bad_template")
+
+    templates = _template_ids(components, edges)
+    allowed_relative = templates - direct
+    for component in components:
+        if component.id in allowed_relative:
+            continue
+        if any(not binding.path.startswith("/") for binding in _bindings(component)):
+            raise SurfaceError("bad_template")
+
+    # Nothing may float outside the root-reachable graph, or an unattached
+    # subtree could smuggle in components (and their bindings) that never
+    # render.
+    reachable = _reachable(edges, "root")
+    if any(component.id not in reachable for component in components):
+        raise SurfaceError("orphan")
+
     # Longest path from root, counting root as depth 1. Cycles are gone by now,
     # so revisiting a node only matters when we found a longer route to it.
     depth = {"root": 1}
@@ -120,13 +200,6 @@ def _check_graph(components: list[BaseModel]) -> None:
                 depth[target] = level + 1
                 stack.append((target, level + 1))
 
-    templates = _template_ids(components, edges)
-    for component in components:
-        if component.id in templates:
-            continue
-        if any(not binding.path.startswith("/") for binding in _bindings(component)):
-            raise SurfaceError("bad_template")
-
 
 def _check_data_model(data_model: Any) -> None:
     """Bound the ``dataModel`` tree and allow only live-ref dicts.
@@ -138,21 +211,25 @@ def _check_data_model(data_model: Any) -> None:
     if not isinstance(data_model, dict):
         raise SurfaceError("bad_data")
     leaves = 0
+    refs = 0
 
     def walk(node: Any, depth: int) -> None:
-        nonlocal leaves
+        nonlocal leaves, refs
         if isinstance(node, dict):
             if depth > MAX_DATA_DEPTH:
                 raise SurfaceError("bad_data")
             if "$ref" in node:
+                refs += 1
                 leaves += 1
-                if leaves > MAX_DATA_LEAVES:
+                if refs > MAX_DATA_REFS or leaves > MAX_DATA_LEAVES:
                     raise SurfaceError("bad_data")
                 ref = node.get("$ref")
                 if len(node) != 1 or not isinstance(ref, str) or not REF_PATTERN.fullmatch(ref):
                     raise SurfaceError("bad_data")
                 return
-            for item in node.values():
+            for key, item in node.items():
+                if not isinstance(key, str) or not DATA_KEY_PATTERN.fullmatch(key):
+                    raise SurfaceError("bad_data")
                 walk(item, depth + 1)
             return
         if isinstance(node, list):
@@ -209,6 +286,8 @@ def validate_surface(payload: dict) -> dict:
         components = _COMPONENTS.validate_python(raw_components)
     except ValidationError:
         raise SurfaceError("schema") from None
+
+    _check_panels(components)
 
     data_model = surface.get("dataModel")
     if "dataModel" in surface:

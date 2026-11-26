@@ -22,7 +22,7 @@ SCENARIOS = ("gym", "review", "stuck", "rough")
 JOB_NAME = "a2ui_demo"
 
 
-def _gym() -> tuple[str, dict, str]:
+def _gym() -> tuple[str, list[dict], dict]:
     components = [
         {
             "id": "root",
@@ -86,7 +86,7 @@ def _gym() -> tuple[str, dict, str]:
     return "Short night, so let's keep tonight lighter.", components, data_model
 
 
-def _review() -> tuple[str, dict, str]:
+def _review() -> tuple[str, list[dict], dict]:
     components = [
         {
             "id": "root",
@@ -202,7 +202,7 @@ def _stuck_components(mission_id: str) -> tuple[list[dict], dict]:
     return components, data_model
 
 
-def _rough() -> tuple[str, dict, str]:
+def _rough() -> tuple[str, list[dict], dict]:
     components = [
         {
             "id": "root",
