@@ -7,18 +7,33 @@ time, so the prompt cannot drift from the validator that enforces it.
 from __future__ import annotations
 
 import json
-from typing import get_args
+from typing import Literal, get_args, get_origin
+
+from pydantic import BaseModel
+
+from apps.router.panels import PANEL_VOCABULARY
 
 from .catalog import (
     ALLOWED_ACTION_NAMES,
     CATALOG_ID,
+    COMPONENT_ID_PATTERN,
     MAX_TEXT_LENGTH,
     REF_KINDS,
     TASK_LISTS,
+    Action,
+    ActionEvent,
+    Binding,
+    Button,
+    Card,
+    CheckBox,
+    ChoicePicker,
     Component,
+    List,
+    ListTemplate,
+    Panel,
+    Slider,
+    Text,
 )
-from .demo import build_demo_surface
-from .resolve import MAX_TASKS
 from .validate import MAX_COMPONENTS, MAX_DATA_REFS, MAX_DEPTH, MAX_SURFACE_BYTES
 
 # Context keys the iOS action router reads for each event. Kept next to the
@@ -29,73 +44,136 @@ _ACTION_CONTEXTS = {
     "task.drop": "{task}",
     "task.create": "{title}",
     "journal.checkin": "{mood?,energy?}",
-    "weight.log": "{kg}",
+    "weight.log": "{kg:number}",
     "workout.start": "{workout}",
     "mission.add_steps": "{mission}",
-    "week.set_focus": "{picked}",
+    "week.set_focus": '{picked:<picker binding, e.g. {"picked":{"@path":"/focus/picked"}}}',
     "card.dismiss": "{}",
 }
-assert set(_ACTION_CONTEXTS) == set(ALLOWED_ACTION_NAMES)
 
+# Plain forms only: a model must never copy prose braces into the ``$ref``
+# string (``tasks:{due_today|overdue}`` is rejected by the validator).
 _REF_FORMS = {
-    "tasks": "tasks:{" + "|".join(TASK_LISTS) + "}",
-    "task": "task:<id>",
-    "workout": "workout:today|workout:<id>",
-    "sleep": "sleep:last_night",
-    "weight": "weight:latest",
-    "mission": "mission:<id>",
+    "tasks": tuple(f"tasks:{name}" for name in TASK_LISTS),
+    "task": ("task:<uuid>",),
+    "workout": ("workout:today", "workout:<uuid>"),
+    "sleep": ("sleep:last_night",),
+    "weight": ("weight:latest",),
+    "mission": ("mission:<uuid>",),
 }
-_REF_SHAPES = {
-    "tasks": f"list of {{id,title,due_date,status,done}} (max {MAX_TASKS})",
-    "task": "{id,title,due_date,status,done}",
-    "workout": "{id,date,activity,status,exercises:[{name,sets:[{reps,weight}]}]}",
-    "sleep": "{date,hours,quality,summary}",
-    "weight": "{date,kg,unit,display}",
-    "mission": "{id,title,next_step:{id,title,due_date}|null,steps_open}",
-}
+
+
+def _literal_values(model: type[BaseModel], field_name: str) -> tuple[str, ...]:
+    annotation = model.model_fields[field_name].annotation
+    if get_origin(annotation) is not Literal:
+        return ()
+    return tuple(str(value) for value in get_args(annotation))
+
+
+def _bounds(model: type[BaseModel], field_name: str) -> tuple[int, int]:
+    ge = le = None
+    for constraint in model.model_fields[field_name].metadata:
+        if hasattr(constraint, "ge"):
+            ge = constraint.ge
+        if hasattr(constraint, "le"):
+            le = constraint.le
+    return ge, le
+
+
+def _field_doc(model: type[BaseModel], name: str, field) -> str:
+    if model is List and name == "children":
+        return '{template:<id>,path:"/abs"}'
+    label = name if field.is_required() else f"{name}?"
+    if model is Slider and name in {"min", "max"}:
+        lo, hi = _bounds(model, name)
+        prefix = "min<max," if name == "min" else ""
+        return f"{prefix}{name}={lo}..{hi}"
+    if model is ChoicePicker and name == "max":
+        lo, hi = _bounds(model, name)
+        return f"{label}={lo}..{hi} ({lo}=single select)"
+    values = _literal_values(model, name)
+    return f"{label}={'|'.join(values)}" if values else label
 
 
 def _component_docs() -> str:
     models = get_args(get_args(Component)[0])
     docs = []
     for model in models:
-        props = []
-        for name, field in model.model_fields.items():
-            if name in {"id", "component"}:
-                continue
-            props.append(name if field.is_required() else f"{name}?")
-        docs.append(f"{model.__name__}({','.join(props)})")
+        if model is Panel:
+            docs.append("Panel")
+            continue
+        props = [
+            _field_doc(model, name, field)
+            for name, field in model.model_fields.items()
+            if name not in {"id", "component"}
+        ]
+        suffix = "" if model.__name__ == "Divider" else f"({','.join(props)})"
+        docs.append(f"{model.__name__}{suffix}")
     return " ".join(docs)
 
 
-def _ref_docs() -> str:
-    return "; ".join(f"{_REF_FORMS[kind]} -> {_REF_SHAPES[kind]}" for kind in REF_KINDS)
+def _ref_forms() -> str:
+    return " | ".join(form for kind in REF_KINDS for form in _REF_FORMS[kind])
 
 
 def _action_docs() -> str:
     return "; ".join(f"{name}{_ACTION_CONTEXTS[name]}" for name in ALLOWED_ACTION_NAMES)
 
 
-_EXAMPLE = json.dumps(build_demo_surface("gym")[1], separators=(",", ":"))
+def build_small_example() -> dict:
+    """Build the prompt example from the catalog models, not hand-written JSON."""
+    components = [
+        Card(id="root", component="Card", children=["t", "l", "b"]),
+        Text(id="t", component="Text", text="Hi", style="title"),
+        List(id="l", component="List", children=ListTemplate(template="i", path="/t")),
+        CheckBox(
+            id="i",
+            component="CheckBox",
+            label=Binding(path="title"),
+            value=Binding(path="done"),
+            action=Action(event=ActionEvent(name="task.toggle", context={"task": Binding(path="id")})),
+        ),
+        Button(
+            id="b",
+            component="Button",
+            label="Tomorrow",
+            action=Action(event=ActionEvent(name="task.move", context={"to": "tomorrow"})),
+        ),
+    ]
+    return {
+        "version": "1.0",
+        "createSurface": {
+            "surfaceId": "t",
+            "catalogId": CATALOG_ID,
+            "components": [
+                component.model_dump(by_alias=True, exclude_none=True, exclude_defaults=True)
+                for component in components
+            ],
+            "dataModel": {"t": {"$ref": "tasks:due_today"}},
+        },
+    }
+
+
+SMALL_EXAMPLE = build_small_example()
+_EXAMPLE = json.dumps(SMALL_EXAMPLE, separators=(",", ":"))
 
 CARD_INSTRUCTION = (
-    "A2UI card\n"
-    "When: add a card only when the user can act on live data right now "
-    "(plan the day, a check-in, a review, a stuck project, a workout). "
-    "Most replies need no card. At most ONE ```nbhd-card block, at the very end, "
-    "after your text. Never mention the block in text.\n"
-    "Format: one JSON envelope "
+    "When: card only if user can act on live data now (day plan, check-in, "
+    "review, stuck project, workout). Most replies need none. <=1 "
+    "```nbhd-card block, last, after text; never mention it.\n"
+    "Format: "
     '{"version":"1.0","createSurface":{"surfaceId":"<kebab id>",'
     '"catalogId":"' + CATALOG_ID + '","components":[...],"dataModel":{...}}}. '
-    "Flat components have id and component; root id is root; containers reference "
-    "children by id.\n"
-    "Components: " + _component_docs() + ".\n"
-    'Bindings: {"@path":"/abs/pointer"}; inside a List template, relative '
-    '{"@path":"field"}.\n'
-    "Data: dataModel values from the user's data MUST be refs, never copied values. " + _ref_docs() + ".\n"
+    "Flat: id+component; root id=root; containers list child ids; ids "
+    "match " + COMPONENT_ID_PATTERN + " (lowercase).\n"
+    "Components: " + _component_docs() + ". Bindings: "
+    '{"@path":"/abs"}; in a List template, relative {"@path":"field"}.\n'
+    "Panels " + PANEL_VOCABULARY + ".\n"
+    "Data: dataModel MUST be refs, never copied: "
+    '{"$ref":"<form>"}, <form> = ' + _ref_forms() + ".\n"
     'Actions: {"event":{"name":<name>,"context":{...}}}: ' + _action_docs() + ".\n"
-    f"Limits: <= {MAX_COMPONENTS} components, depth <= {MAX_DEPTH}, envelope <= "
-    f"{MAX_SURFACE_BYTES} bytes, <= {MAX_DATA_REFS} data refs, text <= "
-    f"{MAX_TEXT_LENGTH} chars, no URLs.\n"
-    "Example:\n```nbhd-card\n" + _EXAMPLE + "\n```\n"
+    f"Limits: {MAX_COMPONENTS} components, depth <= {MAX_DEPTH}, "
+    f"{MAX_SURFACE_BYTES}B, <= {MAX_DATA_REFS} refs, text {MAX_TEXT_LENGTH} "
+    "chars, no URLs.\n"
+    "Example\n```nbhd-card\n" + _EXAMPLE + "\n```\n"
 )
