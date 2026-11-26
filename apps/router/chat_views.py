@@ -514,6 +514,16 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
     from apps.router.journal_link import rehydrate_journal_link
 
     journal_link = rehydrate_journal_link(msg.journal_link, entity_map, tenant_id=msg.tenant_id, channel="ios_detail")
+    # A2UI surfaces are a gated rollout: only tenants on CHAT_SURFACES_TENANT_IDS
+    # ever see them, and the key is always present (``[]`` when empty or gated
+    # off). Stored surfaces rest placeholder-space, so rehydrate here via the
+    # SAME shared helper the ?since= feed calls.
+    from apps.router.chat_gates import chat_surfaces_enabled
+    from apps.router.surfaces.store import rehydrate_surfaces
+
+    surfaces = []
+    if msg.a2ui and chat_surfaces_enabled(getattr(msg, "tenant", None)):
+        surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id)
     return {
         "client_msg_id": msg.client_msg_id,
         "thread_id": str(msg.thread_id),
@@ -569,6 +579,9 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         # (valid) marker. Shared source of truth with the ?since= feed.
         "journal_link": journal_link,
         "panels": rehydrate_panels(msg.panels, entity_map, tenant_id=msg.tenant_id),
+        # Validated A2UI v1.0 surface envelopes (nbhd/v1 catalog), REHYDRATED
+        # above; always present, ``[]`` when empty or the tenant is gated off.
+        "a2ui": surfaces,
     }
 
 

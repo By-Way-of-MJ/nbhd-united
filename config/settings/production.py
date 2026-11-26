@@ -159,6 +159,8 @@ SEND_TEST_TENANT_IDS = env("SEND_TEST_TENANT_IDS", default="")
 # Enable only after the running journal-tools manifest includes attentionHoldsEnabled.
 ATTENTION_HOLD_TENANT_IDS = env("ATTENTION_HOLD_TENANT_IDS", default="")
 KEEP_CHATTING_TENANT_IDS = env("KEEP_CHATTING_TENANT_IDS", default="")
+# A2UI surfaces in chat (rollout gate; comma-separated tenant UUIDs or *; empty = nobody)
+CHAT_SURFACES_TENANT_IDS = env("CHAT_SURFACES_TENANT_IDS", default="")
 
 # iOS paywall gate — mirror of the base.py name so the Container App env var is
 # documented here. Comma-separated tenant UUIDs or "*"; UNSET (the state at
