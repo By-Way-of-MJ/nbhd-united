@@ -30,11 +30,13 @@ from .catalog import (
     Component,
     List,
     ListTemplate,
-    Panel,
     Slider,
     Text,
 )
 from .validate import MAX_COMPONENTS, MAX_DATA_REFS, MAX_DEPTH, MAX_SURFACE_BYTES
+
+# Inline literal sets longer than this are rendered by their vocabulary line.
+_MAX_INLINE_LITERALS = 32
 
 # Context keys the iOS action router reads for each event. Kept next to the
 # catalog so a new action cannot be documented without its payload.
@@ -92,16 +94,17 @@ def _field_doc(model: type[BaseModel], name: str, field) -> str:
         lo, hi = _bounds(model, name)
         return f"{label}={lo}..{hi} ({lo}=single select)"
     values = _literal_values(model, name)
-    return f"{label}={'|'.join(values)}" if values else label
+    # A long literal set is already documented by its own vocabulary line
+    # (Panel kinds); keep the component shape readable instead of repeating it.
+    if values and len("|".join(values)) <= _MAX_INLINE_LITERALS:
+        return f"{label}={'|'.join(values)}"
+    return label
 
 
 def _component_docs() -> str:
     models = get_args(get_args(Component)[0])
     docs = []
     for model in models:
-        if model is Panel:
-            docs.append("Panel")
-            continue
         props = [
             _field_doc(model, name, field)
             for name, field in model.model_fields.items()
@@ -159,13 +162,13 @@ _EXAMPLE = json.dumps(SMALL_EXAMPLE, separators=(",", ":"))
 
 CARD_INSTRUCTION = (
     "When: card only if user can act on live data now (day plan, check-in, "
-    "review, stuck project, workout). Most replies need none. <=1 "
-    "```nbhd-card block, last, after text; never mention it.\n"
+    "review, stuck project, workout). Most need none. <=1 "
+    "```nbhd-card block, last, after text; never mention.\n"
     "Format: "
     '{"version":"1.0","createSurface":{"surfaceId":"<kebab id>",'
     '"catalogId":"' + CATALOG_ID + '","components":[...],"dataModel":{...}}}. '
     "Flat: id+component; root id=root; containers list child ids; ids "
-    "match " + COMPONENT_ID_PATTERN + " (lowercase).\n"
+    "match " + COMPONENT_ID_PATTERN + " lowercase.\n"
     "Components: " + _component_docs() + ". Bindings: "
     '{"@path":"/abs"}; in a List template, relative {"@path":"field"}.\n'
     "Panels " + PANEL_VOCABULARY + ".\n"

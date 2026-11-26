@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from django.test import SimpleTestCase, override_settings
 
+from apps.router.surfaces.catalog import MAX_TEXT_LENGTH
 from apps.router.surfaces.store import clean_surfaces, redact_surfaces, rehydrate_surfaces
 from apps.router.surfaces.validate import validate_surface
 
@@ -229,6 +230,19 @@ class RedactSurfacesTests(SimpleTestCase):
         self.assertEqual(body["dataModel"]["title"], "Call [PERSON_1]")
         self.assertEqual(body["dataModel"]["tasks"], {"$ref": "tasks:due_today"})
         self.assertEqual(payload["createSurface"]["components"][1]["text"], "Call Alice")
+
+    def test_surface_pushed_over_the_text_limit_by_redaction_is_dropped(self):
+        tenant = known_value_tenant()
+        text = "x" * (MAX_TEXT_LENGTH - len("Alice") - 1) + " Alice"
+        payload = surface(text=text)
+
+        with self.assertLogs("apps.router.surfaces.store", level="WARNING") as logs:
+            result = redact_surfaces([payload], tenant)
+
+        self.assertEqual(result, [])
+        output = "\n".join(logs.output)
+        self.assertIn("card_dropped reason=post_redaction_schema", output)
+        self.assertNotIn("Alice", output)
 
 
 class StoredSurfaceRedactionTests(SimpleTestCase):

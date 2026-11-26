@@ -142,6 +142,19 @@ class CardInstructionTests(SimpleTestCase):
             with self.subTest(kind=kind):
                 self.assert_rendered_and_valid(kind, {"component": "Panel", "kind": kind})
 
+    def test_panel_props_are_rendered_from_the_model(self):
+        self.assertIn("Panel(kind,ref?,params?)", CARD_INSTRUCTION)
+        validate_surface(
+            minimal_surface(
+                {
+                    "component": "Panel",
+                    "kind": "tasks",
+                    "ref": "tasks:due_today",
+                    "params": {"filter": "due_today"},
+                }
+            )
+        )
+
     def test_slider_bounds_and_order_are_rendered(self):
         for field_name in ("min", "max"):
             lo, hi = bounds(Slider, field_name)

@@ -113,6 +113,51 @@ class ExtractCardTests(SimpleTestCase):
         source = "  Ordinary text\nwith trailing space \n"
         self.assertEqual(extract_card(source), (source, []))
 
+    def test_prose_mentioning_nbhd_card_is_unchanged(self):
+        sources = (
+            "Use ```python fences, not nbhd-card ones.\nNext line",
+            "Cards go in a ```nbhd-card``` block.\nMore text",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(extract_card(source), (source, []))
+                self.assertEqual(strip_streaming_panels(source), source)
+
+    def test_unlabelled_envelope_fence_is_stripped_and_extracted(self):
+        for opener in ("```", "```json", "````JSON"):
+            with self.subTest(opener=opener):
+                source = "Before\n" + opener + "\n" + json.dumps(CARD) + "\n```\nAfter"
+                text, surfaces = extract_card(source)
+                self.assertEqual(text, "Before\nAfter")
+                self.assertEqual(len(surfaces), 1)
+                self.assertEqual(surfaces[0]["createSurface"]["surfaceId"], "card")
+
+    def test_unlabelled_non_card_fences_are_untouched(self):
+        sources = (
+            "Before\n```json\n" + json.dumps({"a": 1}) + "\n```\nAfter",
+            "Before\n```python\n" + json.dumps(CARD) + "\n```\nAfter",
+            "Before\n```python\nprint('hello')\n```\nAfter",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(extract_card(source), (source, []))
+
+    def test_labelled_card_wins_over_unlabelled_fallback(self):
+        fallback = {
+            "version": "1.0",
+            "createSurface": {
+                "surfaceId": "fallback",
+                "catalogId": "nbhd/v1",
+                "components": [{"id": "root", "component": "Divider"}],
+            },
+        }
+        source = "Before\n```json\n" + json.dumps(fallback) + "\n```\n" + card_block() + "\nAfter"
+
+        text, surfaces = extract_card(source)
+
+        self.assertEqual(text, "Before\nAfter")
+        self.assertEqual([surface["createSurface"]["surfaceId"] for surface in surfaces], ["card"])
+
     def test_card_and_panels_extract_independently(self):
         source = "Before\n" + PANEL_BLOCK + "\n" + card_block() + "\nAfter"
 

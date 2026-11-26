@@ -103,7 +103,9 @@ def redact_surfaces(value, tenant) -> list[dict]:
     labels, ChoicePicker options, action-context literals, Panel.ref and plain
     ``dataModel`` leaves pass through the same known-value redactor before the
     surface is stored. ``$ref`` entries stay untouched so live values keep
-    resolving at read time.
+    resolving at read time. Each rewritten surface is validated again because a
+    longer placeholder can push a bounded field past its limit; one that fails
+    is dropped with a content-free log.
     """
     from apps.pii.egress import redact_known_values
 
@@ -112,13 +114,22 @@ def redact_surfaces(value, tenant) -> list[dict]:
     def finalize(text: str) -> str:
         return redact_known_values(tenant, text, seam="surface_storage")
 
+    rewritten = []
     for envelope in surfaces:
         body = envelope.get("createSurface") or {}
         for component in body.get("components", ()):
             _rewrite_component(component, finalize)
         if isinstance(body.get("dataModel"), dict):
             body["dataModel"] = _rewrite_tree(body["dataModel"], finalize)
-    return surfaces
+        # A placeholder is longer than the value it replaces, so redaction can
+        # push a bounded field (text length, payload size) over its limit.
+        try:
+            validate_surface(envelope)
+        except SurfaceError as err:
+            logger.warning("card_dropped reason=%s", f"post_redaction_{err.code}")
+            continue
+        rewritten.append(envelope)
+    return rewritten
 
 
 def rehydrate_surfaces(value, entity_map, *, tenant_id, tenant=None, cache: dict | None = None) -> list[dict]:
