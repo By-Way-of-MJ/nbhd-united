@@ -483,6 +483,42 @@ class SurfaceGraphScopeTests(SimpleTestCase):
         )
         self.assert_code(payload, "bad_template")
 
+    def test_absolute_when_on_a_direct_component_is_accepted(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["title"]},
+                {
+                    "id": "title",
+                    "component": "Text",
+                    "text": "Hi",
+                    "when": {"@path": "/show/title"},
+                },
+            ],
+            data_model={"show": True},
+        )
+        by_id = {component["id"]: component for component in validate_surface(payload)["createSurface"]["components"]}
+        self.assertEqual(by_id["title"]["when"], {"@path": "/show/title"})
+
+    def test_relative_when_on_a_direct_component_is_rejected(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "Column", "children": ["title"]},
+                {"id": "title", "component": "Text", "text": "Hi", "when": {"@path": "show"}},
+            ]
+        )
+        self.assert_code(payload, "bad_template")
+
+    def test_relative_when_inside_a_list_template_is_accepted(self):
+        payload = surface(
+            [
+                {"id": "root", "component": "List", "children": {"template": "item", "path": "/tasks"}},
+                {"id": "item", "component": "Text", "text": {"@path": "title"}, "when": {"@path": "show"}},
+            ],
+            data_model={"tasks": [{"title": "Hi", "show": True}]},
+        )
+        by_id = {component["id"]: component for component in validate_surface(payload)["createSurface"]["components"]}
+        self.assertEqual(by_id["item"]["when"], {"@path": "show"})
+
     def test_unreachable_component_is_an_orphan(self):
         payload = surface(
             [

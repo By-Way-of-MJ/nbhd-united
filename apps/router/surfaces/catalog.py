@@ -108,9 +108,19 @@ class Action(BaseModel):
 
 
 class _Component(BaseModel):
+    """Base for every component in a surface.
+
+    ``when`` is an optional binding that controls whether the component and its
+    whole subtree render at all. The bound value must be "present": not
+    null/missing, not ``false``, not ``""``, not ``[]`` and not ``{}``.
+    Scoping is the same as every other binding: absolute (``/path``) on a
+    direct component, relative (``path``) only inside a List template.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     id: ComponentId
+    when: Binding | None = None
 
 
 class _ChildrenComponent(_Component):

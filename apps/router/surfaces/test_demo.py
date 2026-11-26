@@ -43,6 +43,18 @@ def _build(scenario: str) -> tuple[str, dict]:
     )
 
 
+def _binding_paths(value):
+    if isinstance(value, dict):
+        if set(value) == {"@path"}:
+            yield value["@path"]
+            return
+        for item in value.values():
+            yield from _binding_paths(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _binding_paths(item)
+
+
 class DemoSurfaceBuildTests(SimpleTestCase):
     def _assert_refs_and_static_values_only(self, node) -> None:
         if isinstance(node, dict):
@@ -88,6 +100,59 @@ class DemoSurfaceBuildTests(SimpleTestCase):
                 self.assertEqual(len(refs), REF_COUNTS[scenario])
                 if scenario == "stuck":
                     self.assertEqual(refs, [f"mission:{MISSION_ID}"])
+
+    def test_every_ref_bound_component_has_when_on_itself_or_an_ancestor(self):
+        for scenario in SCENARIOS:
+            with self.subTest(scenario=scenario):
+                _message_text, envelope = _build(scenario)
+                body = envelope["createSurface"]
+                by_id = {component["id"]: component for component in body["components"]}
+                data_model = body.get("dataModel", {})
+                ref_keys = {key for key, value in data_model.items() if isinstance(value, dict) and "$ref" in value}
+
+                pending = [("root", False, False)]
+                seen = set()
+                while pending:
+                    component_id, inherited_when, template_ref = pending.pop()
+                    if (component_id, inherited_when, template_ref) in seen:
+                        continue
+                    seen.add((component_id, inherited_when, template_ref))
+                    component = by_id[component_id]
+                    has_when = inherited_when or "when" in component
+                    props = {key: value for key, value in component.items() if key != "when"}
+                    for path in _binding_paths(props):
+                        if path.startswith("/"):
+                            bound = path.split("/", 2)[1] in ref_keys
+                        else:
+                            bound = template_ref
+                        if bound:
+                            self.assertTrue(
+                                has_when,
+                                f"{scenario}:{component_id} is bound to ref data without when",
+                            )
+
+                    children = component.get("children")
+                    if isinstance(children, list):
+                        pending.extend((child, has_when, False) for child in children)
+                    elif component["component"] == "List":
+                        pending.append(
+                            (
+                                children["template"],
+                                has_when,
+                                children["path"].split("/", 2)[1] in ref_keys,
+                            )
+                        )
+
+    def test_gym_hides_parts_that_depend_on_missing_data(self):
+        _message_text, envelope = _build("gym")
+        by_id = {component["id"]: component for component in envelope["createSurface"]["components"]}
+        self.assertEqual(by_id["title"]["text"], "Go easier today")
+        self.assertEqual(by_id["sleep-summary"]["when"], {"@path": "/sleep/summary"})
+        self.assertEqual(by_id["workout-panel"]["when"], {"@path": "/workout"})
+        self.assertEqual(by_id["due-label"]["when"], {"@path": "/tasks"})
+        self.assertEqual(by_id["due-list"]["when"], {"@path": "/tasks"})
+        self.assertEqual(by_id["start-workout"]["when"], {"@path": "/workout"})
+        self.assertEqual(by_id["move-first-task"]["when"], {"@path": "/tasks"})
 
     def test_unknown_scenario_raises(self):
         with self.assertRaisesMessage(ValueError, "unknown scenario: nope"):

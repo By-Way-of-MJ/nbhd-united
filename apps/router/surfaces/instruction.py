@@ -49,7 +49,7 @@ _ACTION_CONTEXTS = {
     "weight.log": "{kg:number}",
     "workout.start": "{workout}",
     "mission.add_steps": "{mission}",
-    "week.set_focus": '{picked:<picker binding, e.g. {"picked":{"@path":"/focus/picked"}}}',
+    "week.set_focus": '{"picked":{"@path":"/focus/picked"}}',
     "card.dismiss": "{}",
 }
 
@@ -105,14 +105,16 @@ def _component_docs() -> str:
     models = get_args(get_args(Component)[0])
     docs = []
     for model in models:
+        if model.__name__ in {"Column", "Row", "Card"}:
+            continue
         props = [
             _field_doc(model, name, field)
             for name, field in model.model_fields.items()
-            if name not in {"id", "component"}
+            if name not in {"id", "component", "when"}
         ]
         suffix = "" if model.__name__ == "Divider" else f"({','.join(props)})"
         docs.append(f"{model.__name__}{suffix}")
-    return " ".join(docs)
+    return "Column/Row/Card(children) " + " ".join(docs)
 
 
 def _ref_forms() -> str:
@@ -121,6 +123,15 @@ def _ref_forms() -> str:
 
 def _action_docs() -> str:
     return "; ".join(f"{name}{_ACTION_CONTEXTS[name]}" for name in ALLOWED_ACTION_NAMES)
+
+
+def _panel_docs() -> str:
+    return (
+        PANEL_VOCABULARY.replace("optional params: ", "")
+        .replace(" (log_table only)", "")
+        .replace(" (tasks only)", "")
+        .replace(" (timer only)", "")
+    )
 
 
 def build_small_example() -> dict:
@@ -140,6 +151,7 @@ def build_small_example() -> dict:
             id="b",
             component="Button",
             label="Tomorrow",
+            when=Binding(path="/t"),
             action=Action(event=ActionEvent(name="task.move", context={"to": "tomorrow"})),
         ),
     ]
@@ -161,22 +173,24 @@ SMALL_EXAMPLE = build_small_example()
 _EXAMPLE = json.dumps(SMALL_EXAMPLE, separators=(",", ":"))
 
 CARD_INSTRUCTION = (
-    "When: card only if user can act on live data now (day plan, check-in, "
-    "review, stuck project, workout). Most need none. <=1 "
+    "When: card only if user can act on live data (plan, check-in, "
+    "review, stuck, workout). <=1 "
     "```nbhd-card block, last, after text; never mention.\n"
     "Format: "
-    '{"version":"1.0","createSurface":{"surfaceId":"<kebab id>",'
+    '{"version":"1.0","createSurface":{"surfaceId":"<id>",'
     '"catalogId":"' + CATALOG_ID + '","components":[...],"dataModel":{...}}}. '
-    "Flat: id+component; root id=root; containers list child ids; ids "
+    "Flat: id+component; root=root; containers list ids; ids "
     "match " + COMPONENT_ID_PATTERN + " lowercase.\n"
     "Components: " + _component_docs() + ". Bindings: "
     '{"@path":"/abs"}; in a List template, relative {"@path":"field"}.\n'
-    "Panels " + PANEL_VOCABULARY + ".\n"
-    "Data: dataModel MUST be refs, never copied: "
+    'Any component may take "when":{"@path":...}; it is hidden unless that value is non-empty. '
+    "Use it on headings, panels and buttons that depend on data.\n"
+    "Panels " + _panel_docs() + ".\n"
+    "Data: dataModel = refs, never copied: "
     '{"$ref":"<form>"}, <form> = ' + _ref_forms() + ".\n"
     'Actions: {"event":{"name":<name>,"context":{...}}}: ' + _action_docs() + ".\n"
-    f"Limits: {MAX_COMPONENTS} components, depth <= {MAX_DEPTH}, "
-    f"{MAX_SURFACE_BYTES}B, <= {MAX_DATA_REFS} refs, text {MAX_TEXT_LENGTH} "
+    f"Limits: {MAX_COMPONENTS} comps, depth<={MAX_DEPTH}, "
+    f"{MAX_SURFACE_BYTES}B, <={MAX_DATA_REFS} refs, text {MAX_TEXT_LENGTH} "
     "chars, no URLs.\n"
     "Example\n```nbhd-card\n" + _EXAMPLE + "\n```\n"
 )

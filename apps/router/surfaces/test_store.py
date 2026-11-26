@@ -194,6 +194,25 @@ def known_value_tenant():
     return SimpleNamespace(id=uuid4(), pii_entity_map={"[PERSON_1]": "Alice"})
 
 
+class WhenBindingStorageTests(SimpleTestCase):
+    def test_when_binding_survives_redaction_and_rehydration(self):
+        tenant = known_value_tenant()
+        payload = surface(text="Call Alice")
+        title = next(component for component in payload["createSurface"]["components"] if component["id"] == "title")
+        title["when"] = {"@path": "/tasks"}
+
+        [redacted] = redact_surfaces([payload], tenant)
+        redacted_by_id = {component["id"]: component for component in redacted["createSurface"]["components"]}
+        self.assertEqual(redacted_by_id["title"]["text"], "Call [PERSON_1]")
+        self.assertEqual(redacted_by_id["title"]["when"], {"@path": "/tasks"})
+
+        with patch("apps.router.reply_text.finalize_outbound_text", side_effect=_upper):
+            [rehydrated] = rehydrate_surfaces([redacted], {}, tenant_id=None)
+        rehydrated_by_id = {component["id"]: component for component in rehydrated["createSurface"]["components"]}
+        self.assertEqual(rehydrated_by_id["title"]["text"], "CALL [PERSON_1]")
+        self.assertEqual(rehydrated_by_id["title"]["when"], {"@path": "/tasks"})
+
+
 class RedactSurfacesTests(SimpleTestCase):
     def test_every_user_visible_string_is_redacted_but_code_entries_survive(self):
         tenant = known_value_tenant()
