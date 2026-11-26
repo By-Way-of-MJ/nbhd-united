@@ -55,6 +55,49 @@ def _binding_paths(value):
             yield from _binding_paths(item)
 
 
+def _when_path(component: dict) -> str | None:
+    binding = component.get("when")
+    if isinstance(binding, dict) and set(binding) == {"@path"}:
+        return binding["@path"]
+    return None
+
+
+def _gate_covers(gates, key: str) -> bool:
+    root = f"/{key}"
+    return any(path == root or path.startswith(f"{root}/") for path in gates if path.startswith("/"))
+
+
+def _ungated_ref_bindings(components: list[dict], data_model: dict) -> list[str]:
+    """Report bindings to ref-backed data whose own/ancestor ``when`` misses the key."""
+    by_id = {component["id"]: component for component in components}
+    ref_keys = {key for key, value in data_model.items() if isinstance(value, dict) and "$ref" in value}
+    violations: list[str] = []
+    pending: list[tuple[str, frozenset[str], str | None]] = [("root", frozenset(), None)]
+    seen = set()
+    while pending:
+        component_id, inherited, template_key = pending.pop()
+        state = (component_id, inherited, template_key)
+        if state in seen:
+            continue
+        seen.add(state)
+        component = by_id[component_id]
+        own = _when_path(component)
+        gates = inherited | ({own} if own else set())
+        props = {key: value for key, value in component.items() if key != "when"}
+        for path in _binding_paths(props):
+            key = path.split("/", 2)[1] if path.startswith("/") else template_key
+            if key in ref_keys and not _gate_covers(gates, key):
+                violations.append(f"{component_id}: {path} is not gated on /{key}")
+
+        children = component.get("children")
+        if isinstance(children, list):
+            pending.extend((child, gates, None) for child in children)
+        elif component["component"] == "List":
+            path_key = children["path"].split("/", 2)[1]
+            pending.append((children["template"], gates, path_key if path_key in ref_keys else None))
+    return violations
+
+
 class DemoSurfaceBuildTests(SimpleTestCase):
     def _assert_refs_and_static_values_only(self, node) -> None:
         if isinstance(node, dict):
@@ -101,47 +144,28 @@ class DemoSurfaceBuildTests(SimpleTestCase):
                 if scenario == "stuck":
                     self.assertEqual(refs, [f"mission:{MISSION_ID}"])
 
-    def test_every_ref_bound_component_has_when_on_itself_or_an_ancestor(self):
+    def test_every_ref_bound_component_is_gated_on_its_data_key(self):
         for scenario in SCENARIOS:
             with self.subTest(scenario=scenario):
                 _message_text, envelope = _build(scenario)
                 body = envelope["createSurface"]
-                by_id = {component["id"]: component for component in body["components"]}
-                data_model = body.get("dataModel", {})
-                ref_keys = {key for key, value in data_model.items() if isinstance(value, dict) and "$ref" in value}
+                violations = _ungated_ref_bindings(body["components"], body.get("dataModel", {}))
+                self.assertEqual(violations, [], f"{scenario}: wrong or missing when gate")
 
-                pending = [("root", False, False)]
-                seen = set()
-                while pending:
-                    component_id, inherited_when, template_ref = pending.pop()
-                    if (component_id, inherited_when, template_ref) in seen:
-                        continue
-                    seen.add((component_id, inherited_when, template_ref))
-                    component = by_id[component_id]
-                    has_when = inherited_when or "when" in component
-                    props = {key: value for key, value in component.items() if key != "when"}
-                    for path in _binding_paths(props):
-                        if path.startswith("/"):
-                            bound = path.split("/", 2)[1] in ref_keys
-                        else:
-                            bound = template_ref
-                        if bound:
-                            self.assertTrue(
-                                has_when,
-                                f"{scenario}:{component_id} is bound to ref data without when",
-                            )
+    def test_stuck_root_hides_without_mission(self):
+        _message_text, envelope = _build("stuck")
+        by_id = {component["id"]: component for component in envelope["createSurface"]["components"]}
+        self.assertEqual(by_id["root"]["when"], {"@path": "/mission"})
 
-                    children = component.get("children")
-                    if isinstance(children, list):
-                        pending.extend((child, has_when, False) for child in children)
-                    elif component["component"] == "List":
-                        pending.append(
-                            (
-                                children["template"],
-                                has_when,
-                                children["path"].split("/", 2)[1] in ref_keys,
-                            )
-                        )
+    def test_guard_reports_a_gate_on_the_wrong_data_key(self):
+        _message_text, envelope = _build("gym")
+        body = envelope["createSurface"]
+        components = [dict(component) for component in body["components"]]
+        for component in components:
+            if component["id"] == "start-workout":
+                component["when"] = {"@path": "/tasks"}
+        violations = _ungated_ref_bindings(components, body["dataModel"])
+        self.assertTrue(any(item.startswith("start-workout:") for item in violations), violations)
 
     def test_gym_hides_parts_that_depend_on_missing_data(self):
         _message_text, envelope = _build("gym")
