@@ -335,6 +335,8 @@ CHAT_SHAPE_TENANT_IDS = env("CHAT_SHAPE_TENANT_IDS", default="")
 # Tool/plugin panels: set ONLY after verifying the running image has the #1638
 # journal-tools manifest (panelsEnabled). Separate from Django-only shape panels.
 CHAT_PANELS_TOOL_TENANT_IDS = env("CHAT_PANELS_TOOL_TENANT_IDS", default="")
+# A2UI surfaces in chat (rollout gate; comma-separated tenant UUIDs or *; empty = nobody)
+CHAT_SURFACES_TENANT_IDS = env("CHAT_SURFACES_TENANT_IDS", default="")
 CHAT_SHAPE_PANELS = env(
     "CHAT_SHAPE_PANELS", default="sleep,schedule,training_week,workout,timer,log_table,journal_table,project"
 )

@@ -24,7 +24,7 @@ a party (IDOR defeated by construction, design §4.5).
 from __future__ import annotations
 
 import contextlib
-from datetime import timedelta
+from datetime import date, timedelta
 
 from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -1468,6 +1468,72 @@ def task_project_refs(tenant, step_ids, goal_ids) -> tuple[dict, dict]:
                     [previous_tenant or "", previous_service or ""],
                 )
     return step_goals, titles
+
+
+def mission_summary(tenant, mission_id) -> dict | None:
+    """Owner-facing mission summary on a transaction-pinned tenant backend.
+
+    ``SharedGoal``, ``SharedGoalMembership`` and ``SharedGoalStep`` are FORCE RLS
+    for ``app_user`` (friends 0015). Over the transaction-mode pooler the
+    request's session-scoped GUC is not present on later statements, so the
+    ownership check and the step read share one transaction that re-asserts the
+    tenant context — the same discipline as ``task_project_refs``. Returns
+    ``{id, title, next_step, steps_open}``, or ``None`` when the mission does not
+    exist or this tenant is not an active member.
+    """
+    from apps.tenants.middleware import set_rls_context
+
+    from .models import SharedGoalStep
+
+    with transaction.atomic():
+        previous_tenant = previous_service = ""
+        if connection.vendor == "postgresql":
+            # Nested atomic is a savepoint: remember the caller's GUC so the
+            # SET LOCAL below never outlives this lookup.
+            with connection.cursor() as cur:
+                cur.execute("SELECT current_setting('app.tenant_id', true), current_setting('app.service_role', true)")
+                previous_tenant, previous_service = cur.fetchone()
+            set_rls_context(tenant_id=_tenant_id(tenant), as_tenant=True)
+        summary = None
+        goal = get_mission(mission_id)
+        if goal is not None:
+            membership = mission_memberships().filter(shared_goal=goal, tenant=tenant, status="active").first()
+            if membership is not None:
+                steps = list(
+                    SharedGoalStep.objects.filter(shared_goal=goal).values("id", "title", "status", "due_date", "order")
+                )
+                open_steps = [step for step in steps if step["status"] in ("open", "in_progress")]
+                open_steps.sort(
+                    key=lambda step: (
+                        step["due_date"] is None,
+                        step["due_date"] or date.max,
+                        step["order"],
+                        step["title"],
+                    )
+                )
+                next_step = None
+                if open_steps:
+                    step = open_steps[0]
+                    next_step = {
+                        "id": str(step["id"]),
+                        "title": step["title"],
+                        "due_date": step["due_date"].isoformat() if step["due_date"] else None,
+                    }
+                summary = {
+                    "id": str(goal.id),
+                    "title": goal.title,
+                    "next_step": next_step,
+                    "steps_open": len(open_steps),
+                }
+        # Same restore discipline as backstop_service_context: rollback already
+        # undoes SET LOCAL, so never issue restoration SQL on a broken txn.
+        if connection.vendor == "postgresql" and not connection.needs_rollback:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('app.tenant_id', %s, true), set_config('app.service_role', %s, true)",
+                    [previous_tenant or "", previous_service or ""],
+                )
+    return summary
 
 
 def project_notes(goal, *, viewer=None):

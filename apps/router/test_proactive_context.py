@@ -23,15 +23,20 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 
+from apps.crypto.keys import mint_and_wrap_dek
+from apps.orchestrator.azure_client import _MOCK_KEK_REGISTRY
+from apps.pii.redactor import RedactionOutcome, as_confirmed
 from apps.router.cron_delivery import _rate_counts
 from apps.router.models import ProactiveOutbound
 from apps.router.proactive_context import (
+    A2UI_DEMO_JOB_NAME,
     parse_markdown_items,
     record_proactive_outbound,
     surface_proactive_context,
 )
 from apps.tenants.models import Tenant
 from apps.tenants.test_utils import seed_internal_key
+from apps.transcripts.models import TranscriptEvent
 
 
 def _large_table(rows: int = 26) -> str:
@@ -225,6 +230,49 @@ class RecordProactiveOutboundTest(_TenantFixture):
         self.assertFalse(Document.objects.filter(tenant=self.tenant).exists())
 
 
+class ProactiveRecallCaptureTest(_TenantFixture):
+    """Recall capture follows assistant memory, not operator demo fixtures."""
+
+    def setUp(self):
+        super().setUp()
+        mock_patcher = patch("apps.orchestrator.azure_client._is_mock", return_value=True)
+        mock_patcher.start()
+        self.addCleanup(mock_patcher.stop)
+        self.addCleanup(_MOCK_KEK_REGISTRY.clear)
+        self.tenant.recall_capture_enabled = True
+        self.tenant.save(update_fields=["recall_capture_enabled"])
+        mint_and_wrap_dek(self.tenant)
+
+    def test_a2ui_demo_row_skips_capture_while_normal_row_still_captures(self):
+        confirmed = as_confirmed(RedactionOutcome("captured assistant text", True, "redacted"))
+        assert confirmed is not None
+
+        with patch("apps.pii.redactor.confirm_assistant_output", return_value=confirmed) as confirm:
+            demo = record_proactive_outbound(
+                tenant=self.tenant,
+                channel="app",
+                channel_user_id="u-app",
+                message_text="operator demo card",
+                job_name=A2UI_DEMO_JOB_NAME,
+            )
+            assert demo is not None
+            confirm.assert_not_called()
+            self.assertFalse(TranscriptEvent.objects.filter(tenant=self.tenant).exists())
+
+            normal = record_proactive_outbound(
+                tenant=self.tenant,
+                channel="app",
+                channel_user_id="u-app",
+                message_text="real proactive nudge",
+            )
+            assert normal is not None
+
+        event = TranscriptEvent.objects.get(tenant=self.tenant)
+        self.assertEqual(event.source_type, TranscriptEvent.SourceType.PROACTIVE)
+        self.assertEqual(event.source_event_id, str(normal.id))
+        self.assertEqual(event.role, TranscriptEvent.Role.ASSISTANT)
+
+
 class SurfaceProactiveContextTest(_TenantFixture):
     def test_empty_when_no_rows(self):
         block = surface_proactive_context(tenant=self.tenant)
@@ -386,6 +434,32 @@ class SurfaceProactiveContextTest(_TenantFixture):
         self.assertEqual(surface_proactive_context(tenant=self.tenant), "")
         row.refresh_from_db()
         self.assertIsNone(row.consumed_at)
+
+    def test_a2ui_demo_rows_are_not_resurfaced_into_context(self):
+        # Operator demo cards are app-feed test rows (job_name="a2ui_demo"),
+        # not real assistant context. Push/feed rendering is untouched; only the
+        # model-facing [earlier-from-you] block must ignore them.
+        real = record_proactive_outbound(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="u-app",
+            message_text="real proactive nudge",
+        )
+        demo = record_proactive_outbound(
+            tenant=self.tenant,
+            channel="app",
+            channel_user_id="u-app",
+            message_text="operator demo card",
+            job_name="a2ui_demo",
+        )
+        assert real is not None
+        assert demo is not None
+
+        block = surface_proactive_context(tenant=self.tenant)
+        self.assertIn("real proactive nudge", block)
+        self.assertNotIn("operator demo card", block)
+        demo.refresh_from_db()
+        self.assertIsNone(demo.consumed_at)
 
     def test_other_tenant_rows_not_surfaced(self):
         # Tenant-wide scoping stops at the tenant boundary — a different

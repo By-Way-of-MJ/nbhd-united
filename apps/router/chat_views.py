@@ -514,6 +514,23 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
     from apps.router.journal_link import rehydrate_journal_link
 
     journal_link = rehydrate_journal_link(msg.journal_link, entity_map, tenant_id=msg.tenant_id, channel="ios_detail")
+    # A2UI surfaces are a gated rollout: only tenants on CHAT_SURFACES_TENANT_IDS
+    # ever see them, and the key is always present (``[]`` when empty or gated
+    # off). Stored surfaces rest placeholder-space, so rehydrate here via the
+    # SAME shared helper the ?since= feed calls; passing the tenant lets that
+    # helper resolve live dataModel refs fresh for this request.
+    from apps.router.chat_gates import chat_surfaces_enabled
+    from apps.router.surfaces.store import rehydrate_surfaces
+
+    surfaces = []
+    if msg.a2ui:
+        # Only touch the tenant FK for rows that actually carry surfaces: thread
+        # views load plain rows (no select_related), so an unconditional
+        # getattr(msg, "tenant") is one extra SELECT tenants for every message
+        # of every tenant. The gate is irrelevant when there is nothing to gate.
+        tenant = getattr(msg, "tenant", None)
+        if chat_surfaces_enabled(tenant):
+            surfaces = rehydrate_surfaces(msg.a2ui, entity_map, tenant_id=msg.tenant_id, tenant=tenant)
     return {
         "client_msg_id": msg.client_msg_id,
         "thread_id": str(msg.thread_id),
@@ -569,6 +586,9 @@ def _serialize_message(msg: AppChatMessage, *, entity_map=None, user_text: Redac
         # (valid) marker. Shared source of truth with the ?since= feed.
         "journal_link": journal_link,
         "panels": rehydrate_panels(msg.panels, entity_map, tenant_id=msg.tenant_id),
+        # Validated A2UI v1.0 surface envelopes (nbhd/v1 catalog), REHYDRATED
+        # above; always present, ``[]`` when empty or the tenant is gated off.
+        "a2ui": surfaces,
     }
 
 

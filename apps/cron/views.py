@@ -399,6 +399,8 @@ TASK_MAP = {
     # residue and bounds FAILED-row retention. See
     # pending_queue.cleanup_stale_pending_messages_task.
     "cleanup_stale_pending_messages": "apps.router.pending_queue.cleanup_stale_pending_messages_task",
+    # Operator-fired A2UI demo card for a gated tenant (layout + live refs only).
+    "post_demo_surface": "apps.router.surfaces.demo.post_demo_surface_task",
     # Atomic fleet-bump fan-out (rollout-atomic-bump endpoint). Per-tenant
     # version + config + image bump that survives gunicorn 300s budget
     # for any fleet size. Differs from apply_single_tenant_image (image-only,

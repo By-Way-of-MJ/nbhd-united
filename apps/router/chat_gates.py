@@ -47,6 +47,11 @@ def chat_panels_tool_enabled(tenant) -> bool:
     return _tenant_allowed(tenant, "CHAT_PANELS_TOOL_TENANT_IDS")
 
 
+def chat_surfaces_enabled(tenant) -> bool:
+    """A2UI surfaces attached to chat messages reach the iOS app."""
+    return _tenant_allowed(tenant, "CHAT_SURFACES_TENANT_IDS")
+
+
 def talk_route_enabled(tenant) -> bool:
     """Talk-mode ack/quick-read router (Django-only; image-independent)."""
     return _tenant_allowed(tenant, "TALK_ROUTE_TENANT_IDS")

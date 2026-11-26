@@ -78,21 +78,24 @@ class _PanelCandidates(RootModel[list[Any]]):
     model_config = ConfigDict(strict=True)
 
 
-def validate_panels(value: Any) -> list[dict]:
+def validate_panels(value: Any, *, log: bool = True) -> list[dict]:
     if value is None:
         return []
     if not isinstance(value, list):
-        logger.warning("panels_dropped reason=not_list")
+        if log:
+            logger.warning("panels_dropped reason=not_list")
         return []
     valid = []
     for candidate in value:
         try:
             panel = Panel.model_validate(candidate)
         except ValidationError:
-            logger.warning("panel_dropped reason=invalid_schema")
+            if log:
+                logger.warning("panel_dropped reason=invalid_schema")
             continue
         if len(valid) == MAX_PANELS:
-            logger.warning("panels_dropped reason=limit")
+            if log:
+                logger.warning("panels_dropped reason=limit")
             break
         valid.append(panel.model_dump(mode="json", exclude_none=True))
     return valid

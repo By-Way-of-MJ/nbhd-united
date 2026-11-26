@@ -70,6 +70,11 @@ UNCONSUMED_WINDOW_HOURS = 168  # 7 days
 # crons fired before the user replied" tail.
 DEFAULT_LIMIT = 3
 
+# Operator demo surfaces are app-feed fixtures, not assistant memory. The demo
+# module imports this name so the row label and the recall-capture skip cannot
+# drift apart.
+A2UI_DEMO_JOB_NAME = "a2ui_demo"
+
 # Markdown list-item patterns. Order matters — numbered first so a line
 # like "1. foo" isn't matched as a sub-item of an outer bullet.
 _NUMBERED_PATTERN = re.compile(r"^\s*\d+[.)]\s+(.+)$")
@@ -104,6 +109,7 @@ def record_proactive_outbound(
     journal_link: dict | None = None,
     quick_replies: list[str] | None = None,
     panels: list[dict] | None = None,
+    a2ui: list[dict] | None = None,
     artifact_dedup_key: str | None = None,
     thread_id=None,
     defer_push: bool = False,
@@ -133,7 +139,8 @@ def record_proactive_outbound(
         panels = prepare_panels(tenant, panels, tool=True)
         transcript_redaction = None
         transcript_quarantine = None
-        if getattr(tenant, "recall_capture_enabled", False):
+        capture_recall = getattr(tenant, "recall_capture_enabled", False) and job_name != A2UI_DEMO_JOB_NAME
+        if capture_recall:
             try:
                 from apps.pii.redactor import RedactionOutcome, confirm_assistant_output
                 from apps.transcripts.capture import encrypt_transcript_text
@@ -192,6 +199,7 @@ def record_proactive_outbound(
                 # deterministic model-facing offer set below.
                 quick_replies=quick_replies,
                 panels=panels or None,
+                a2ui=a2ui,
             )
             if transcript_redaction is not None or transcript_quarantine is not None:
                 try:
@@ -475,12 +483,14 @@ def surface_proactive_context(
     # Tenant-scoped — the (tenant, created_at) index (proactive_tenant_created_idx)
     # backs the range scan below. User-delivery channels are not distinguished: one
     # tenant = one human, and switching transports must not break continuity.
-    # Internal eval evidence and thread-targeted sub-agent results are excluded;
-    # the latter already landed in their authoritative app thread.
+    # Internal eval evidence, thread-targeted sub-agent results, and operator A2UI
+    # demo cards are excluded; the latter are test rows, never real assistant
+    # context, even though they still render in the app feed.
     base = (
         ProactiveOutbound.objects.filter(tenant=tenant)
         .exclude(channel=ProactiveOutbound.Channel.EVAL)
         .exclude(job_name="_subagent_result")
+        .exclude(job_name="a2ui_demo")
     )
 
     # ONE query over both consumption states (was two sequential SELECTs — a

@@ -390,6 +390,11 @@ class ProactiveOutbound(models.Model):
     panels = models.JSONField(
         null=True, blank=True, help_text="Live panel references attached to the assistant message."
     )
+    a2ui = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Validated A2UI v1.0 surface envelopes (nbhd/v1 catalog) attached to the assistant message.",
+    )
 
     quick_replies = models.JSONField(null=True, blank=True, default=None)
 
@@ -939,6 +944,11 @@ class AppChatMessage(models.Model):
     # now; Telegram/LINE strip the marker but never populate this field.
     panels = models.JSONField(
         null=True, blank=True, help_text="Live panel references attached to the assistant message."
+    )
+    a2ui = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Validated A2UI v1.0 surface envelopes (nbhd/v1 catalog) attached to the assistant message.",
     )
 
     quick_replies = models.JSONField(null=True, blank=True, default=None)
