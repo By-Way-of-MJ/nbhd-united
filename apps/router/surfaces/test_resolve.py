@@ -85,6 +85,11 @@ class ResolveRefsTests(TestCase):
         self._task(title="Today", due_date=self.today)
         self.assertEqual([row["id"] for row in self._resolve("tasks:overdue")], [str(late.id)])
 
+    def test_tasks_overdue_includes_eight_days_ago_and_excludes_today(self):
+        old = self._task(title="Old", due_date=self.today - timedelta(days=8))
+        self._task(title="Today", due_date=self.today)
+        self.assertEqual([row["id"] for row in self._resolve("tasks:overdue")], [str(old.id)])
+
     def test_tasks_this_week_is_the_local_calendar_week(self):
         monday = self.today - timedelta(days=self.today.weekday())
         inside = self._task(title="Inside", due_date=monday)

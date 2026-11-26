@@ -92,15 +92,21 @@ def _task_list_filter(tenant, list_name: str) -> tuple[dict, bool]:
 
     Date boundaries come from ``apps.common.windows`` in the tenant's local
     timezone — the same "tenant-local date" the REST list uses — so no date
-    math is reinvented here.
+    math is reinvented here. ``overdue`` is the exception: it is an open-ended
+    "strictly before today" range, so it uses ``tenant_today`` directly.
     """
     if list_name == "open":
         return {"status": "open"}, False
+    if list_name == "overdue":
+        # Strictly before the tenant-local today, with no lower bound, oldest
+        # first — a task overdue by a week must still show up.
+        return {
+            "due_before_strict": tenant_today(tenant).isoformat(),
+            "order_by": "due_date",
+        }, True
     tz_name = tenant_tz_name(tenant)
     if list_name == "due_today":
         window = resolve_window(Window(kind="today"), tz_name)
-    elif list_name == "overdue":
-        window = resolve_window(Window(kind="yesterday"), tz_name)
     else:  # this_week
         window = resolve_window(Window(kind="this_week"), tz_name)
     if window is None:
@@ -126,14 +132,17 @@ def _tasks(tenant, list_name: str) -> list[dict]:
         if value:
             qs = qs.filter(**{field: value})
     due_before = _parse_iso_date(params.get("due_before"), "due_before")
+    due_before_strict = _parse_iso_date(params.get("due_before_strict"), "due_before_strict")
     due_after = _parse_iso_date(params.get("due_after"), "due_after")
     if due_before:
         qs = qs.filter(due_date__lte=due_before)
+    if due_before_strict:
+        qs = qs.filter(due_date__lt=due_before_strict)
     if due_after:
         qs = qs.filter(due_date__gte=due_after)
     if open_only:
         qs = qs.exclude(status__in=[Task.Status.DONE, Task.Status.SKIPPED])
-    qs = qs.order_by("-updated_at")
+    qs = qs.order_by(params.get("order_by", "-updated_at"))
     tasks = list(qs[:MAX_TASKS])
     return [_task_row(row) for row in TaskSerializer(tasks, many=True, context=_owner_ctx(tenant, tasks)).data]
 
