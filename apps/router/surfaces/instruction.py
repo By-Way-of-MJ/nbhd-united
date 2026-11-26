@@ -125,15 +125,6 @@ def _action_docs() -> str:
     return "; ".join(f"{name}{_ACTION_CONTEXTS[name]}" for name in ALLOWED_ACTION_NAMES)
 
 
-def _panel_docs() -> str:
-    return (
-        PANEL_VOCABULARY.replace("optional params: ", "")
-        .replace(" (log_table only)", "")
-        .replace(" (tasks only)", "")
-        .replace(" (timer only)", "")
-    )
-
-
 def build_small_example() -> dict:
     """Build the prompt example from the catalog models, not hand-written JSON."""
     components = [
@@ -173,8 +164,8 @@ SMALL_EXAMPLE = build_small_example()
 _EXAMPLE = json.dumps(SMALL_EXAMPLE, separators=(",", ":"))
 
 CARD_INSTRUCTION = (
-    "When: card only if user can act on live data (plan, check-in, "
-    "review, stuck, workout). <=1 "
+    "When: card only if user can act on live data now (day plan, check-in, "
+    "review, stuck project, workout). Most replies need NO card. <=1 "
     "```nbhd-card block, last, after text; never mention.\n"
     "Format: "
     '{"version":"1.0","createSurface":{"surfaceId":"<id>",'
@@ -185,7 +176,7 @@ CARD_INSTRUCTION = (
     '{"@path":"/abs"}; in a List template, relative {"@path":"field"}.\n'
     'Any component may take "when":{"@path":...}; it is hidden unless that value is non-empty. '
     "Use it on headings, panels and buttons that depend on data.\n"
-    "Panels " + _panel_docs() + ".\n"
+    "Panels " + PANEL_VOCABULARY + ".\n"
     "Data: dataModel = refs, never copied: "
     '{"$ref":"<form>"}, <form> = ' + _ref_forms() + ".\n"
     'Actions: {"event":{"name":<name>,"context":{...}}}: ' + _action_docs() + ".\n"

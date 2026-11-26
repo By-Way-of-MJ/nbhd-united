@@ -33,7 +33,7 @@ from apps.router.surfaces.instruction import (
 )
 from apps.router.surfaces.validate import SurfaceError, validate_surface
 
-MAX_INSTRUCTION_CHARS = 2600
+MAX_INSTRUCTION_CHARS = 2900
 MAX_EXAMPLE_CHARS = 700
 
 
@@ -188,6 +188,9 @@ class CardInstructionTests(SimpleTestCase):
 
     def test_instruction_fits_prompt_budget(self):
         self.assertLessEqual(len(CARD_INSTRUCTION), MAX_INSTRUCTION_CHARS)
+
+    def test_instruction_says_most_replies_need_no_card(self):
+        self.assertIn("Most replies need NO card", CARD_INSTRUCTION)
 
     def test_instruction_ends_with_a_newline(self):
         self.assertTrue(CARD_INSTRUCTION.endswith("\n"))
