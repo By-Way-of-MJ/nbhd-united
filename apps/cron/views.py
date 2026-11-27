@@ -278,6 +278,7 @@ TASK_MAP = {
     "project_due_nudges": "apps.friends.tasks.project_due_nudges_task",
     # Hourly Jev "worth a message?" shadow check — log only, never sends.
     "jev_heartbeat_shadow": "apps.orchestrator.jev_heartbeat_shadow.jev_heartbeat_shadow_task",
+    "check_degradation": "apps.common.degradation.check_degradation_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)
@@ -2206,7 +2207,9 @@ def run_health_check(request):
             if len(confirmed) > 10:
                 lines.append(f"  ... and {len(confirmed) - 10} more")
 
-            status = _send_alert_via_pushover("\n".join(lines))
+            from apps.common.operator_alert import send_operator_alert
+
+            status = send_operator_alert("\n".join(lines))
             # Cooldown policy:
             #   delivered / undeliverable -> full 30-min cooldown (it landed, or
             #     retrying won't fix it: missing config / CF-Access 302 / 4xx).
