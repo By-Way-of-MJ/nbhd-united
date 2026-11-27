@@ -10,6 +10,10 @@ from pydantic import ValidationError
 
 from apps.common import jev
 
+LIVE_RESPONSE = """
+{"model":"typesafe/jev-1.13-20260917","answers":{"rain":{"type":"choice","choice":"yes","probabilities":{"yes":0.99,"no":0.01},"confidence":0.98}},"usage":{"input_tokens":312,"output_tokens":31,"cost":0.000013104,"is_byok":false,"cost_details":{"upstream_inference_cost":0.000013104,"upstream_inference_prompt_cost":0.000013104,"upstream_inference_completions_cost":0}},"id":"gen-dec-1795747018-azfMsOaHHQ5HKWWnsEzE","provider":"TypeSafe"}
+"""
+
 
 def envelope(answers):
     return {
@@ -72,17 +76,56 @@ class JevTests(SimpleTestCase):
                 "model": jev.JEV_MODEL,
                 "state": {"latest_message": "[PERSON_1]"},
                 "questions": {key: value.model_dump(exclude_none=True) for key, value in self.questions.items()},
+                "provider": {"zdr": True, "data_collection": "deny"},
             },
             timeout=(2, 4),
             allow_redirects=False,
         )
+
+    def test_live_response_with_new_usage_fields_parses(self):
+        parsed = jev.DecisionResponse.model_validate_json(LIVE_RESPONSE)
+        self.assertEqual(parsed.answers["rain"].choice, "yes")
+        self.assertEqual(parsed.usage.input_tokens, 312)
+        questions = {"rain": jev.ChoiceQuestion(instructions="Rain?", criteria={"yes": "Yes", "no": "No"})}
+        with patch("apps.common.jev._post", return_value=Mock(status_code=200, text=LIVE_RESPONSE)):
+            result = jev.decide({"latest_message": "[PERSON_1]"}, questions)
+        self.assertEqual(result.answers["rain"].choice, "yes")
+
+    def test_unknown_top_level_and_answer_fields_are_ignored(self):
+        data = copy.deepcopy(self.data)
+        data["unknown_top_level"] = {"raw": "ignored"}
+        data["usage"].update(is_byok=False, cost_details={"upstream_inference_cost": 0.00001})
+        data["answers"]["choice"]["unknown_answer_field"] = {"raw": "ignored"}
+        result, _ = self.call(data)
+        self.assertEqual(result.answers["choice"].choice, "yes")
+
+    def test_question_models_still_reject_extra_keys(self):
+        with self.assertRaises(ValidationError):
+            jev.ChoiceQuestion(instructions="x", criteria={"yes": "Yes", "no": "No"}, raw="private sentinel")
+        with self.assertRaises(ValidationError):
+            jev.NoulQuestion(instructions="x", raw="private sentinel")
+        with self.assertRaises(ValidationError):
+            jev.ScoreQuestion(instructions="x", criteria=["None", "Some"], raw="private sentinel")
+
+    def test_validation_failure_logs_class_and_paths_without_state(self):
+        data = copy.deepcopy(self.data)
+        data["answers"]["choice"]["probabilities"] = {"yes": 1.0, "none": 0.5}
+        with (
+            patch("apps.common.jev._post", return_value=Mock(status_code=200, text=json.dumps(data))),
+            self.assertLogs("apps.common.jev", level="WARNING") as logs,
+            self.assertRaises(jev.JevUnavailable),
+        ):
+            jev.decide("SECRET_STATE_VALUE", self.questions)
+        output = "\n".join(logs.output)
+        self.assertIn("ValidationError", output)
+        self.assertIn("answers.choice", output)
+        self.assertNotIn("SECRET_STATE_VALUE", output)
 
     def test_invalid_responses_fail_closed(self):
         mutations = {
             "missing": lambda d: d["answers"].pop("noul"),
             "extra answer": lambda d: d["answers"].update(extra=d["answers"]["noul"]),
             "wrong type": lambda d: d["answers"].update(choice={"type": "noul", "noul": 1.0}),
-            "extra field": lambda d: d["answers"]["choice"].update(raw="private sentinel"),
             "string float": lambda d: d["answers"]["choice"].update(confidence="1.0"),
             "bool float": lambda d: d["answers"]["noul"].update(noul=True),
             "nan": lambda d: d["answers"]["choice"]["probabilities"].update(yes=float("nan")),
