@@ -30,6 +30,7 @@ Design: ``ANALYSIS_proactive_everything.md`` (rev 2). Plan:
 from __future__ import annotations
 
 import logging
+import re
 import zoneinfo
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -130,8 +131,9 @@ TZ_COUNTRY.update(
 )
 
 # A calendar entry "looks like a meeting with other people" when its text has
-# one of these. Personal blocks (gym, dinner) never trigger heads-ups.
-_MEETING_MARKERS = (
+# one of these (links match anywhere, words on word boundaries, so "recall" is
+# not "call"). Personal blocks (gym, dinner) never trigger heads-ups.
+_MEETING_LINKS = (
     "zoom.us",
     "meet.google",
     "teams.microsoft",
@@ -140,14 +142,8 @@ _MEETING_MARKERS = (
     "whereby",
     "calendly",
     "cal.com",
-    "meeting",
-    " call",
-    "call ",
-    " sync",
-    "interview",
-    " with ",
-    "1:1",
 )
+_MEETING_WORDS = re.compile(r"\b(meeting|call|sync|interview|with|1:1|standup|catch[- ]?up)\b", re.IGNORECASE)
 
 
 # ── gates ────────────────────────────────────────────────────────────────────
@@ -221,8 +217,9 @@ def outside_usual_hours(start_local: datetime) -> bool:
 
 
 def looks_like_meeting(*texts: str) -> bool:
-    blob = " " + " ".join(t or "" for t in texts).lower() + " "
-    return any(marker in blob for marker in _MEETING_MARKERS)
+    blob = " ".join(t or "" for t in texts)
+    lowered = blob.lower()
+    return any(link in lowered for link in _MEETING_LINKS) or bool(_MEETING_WORDS.search(blob))
 
 
 # ── detection ────────────────────────────────────────────────────────────────
@@ -446,17 +443,27 @@ def _local_day_start(now: datetime, tz) -> datetime:
 def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
     from apps.common.tenant_tz import tenant_tz
     from apps.router.cron_delivery import resolve_user_channel
-    from apps.router.models import ProactiveSignal
+    from apps.router.models import ProactiveOutbound, ProactiveSignal
     from apps.router.proactive_context import record_proactive_outbound
 
     now = now or timezone.now()
     Status = ProactiveSignal.Status
     summary = {"expired": 0, "sent": 0, "dropped": 0, "held": 0}
 
-    # Crash recovery: a claim older than STALE_CLAIM goes back to pending.
-    ProactiveSignal.objects.filter(status=Status.SENDING, claimed_at__lt=now - STALE_CLAIM).update(
-        status=Status.PENDING, claimed_at=None
-    )
+    # Crash recovery for claims older than STALE_CLAIM: if the heads-up row was
+    # already written after the claim, the run died before marking SENT, so mark
+    # it SENT now; otherwise return it to pending. Never sends twice.
+    for stale in ProactiveSignal.objects.filter(status=Status.SENDING, claimed_at__lt=now - STALE_CLAIM):
+        delivered = ProactiveOutbound.objects.filter(
+            tenant_id=stale.tenant_id, job_name=JOB_NAME, created_at__gte=stale.claimed_at
+        ).exists()
+        ProactiveSignal.objects.filter(pk=stale.pk, status=Status.SENDING).update(
+            **(
+                {"status": Status.SENT, "handled_at": now, "outcome_reason": "recovered"}
+                if delivered
+                else {"status": Status.PENDING, "claimed_at": None}
+            )
+        )
     summary["expired"] = ProactiveSignal.objects.filter(status=Status.PENDING, expires_at__lte=now).update(
         status=Status.EXPIRED, handled_at=now, outcome_reason="event_started"
     )
@@ -480,6 +487,21 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
             summary["dropped"] += n
             logger.info("proactive_signal tenant=%s outcome=dropped reason=disabled n=%d", tid, n)
             continue
+        # Re-check each signal against the live calendar before claiming it: a
+        # meeting moved or deleted since detection must not get a stale heads-up.
+        fresh, stale = [], []
+        for signal in signals:
+            (fresh if still_true(tenant, signal) else stale).append(signal)
+        if stale:
+            n = ProactiveSignal.objects.filter(pk__in=[s.pk for s in stale], status=Status.PENDING).update(
+                status=Status.DROPPED, handled_at=now, outcome_reason="event_changed"
+            )
+            summary["dropped"] += n
+            logger.info("proactive_signal tenant=%s outcome=dropped reason=event_changed n=%d", tid, n)
+
+        signals = fresh
+        if not signals:
+            continue
         tz = tenant_tz(tenant)
         if not in_delivery_window(tenant, now.astimezone(tz)):
             summary["held"] += len(signals)
@@ -502,20 +524,8 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
             logger.info("proactive_signal tenant=%s outcome=dropped reason=channel_unsupported n=%d", tid, n)
             continue
 
-        # Re-check each signal against the live calendar before claiming it: a
-        # meeting moved or deleted since detection must not get a stale heads-up.
-        fresh, stale = [], []
-        for signal in signals:
-            (fresh if still_true(tenant, signal) else stale).append(signal)
-        if stale:
-            n = ProactiveSignal.objects.filter(pk__in=[s.pk for s in stale], status=Status.PENDING).update(
-                status=Status.DROPPED, handled_at=now, outcome_reason="event_changed"
-            )
-            summary["dropped"] += n
-            logger.info("proactive_signal tenant=%s outcome=dropped reason=event_changed n=%d", tid, n)
-
         claimed = []
-        for signal in fresh[:remaining]:
+        for signal in signals[:remaining]:
             if ProactiveSignal.objects.filter(pk=signal.pk, status=Status.PENDING).update(
                 status=Status.SENDING, claimed_at=now
             ):
@@ -524,29 +534,28 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
             continue
         ids = [s.pk for s in claimed]
         try:
-            # One transaction: the feed row and SENT commit together, and the
-            # push waits for that commit (defer_push). A crash in between
-            # rolls both back, so a signal can never be delivered twice.
-            with transaction.atomic():
-                row = record_proactive_outbound(
-                    tenant=tenant,
-                    channel="app",
-                    channel_user_id=str(user.id),
-                    message_text=render_message(claimed),
-                    job_name=JOB_NAME,
-                    defer_push=True,
-                )
-                if row is None:
-                    raise RuntimeError("record_proactive_outbound returned None")
-                ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
-                    status=Status.SENT, handled_at=now, outcome_reason="ok"
-                )
+            # No outer transaction: record_proactive_outbound may call the key
+            # broker (recall capture), and network I/O must never run inside a
+            # transaction. A crash between the two writes is closed by the
+            # stale-claim recovery above, which marks already-delivered claims SENT.
+            row = record_proactive_outbound(
+                tenant=tenant,
+                channel="app",
+                channel_user_id=str(user.id),
+                message_text=render_message(claimed),
+                job_name=JOB_NAME,
+            )
         except Exception:
+            row = None
             logger.warning("proactive_signal tenant=%s outcome=send_failed", tid, exc_info=True)
+        if row is None:
             ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
                 status=Status.PENDING, claimed_at=None
             )
             continue
+        ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
+            status=Status.SENT, handled_at=now, outcome_reason="ok"
+        )
         summary["sent"] += len(ids)
         for signal in claimed:
             logger.info("proactive_signal tenant=%s kind=%s outcome=sent", tid, signal.kind)

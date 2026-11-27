@@ -43,6 +43,8 @@ class PureFactTests(SimpleTestCase):
         self.assertTrue(ps.looks_like_meeting("Call with Sam", "", ""))
         self.assertTrue(ps.looks_like_meeting("Catch up", "https://zoom.us/j/1", ""))
         self.assertFalse(ps.looks_like_meeting("Gym", "Gold's", "legs"))
+        self.assertFalse(ps.looks_like_meeting("Recall drill", "", "Callum's place"))
+        self.assertTrue(ps.looks_like_meeting("Standup", "", ""))
 
     def test_render_holiday_line_is_fixed_template(self):
         facts = {
@@ -333,6 +335,19 @@ class DeliveryTests(TestCase):
         )
         self.assertEqual(self._deliver(self.in_window)["sent"], 1)
         self.assertEqual(self._deliver(self.in_window + timedelta(minutes=15))["sent"], 0)
+        self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 1)
+
+    def test_stale_claim_already_delivered_is_marked_sent_not_resent(self):
+        signal = self._signal("a")
+        claimed_at = self.in_window - timedelta(minutes=30)
+        ProactiveSignal.objects.filter(pk=signal.pk).update(status="sending", claimed_at=claimed_at)
+        ProactiveOutbound.objects.create(
+            tenant=self.tenant, channel="app", channel_user_id="u", message_text="Heads up", job_name=ps.JOB_NAME
+        )
+        ProactiveOutbound.objects.filter(tenant=self.tenant).update(created_at=claimed_at + timedelta(seconds=5))
+        self.assertEqual(self._deliver(self.in_window)["sent"], 0)
+        signal.refresh_from_db()
+        self.assertEqual((signal.status, signal.outcome_reason), ("sent", "recovered"))
         self.assertEqual(ProactiveOutbound.objects.filter(tenant=self.tenant).count(), 1)
 
     def test_multi_line_message_has_no_bullets(self):
