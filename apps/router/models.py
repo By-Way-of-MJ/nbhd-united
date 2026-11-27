@@ -418,6 +418,57 @@ class ProactiveOutbound(models.Model):
         return f"ProactiveOutbound({self.channel}, tenant={self.tenant_id}, job={self.job_name or '-'})"
 
 
+class ProactiveSignal(models.Model):
+    """One fact worth a heads-up, detected by code ("notice things for me").
+
+    Facts only: codes, dates and public-holiday names, never event titles,
+    notes or other user text. Delivery renders a fixed template from
+    ``facts`` (see ``apps/router/proactive_signals.py``). ``dedup_key`` is
+    unique per tenant, so a re-sync or re-detection never queues the same
+    heads-up twice. ``expires_at`` (the event start) guarantees a heads-up
+    for a past event is dropped, never sent late.
+    """
+
+    class Kind(models.TextChoices):
+        CALENDAR_HOLIDAY = "calendar_holiday", "Meeting on a public holiday"
+        CALENDAR_OUTSIDE_HOURS = "calendar_outside_hours", "Meeting outside usual hours"
+        CALENDAR_OVERLAP = "calendar_overlap", "Overlapping events"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Waiting for the delivery window"
+        SENDING = "sending", "Claimed by a delivery run"
+        SENT = "sent", "Delivered"
+        EXPIRED = "expired", "Event started before delivery"
+        DROPPED = "dropped", "Not deliverable (channel/gate)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey("tenants.Tenant", on_delete=models.CASCADE, related_name="proactive_signals")
+    kind = models.CharField(max_length=32, choices=Kind.choices)
+    event = models.ForeignKey(
+        "datebook.MirrorEvent", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    facts = models.JSONField(default=dict, blank=True)
+    dedup_key = models.CharField(max_length=128)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    outcome_reason = models.CharField(max_length=32, blank=True, default="")
+    expires_at = models.DateTimeField()
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    handled_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "proactive_signals"
+        constraints = [
+            models.UniqueConstraint(fields=["tenant", "dedup_key"], name="proactive_signal_unique_dedup"),
+        ]
+        indexes = [
+            models.Index(fields=["status", "expires_at"], name="proactive_signal_pending_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"ProactiveSignal({self.kind}, tenant={self.tenant_id}, {self.status})"
+
+
 class HelperRun(models.Model):
     """Durable closure obligation, admitted before a runtime helper starts."""
 

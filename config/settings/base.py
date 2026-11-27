@@ -363,6 +363,9 @@ IOS_PAYWALL_ENFORCE_TENANT_IDS = env("IOS_PAYWALL_ENFORCE_TENANT_IDS", default="
 # Hourly Jev "worth a message?" SHADOW check: comma-separated tenant UUIDs or
 # "*"; empty/unset means nobody. Logs Jev's decision only — never sends.
 JEV_HEARTBEAT_SHADOW_TENANT_IDS = env("JEV_HEARTBEAT_SHADOW_TENANT_IDS", default="")
+# Proactive calendar heads-ups canary gate ("notice things for me"). Comma-separated
+# tenant UUIDs, "*" = all; EMPTY MEANS NOBODY. Also needs Tenant.proactive_signals_enabled.
+PROACTIVE_SIGNALS_TENANT_IDS = env("PROACTIVE_SIGNALS_TENANT_IDS", default="")
 
 # Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
 # (empty = nobody, exact "*" = everyone). Container App env var name MUST match.

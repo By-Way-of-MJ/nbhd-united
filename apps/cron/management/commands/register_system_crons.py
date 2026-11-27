@@ -166,6 +166,10 @@ SYSTEM_CRONS = [
     # when a fail-open dependency (Jev) failed >=50% of >=5 calls over the last
     # 3 complete hours. Counts only; 6h cooldown per feature.
     ("check-degradation", "5 * * * *", "/api/cron/trigger/check_degradation/"),
+    # Every 15 min — proactive calendar heads-ups ("notice things for me"): sends
+    # pending ProactiveSignal rows inside each user's heartbeat window, max 3/day,
+    # drops expired ones. No-op for tenants outside PROACTIVE_SIGNALS_TENANT_IDS.
+    ("deliver-proactive-signals", "*/15 * * * *", "/api/cron/trigger/deliver_proactive_signals/"),
     # Monthly on 1st at 06:00 UTC — write FinanceSnapshot for every
     # finance-enabled active tenant. Idempotent per (tenant, date).
     # Powers the /api/v1/finance/snapshots/ endpoint (monthly debt/savings

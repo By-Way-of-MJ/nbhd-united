@@ -279,6 +279,9 @@ TASK_MAP = {
     # Hourly Jev "worth a message?" shadow check — log only, never sends.
     "jev_heartbeat_shadow": "apps.orchestrator.jev_heartbeat_shadow.jev_heartbeat_shadow_task",
     "check_degradation": "apps.common.degradation.check_degradation_task",
+    "detect_calendar_signals": "apps.router.proactive_signals.detect_calendar_signals_task",
+    "deliver_proactive_signals": "apps.router.proactive_signals.deliver_proactive_signals_task",
+    "send_test_operator_alert": "apps.common.operator_alert.send_test_operator_alert_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)
