@@ -11,6 +11,7 @@ from django.views.decorators.http import require_POST
 from rest_framework import status as http_status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
 from apps.tenants.models import Tenant
@@ -22,6 +23,7 @@ from apps.yardtalk.services import (
 
 from .constants import CREDIT_PACKS
 from .credits import credits_state, handle_credit_refund, handle_credit_topup_completed
+from .models import AdAttribution
 from .services import (
     handle_checkout_completed,
     handle_invoice_paid,
@@ -518,3 +520,51 @@ class AppleSyncView(APIView):
         tenant.refresh_from_db()
         # No `paywall` here; only `/tenants/me/` computes it; clients default to false.
         return Response({"subscription": apple_iap.subscription_summary(tenant)})
+
+
+class AdAttributionUserThrottle(SimpleRateThrottle):
+    """Per-user bound on the attribution report; the first token wins, so a
+    normal client only ever hits this once (a reinstall may retry a few times)."""
+
+    scope = "ad_attribution"
+    rate = "30/hour"
+
+    def get_cache_key(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return None
+        return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+
+
+class AdAttributionView(APIView):
+    """POST {"token": "<AAAttribution token>"} from the signed-in app.
+
+    One row per tenant; the first token wins and later reports are no-ops. The
+    response only ever contains the row status — never the token."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [AdAttributionUserThrottle]
+
+    def post(self, request):
+        from .adservices import resolve
+
+        tenant = getattr(request.user, "tenant", None)
+        if tenant is None:
+            return Response({"detail": "No account found."}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        data = request.data if isinstance(request.data, dict) else {}
+        token = data.get("token")
+        if not isinstance(token, str) or not 1 <= len(token) <= 4096:
+            return Response(
+                {"detail": "token must be a string of 1..4096 characters."},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+
+        row, created = AdAttribution.objects.get_or_create(tenant=tenant, defaults={"token": token})
+        if not created:
+            return Response({"status": row.status})
+
+        try:
+            resolve(row)
+        except Exception:
+            logger.exception("ad attribution resolve failed")
+        return Response({"status": row.status})
