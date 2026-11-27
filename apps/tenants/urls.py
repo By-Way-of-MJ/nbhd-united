@@ -30,6 +30,7 @@ from .views import (
     PIIReviewQueueKeepView,
     PIIReviewQueueView,
     PreferredModelView,
+    ProactiveSettingsView,
     ProfileView,
     ProvisioningStatusView,
     RefreshConfigView,
@@ -123,6 +124,7 @@ urlpatterns = [
     # See apps/tenants/unsubscribe_views.py and unsubscribe_signing.py.
     path("unsubscribe/<str:token>/", unsubscribe, name="email-unsubscribe"),
     path("heartbeat/", HeartbeatConfigView.as_view(), name="heartbeat-config"),
+    path("settings/proactive/", ProactiveSettingsView.as_view(), name="proactive-settings"),
     path("delete-account/", DeleteAccountView.as_view(), name="delete-account"),
     path("cancel-deletion/", CancelDeletionView.as_view(), name="cancel-deletion"),
     path("settings/preferred-model/", PreferredModelView.as_view(), name="preferred-model"),

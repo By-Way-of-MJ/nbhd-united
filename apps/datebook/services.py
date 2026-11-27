@@ -1028,7 +1028,15 @@ def _reminder_model_fields(payload: dict) -> dict:
 
 def _publish_staged_rows(
     model, tenant, staged_rows, prospective: dict[str, str], generation: int, field_builder
-) -> None:
+) -> list[tuple[str, str, object]]:
+    """Publish staged rows; return ``(id, "new" | "moved", start)`` for changed events.
+
+    Changes are read before the live row is overwritten: a row never published
+    before (``first_seen_generation == 0``) is new; a published row whose start
+    moved is "moved". Only events carry a start, so reminders always return [].
+    """
+    changes: list[tuple[str, str, object]] = []
+    tracks_start = hasattr(model, "zoned_start_at")
     live_fields = [
         field.name
         for field in model._meta.fields
@@ -1051,8 +1059,16 @@ def _publish_staged_rows(
     ]
     for row in staged_rows:
         payload = row.staged_payload
+        is_new = row.first_seen_generation == 0
+        old_start = getattr(row, "zoned_start_at", None) if tracks_start else None
         for key, value in field_builder(payload).items():
             setattr(row, key, value)
+        if tracks_start:
+            new_start = getattr(row, "zoned_start_at", None)
+            if is_new:
+                changes.append((str(row.id), "new", new_start))
+            elif new_start is not None and new_start != old_start:
+                changes.append((str(row.id), "moved", new_start))
         row.pii_receipts = payload["pii_receipts"]
         row.active = True
         if row.first_seen_generation == 0:
@@ -1084,6 +1100,7 @@ def _publish_staged_rows(
         active=False,
         inactive_generation=generation,
     )
+    return changes
 
 
 def push_visibility_refresh(_tenant_id: str) -> None:
@@ -1230,8 +1247,13 @@ def commit_sync_run(
                 )
             else:
                 generation = gateway.current_generation + 1
+                # Read before the gateway is updated below: signals need the
+                # previous window and whether a complete sync ever happened.
+                previous_events_window_end = gateway.events_window_end
+                first_events_sync = gateway.events_last_complete_sync_at is None
+                event_changes: list = []
                 if run.events_committable:
-                    _publish_staged_rows(
+                    event_changes = _publish_staged_rows(
                         MirrorEvent,
                         locked_tenant,
                         staged_events,
@@ -1285,6 +1307,18 @@ def commit_sync_run(
                     "reminders": "committed" if run.reminders_committable else "not_committed",
                 }
                 transaction.on_commit(lambda tenant_id=str(tenant.id): push_visibility_refresh(tenant_id))
+                try:
+                    from apps.router.proactive_signals import queue_calendar_detection
+
+                    queue_calendar_detection(
+                        locked_tenant,
+                        event_changes,
+                        previous_window_end=previous_events_window_end,
+                        first_sync=first_events_sync,
+                    )
+                except Exception:
+                    # Signals are best-effort; a calendar sync must never fail on them.
+                    logger.warning("proactive_signal queue_failed tenant=%s", str(tenant.id)[:8])
 
     if deferred_error is not None:
         raise deferred_error

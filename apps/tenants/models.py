@@ -659,6 +659,18 @@ class Tenant(models.Model):
         default=False,
         help_text="Capture and render structured current-situation signals for this tenant",
     )
+    proactive_signals_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "User opt-in: 'Let nbhd notice things for me' — calendar heads-ups (holiday clash, "
+            "outside usual hours, overlap). Also requires PROACTIVE_SIGNALS_TENANT_IDS."
+        ),
+    )
+    work_countries = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="ISO-3166 alpha-2 codes of countries the user works with (holiday checks), e.g. ['US'].",
+    )
     tour_guide_mode = models.CharField(
         choices=TourGuideMode.choices,
         default=TourGuideMode.LINKS,

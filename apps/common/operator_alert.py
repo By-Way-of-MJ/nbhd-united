@@ -59,3 +59,18 @@ def send_operator_alert(message: str, *, subject: str = "NBHD Health Alert") -> 
     # Pushover account must not buy a long "retrying won't help" cooldown while
     # the email fallback is what actually failed.
     return status if status in ("timeout", "transient") else "transient"
+
+
+def send_test_operator_alert_task() -> dict:
+    """QStash entry point (``TASK_MAP['send_test_operator_alert']``).
+
+    Proves the alert path end to end (Pushover, then email) without the
+    recipient address ever leaving the server: the address comes from
+    ``PLATFORM_OWNER_EMAIL`` here, never from the request body.
+    """
+    status = send_operator_alert(
+        "NBHD test alert: if you can read this, operator alerts reach you.",
+        subject="NBHD test alert",
+    )
+    logger.info("operator_alert test status=%s", status)
+    return {"status": status}

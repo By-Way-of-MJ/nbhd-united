@@ -91,3 +91,4 @@ whitenoise
 django-extensions
 pip-tools
 python-dateutil
+holidays==0.104  # proactive signals: public-holiday facts (pure Python; deps: python-dateutil)

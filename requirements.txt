@@ -207,6 +207,8 @@ h2==4.3.0
     # via httpx
 hf-xet==1.4.2
     # via huggingface-hub
+holidays==0.104
+    # via -r requirements.in
 hpack==4.1.0
     # via h2
 httpcore==1.0.9
@@ -439,6 +441,7 @@ python-dateutil==2.9.0.post0
     #   -r requirements.in
     #   botocore
     #   croniter
+    #   holidays
     #   matplotlib
 python-dotenv==1.2.2
     # via
