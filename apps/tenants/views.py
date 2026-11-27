@@ -553,13 +553,13 @@ class ProactiveSettingsView(APIView):
             unknown = [c for c in raw if str(c or "").strip().upper() not in COUNTRY_TZ]
             if unknown:
                 return Response(
-                    {"work_countries": [f"Unsupported country code(s): {', '.join(map(str, unknown[:5]))}"]},
+                    {"work_countries": ["Unsupported country code. Use one from supported_countries."]},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             tenant.work_countries = clean_countries(raw)
             update_fields.append("work_countries")
         if update_fields:
-            tenant.save(update_fields=update_fields)
+            tenant.save(update_fields=[*update_fields, "updated_at"])
         return Response(self._payload(tenant))
 
 

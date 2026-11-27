@@ -64,7 +64,6 @@ COUNTRY_TZ: dict[str, str] = {
     "ES": "Europe/Madrid",
     "NL": "Europe/Amsterdam",
     "CH": "Europe/Zurich",
-    "SE": "Europe/Stockholm",
     "JP": "Asia/Tokyo",
     "KR": "Asia/Seoul",
     "CN": "Asia/Shanghai",
@@ -91,7 +90,6 @@ COUNTRY_LABEL: dict[str, str] = {
     "IT": "Italy",
     "ES": "Spain",
     "CH": "Switzerland",
-    "SE": "Sweden",
     "JP": "Japan",
     "KR": "South Korea",
     "CN": "China",
@@ -143,12 +141,12 @@ _MEETING_MARKERS = (
     "calendly",
     "cal.com",
     "meeting",
-    "call",
+    " call",
+    "call ",
     " sync",
     "interview",
     " with ",
     "1:1",
-    "1-1",
 )
 
 
@@ -195,7 +193,9 @@ def clean_countries(values) -> list[str]:
 def _country_holidays(code: str, year: int):
     import holidays
 
-    return holidays.country_holidays(code, years=year)
+    # Force English: without ``language`` the package follows the process
+    # locale and Linux (LANG=C) yields e.g. "勤労感謝の日" / "Neujahr".
+    return holidays.country_holidays(code, years=year, language="en_US")
 
 
 def holiday_hits(start_utc: datetime, countries: list[str]) -> list[dict]:
@@ -242,8 +242,9 @@ def _overlaps_other(tenant, event) -> bool:
             zoned_end_at__gt=event.zoned_start_at,
         )
         .exclude(pk=event.pk)
-        # The same meeting copied into two calendars is not an overlap.
-        .exclude(zoned_start_at=event.zoned_start_at, zoned_end_at=event.zoned_end_at)
+        # The same meeting copied into two calendars (same slot, same title)
+        # is not an overlap; two different meetings in one slot still are.
+        .exclude(zoned_start_at=event.zoned_start_at, zoned_end_at=event.zoned_end_at, title=event.title)
     )
     return others.exists()
 
@@ -409,7 +410,7 @@ def render_line(kind: str, facts: dict) -> str:
     if kind == "calendar_outside_hours":
         return f"Your meeting on {day} starts at {time} your time, outside your usual hours."
     if kind == "calendar_overlap":
-        return f"Two meetings overlap on {day} at {time} your time."
+        return f"Your meeting on {day} at {time} (your time) overlaps something else in your calendar."
     return ""
 
 
@@ -417,7 +418,24 @@ def render_message(signals) -> str:
     lines = [line for line in (render_line(s.kind, s.facts) for s in signals) if line]
     if len(lines) == 1:
         return f"Heads up: {lines[0]}"
-    return "Heads up on your calendar:\n" + "\n".join(f"• {line}" for line in lines)
+    # Plain lines, not bullets: [earlier-from-you] reads bulleted proactive
+    # messages as items the user was asked about.
+    return "Heads up on your calendar:\n" + "\n".join(lines)
+
+
+def still_true(tenant, signal) -> bool:
+    """The fact behind a pending signal still holds on the live calendar."""
+    event = signal.event
+    if event is None or not event.active or not event.zoned_start_at:
+        return False
+    try:
+        if event.zoned_start_at != datetime.fromisoformat(signal.facts.get("start", "")):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if signal.kind == "calendar_overlap":
+        return _overlaps_other(tenant, event)
+    return True
 
 
 def _local_day_start(now: datetime, tz) -> datetime:
@@ -445,7 +463,7 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
 
     pending = (
         ProactiveSignal.objects.filter(status=Status.PENDING)
-        .select_related("tenant", "tenant__user")
+        .select_related("tenant", "tenant__user", "event")
         .order_by("tenant_id", "expires_at")
     )
     by_tenant: dict = {}
@@ -455,7 +473,7 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
     for signals in by_tenant.values():
         tenant = signals[0].tenant
         tid = str(tenant.id)[:8]
-        if not signals_enabled(tenant):
+        if tenant.status != tenant.Status.ACTIVE or not signals_enabled(tenant):
             n = ProactiveSignal.objects.filter(pk__in=[s.pk for s in signals], status=Status.PENDING).update(
                 status=Status.DROPPED, handled_at=now, outcome_reason="disabled"
             )
@@ -484,34 +502,51 @@ def deliver_proactive_signals(*, now: datetime | None = None) -> dict:
             logger.info("proactive_signal tenant=%s outcome=dropped reason=channel_unsupported n=%d", tid, n)
             continue
 
+        # Re-check each signal against the live calendar before claiming it: a
+        # meeting moved or deleted since detection must not get a stale heads-up.
+        fresh, stale = [], []
+        for signal in signals:
+            (fresh if still_true(tenant, signal) else stale).append(signal)
+        if stale:
+            n = ProactiveSignal.objects.filter(pk__in=[s.pk for s in stale], status=Status.PENDING).update(
+                status=Status.DROPPED, handled_at=now, outcome_reason="event_changed"
+            )
+            summary["dropped"] += n
+            logger.info("proactive_signal tenant=%s outcome=dropped reason=event_changed n=%d", tid, n)
+
         claimed = []
-        for signal in signals[:remaining]:
+        for signal in fresh[:remaining]:
             if ProactiveSignal.objects.filter(pk=signal.pk, status=Status.PENDING).update(
                 status=Status.SENDING, claimed_at=now
             ):
                 claimed.append(signal)
         if not claimed:
             continue
-        try:
-            row = record_proactive_outbound(
-                tenant=tenant,
-                channel="app",
-                channel_user_id=str(user.id),
-                message_text=render_message(claimed),
-                job_name=JOB_NAME,
-            )
-        except Exception:
-            row = None
-            logger.exception("proactive_signal tenant=%s outcome=send_failed", tid)
         ids = [s.pk for s in claimed]
-        if row is None:
+        try:
+            # One transaction: the feed row and SENT commit together, and the
+            # push waits for that commit (defer_push). A crash in between
+            # rolls both back, so a signal can never be delivered twice.
+            with transaction.atomic():
+                row = record_proactive_outbound(
+                    tenant=tenant,
+                    channel="app",
+                    channel_user_id=str(user.id),
+                    message_text=render_message(claimed),
+                    job_name=JOB_NAME,
+                    defer_push=True,
+                )
+                if row is None:
+                    raise RuntimeError("record_proactive_outbound returned None")
+                ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
+                    status=Status.SENT, handled_at=now, outcome_reason="ok"
+                )
+        except Exception:
+            logger.warning("proactive_signal tenant=%s outcome=send_failed", tid, exc_info=True)
             ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
                 status=Status.PENDING, claimed_at=None
             )
             continue
-        ProactiveSignal.objects.filter(pk__in=ids, status=Status.SENDING).update(
-            status=Status.SENT, handled_at=now, outcome_reason="ok"
-        )
         summary["sent"] += len(ids)
         for signal in claimed:
             logger.info("proactive_signal tenant=%s kind=%s outcome=sent", tid, signal.kind)

@@ -1250,7 +1250,9 @@ def commit_sync_run(
                 # Read before the gateway is updated below: signals need the
                 # previous window and whether a complete sync ever happened.
                 previous_events_window_end = gateway.events_window_end
-                first_events_sync = gateway.events_last_complete_sync_at is None
+                # A purge or manifest mismatch forces a full snapshot: every row
+                # comes back "new", so treat it like a first sync for signals.
+                first_events_sync = gateway.events_last_complete_sync_at is None or bool(run.events_full_snapshot)
                 event_changes: list = []
                 if run.events_committable:
                     event_changes = _publish_staged_rows(
@@ -1318,7 +1320,7 @@ def commit_sync_run(
                     )
                 except Exception:
                     # Signals are best-effort; a calendar sync must never fail on them.
-                    logger.warning("proactive_signal queue_failed tenant=%s", str(tenant.id)[:8])
+                    logger.warning("proactive_signal queue_failed tenant=%s", str(tenant.id)[:8], exc_info=True)
 
     if deferred_error is not None:
         raise deferred_error
