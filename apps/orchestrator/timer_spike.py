@@ -68,9 +68,22 @@ def run_spike(tenant_id: str, mode: str = "ping", *, post=None, wake=None, clock
     wake = wake or wake_hibernated_tenant
     result = {"mode": mode, "status": "skipped", "hibernated": False}
     tenant = Tenant.objects.select_related("user").filter(pk=tenant_id).first()
-    if tenant is None or not tenant.container_fqdn or not _tenant_allowed(tenant, GATE_SETTING):
+    if (
+        tenant is None
+        or not tenant.container_fqdn
+        or tenant.status != Tenant.Status.ACTIVE
+        or not _tenant_allowed(tenant, GATE_SETTING)
+    ):
         result["reason"] = "not_allowed"
         logger.info("timer_spike tenant=%s outcome=skipped reason=not_allowed", str(tenant_id)[:8])
+        return result
+    # The briefing has real side effects (daily-note writes, a message). It
+    # runs only on a warm container and is POSTed exactly once: a retry after
+    # a mid-turn disconnect would run the whole briefing twice, and the idle
+    # sweep could hibernate a freshly woken container mid-turn.
+    if mode == "briefing" and tenant.hibernated_at is not None:
+        result["reason"] = "briefing_needs_warm_container"
+        logger.info("timer_spike tenant=%s outcome=skipped reason=briefing_needs_warm_container", str(tenant.id)[:8])
         return result
 
     started = clock()
@@ -114,6 +127,9 @@ def run_spike(tenant_id: str, mode: str = "ping", *, post=None, wake=None, clock
                     reply = ""
                 result["reply_chars"] = len(reply)
             break
+        if mode == "briefing":
+            result.update(status=f"not_ready_{code or 'conn'}", attempts=attempts)
+            break
         if clock() - started > DEADLINE_SECONDS:
             result.update(status="not_ready", attempts=attempts)
             break
@@ -142,14 +158,14 @@ def timer_spike_task(tenant_id: str, mode: str = "ping") -> dict:
         return {"started": False, "reason": "bad_mode"}
 
     def _run():
-        from django.db import close_old_connections
+        from django.db import connection
 
         try:
             run_spike(str(tenant_id), mode)
         except Exception:
             logger.exception("timer_spike tenant=%s outcome=error", str(tenant_id)[:8])
         finally:
-            close_old_connections()
+            connection.close()
 
     threading.Thread(target=_run, daemon=True).start()
     return {"started": True, "mode": mode}

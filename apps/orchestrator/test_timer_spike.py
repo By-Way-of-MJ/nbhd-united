@@ -93,6 +93,27 @@ class TimerSpikeTests(TestCase):
         self.assertTrue(content.startswith(timer_spike.BRIEFING_PREFIX))
         self.assertTrue(content.endswith("CRON:PROMPT"))
 
+    def test_briefing_refuses_cold_container_and_never_retries(self):
+        result, calls, wake = self._run([_response(200)], mode="briefing", hibernated=True)
+        self.assertEqual(result["reason"], "briefing_needs_warm_container")
+        self.assertEqual(calls, [])
+        wake.assert_not_called()
+        Tenant.objects.filter(pk=self.tenant.pk).update(hibernated_at=None)
+        with patch("apps.orchestrator.config_generator._build_morning_briefing_prompt", return_value="P"):
+            result, calls, _ = self._run([httpx.RemoteProtocolError("dropped"), _response(200)], mode="briefing")
+        self.assertEqual(len(calls), 1)  # posted exactly once, even after a disconnect
+        self.assertEqual(result["status"], "not_ready_conn")
+
+    def test_read_timeout_is_reported(self):
+        result, _, _ = self._run([httpx.ReadTimeout("slow")])
+        self.assertEqual(result["status"], "timeout")
+
+    @override_settings(TIMER_SPIKE_TENANT_IDS="00000000-0000-0000-0000-000000000000")
+    def test_other_tenant_in_gate_does_nothing(self):
+        result, calls, _ = self._run([_response(200)])
+        self.assertEqual(result["reason"], "not_allowed")
+        self.assertEqual(calls, [])
+
     @override_settings(TIMER_SPIKE_TENANT_IDS="")
     def test_gate_closed_does_nothing(self):
         result, calls, wake = self._run([_response(200)])
