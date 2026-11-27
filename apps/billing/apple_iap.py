@@ -403,9 +403,9 @@ def _resolve_double_billing(tenant) -> None:
 def _alert(message: str) -> None:
     logger.warning(message)
     try:
-        from apps.cron.views import _send_alert_via_pushover
+        from apps.common.operator_alert import send_operator_alert
 
-        _send_alert_via_pushover(message)
+        send_operator_alert(message, subject="NBHD Apple IAP alert")
     except Exception:  # noqa: BLE001
         logger.warning("apple_iap: alert not sent", exc_info=True)
 

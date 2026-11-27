@@ -162,6 +162,10 @@ SYSTEM_CRONS = [
     # messaging and logs the decision. Never sends or wakes a container; gated
     # by JEV_HEARTBEAT_SHADOW_TENANT_IDS.
     ("jev-heartbeat-shadow", "23 * * * *", "/api/cron/trigger/jev_heartbeat_shadow/"),
+    # Hourly at :05 — silent-degradation alarm: alerts MJ (Pushover, email fallback)
+    # when a fail-open dependency (Jev) failed >=50% of >=5 calls over the last
+    # 3 complete hours. Counts only; 6h cooldown per feature.
+    ("check-degradation", "5 * * * *", "/api/cron/trigger/check_degradation/"),
     # Monthly on 1st at 06:00 UTC — write FinanceSnapshot for every
     # finance-enabled active tenant. Idempotent per (tenant, date).
     # Powers the /api/v1/finance/snapshots/ endpoint (monthly debt/savings
