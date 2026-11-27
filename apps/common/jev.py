@@ -12,7 +12,7 @@ from django.conf import settings
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from urllib3.util import Timeout
 
-from apps.common.degradation import record_outcome
+from apps.common.degradation import record_outcome_async
 from apps.common.openrouter import _ZDR_PROVIDER
 
 logger = logging.getLogger(__name__)
@@ -215,12 +215,12 @@ def decide(state, questions, *, deadline: float | None = None) -> DecisionRespon
                 raise ValueError("Unexpected score legend")
         if deadline is not None and monotonic() >= deadline:
             raise JevUnavailable("Jev unavailable")
-        record_outcome("jev", True)
+        record_outcome_async("jev", True)
         return result
     except Exception as exc:
         # Pydantic and HTTP exceptions can contain raw state/provider output.
         logger.warning("jev_unavailable reason=%s", type(exc).__name__)
-        record_outcome("jev", False, reason=type(exc).__name__)
+        record_outcome_async("jev", False, reason=type(exc).__name__)
         if isinstance(exc, ValidationError):
             logger.warning(
                 "jev_validation_errors errors=%s",

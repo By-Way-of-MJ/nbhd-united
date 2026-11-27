@@ -71,6 +71,20 @@ def record_outcome(feature: str, ok: bool, *, reason: str | None = None, now: fl
         logger.warning("degradation_record_failed feature=%s", feature if feature in FEATURES else "?")
 
 
+def record_outcome_async(feature: str, ok: bool, *, reason: str | None = None) -> None:
+    """Fire-and-forget ``record_outcome`` for latency-bounded callers.
+
+    Jev runs under the caller's wall-clock budget (``future.result(timeout=…)``);
+    a slow Redis must never turn a good answer into a timeout.
+    """
+    import threading
+
+    try:
+        threading.Thread(target=record_outcome, args=(feature, ok), kwargs={"reason": reason}, daemon=True).start()
+    except Exception:
+        logger.warning("degradation_record_async_failed")
+
+
 def window_counts(feature: str, *, now: float | None = None) -> tuple[int, int, str]:
     """Return ``(ok, fail, last_reason)`` over the last ``WINDOW_HOURS`` complete hours."""
     current = _hour_bucket(now)

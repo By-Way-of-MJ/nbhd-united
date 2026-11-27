@@ -48,6 +48,21 @@ class DegradationTests(SimpleTestCase):
         self.assertEqual(degradation.window_counts("jev", now=self.now), (0, 1, ""))
         self.assertIsNone(cache.get(degradation._key("not-a-feature", 999, "fail")))
 
+    def test_async_record_runs_record_outcome_off_thread(self):
+        import threading
+
+        seen = []
+
+        def fake(feature, ok, *, reason=None):
+            seen.append((feature, ok, reason, threading.current_thread() is threading.main_thread()))
+
+        with patch.object(degradation, "record_outcome", side_effect=fake):
+            degradation.record_outcome_async("jev", False, reason="ValidationError")
+            for thread in threading.enumerate():
+                if thread is not threading.current_thread():
+                    thread.join(timeout=2)
+        self.assertEqual(seen, [("jev", False, "ValidationError", False)])
+
     def test_record_never_raises(self):
         with patch.object(degradation.cache, "add", side_effect=RuntimeError("redis down")):
             degradation.record_outcome("jev", True, now=self.now)
@@ -95,9 +110,16 @@ class OperatorAlertTests(SimpleTestCase):
         self.assertEqual(mail.outbox[0].subject, "S")
 
     @override_settings(PLATFORM_OWNER_EMAIL="")
-    @patch("apps.cron.views._send_alert_via_pushover", return_value="timeout")
-    def test_both_down_returns_pushover_status(self, _push):
-        self.assertEqual(send_operator_alert("m"), "timeout")
+    @patch("apps.cron.views._send_alert_via_pushover", return_value="undeliverable")
+    def test_both_down_is_transient_so_callers_retry(self, _push):
+        # A lapsed Pushover says "undeliverable"; if email also fails nothing
+        # reached MJ, so callers must retry next tick, not take a long cooldown.
+        self.assertEqual(send_operator_alert("m"), "transient")
+
+    @patch("apps.cron.views._send_alert_via_pushover", return_value="undeliverable")
+    @patch("apps.common.operator_alert.send_mail", side_effect=OSError("smtp down"))
+    def test_email_failure_is_transient(self, _mail, _push):
+        self.assertEqual(send_operator_alert("m"), "transient")
 
     @patch("apps.cron.views._send_alert_via_pushover", side_effect=RuntimeError("boom"))
     def test_pushover_raising_still_emails(self, _push):

@@ -10,7 +10,8 @@ The return value keeps the Pushover caller's vocabulary
 (``delivered | undeliverable | timeout | transient``), so existing cooldown
 logic is unchanged:
 - either channel delivers → ``delivered``;
-- otherwise → the Pushover status.
+- neither delivers → Pushover's ``timeout`` / ``transient`` as-is, and
+  ``undeliverable`` becomes ``transient``, so the caller retries soon.
 
 Callers pass content-free text: counts, feature names, tenant display names
 as today. Never message content.
@@ -53,4 +54,8 @@ def send_operator_alert(message: str, *, subject: str = "NBHD Health Alert") -> 
     if _send_email(subject, message):
         logger.info("operator_alert delivered by email (pushover status=%s)", status)
         return "delivered"
-    return status
+    # Nothing reached MJ. Keep Pushover's "timeout" (short backoff) and
+    # "transient" (retry next tick), but never report "undeliverable": a lapsed
+    # Pushover account must not buy a long "retrying won't help" cooldown while
+    # the email fallback is what actually failed.
+    return status if status in ("timeout", "transient") else "transient"
