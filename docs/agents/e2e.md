@@ -1,5 +1,18 @@
 # Real product E2E harness
 
+## Local real assistant staging
+
+For synthetic, readable local chat on basecamp, use `scripts/stage/up.sh <clean-checkout-path>`
+(the checkout must be inside this clone), then `scripts/stage/say.py "message" --thread stage`,
+`scripts/stage/cron.py "Morning Briefing"`, `scripts/stage/logs.sh '[nbhd:tools]'`, or
+`scripts/stage/sql.py 'list(tenant.tasks.values("title", "status"))'`. Same thread names retain
+conversation context. `--flag NAME_TENANT_IDS=VALUE` opts into known checkout rollout settings.
+This separate harness uses real Docker Django/Postgres/Redis/OpenClaw and the machine's
+OpenRouter key, with invented Mika fixtures and blocked external-service egress. Run
+`scripts/stage/down.sh` after use and before another checkout. See
+[all production differences](../../scripts/stage/DIFFS.md), especially the missing neural
+PII detector. The production harness rules below still apply to production E2E.
+
 Read this before running the dedicated synthetic tenant through production chat or PII flows. The harness is intentionally narrower than the public API: `scripts/e2e/nbhd_e2e.py` selects one of two fixed HTTPS production hosts, a checked-in tenant/account pair, fixed fixture content, and a disposable non-main thread. The installed skill can invoke only `scripts/e2e/nbhd_e2e_skill.py`, a runtime command allowlist that does not expose global host flags.
 
 ## Privacy ladder
