@@ -1,5 +1,6 @@
 """Strict, content-free TypeSafe Decisions door; callers own decision policy."""
 
+import logging
 import os
 import sys
 from enum import Enum
@@ -8,8 +9,12 @@ from typing import Annotated, Literal, get_args
 
 import requests
 from django.conf import settings
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 from urllib3.util import Timeout
+
+from apps.common.openrouter import _ZDR_PROVIDER
+
+logger = logging.getLogger(__name__)
 
 JEV_MODEL = "typesafe/jev-1.13"
 DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
@@ -19,6 +24,12 @@ Description = Annotated[str, Field(min_length=1)]
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class ResponseModel(BaseModel):
+    """Provider responses may grow unknown metadata fields without warning."""
+
+    model_config = ConfigDict(extra="ignore", strict=True)
 
 
 class ChoiceQuestion(StrictModel):
@@ -55,7 +66,7 @@ def choice_question(annotation, instructions, descriptions):
     return ChoiceQuestion(instructions=instructions, criteria={value: descriptions[value] for value in options})
 
 
-class ChoiceAnswer(StrictModel):
+class ChoiceAnswer(ResponseModel):
     type: Literal["choice"]
     choice: str
     probabilities: dict[str, Probability] = Field(min_length=2)
@@ -70,7 +81,7 @@ class ChoiceAnswer(StrictModel):
         return self
 
 
-class NoulAnswer(StrictModel):
+class NoulAnswer(ResponseModel):
     type: Literal["noul"]
     noul: Probability
 
@@ -80,7 +91,7 @@ class NoulAnswer(StrictModel):
         return max(self.noul, 1 - self.noul)
 
 
-class ScoreAnswer(StrictModel):
+class ScoreAnswer(ResponseModel):
     type: Literal["score"]
     score: Annotated[float, Field(ge=0, allow_inf_nan=False)]
     legend: dict[str, Description]
@@ -105,13 +116,13 @@ class ScoreAnswer(StrictModel):
 Answer = Annotated[ChoiceAnswer | NoulAnswer | ScoreAnswer, Field(discriminator="type")]
 
 
-class DecisionUsage(StrictModel):
+class DecisionUsage(ResponseModel):
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     cost: float = Field(ge=0, allow_inf_nan=False)
 
 
-class DecisionResponse(StrictModel):
+class DecisionResponse(ResponseModel):
     model: str
     answers: dict[str, Answer]
     usage: DecisionUsage
@@ -166,6 +177,7 @@ def decide(state, questions, *, deadline: float | None = None) -> DecisionRespon
             "model": JEV_MODEL,
             "state": state,
             "questions": {name: question.model_dump(exclude_none=True) for name, question in questions.items()},
+            "provider": dict(_ZDR_PROVIDER),
         }
         timeout = (2, 4)
         if deadline is not None:
@@ -203,6 +215,12 @@ def decide(state, questions, *, deadline: float | None = None) -> DecisionRespon
         if deadline is not None and monotonic() >= deadline:
             raise JevUnavailable("Jev unavailable")
         return result
-    except Exception:
+    except Exception as exc:
         # Pydantic and HTTP exceptions can contain raw state/provider output.
+        logger.warning("jev_unavailable reason=%s", type(exc).__name__)
+        if isinstance(exc, ValidationError):
+            logger.warning(
+                "jev_validation_errors errors=%s",
+                [(".".join(str(p) for p in error["loc"]), error["type"]) for error in exc.errors()][:5],
+            )
         raise JevUnavailable("Jev unavailable") from None
