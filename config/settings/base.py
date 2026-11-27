@@ -366,6 +366,9 @@ JEV_HEARTBEAT_SHADOW_TENANT_IDS = env("JEV_HEARTBEAT_SHADOW_TENANT_IDS", default
 # Proactive calendar heads-ups canary gate ("notice things for me"). Comma-separated
 # tenant UUIDs, "*" = all; EMPTY MEANS NOBODY. Also needs Tenant.proactive_signals_enabled.
 PROACTIVE_SIGNALS_TENANT_IDS = env("PROACTIVE_SIGNALS_TENANT_IDS", default="")
+# Always-on Phase 1 spike (apps/orchestrator/timer_spike.py): tenants allowed to receive
+# Django-fired test turns. EMPTY MEANS NOBODY. Temporary — remove with the spike module.
+TIMER_SPIKE_TENANT_IDS = env("TIMER_SPIKE_TENANT_IDS", default="")
 
 # Web redesign ("Open Sky" logged-in console): tenant UUID allowlist, fail-closed
 # (empty = nobody, exact "*" = everyone). Container App env var name MUST match.

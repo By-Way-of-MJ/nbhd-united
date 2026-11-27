@@ -282,6 +282,7 @@ TASK_MAP = {
     "detect_calendar_signals": "apps.router.proactive_signals.detect_calendar_signals_task",
     "deliver_proactive_signals": "apps.router.proactive_signals.deliver_proactive_signals_task",
     "send_test_operator_alert": "apps.common.operator_alert.send_test_operator_alert_task",
+    "timer_spike": "apps.orchestrator.timer_spike.timer_spike_task",
     # Neighborhood: coords-only copy-forward onto shared snapshots after a recluster
     "refresh_shared_positions": "apps.friends.tasks.refresh_shared_positions_task",
     # Hibernate suspended containers (one-off cleanup)
