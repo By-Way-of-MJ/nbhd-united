@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .entity_registry_views import EntityRegistryBulkStopView, EntityRegistryRestoreView
 from .line_views import line_generate_link, line_set_preferred_channel, line_status, line_unlink
+from .proactive_views import ProactiveSettingsView
 from .promo_views import redeem_promo
 from .runtime_views import (
     RuntimeAgendaEngagementView,
@@ -30,7 +31,6 @@ from .views import (
     PIIReviewQueueKeepView,
     PIIReviewQueueView,
     PreferredModelView,
-    ProactiveSettingsView,
     ProfileView,
     ProvisioningStatusView,
     RefreshConfigView,
